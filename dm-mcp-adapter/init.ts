@@ -91,6 +91,18 @@ export function recordFailure(state: McpExtensionState, serverName: string, mess
   publishMcpStatusSnapshot(state);
 }
 
+/**
+ * Turns ambiguous unauthenticated endpoint probing into an actionable message.
+ * The raw probe diagnostic remains available through the local debug logger.
+ */
+export function formatMcpConnectionFailure(message: string): string {
+  const sanitized = sanitizeTerminalText(message);
+  if (/endpoint returned .*\(401\).*authentication may be required/i.test(sanitized)) {
+    return "Authentication may be required (HTTP 401). Check the server credentials or OAuth sign-in, then reconnect.";
+  }
+  return sanitized;
+}
+
 export function isTuiMode(ctx: Pick<ExtensionContext, "hasUI" | "mode">): boolean {
   return ctx.hasUI && ctx.mode === "tui";
 }
@@ -351,7 +363,13 @@ export async function initializeMcp(
     owner.throwIfInactive();
     if (error || !connection) {
       if (initialSignal?.aborted) continue;
-      if (error) recordFailure(state, name, error);
+      const displayError = formatMcpConnectionFailure(error ?? "Unknown connection failure");
+      if (error) {
+        recordFailure(state, name, displayError);
+        if (displayError !== sanitizeTerminalText(error)) {
+          logger.debug("MCP: startup connection probe diagnostic", { server: name, diagnostic: sanitizeTerminalText(error) });
+        }
+      }
       if (transient) {
         const notice = `MCP: ${name} temporarily unavailable (HTTP 503); retry later`;
         logger.debug(`MCP: startup connect hit transient upstream outage for ${name}; will retry`);
@@ -359,11 +377,11 @@ export async function initializeMcp(
         else console.error(notice);
         continue;
       }
-      const displayError = sanitizeTerminalText(error ?? "Unknown connection failure");
       if (ui) {
         ui.notify(`MCP: Failed to connect to ${name}: ${displayError}`, "error");
+      } else {
+        console.error(`MCP: Failed to connect to ${name}: ${displayError}`);
       }
-      console.error(`MCP: Failed to connect to ${name}: ${displayError}`);
       continue;
     }
 

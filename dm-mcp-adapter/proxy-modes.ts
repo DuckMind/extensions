@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import type { McpExtensionState } from "./state.ts";
 import type { ToolMetadata, McpContent } from "./types.ts";
 import { getServerPrefix, isServerDisabled, parseUiPromptHandoff } from "./types.ts";
-import { lazyConnect, markKeepAliveAfterConnect, notifyToolMetadataUpdated, updateServerMetadata, updateMetadataCache, getFailureAgeSeconds, updateStatusBar, clearFailure, recordFailure } from "./init.ts";
+import { clearFailure, formatMcpConnectionFailure, getFailureAgeSeconds, lazyConnect, markKeepAliveAfterConnect, notifyToolMetadataUpdated, recordFailure, updateMetadataCache, updateServerMetadata, updateStatusBar } from "./init.ts";
 import { abortable, throwIfAborted } from "./abort.ts";
 import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
 import { buildToolMetadata, getToolNames, findToolByName, formatSchema } from "./tool-metadata.ts";
@@ -20,6 +20,7 @@ import { paginate, rankSuggestions, rankToolMatches, resolveSearchKeywords } fro
 import { ensureToolCallApproved, isToolCallApprovalRequired } from "./tool-approval.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
 import { getInputRequiredNeedsUiDetails } from "./errors.ts";
+import { logger } from "./logger.ts";
 
 type ProxyToolResult = AgentToolResult<Record<string, unknown>>;
 type ClientCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
@@ -908,7 +909,11 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
     updateStatusBar(state);
     return executeList(state, serverName);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const message = formatMcpConnectionFailure(rawMessage);
+    if (message !== rawMessage) {
+      logger.debug("MCP: manual connection probe diagnostic", { server: serverName, diagnostic: rawMessage });
+    }
     if (!isAbortError(error, ownedSignal)) recordFailure(state, serverName, message);
     updateStatusBar(state);
     return {
@@ -1249,7 +1254,11 @@ export async function executeCall(
         };
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const rawMessage = error instanceof Error ? error.message : String(error);
+      const message = formatMcpConnectionFailure(rawMessage);
+      if (message !== rawMessage) {
+        logger.debug("MCP: reconnect probe diagnostic", { server: serverName, diagnostic: rawMessage });
+      }
       if (!isAbortError(error, ownedSignal)) recordFailure(state, serverName, message);
       updateStatusBar(state);
       return {

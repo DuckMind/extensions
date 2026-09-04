@@ -1,7 +1,7 @@
 /**
  * kendex DM Skills Manager.
  *
- * A polished /skill manager view for browsing, previewing, inserting, creating,
+ * A polished /skills manager view for browsing, previewing, inserting, creating,
  * editing, renaming, deleting, and enabling/disabling DM skills.
  */
 
@@ -49,17 +49,17 @@ export default function skillsManager(pi: ExtensionAPI): void {
 			ctx.ui.notify("Skills Manager enabled. Reloading...", "info");
 			await ctx.reload();
 		};
-		pi.registerCommand("skill", {
+		pi.registerCommand("skills", {
 			description: "Skills manager recovery command.",
 			handler: async (args, ctx) => {
 				if (args.trim().toLowerCase() !== "enable") {
-					ctx.ui.notify("Skills Manager is disabled. Run /skill:enable, then /reload.", "warning");
+					ctx.ui.notify("Skills Manager is disabled. Run /skills:enable, then /reload.", "warning");
 					return;
 				}
 				await enableRecovery(ctx);
 			},
 		});
-		pi.registerCommand("skill:enable", {
+		pi.registerCommand("skills:enable", {
 			description: "Re-enable the skills manager",
 			handler: async (_args, ctx) => enableRecovery(ctx),
 		});
@@ -83,7 +83,7 @@ export default function skillsManager(pi: ExtensionAPI): void {
 		return false;
 	}
 
-	pi.registerCommand("skill", {
+	pi.registerCommand("skills", {
 		description: "DM skills manager view. Native skills remain /skill:name.",
 		handler: async (args, ctx) => {
 			const rawArgs = args.trim();
@@ -99,11 +99,11 @@ export default function skillsManager(pi: ExtensionAPI): void {
 				return;
 			}
 			if (rawArgs) {
-				ctx.ui.notify("Use /skill:name for native skill invocation, or /skill with no arguments for the manager.", "warning");
+				ctx.ui.notify("Use /skill:name for native skill invocation, or /skills with no arguments for the manager.", "warning");
 				return;
 			}
 			if (!ctx.hasUI) {
-				ctx.ui.notify("/skill manager requires interactive mode", "warning");
+				ctx.ui.notify("/skills manager requires interactive mode", "warning");
 				return;
 			}
 			try {

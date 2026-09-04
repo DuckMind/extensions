@@ -37,7 +37,7 @@
         {
           "key": "enabled",
           "label": "Enable skills manager",
-          "description": "Register the /skill manager view, startup skill-list hiding, and skills management UI. If disabled, /skill enable remains available as a recovery command. Native /skill:name commands stay controlled by DM's Skill commands setting.",
+          "description": "Register the /skills manager view, startup skill-list hiding, and skills management UI. If disabled, /skills enable remains available as a recovery command. Native /skill:name commands stay controlled by DM's Skill commands setting.",
           "type": "boolean",
           "default": true,
           "category": "General",
