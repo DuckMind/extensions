@@ -1,0 +1,49 @@
+{
+  "name": "dm-cliproxy",
+  "version": "0.3.5",
+  "type": "module",
+  "description": "DM extension for managing model providers through a single CliProxyAPI endpoint",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abix5/pi-cliproxyapi.git"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "NOTICE.md"
+  ],
+  "dm": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "duckmind",
+    "dm",
+    "dm-extension",
+    "cliproxy",
+    "cliproxyapi",
+    "proxy"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check:migration": "node --disable-warning=ExperimentalWarning --experimental-strip-types scripts/check-config-migration.ts",
+    "test:smoke": "node --experimental-strip-types --no-warnings tests/smoke.ts",
+    "test:security": "node --experimental-strip-types --no-warnings tests/security.ts",
+    "test:state": "node --experimental-strip-types --no-warnings tests/state.ts",
+    "verify": "npm run typecheck && npm run check:migration && npm run test:smoke && npm run test:security && npm run test:state"
+  },
+  "peerDependencies": {
+    "@duckmind/dm-ai": "*",
+    "@duckmind/dm-coding-agent": "*",
+    "@duckmind/dm-tui": "*"
+  },
+  "devDependencies": {
+    "@duckmind/dm-ai": "file:../../dm-mono/packages/ai",
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",
+    "@duckmind/dm-tui": "file:../../dm-mono/packages/tui",
+    "typescript": "^5.6.0"
+  }
+}

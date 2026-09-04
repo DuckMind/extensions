@@ -1,0 +1,38 @@
+{
+  "name": "dm-image2",
+  "version": "0.1.0",
+  "description": "Dedicated imagen.py-based image generation extension for DM using active Ultradex/Codex accounts",
+  "type": "module",
+  "files": [
+    "index.js",
+    "src/",
+    "vendor/",
+    "skills/",
+    "README.md",
+    "test/"
+  ],
+  "keywords": [
+    "duckmind",
+    "dm",
+    "image",
+    "svg",
+    "png",
+    "ultra",
+    "codex"
+  ],
+  "peerDependencies": {
+    "@sinclair/typebox": "*",
+    "@duckmind/dm-coding-agent": "*"
+  },
+  "dm": {
+    "extensions": [
+      "./index.js"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "devDependencies": {
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent"
+  }
+}

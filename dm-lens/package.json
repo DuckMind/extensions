@@ -1,0 +1,98 @@
+{
+  "name": "dm-lens",
+  "version": "4.1.3",
+  "description": "Real-time code feedback for DM \u2014 LSP, linters, formatters, type-checking, and structural analysis.",
+  "type": "module",
+  "main": "./index.ts",
+  "bin": {
+    "dm-lens": "mcp/cli.ts",
+    "dm-lens-mcp": "mcp/server.ts",
+    "dm-lens-analyze": "mcp/analyze-cli.ts"
+  },
+  "license": "MIT",
+  "author": "Apostolos Mantzaris",
+  "keywords": [
+    "duckmind",
+    "dm",
+    "dm-package",
+    "dm-extension",
+    "code-quality",
+    "lsp",
+    "ast-grep"
+  ],
+  "files": [
+    "index.ts",
+    "i18n.ts",
+    "clients/",
+    "mcp/",
+    "tools/",
+    "config/",
+    "rules/",
+    "skills/",
+    "vendor/",
+    "scripts/lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit --project tsconfig.json",
+    "test": "node --test __tests__/package-manifest.test.mjs",
+    "verify": "npm run typecheck && npm test"
+  },
+  "dm": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apmantza/pi-lens.git"
+  },
+  "bugs": {
+    "url": "https://github.com/apmantza/pi-lens/issues"
+  },
+  "homepage": "https://github.com/apmantza/pi-lens#readme",
+  "dependencies": {
+    "@ast-grep/cli": "^0.45.0",
+    "@ast-grep/napi": "^0.45.0",
+    "js-yaml": "^5.2.2",
+    "minimatch": "^10.2.6",
+    "pidusage": "^4.0.1",
+    "vscode-jsonrpc": "^9.0.0"
+  },
+  "optionalDependencies": {
+    "web-tree-sitter": "0.25.10"
+  },
+  "peerDependencies": {
+    "@duckmind/dm-ai": "*",
+    "@duckmind/dm-coding-agent": "*",
+    "@duckmind/dm-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@duckmind/dm-ai": {
+      "optional": true
+    },
+    "@duckmind/dm-coding-agent": {
+      "optional": true
+    },
+    "@duckmind/dm-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "@duckmind/dm-ai": "file:../../dm-mono/packages/ai",
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",
+    "@duckmind/dm-tui": "file:../../dm-mono/packages/tui",
+    "@types/pidusage": "^2.0.5",
+    "typebox": "^1.0.0"
+  }
+}

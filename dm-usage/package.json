@@ -1,0 +1,37 @@
+{
+  "name": "dm-usage",
+  "version": "0.3.2",
+  "description": "DM extension that shows local session usage statistics and cost insights",
+  "type": "module",
+  "license": "MIT",
+  "author": "Thomas Mustier",
+  "keywords": [
+    "duckmind",
+    "dm",
+    "usage",
+    "cost",
+    "tokens",
+    "dashboard"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "screenshot.png",
+    "insights-screenshot.png"
+  ],
+  "peerDependencies": {
+    "@duckmind/dm-coding-agent": "*",
+    "@duckmind/dm-tui": "*"
+  },
+  "devDependencies": {
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",
+    "@duckmind/dm-tui": "file:../../dm-mono/packages/tui"
+  },
+  "dm": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "image": "./screenshot.png"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "name": "dm-localllm-provider",
+  "version": "0.5.0",
+  "description": "Wizard-based setup for local OpenAI-compatible LLM servers in DM",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "author": "Eric Qian",
+  "keywords": [
+    "duckmind",
+    "dm",
+    "dm-package",
+    "dm-extension",
+    "llm",
+    "vllm",
+    "ollama",
+    "lm-studio"
+  ],
+  "files": [
+    "index.ts",
+    "detect.ts",
+    "keychain.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm test"
+  },
+  "dm": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@duckmind/dm-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.7",
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent"
+  }
+}

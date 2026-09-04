@@ -1,0 +1,78 @@
+{
+  "name": "dm-web-access",
+  "version": "0.27.0",
+  "description": "Web search, URL fetching, PDF extraction, YouTube video understanding, and local video analysis for DM.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Nico Bailon",
+  "keywords": [
+    "duckmind",
+    "dm",
+    "dm-package",
+    "dm-extension",
+    "web-search",
+    "fetch",
+    "pdf",
+    "youtube"
+  ],
+  "files": [
+    "*.ts",
+    "CHANGELOG.md",
+    "README.md",
+    "SECURITY.md",
+    "banner.png",
+    "dm-web-fetch-demo.mp4"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test",
+    "verify": "npm run typecheck && npm test"
+  },
+  "dm": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicobailon/pi-web-access.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nicobailon/pi-web-access/issues"
+  },
+  "homepage": "https://github.com/nicobailon/pi-web-access#readme",
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "defuddle": "0.19.3",
+    "linkedom": "^0.16.0",
+    "p-limit": "^6.1.0",
+    "promise.try": "^2.0.1",
+    "turndown": "^7.2.0",
+    "typebox": "^1.1.38",
+    "unpdf": "^1.6.2",
+    "undici": "^8.9.0"
+  },
+  "peerDependencies": {
+    "@duckmind/dm-ai": "*",
+    "@duckmind/dm-coding-agent": "*",
+    "@duckmind/dm-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@duckmind/dm-ai": {
+      "optional": true
+    },
+    "@duckmind/dm-coding-agent": {
+      "optional": true
+    },
+    "@duckmind/dm-tui": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/turndown": "^5.0.6",
+    "typescript": "^7.0.2",
+    "@duckmind/dm-ai": "file:../../dm-mono/packages/ai",
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",
+    "@duckmind/dm-tui": "file:../../dm-mono/packages/tui"
+  }
+}

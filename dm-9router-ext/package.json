@@ -1,0 +1,45 @@
+{
+  "name": "dm-9router-ext",
+  "version": "0.1.1",
+  "description": "DM extension for 9router AI routing proxy instances",
+  "keywords": [
+    "duckmind",
+    "dm",
+    "dm-package",
+    "dm-extension",
+    "9router",
+    "ai-router",
+    "openai-proxy"
+  ],
+  "license": "MIT",
+  "author": "Irfan Sofyana <mail@irfansp.dev>",
+  "type": "module",
+  "main": "./src/index.ts",
+  "files": [
+    "src",
+    "test",
+    "README.md",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.mjs",
+    "verify": "npm run typecheck && npm test"
+  },
+  "dm": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "typebox": "*",
+    "@duckmind/dm-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "typebox": "1.1.38",
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent"
+  }
+}

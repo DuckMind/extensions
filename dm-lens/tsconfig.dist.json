@@ -1,0 +1,21 @@
+{
+	"extends": "./tsconfig.build.json",
+	"compilerOptions": {
+		"rootDir": ".",
+		"outDir": "./dist",
+		"declaration": false,
+		"sourceMap": false,
+		"types": [],
+		"allowJs": true
+	},
+	"include": [
+		"index.ts",
+		"i18n.ts",
+		"clients/**/*.ts",
+		"commands/**/*.ts",
+		"tools/**/*.ts",
+		"mcp/**/*.ts",
+		"scripts/lib/process-scan.mjs"
+	],
+	"exclude": ["node_modules", "tests", "**/*.test.ts"]
+}

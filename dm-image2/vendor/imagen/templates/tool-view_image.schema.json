@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Local filesystem path to an image file."
+    },
+    "detail": {
+      "type": "string",
+      "description": "Optional detail override. The only supported value is `original`."
+    }
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}

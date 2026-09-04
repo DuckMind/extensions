@@ -1,0 +1,32 @@
+{
+  "name": "dm-ponytail",
+  "version": "4.9.0",
+  "description": "DM extension that applies Ponytail's full minimal-code mode by default",
+  "type": "commonjs",
+  "keywords": [
+    "duckmind",
+    "dm",
+    "dm-extension",
+    "ponytail"
+  ],
+  "license": "MIT",
+  "author": "DietrichGebert",
+  "files": [
+    "extensions/",
+    "hooks/",
+    "skills/",
+    "README.md",
+    "LICENSE"
+  ],
+  "dm": {
+    "extensions": [
+      "./extensions/ponytail.mjs"
+    ]
+  },
+  "peerDependencies": {
+    "@duckmind/dm-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent"
+  }
+}

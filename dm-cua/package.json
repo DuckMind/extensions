@@ -1,0 +1,37 @@
+{
+  "name": "dm-cua",
+  "version": "0.1.0",
+  "description": "First-class browser CUA for DM with a dedicated profile and automatic Chrome bootstrap",
+  "type": "module",
+  "files": [
+    "index.js",
+    "bin/",
+    "src/",
+    "skills/",
+    "README.md"
+  ],
+  "keywords": [
+    "duckmind",
+    "dm",
+    "browser",
+    "cua",
+    "chrome",
+    "cloakbrowser",
+    "automation"
+  ],
+  "peerDependencies": {
+    "@sinclair/typebox": "*",
+    "@duckmind/dm-coding-agent": "*"
+  },
+  "dm": {
+    "extensions": [
+      "./index.js"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "devDependencies": {
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent"
+  }
+}

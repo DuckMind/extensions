@@ -1,0 +1,35 @@
+{
+  "name": "dm-context",
+  "version": "2.1.2",
+  "description": "Agentic Context Management for DM",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "verify": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@duckmind/dm-ai": "file:../../dm-mono/packages/ai",
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",
+    "@duckmind/dm-tui": "file:../../dm-mono/packages/tui"
+  },
+  "keywords": [
+    "duckmind",
+    "dm",
+    "context-management",
+    "context-optimization",
+    "time-travel",
+    "checkpoint"
+  ],
+  "license": "MIT",
+  "dm": {
+    "extensions": [
+      "./src/index.ts",
+      "./src/context.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  }
+}

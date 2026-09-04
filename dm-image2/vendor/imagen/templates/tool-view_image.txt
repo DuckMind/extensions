@@ -1,0 +1,5 @@
+View a local image from the filesystem.
+
+Use when a relevant local image path is known or discovered during the task, and the image is not already attached to the prompt.
+
+Use `detail: "original"` when high-fidelity image reading is needed and the model supports original image detail.
