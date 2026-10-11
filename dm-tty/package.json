@@ -1,0 +1,50 @@
+{
+  "name": "dm-tty",
+  "version": "0.1.0",
+  "description": "Authenticated browser access to a local POSIX shell terminal",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "standalone.ts",
+    "server.ts",
+    "control.ts",
+    "sessions.ts",
+    "pty.ts",
+    "pty_bridge.py",
+    "web/",
+    "README.md"
+  ],
+  "keywords": [
+    "duckmind",
+    "dm",
+    "dm-extension",
+    "terminal",
+    "browser",
+    "remote"
+  ],
+  "dependencies": {
+    "@xterm/xterm": "5.5.0",
+    "@xterm/addon-fit": "0.10.0",
+    "ws": "8.21.0"
+  },
+  "peerDependencies": {
+    "@duckmind/dm-coding-agent": "*"
+  },
+  "dm": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",
+    "@types/node": "22.19.19",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "verify": "npm run typecheck && npm test"
+  }
+}

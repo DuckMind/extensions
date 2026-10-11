@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DM TTY</title>
+  <link rel="stylesheet" href="/xterm.css">
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/xterm.js"></script>
+  <script defer src="/addon-fit.js"></script>
+  <script defer src="/client.js"></script>
+</head>
+<body>
+  <header>
+    <strong>DM TTY</strong>
+    <span id="state" role="status" aria-live="polite">Offline</span>
+    <button id="history" type="button" aria-controls="history-panel" aria-expanded="false" hidden>History</button>
+    <details id="session-menu">
+      <summary aria-label="Connection and terminal options">⋯</summary>
+      <section class="menu-panel" aria-label="Terminal options">
+        <label for="token">Access token</label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="From /tty start">
+        <div class="menu-actions">
+          <button id="connect" type="button">Connect</button>
+          <button id="disconnect" type="button" disabled>Disconnect</button>
+        </div>
+        <div class="menu-actions">
+          <button id="select-output" type="button" disabled>Select all output</button>
+          <button id="copy-output" type="button" disabled>Copy all output</button>
+        </div>
+        <span id="copy-status" role="status" aria-live="polite"></span>
+        <details id="session-panel">
+          <summary>Sessions</summary>
+          <p>Open a running tmux or screen session by selecting its tab. Switching tabs does not stop the session.</p>
+          <button id="session-refresh" type="button" disabled>Refresh tabs</button>
+          <form id="session-create" autocomplete="off">
+            <label for="session-backend">New session</label>
+            <select id="session-backend" aria-label="Session backend"><option value="tmux">tmux</option><option value="screen">screen</option></select>
+            <label for="session-name">Name</label>
+            <input id="session-name" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="work" required>
+            <button id="session-add" type="submit" disabled>Create and open</button>
+          </form>
+        </details>
+        <p class="security-note">Full shell access. Use SSH or HTTPS remotely.</p>
+      </section>
+    </details>
+  </header>
+  <nav id="tabs" role="tablist" aria-label="Terminal sessions" hidden></nav>
+  <main id="terminal" aria-label="Remote shell terminal">
+    <section id="history-panel" aria-label="Recent session output" tabindex="0" hidden>
+      <div class="history-actions">
+        <p>Recent stream · up to 2,000 lines / 65,536 characters · terminal redraws may repeat text</p>
+        <button id="history-select" type="button">Select all</button>
+        <button id="history-copy" type="button">Copy</button>
+      </div>
+      <pre id="history-text"></pre>
+    </section>
+    <form id="command-form" autocomplete="off" hidden>
+      <label class="sr-only" for="command">Shell command (Vietnamese IME)</label>
+      <textarea id="command" rows="1" wrap="off" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Shell command (Vietnamese IME)"></textarea>
+      <div id="command-preview" aria-hidden="true"><span id="command-before"></span><span id="command-selection"></span><span id="command-caret"></span><span id="command-after"></span></div>
+    </form>
+  </main>
+  <nav id="accessory" aria-label="Terminal keys">
+    <div id="primary-key-strip" class="key-strip">
+      <button type="button" class="key-scroll" data-scroll="-1" aria-label="Scroll terminal keys left" hidden>‹</button>
+      <div id="primary-key-row" class="key-row">
+      <button type="button" data-key="Escape" disabled>Esc</button>
+      <button type="button" data-key="Tab" disabled>Tab</button>
+      <button type="button" id="ctrl" aria-pressed="false" disabled>Ctrl</button>
+      <button type="button" id="alt" aria-pressed="false" disabled>Alt</button>
+      <button type="button" data-key="ArrowUp" aria-label="Up" disabled>↑</button>
+      <button type="button" data-key="ArrowDown" aria-label="Down" disabled>↓</button>
+      <button type="button" data-key="ArrowLeft" aria-label="Left" disabled>←</button>
+      <button type="button" data-key="ArrowRight" aria-label="Right" disabled>→</button>
+      <button type="button" data-key="Backspace" aria-label="Backspace" disabled>⌫</button>
+      <button type="button" data-key="Enter" aria-label="Send draft or Return" disabled>↵</button>
+      <button type="button" id="more" aria-expanded="false" aria-controls="function-keys" disabled>…</button>
+      </div>
+      <button type="button" class="key-scroll" data-scroll="1" aria-label="Scroll terminal keys right" hidden>›</button>
+    </div>
+    <div id="function-keys" class="key-strip" hidden>
+      <button type="button" class="key-scroll" data-scroll="-1" aria-label="Scroll extra keys left" hidden>‹</button>
+      <div id="extra-key-row" class="key-row">
+      <button type="button" data-text="/" aria-label="Insert slash" disabled>/</button>
+      <button type="button" data-text="-" aria-label="Insert dash" disabled>-</button>
+      <button type="button" data-text="|" aria-label="Insert pipe" disabled>|</button>
+      <button type="button" data-text="~" aria-label="Insert tilde" disabled>~</button>
+      <button type="button" data-text="_" aria-label="Insert underscore" disabled>_</button>
+      <button type="button" data-text="&amp;" aria-label="Insert ampersand" disabled>&amp;</button>
+      <button type="button" data-key="Home" disabled>Home</button>
+      <button type="button" data-key="End" disabled>End</button>
+      <button type="button" data-key="PageUp" disabled>PgUp</button>
+      <button type="button" data-key="PageDown" disabled>PgDn</button>
+      <button type="button" data-key="F1" disabled>F1</button>
+      <button type="button" data-key="F2" disabled>F2</button>
+      <button type="button" data-key="F3" disabled>F3</button>
+      <button type="button" data-key="F4" disabled>F4</button>
+      <button type="button" data-key="F5" disabled>F5</button>
+      <button type="button" data-key="F6" disabled>F6</button>
+      <button type="button" data-key="F7" disabled>F7</button>
+      <button type="button" data-key="F8" disabled>F8</button>
+      <button type="button" data-key="F9" disabled>F9</button>
+      <button type="button" data-key="F10" disabled>F10</button>
+      <button type="button" data-key="F11" disabled>F11</button>
+      <button type="button" data-key="F12" disabled>F12</button>
+      </div>
+      <button type="button" class="key-scroll" data-scroll="1" aria-label="Scroll extra keys right" hidden>›</button>
+    </div>
+  </nav>
+</body>
+</html>
