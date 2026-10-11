@@ -7,8 +7,76 @@
 
 import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
 import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import * as path from "node:path";
+import {
+	type BundledResourceHealth,
+	classifyBundledResourceDir,
+	reportBundledResourceDirHealth,
+} from "./bundled-resource-health.js";
+import {
+	getDegradationLedgerGeneration,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
+import yaml from "./deps/js-yaml.js";
 import { resolvePackagePath } from "./package-root.js";
+import {
+	getUserRuleRoot,
+	ruleCorpusFingerprintForCycle,
+} from "./custom-rule-locations.js";
+import { compareOrdinal } from "./string-utils.js";
+
+/**
+ * The bundled `rules/tree-sitter-queries` root — the ONE spelling of this
+ * path, imported by `clients/cache/rule-cache.ts` (re-exported there as
+ * `BUNDLED_RULES_ROOT`, #2636 review F4) rather than computed a second time,
+ * so the "one ledger row, not two" claim for `tree-sitter-queries-dir-missing`
+ * rests on reference equality, not merely two independently-resolved strings
+ * that happen to match.
+ */
+export const BUNDLED_QUERIES_ROOT = resolvePackagePath(
+	import.meta.url,
+	"rules",
+	"tree-sitter-queries",
+);
+
+let cachedBundledQueriesRootHealth: BundledResourceHealth | undefined;
+let cachedBundledQueriesRootHealthGeneration: number | undefined;
+
+/**
+ * #2636 review F6/round-2 F3: memoized, but keyed on the degradation
+ * ledger's OWN generation counter (bumped by `resetDegradationLedger`, wired
+ * into `handleSessionStart`) rather than "compute once, forever" — round 1's
+ * version overclaimed that the underlying fact "cannot change mid-process
+ * any more than the package's own install location can", but a managed
+ * extension cache RELOCATING a live install mid-process is exactly the
+ * failure #2587/#2626 investigated: a permanently-cached "absent" verdict
+ * from the FIRST probe would never notice the directory coming back (or
+ * disappearing later), the same silent-zero shape this issue exists to end.
+ * Re-probing once per SESSION (not once per call) is the right middle
+ * ground: a real, measured `readdirSync` cost (4.2 µs) is paid once per
+ * session rather than on every dispatched file — same generation-keyed
+ * pattern `clients/ast-grep-client.ts`'s `ensureRulesHealthReported` uses
+ * for its own per-instance re-check.
+ */
+export function getBundledQueriesRootHealth(): BundledResourceHealth {
+	const generation = getDegradationLedgerGeneration();
+	if (
+		cachedBundledQueriesRootHealth === undefined ||
+		cachedBundledQueriesRootHealthGeneration !== generation
+	) {
+		cachedBundledQueriesRootHealthGeneration = generation;
+		cachedBundledQueriesRootHealth =
+			classifyBundledResourceDir(BUNDLED_QUERIES_ROOT);
+	}
+	return cachedBundledQueriesRootHealth;
+}
+
+/** Test-only: clear the memo so a scenario can simulate a different install layout. */
+export function _resetBundledQueriesRootHealthForTests(): void {
+	cachedBundledQueriesRootHealth = undefined;
+	cachedBundledQueriesRootHealthGeneration = undefined;
+}
 
 export function isDisabledQueryDirectoryName(name: string): boolean {
 	return name.endsWith("-disabled");
@@ -69,7 +137,8 @@ export function ruleFilesForLanguage(
 	for (const lang of ruleSourceLanguages(languageId)) {
 		for (const dir of [
 			path.join(resolvedRoot, "rules", "tree-sitter-queries", lang),
-			resolvePackagePath(import.meta.url, "rules", "tree-sitter-queries", lang),
+			path.join(getUserRuleRoot(), "tree-sitter-queries", lang),
+			path.join(BUNDLED_QUERIES_ROOT, lang),
 		]) {
 			if (!fs.existsSync(dir)) continue;
 			for (const f of fs.readdirSync(dir)) {
@@ -77,7 +146,155 @@ export function ruleFilesForLanguage(
 			}
 		}
 	}
+	// #2636 (review F2): a language resolving zero files here is NORMAL when
+	// nobody has authored bundled/project queries for it — seven REACHABLE
+	// grammars have none by design: bash, dart, elixir, lua, ocaml, swift, zig
+	// (`.sh`/`.bash`, `.dart`, `.ex`/`.exs`, `.lua`, `.ml`/`.mli`, `.swift`,
+	// `.zig` — see `language-registry.ts`'s `EXTENSION_TO_GRAMMAR`). cobol and
+	// plsql are NOT in that registry at all — only their `-disabled` query
+	// directories exist — so `ruleFilesForLanguage` never actually resolves
+	// those two languageIds in production; they are not examples of this
+	// case. A BUG looks identical from an empty `files` set alone: the
+	// bundled root itself relocated out from under the package (same
+	// managed-cache-relocation shape #2626 fixed for skills/). Only pay for
+	// the extra classification in this COLD branch (never on the common,
+	// non-empty path), key it on the shared ROOT rather than this call's
+	// `languageId` (every language hitting an actually-missing root collapses
+	// into the SAME ledger row instead of one per language), and only RECORD
+	// when the root is actually unhealthy — one of the seven by-design-empty
+	// languages is touched routinely (any `.sh`/`.lua` edit).
+	//
+	// #2636 review round 2, F2: NO separate phase/latency row here (unlike
+	// the ast-grep/skills sibling sites, which log one PER CONSTRUCTION or
+	// PER REQUEST — a bounded cardinality). This branch runs on EVERY
+	// dispatched file while the root stays broken (AGENTS.md's "no raw
+	// per-occurrence log for repeats"): 200 touches of a by-design-empty
+	// language against a broken root would otherwise write 200 raw
+	// `latency.log` rows. `reportBundledResourceDirHealth`'s
+	// `incrementDegradationCount` already answers "did this run" AND "how
+	// many times" in a BOUNDED way — one row per session at count 1, then
+	// only at power-of-two milestones (1, 2, 4, 8, … so 200 occurrences write
+	// exactly 8 durable rows) — so a second, unbounded record here would add
+	// nothing the ledger row lacks.
+	if (files.size === 0) {
+		const health = getBundledQueriesRootHealth();
+		if (health.status !== "healthy") {
+			reportBundledResourceDirHealth(
+				"tree-sitter-queries-dir-missing",
+				BUNDLED_QUERIES_ROOT,
+				health,
+				"bundled tree-sitter query rules",
+			);
+		}
+	}
 	return [...files];
+}
+
+/**
+ * Content fingerprint for the effective tree-sitter rule set. This is the
+ * DISK RuleCache identity (cross-process): it content-hashes the mutable
+ * rule files (project + user roots), because a rule edit that preserves both
+ * mtime and size (a same-length tweak, a checkout that restores timestamps)
+ * must not replay a stale compiled set from disk under the still-matching
+ * fingerprint (#1118, the v7 bump). Bundled files are immutable within a
+ * process, so mtime+size is sufficient for them (#2636-era invariant, same
+ * standing as `bundledSnapshots` in `clients/sgconfig.ts`).
+ *
+ * The in-process loader memo does NOT call this on its warm path. #4212 round
+ * 2 did exactly that and re-walked and re-hashed the whole corpus on EVERY warm
+ * call (100 warm `loadQueries` calls measured 134.98 ms vs master's 18.03).
+ * The loader gates its memo on `computeMutableRuleFingerprint` instead — the
+ * same content-hash strength over a smaller population (the two mutable roots,
+ * never the bundled one), computed at most once per dispatch cycle by
+ * `ruleCorpusFingerprintForCycle`. This helper stays the DISK identity: it is
+ * what `RuleCache` re-derives per dispatched file, so a miss there forces a
+ * reload no in-process memo can suppress.
+ */
+export function computeRuleFilesFingerprint(ruleFiles: string[]): string {
+	const hash = crypto.createHash("sha256");
+	for (const file of [...ruleFiles].sort(compareOrdinal)) {
+		const resolved = path.resolve(file);
+		if (!fs.existsSync(resolved)) continue;
+		const stat = fs.statSync(resolved);
+		hash.update(`${file}:${stat.mtimeMs}:${stat.size}`);
+		if (
+			resolved !== BUNDLED_QUERIES_ROOT &&
+			!resolved.startsWith(BUNDLED_QUERIES_ROOT + path.sep)
+		) {
+			hash.update(fs.readFileSync(resolved));
+		}
+	}
+	return hash.digest("hex").slice(0, 16);
+}
+
+/**
+ * Content fingerprint of the MUTABLE tree-sitter rule corpus — the project
+ * root's `rules/tree-sitter-queries/` and the user-level root — used to gate
+ * the in-process loader memo. It walks those two roots and content-hashes each
+ * `.yml` file's path and bytes; it never touches the bundled root (immutable
+ * per process; the dispatch-side RuleCache v7 fingerprint above still observes
+ * bundled-file metadata on every dispatched file, and the bundled health seam
+ * reports relocation per session).
+ *
+ * Content rather than stat, because #4212 round 3's stat-only signature
+ * (path + mtime + size) demonstrably missed an in-place same-length rewrite
+ * whose mtime was restored with `touch`: the round-3 verify wrote `AAAA` →
+ * `BBBB`, restored the nanosecond mtime, and the next no-`force` load still
+ * returned `AAAA`. Bytes cannot be forged that way.
+ *
+ * It runs at most once per dispatch cycle — `ruleCorpusFingerprintForCycle`
+ * memoizes it on the turn identity — because per-call is what rounds 2 and 3
+ * each measured as a regression. The consequence, stated plainly: a rule edit
+ * made DURING a cycle is seen by the next cycle, or earlier by any dispatch
+ * (whose `force: true` recomputes and republishes into this cycle).
+ */
+function computeMutableRuleFingerprint(rootDir: string): string {
+	const files: string[] = [];
+	for (const queriesDir of [
+		path.join(path.resolve(rootDir), "rules", "tree-sitter-queries"),
+		path.join(getUserRuleRoot(), "tree-sitter-queries"),
+	]) {
+		if (!fs.existsSync(queriesDir)) continue;
+		let languages: fs.Dirent[];
+		try {
+			languages = fs.readdirSync(queriesDir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const language of languages) {
+			if (!language.isDirectory()) continue;
+			let names: string[];
+			try {
+				names = fs.readdirSync(path.join(queriesDir, language.name));
+			} catch {
+				continue;
+			}
+			for (const name of names) {
+				if (name.endsWith(".yml")) {
+					files.push(path.join(queriesDir, language.name, name));
+				}
+			}
+		}
+	}
+	const hash = crypto.createHash("sha256");
+	for (const filePath of files.sort(compareOrdinal)) {
+		hash.update(filePath);
+		hash.update("\0");
+		let content: string;
+		try {
+			content = fs.readFileSync(filePath, "utf-8");
+		} catch {
+			// Vanished between the listing and the read (editor churn): the
+			// sentinel still perturbs the fingerprint, so this cycle reloads
+			// instead of serving a memo built from a different corpus.
+			hash.update("missing");
+			hash.update("\0");
+			continue;
+		}
+		hash.update(content);
+		hash.update("\0");
+	}
+	return hash.digest("hex").slice(0, 16);
 }
 
 /**
@@ -100,13 +317,20 @@ export function queriesForLanguage(
 }
 
 /**
- * Drop a trailing ` # comment` from an unquoted YAML scalar. Quoted values keep
- * their `#` (a message may legitimately contain one), matching YAML's rule that
- * a comment only starts after whitespace outside quotes.
+ * Coerce a parsed YAML scalar to a string, refusing a mapping or array.
+ * `String({})`/`String([])` silently produce the literal text
+ * `"[object Object]"`/`"a,b"` — SonarCloud typescript:S6551 flagged this at
+ * every scalar field in `parseQueryFile` once `parseYaml` widened to
+ * `Record<string, unknown>` (#3054 review F2). Returns `undefined` for
+ * `null`/`undefined`/a non-scalar so call sites keep using `||`/`??` for
+ * defaults exactly as the old `String(x || fallback)` calls did.
  */
-function stripInlineComment(value: string): string {
-	if (value.startsWith('"') || value.startsWith("'")) return value;
-	return value.replace(/\s+#.*$/, "").trim();
+function str(value: unknown): string | undefined {
+	return typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+		? String(value)
+		: undefined;
 }
 
 export function isDisabledQueryFilePath(filePath: string): boolean {
@@ -176,7 +400,22 @@ export class TreeSitterQueryLoader {
 	private queries: Map<string, TreeSitterQuery[]> = new Map();
 	private loaded = false;
 	private loadedRoot: string | null = null;
+	private loadedRuleFingerprint: string | null = null;
 	private verbose: boolean;
+	/**
+	 * This root's per-file parse failures, remembered across the memoized
+	 * (no-`force`) `loadQueries` path so a later session's ledger can carry
+	 * the same row without re-parsing every file (#3070 N1).
+	 */
+	private readonly parseFailures = new Map<string, string>();
+	/**
+	 * Generation (`getDegradationLedgerGeneration()`) at which `parseFailures`
+	 * was last replayed into the ledger — the same generation-keyed memo
+	 * idiom `getBundledQueriesRootHealth` above uses, applied here so a
+	 * memoized `loadQueries` return still re-arms `recordDegradationOnce` once
+	 * per session rather than only in the session that actually parsed.
+	 */
+	private parseFailuresReplayedGeneration: number | undefined;
 
 	constructor(verbose = false) {
 		this.verbose = verbose;
@@ -195,13 +434,67 @@ export class TreeSitterQueryLoader {
 	}
 
 	/**
+	 * One degradation-ledger record per malformed rule file per session
+	 * (#3054 review F1). The old hand-rolled scanner tolerated almost any
+	 * line-level mistake and still produced SOME parsed shape; `yaml.load`
+	 * correctly throws on realistic authoring mistakes the scanner shrugged
+	 * off (a colon in an unquoted scalar, a tab in list indentation, a
+	 * duplicate key, an unclosed quote, a bare `@` value — fuzzed over 800
+	 * corruptions of one shipped query: 139 that loaded before now skip, 0
+	 * the other way). Before this, the only sink on that skip path was
+	 * `dbg()`, gated behind `verbose` — both production instantiations
+	 * (this file's `queryLoader` singleton and `tree-sitter-client.ts`'s
+	 * `new TreeSitterQueryLoader()`) construct with the `verbose = false`
+	 * default — so a silently-dropped custom rule had no surviving signal.
+	 */
+	private recordQueryParseFailure(filePath: string, reason: string): void {
+		this.parseFailures.set(filePath, reason);
+		recordDegradationOnce({
+			kind: "tree-sitter-query-parse-failed",
+			subject: filePath,
+			reason,
+		});
+	}
+
+	/**
+	 * Replay every remembered per-file parse failure into the CURRENT
+	 * session's ledger, at most once per ledger generation (#3070 N1). A
+	 * memoized `loadQueries` return skips `parseQueryFile` entirely, so
+	 * without this replay the `tree-sitter-query-parse-failed` record only
+	 * ever reached the FIRST session that actually parsed — `resetDegradationLedger`
+	 * (wired into `handleSessionStart`) clears the once-keys every session,
+	 * but the loader instance and its `parseFailures` memo are kept across
+	 * sessions (`clients/tree-sitter-shared.ts:39`), the same shape
+	 * `getBundledQueriesRootHealth` above already re-probes per generation.
+	 */
+	private replayQueryParseFailures(): void {
+		const generation = getDegradationLedgerGeneration();
+		if (this.parseFailuresReplayedGeneration === generation) return;
+		this.parseFailuresReplayedGeneration = generation;
+		for (const [filePath, reason] of this.parseFailures) {
+			recordDegradationOnce({
+				kind: "tree-sitter-query-parse-failed",
+				subject: filePath,
+				reason,
+			});
+		}
+	}
+
+	/**
 	 * Load all queries from the rules/tree-sitter-queries directory.
 	 *
-	 * Returns the in-memory memo when the same root was already loaded.
-	 * `force: true` re-reads from disk even then — the memo has no notion of
-	 * rule-file mtimes, so a caller that KNOWS the files changed (the dispatch
-	 * runner's RuleCache-miss path: a miss means the rule-file fingerprint
-	 * moved) must force, or it gets the pre-edit rules back and persists them
+	 * Returns the in-memory memo when the same root is already loaded and the
+	 * mutable corpus's content fingerprint is unchanged. That fingerprint is
+	 * computed at most once per dispatch cycle and reused by every later call
+	 * in the cycle (`ruleCorpusFingerprintForCycle`), so routine re-scans and
+	 * structural searches do no filesystem work at all on the warm path
+	 * (#4212 round 4; rounds 2 and 3 each paid for per-call detection). An edit
+	 * made during a cycle is therefore seen by the NEXT cycle — or earlier, by
+	 * any `force: true` call, which republishes the fresh value into the cycle.
+	 *
+	 * `force: true` re-reads from disk regardless — the dispatch runner's
+	 * RuleCache-miss path: a miss means the content fingerprint moved, so
+	 * without `force` the memo could hand back pre-edit rules to be persisted
 	 * under the fresh fingerprint (#878).
 	 */
 	async loadQueries(
@@ -209,17 +502,37 @@ export class TreeSitterQueryLoader {
 		options: { force?: boolean } = {},
 	): Promise<Map<string, TreeSitterQuery[]>> {
 		const resolvedRoot = path.resolve(rootDir);
-		if (!options.force && this.loaded && this.loadedRoot === resolvedRoot) {
+		// Captured synchronously, before any await, so the identity is this
+		// call's cycle and not whatever cycle resumes it (AGENTS.md shape 22).
+		// `computeMutableRuleFingerprint` is passed by reference rather than
+		// wrapped, and `force` is positional: this is the hot path, and the
+		// per-call closure plus options object were measurable against a warm
+		// call whose whole budget is ~0.9 us.
+		const ruleFingerprint = ruleCorpusFingerprintForCycle(
+			"tree-sitter",
+			resolvedRoot,
+			computeMutableRuleFingerprint,
+			options.force,
+		);
+		if (
+			!options.force &&
+			this.loaded &&
+			this.loadedRoot === resolvedRoot &&
+			this.loadedRuleFingerprint === ruleFingerprint
+		) {
+			this.replayQueryParseFailures();
 			return this.queries;
 		}
 
 		this.queries.clear();
+		this.parseFailures.clear();
 		this.loaded = false;
 
 		// Load from user's project rules AND package built-in rules (coexist)
 		const queryDirs = [
 			...new Set([
 				path.join(resolvedRoot, "rules", "tree-sitter-queries"),
+				path.join(getUserRuleRoot(), "tree-sitter-queries"),
 				resolvePackagePath(import.meta.url, "rules", "tree-sitter-queries"),
 			]),
 		];
@@ -248,7 +561,9 @@ export class TreeSitterQueryLoader {
 					const filePath = path.join(langDir, file);
 					const query = this.parseQueryFile(filePath, languageKey);
 					if (query) {
-						langQueries.push(query);
+						if (!langQueries.some((existing) => existing.id === query.id)) {
+							langQueries.push(query);
+						}
 					}
 				}
 
@@ -261,6 +576,14 @@ export class TreeSitterQueryLoader {
 
 		this.loaded = true;
 		this.loadedRoot = resolvedRoot;
+		// The reload above is synchronous end to end, so the corpus observed
+		// here is the corpus the fingerprint was computed from — reuse it.
+		this.loadedRuleFingerprint = ruleFingerprint;
+		// Every failure hit above was recorded into THIS generation's ledger
+		// directly (via recordQueryParseFailure); mark it replayed so a
+		// same-generation memoized call right after this one doesn't redo the
+		// (harmless but pointless) replay loop.
+		this.parseFailuresReplayedGeneration = getDegradationLedgerGeneration();
 		return this.queries;
 	}
 
@@ -274,40 +597,51 @@ export class TreeSitterQueryLoader {
 		try {
 			const content = fs.readFileSync(filePath, "utf-8");
 
-			// Simple YAML parsing (extract key: value pairs)
 			const parsed = this.parseYaml(content);
 
-			if (!parsed.id || !parsed.query) {
+			// #3054 review F2: type-checked, not just truthy. `yaml.load` widened
+			// `parsed` to `Record<string, unknown>`, so a mapping- or
+			// array-valued `id`/`query` (a plausible authoring slip: forgetting
+			// the `|` on `query:` turns the block into a nested mapping) is
+			// truthy and used to sail through the old `!parsed.id || !parsed.query`
+			// check, then `String(...)` turned it into the literal text
+			// `"[object Object]"` — which for `query` reached the Query
+			// constructor (SonarCloud typescript:S6551 flagged every such
+			// stringification in this function; fixed below via `str()`).
+			const id = str(parsed.id);
+			const query = typeof parsed.query === "string" ? parsed.query : undefined;
+			if (!id || !query) {
 				this.dbg(`Invalid query file: ${filePath}`);
+				this.recordQueryParseFailure(
+					filePath,
+					!id
+						? `'id' is missing or not a scalar (got ${typeof parsed.id})`
+						: `'query' is missing or not a string (got ${typeof parsed.query})`,
+				);
 				return null;
 			}
 
 			return {
-				id: String(parsed.id),
-				name: String(parsed.name || parsed.id),
+				id,
+				name: str(parsed.name) || id,
 				severity: this.parseSeverity(parsed.severity),
-				category: String(parsed.category || "general"),
-				language: String(parsed.language || language),
-				message: String(parsed.message || `Pattern: ${parsed.id}`),
-				description: parsed.description
-					? String(parsed.description)
-					: undefined,
-				query:
-					this.extractMultilineValue(content, "query") || String(parsed.query),
+				category: str(parsed.category) || "general",
+				language: str(parsed.language) || language,
+				message: str(parsed.message) || `Pattern: ${id}`,
+				description: str(parsed.description) || undefined,
+				query,
 				metavars: Array.isArray(parsed.metavars)
 					? parsed.metavars.map(String)
-					: this.extractMetavars(String(parsed.query)),
-				post_filter: parsed.post_filter
-					? String(parsed.post_filter)
-					: undefined,
+					: this.extractMetavars(query),
+				post_filter: str(parsed.post_filter) || undefined,
 				// biome-ignore lint/suspicious/noExplicitAny: Post filter params
 				post_filter_params: parsed.post_filter_params as any,
-				defect_class: parsed.defect_class
-					? String(parsed.defect_class)
-					: undefined,
-				inline_tier: parsed.inline_tier
-					? (String(parsed.inline_tier) as "blocking" | "warning" | "review")
-					: undefined,
+				defect_class: str(parsed.defect_class) || undefined,
+				inline_tier: (str(parsed.inline_tier) || undefined) as
+					| "blocking"
+					| "warning"
+					| "review"
+					| undefined,
 				skip_test_files: parsed.skip_test_files === true,
 				ignore_paths: Array.isArray(parsed.ignore_paths)
 					? parsed.ignore_paths.map(String)
@@ -325,205 +659,44 @@ export class TreeSitterQueryLoader {
 				owasp: Array.isArray(parsed.owasp)
 					? parsed.owasp.map(String)
 					: undefined,
-				confidence: parsed.confidence
-					? (String(parsed.confidence) as "low" | "medium" | "high")
-					: undefined,
+				confidence: (str(parsed.confidence) || undefined) as
+					| "low"
+					| "medium"
+					| "high"
+					| undefined,
 				has_fix: parsed.has_fix === true || parsed.has_fix === "true",
-				fix_action: parsed.fix_action ? String(parsed.fix_action) : undefined,
+				fix_action: str(parsed.fix_action) || undefined,
 				filePath,
 			};
 		} catch (err) {
 			this.dbg(`Failed to parse ${filePath}: ${err}`);
+			this.recordQueryParseFailure(
+				filePath,
+				err instanceof Error ? err.message : String(err),
+			);
 			return null;
 		}
 	}
 
 	/**
-	 * Simple YAML parser for our query files
+	 * Parse a query file's YAML with `js-yaml` — the same real parser
+	 * `clients/dispatch/runners/yaml-rule-parser.ts` uses for ast-grep rules
+	 * (#206: a hand-rolled line scanner flattened nested structures there; the
+	 * hand-rolled scanner this loader carried made the identical mistake,
+	 * twice over — its inline `[a, b]` array branch unquoted list items but
+	 * its multi-line `- item` branch did not, so `console-statement.yml`'s
+	 * quoted `ignore_paths` glob parsed with the quote marks attached and the
+	 * #965 carve-out never matched a path, #3041/#3046). A genuine syntax
+	 * error throws, caught by `parseQueryFile`'s `try`/`catch`; a
+	 * syntactically valid but wrong-shaped document (a bare scalar, a list,
+	 * `null`) is cast here and skipped by `parseQueryFile`'s `id`/`query`
+	 * type check below — property access on a non-object primitive never
+	 * throws in JS, so no separate `typeof parsed !== "object"` guard is
+	 * needed here (#3054 review F3: that guard was vacuous — deleting it
+	 * reds nothing, every case it caught was already caught one frame up).
 	 */
-	private parseYaml(
-		content: string,
-	): Record<string, string | string[] | boolean> {
-		const result: Record<string, string | string[] | boolean> = {};
-		const lines = content.split("\n");
-
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			const match = line.match(/^([a-z_]+):\s*(.*)$/);
-			if (match) {
-				const key = match[1];
-				// Strip a trailing YAML comment (` # …`) on unquoted scalars, as the
-				// array-item branch below already does. Without this, a rule written
-				// `post_filter: not_in_test_block  # skip test blocks` carried the
-				// whole comment as the filter NAME, so the filter never resolved and
-				// the rule reported unfiltered matches.
-				let value: string | string[] | boolean = stripInlineComment(
-					match[2].trim(),
-				);
-
-				// Handle arrays inline: metavars: [A, B, C]
-				if (value.startsWith("[") && value.endsWith("]")) {
-					value = value
-						.slice(1, -1)
-						.split(",")
-						.map((s) => s.trim().replace(/^["']|["']$/g, ""));
-				}
-				// Handle multi-line arrays: metavars:\n  - A\n  - B
-				// and nested objects: post_filter_params:\n  KEY: "value"
-				else if (value === "") {
-					const arrayItems: string[] = [];
-					const nestedObj: Record<string, string> = {};
-					const baseIndent = line.match(/^(\s*)/)?.[0].length || 0;
-
-					for (let j = i + 1; j < lines.length; j++) {
-						const nextLine = lines[j];
-						const nextIndent = nextLine.match(/^(\s*)/)?.[0].length || 0;
-
-						// Stop if we hit a line with same or less indent (new key)
-						if (
-							nextIndent <= baseIndent &&
-							nextLine.trim() !== "" &&
-							nextLine.match(/^\S/)
-						) {
-							break;
-						}
-
-						// Check if it's an array item
-						const itemMatch = nextLine.match(/^\s+-\s*(.+)$/);
-						if (itemMatch) {
-							const item = itemMatch[1].trim().replace(/\s*#.*$/, "");
-							if (item) arrayItems.push(item);
-							continue;
-						}
-
-						// Check if it's a nested key: value pair
-						const nestedMatch = nextLine.match(/^\s+(\w+):\s*(.+)$/);
-						if (nestedMatch) {
-							let nv = nestedMatch[2].trim();
-							if (
-								(nv.startsWith('"') && nv.endsWith('"')) ||
-								(nv.startsWith("'") && nv.endsWith("'"))
-							) {
-								nv = nv.slice(1, -1);
-							}
-							nestedObj[nestedMatch[1]] = nv;
-						}
-					}
-
-					if (arrayItems.length > 0) {
-						value = arrayItems;
-					} else if (Object.keys(nestedObj).length > 0) {
-						// biome-ignore lint/suspicious/noExplicitAny: nested object from YAML
-						(result as any)[key] = nestedObj;
-						continue;
-					}
-				}
-				// Handle booleans
-				else if (value === "true") value = true;
-				else if (value === "false") value = false;
-				// Strip quotes from strings
-				else if (value.startsWith('"') && value.endsWith('"')) {
-					value = value.slice(1, -1);
-				}
-
-				result[key] = value;
-			}
-		}
-
-		return result;
-	}
-
-	/**
-	 * Extract a multiline value (like query) from YAML
-	 */
-	private extractMultilineValue(content: string, key: string): string | null {
-		const lines = content.split("\n");
-		let startLine = -1;
-		let startIndent = 0;
-
-		const keyPrefix = `${key}:`;
-
-		// Find the key line
-		for (let i = 0; i < lines.length; i++) {
-			const trimmed = lines[i].trimStart();
-			if (trimmed.startsWith(keyPrefix)) {
-				startLine = i;
-				startIndent = lines[i].length - trimmed.length;
-				const afterKey = trimmed.slice(keyPrefix.length).trim();
-				// If there's content on the same line (not just |), return it
-				if (afterKey && afterKey !== "|") return afterKey;
-				break;
-			}
-		}
-
-		if (startLine === -1) return null;
-
-		// Collect all lines until we hit a new key with same or less indent
-		const valueLines: string[] = [];
-		for (let i = startLine + 1; i < lines.length; i++) {
-			const line = lines[i];
-
-			// Track empty lines
-			if (!line.trim()) {
-				valueLines.push("");
-				continue;
-			}
-
-			// Check indent
-			const indentMatch = line.match(/^(\s*)/);
-			const indent = indentMatch ? indentMatch[1].length : 0;
-			const trimmed = line.trim();
-
-			// Stop at a new top-level key (same or less indent than the key).
-			if (indent <= startIndent && trimmed.match(/^[a-z_]+:/)) {
-				break;
-			}
-
-			// A comment at or below the key's indent is a document-level comment
-			// that follows the block, not part of it — stop. Block-scalar content
-			// (including native tree-sitter predicate lines `#eq?`/`#match?`) is
-			// always MORE indented than the key, so those are preserved. Without
-			// this, a stray `# …` line between a `query: |` block and the next key
-			// was appended to the query and made it fail to compile (mixed-async).
-			if (trimmed.startsWith("#") && indent <= startIndent) {
-				break;
-			}
-
-			// Skip YAML comment lines for most keys, but preserve native
-			// tree-sitter predicate lines in query blocks (#eq?, #match?, ...).
-			if (trimmed.startsWith("#") && key !== "query") continue;
-
-			// This is part of the multiline value
-			valueLines.push(line);
-		}
-
-		// Strip the common minimum indent (relative to startIndent).
-		// YAML's `|` block scalar preserves content with consistent
-		// indentation; we want to remove the leading whitespace that
-		// was used for YAML formatting.
-		// biome-ignore lint/suspicious/noExplicitAny: line iteration
-		const nonEmpty = valueLines.filter((l: string) => l.trim().length > 0);
-		if (nonEmpty.length > 0) {
-			const minExtraIndent = Math.min(
-				...nonEmpty.map((l: string) => {
-					const m = l.match(/^(\s*)/);
-					return (m?.[1].length ?? 0) - startIndent;
-				}),
-			);
-			for (let i = 0; i < valueLines.length; i++) {
-				if (valueLines[i].trim().length === 0) continue; // leave blank lines alone
-				valueLines[i] = valueLines[i].slice(
-					startIndent + Math.max(0, minExtraIndent),
-				);
-			}
-		}
-
-		// Clean up - remove trailing empty lines
-		while (valueLines.length > 0 && !valueLines[valueLines.length - 1].trim()) {
-			valueLines.pop();
-		}
-
-		return valueLines.length > 0 ? valueLines.join("\n") : null;
+	private parseYaml(content: string): Record<string, unknown> {
+		return yaml.load(content) as Record<string, unknown>;
 	}
 
 	/**

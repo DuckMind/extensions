@@ -1,7 +1,7 @@
 export type ProjectDiagnosticSeverity = "error" | "warning" | "info" | "hint";
-export type ProjectDiagnosticSemantic = "blocking" | "warning" | "none";
-export type ProjectDiagnosticSource = "lsp" | "dispatch" | "project-scan";
-export type ProjectDiagnosticsTier = "cheap" | "all";
+type ProjectDiagnosticSemantic = "blocking" | "warning" | "none";
+type ProjectDiagnosticSource = "lsp" | "dispatch" | "project-scan";
+type ProjectDiagnosticsTier = "cheap" | "all";
 
 export interface ProjectDiagnostic {
 	filePath: string;
@@ -15,6 +15,40 @@ export interface ProjectDiagnostic {
 	code?: string;
 	message: string;
 	source: ProjectDiagnosticSource;
+	/**
+	 * #3600: wall-clock time (ms) the analyzer READ the bytes this row was
+	 * computed from. A heavyweight lane sets it from its own result's
+	 * `scannedAt`, stamped at the top of the client's run body before it reads;
+	 * a JOINED in-flight run therefore reports the initiator's real read time,
+	 * not the joiner's lane start. Only a result with no stamp at all falls back
+	 * to the lane start. The #1888 correlated commit otherwise re-stamps every
+	 * folded row with the cheap project scan's `scannedAt` (taken after its
+	 * whole file loop) or the fold's `Date.now()`, so a file edited while the
+	 * analyzer was still reading looked older than the row and no widget gate
+	 * demoted it. Absent for the cheap-tier project scan and the projectDelta
+	 * report, whose rows are aged by a content fingerprint and the report's own
+	 * `generatedAt` instead.
+	 */
+	observedAt?: number;
+}
+
+/**
+ * What a finding-bearing file's bytes were when the scan read them — the
+ * second content axis `WorkspaceDiagnosticsCacheEntry` has carried since
+ * #2300/#1095, in the cheap-tier store's own vocabulary. `sizeBytes` is the
+ * cheap reject (no read); `contentHash` settles a same-size rewrite.
+ */
+export interface ProjectScanFileFingerprint {
+	/**
+	 * The file's ON-DISK byte length at the moment the scan read it — the
+	 * buffer's own length, never `Buffer.byteLength` of the decoded string
+	 * (#3060 round 2 F1: those differ by 2 for every byte that is not valid
+	 * UTF-8, so a decoded-string length could never match `statSync().size`
+	 * and retired every row from such a file on every cached read).
+	 */
+	sizeBytes: number;
+	/** sha256 of that same content, via `hashDiagnosticContent`. */
+	contentHash: string;
 }
 
 export interface ProjectDiagnosticsSnapshot {
@@ -25,6 +59,35 @@ export interface ProjectDiagnosticsSnapshot {
 	diagnostics: ProjectDiagnostic[];
 	filesScanned: number;
 	runners: string[];
+	/**
+	 * #2154 (#3060 review F1): the bytes each finding-bearing file actually had
+	 * when this scan read them, keyed by the row's own `filePath`.
+	 *
+	 * `scannedAt` is ONE timestamp, stamped after the whole file loop has
+	 * finished, so `reconcileProjectDiagnosticsSnapshot`'s `mtime <= scannedAt`
+	 * test cannot separate "this file has not changed since it was scanned"
+	 * from "this file changed WHILE the scan was still running, before the
+	 * timestamp was taken". An edit landing mid-scan therefore produced a row
+	 * that read as fresh forever — in that session and every later one, since
+	 * the record is the cross-session cache — which is the reported false
+	 * blocker. A timestamp comparison cannot be made safe here (the producer
+	 * would need a per-file scan time AND an mtime granularity it does not
+	 * control), so the record carries a content axis instead: the byte length,
+	 * and the sha256 of the exact bytes the rules ran over.
+	 *
+	 * Written only for files the scan actually READ — a rule may cite a path it
+	 * never opened. A row whose file has no entry keeps the mtime-only rule: it
+	 * never asserted a content claim, the same fail-open posture
+	 * `WorkspaceDiagnosticsCacheEntry.sizeBytes` takes for a pre-#2300 entry.
+	 * Snapshots written before this field existed cannot reach that path at
+	 * all: `PROJECT_DIAGNOSTICS_CACHE_VERSION` was bumped so the version guard
+	 * rejects them and the project is re-scanned — the same clean break
+	 * `WORKSPACE_DIAGNOSTICS_CACHE_VERSION` v3 made for `serverId` provenance,
+	 * chosen over serving them because every row here is a POSITIVE claim
+	 * ("this file has this finding right now") on the axis that just proved
+	 * unreliable.
+	 */
+	fileFingerprints?: Record<string, ProjectScanFileFingerprint>;
 	/** Visible degraded state after the process-wide WASM runtime aborts. */
 	treeSitterStatus?: "wasm_aborted_restart_required";
 	/**

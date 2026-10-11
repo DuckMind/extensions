@@ -1,0 +1,301 @@
+/** Shared resolver for model-facing tool availability (#2800). */
+
+import { readFlagConfigValue } from "./lens-flag-registry.js";
+import { escapeRegExp } from "./string-utils.js";
+
+/** The complete model-facing tool population on pi and MCP. */
+export const TOOL_REGISTRY = [
+	{
+		name: "ast_grep_search",
+		piName: "ast_grep_search",
+		mcpName: "dmlens_ast_grep_search",
+		situational: true,
+		summary:
+			"AST-aware structural code search across ~40 languages (ast-grep patterns).",
+		disableable: true,
+	},
+	{
+		name: "ast_grep_replace",
+		piName: "ast_grep_replace",
+		mcpName: "dmlens_ast_grep_replace",
+		situational: true,
+		summary: "AST-aware structural code rewrite/refactor (ast-grep patterns).",
+		disableable: true,
+	},
+	{
+		name: "ast_grep_outline",
+		piName: "ast_grep_outline",
+		mcpName: undefined,
+		situational: true,
+		summary:
+			"Syntax-only file/dir structure (symbols/imports/exports/members) via ast-grep outline — no index/LSP.",
+		disableable: true,
+	},
+	{
+		name: "lsp_navigation",
+		piName: "lsp_navigation",
+		mcpName: "dmlens_lsp_navigation",
+		situational: true,
+		summary:
+			"IDE-style LSP navigation: definition, references, implementation, rename, call hierarchy.",
+		disableable: true,
+	},
+	{
+		name: "lens_diagnostics",
+		piName: "lens_diagnostics",
+		mcpName: "dmlens_diagnostics",
+		disableable: true,
+	},
+	{
+		name: "lens_diagnostic_mark",
+		piName: "lens_diagnostic_mark",
+		mcpName: undefined,
+		situational: true,
+		summary:
+			"Record a disposition for a diagnostic: false-positive / suppress (inline ignore comment) / defer (this session) / flagged (to fix).",
+		disableable: true,
+	},
+	{
+		name: "symbol_search",
+		piName: "symbol_search",
+		mcpName: "dmlens_symbol_search",
+		disableable: true,
+	},
+	{
+		name: "module_report",
+		piName: "module_report",
+		mcpName: "dmlens_module_report",
+		disableable: true,
+	},
+	{
+		name: "project_report",
+		piName: "project_report",
+		mcpName: "dmlens_project_report",
+		disableable: true,
+	},
+	{
+		name: "read_symbol",
+		piName: "read_symbol",
+		mcpName: "dmlens_read_symbol",
+		disableable: true,
+	},
+	{
+		name: "read_enclosing",
+		piName: "read_enclosing",
+		mcpName: "dmlens_read_enclosing",
+		disableable: true,
+	},
+	{
+		name: "effective_config",
+		piName: "effective_config",
+		mcpName: "dmlens_effective_config",
+		disableable: true,
+	},
+	{
+		name: "dm_lens_activate_tools",
+		piName: "dm_lens_activate_tools",
+		mcpName: undefined,
+		disableable: false,
+	},
+	{
+		name: "analyze",
+		piName: undefined,
+		mcpName: "dmlens_analyze",
+		disableable: true,
+	},
+	{
+		name: "health",
+		piName: undefined,
+		mcpName: "dmlens_health",
+		disableable: true,
+	},
+	{
+		name: "latency",
+		piName: undefined,
+		mcpName: "dmlens_latency",
+		disableable: true,
+	},
+	{
+		name: "project_scan",
+		piName: undefined,
+		mcpName: "dmlens_project_scan",
+		disableable: true,
+	},
+	{
+		name: "rebuild",
+		piName: undefined,
+		mcpName: "dmlens_rebuild",
+		disableable: true,
+	},
+	{
+		name: "session_start",
+		piName: undefined,
+		mcpName: "dmlens_session_start",
+		disableable: false,
+	},
+	{
+		name: "turn_end",
+		piName: undefined,
+		mcpName: "dmlens_turn_end",
+		disableable: false,
+	},
+	{
+		name: "session_end",
+		piName: undefined,
+		mcpName: "dmlens_session_end",
+		disableable: false,
+	},
+] as const;
+
+export const LENS_TOOL_NAMES = TOOL_REGISTRY.map(
+	(tool) => tool.name,
+) as readonly string[];
+
+/** Tool names registered on pi, excluding MCP-only registry entries. */
+export const DM_LENS_TOOL_NAMES = TOOL_REGISTRY.flatMap((tool) =>
+	tool.piName === undefined ? [] : [tool.piName],
+) as readonly string[];
+
+export type ToolRegistryEntry = (typeof TOOL_REGISTRY)[number];
+
+export type LensToolHost = "pi" | "mcp";
+
+/**
+ * Registry tools with a pi name but no MCP name are pi-only BY DECLARATION
+ * here, never by omission (#2535 F3). A missing entry used to degrade
+ * silently into the pi name on MCP, sending the agent to a dead call — the
+ * guard in tests/clients/adapter-aware-tool-names.test.ts fails on any
+ * pi-only row absent from this map, and `resolveLensToolName` resolves a
+ * known-but-unmapped host to `undefined` so callers omit instead of naming.
+ */
+export const PI_ONLY_TOOL_REASONS: Record<string, string> = {
+	ast_grep_outline:
+		"pi situational tool with no MCP mirror; MCP parity deferred like read_enclosing was.",
+	lens_diagnostic_mark:
+		"dm-lens-internal disposition tool; MCP has no equivalent surface (needs its own engine seam and tool route).",
+	dm_lens_activate_tools:
+		"pi dynamic-tooling loader; MCP lists every tool statically, so there is nothing to activate.",
+};
+
+/**
+ * Resolve the name an agent can call on the delivery host. Unknown names
+ * pass through unchanged (no registry identity). A known tool WITHOUT a
+ * mapping on the requested host resolves to `undefined` — the caller must
+ * omit or rephrase, never print a name the host cannot resolve.
+ */
+export function resolveLensToolName(
+	name: string,
+	host: LensToolHost = "pi",
+): string | undefined {
+	const entry = TOOL_REGISTRY.find(
+		(tool) =>
+			tool.name === name || tool.piName === name || tool.mcpName === name,
+	);
+	if (!entry) return name;
+	if (host === "mcp") return entry.mcpName;
+	return entry.piName;
+}
+
+/**
+ * Render already-written advisory text for the delivery host (#2535). The pi
+ * host reads it back unchanged. For MCP, every whole-word pi tool name with
+ * an MCP mapping becomes its callable MCP name (driven by TOOL_REGISTRY,
+ * longest first — never a hand-maintained second map), and the pi-only
+ * activation clause is rephrased since MCP lists every tool statically.
+ * A pi-only name with no MCP surface never survives translation: it is
+ * either rephrased here or caught by the adapter-aware guard.
+ */
+export function translateGuidanceToolNames(
+	content: string,
+	host: LensToolHost,
+): string {
+	if (host === "pi") return content;
+	let text = content;
+	const byLength = [...TOOL_REGISTRY].sort(
+		(a, b) => (b.piName?.length ?? 0) - (a.piName?.length ?? 0),
+	);
+	for (const entry of byLength) {
+		if (typeof entry.piName !== "string" || typeof entry.mcpName !== "string") {
+			continue;
+		}
+		text = text.replace(
+			new RegExp(`\\b${escapeRegExp(entry.piName)}\\b`, "g"),
+			entry.mcpName,
+		);
+	}
+	return text.replace("activate via dm_lens_activate_tools", "call directly");
+}
+
+export function toolRegistryEntryForPi(
+	name: string,
+): ToolRegistryEntry | undefined {
+	return TOOL_REGISTRY.find((tool) => tool.piName === name);
+}
+
+export function toolRegistryEntryForMcp(
+	name: string,
+): ToolRegistryEntry | undefined {
+	return TOOL_REGISTRY.find((tool) => tool.mcpName === name);
+}
+
+/** Resolve one tool. CLI names are comma-separated to support repeatable flags. */
+export function resolveLensToolEnabled(
+	name: string,
+	globalConfig: unknown,
+	projectConfig: unknown,
+	cliNoTools?: string | readonly string[],
+): boolean {
+	const entry = TOOL_REGISTRY.find((tool) => tool.name === name);
+	if (entry?.disableable === false) return true;
+	const cliNames = Array.isArray(cliNoTools)
+		? cliNoTools
+		: typeof cliNoTools === "string"
+			? cliNoTools.split(",")
+			: [];
+	if (cliNames.some((entry) => entry.trim() === name)) return false;
+	const project = readFlagConfigValue(projectConfig, `tools.${name}.enabled`);
+	if (project !== undefined) return project;
+	const global = readFlagConfigValue(globalConfig, `tools.${name}.enabled`);
+	return global ?? true;
+}
+
+/** Copy and validate the known per-tool leaves from one config document. */
+export function readToolConfig(
+	raw: unknown,
+	warnInvalid: (reason: string, code?: "PILENS_CFG_0009") => void,
+): Record<string, { enabled?: boolean }> | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const section = (raw as Record<string, unknown>).tools;
+	if (!section || typeof section !== "object" || Array.isArray(section))
+		return undefined;
+	const result: Record<string, { enabled?: boolean }> = {};
+	for (const [name, value] of Object.entries(section)) {
+		if (name === "lazy") continue;
+		const entry = TOOL_REGISTRY.find((tool) => tool.name === name);
+		if (!entry) {
+			warnInvalid(
+				`unknown key "tools.${name}.enabled" is not a recognized dm-lens tool`,
+				"PILENS_CFG_0009",
+			);
+			continue;
+		}
+		if (!entry.disableable) {
+			warnInvalid(
+				`key "tools.${name}.enabled" cannot be disabled because it is required for the ${entry.mcpName ? "MCP session" : "pi tool activation"} contract`,
+				"PILENS_CFG_0009",
+			);
+			continue;
+		}
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			warnInvalid(`tools.${name} must be an object with enabled`);
+			continue;
+		}
+		const enabled = (value as Record<string, unknown>).enabled;
+		if (enabled !== undefined && typeof enabled !== "boolean") {
+			warnInvalid(`tools.${name}.enabled must be a boolean`);
+			continue;
+		}
+		result[name] = enabled === undefined ? {} : { enabled };
+	}
+	return Object.keys(result).length > 0 ? result : undefined;
+}

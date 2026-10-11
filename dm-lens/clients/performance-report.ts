@@ -7,10 +7,14 @@ import {
 } from "./latency-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 
-export const DEFAULT_PERF_TOP_N = 5;
-export const MAX_PERF_TOP_N = 50;
+const DEFAULT_PERF_TOP_N = 5;
+const MAX_PERF_TOP_N = 50;
 export const MAX_PERF_PHASE_SAMPLES = 20_000;
-const PARSE_YIELD_EVERY = 500;
+// Yield cadence for the full-window parse below. Exported so the occupancy
+// guard can count yields against the lines fed instead of measuring a
+// wall-clock block the scheduler can inflate (#2886): the count is a
+// deterministic function of the input, not of worker contention.
+export const PARSE_YIELD_EVERY = 500;
 
 // The window follows the same threshold that rotates the log out from under it.
 // Exported so a test can size a fixture to the window it means to saturate
@@ -29,7 +33,7 @@ function boundedPositiveInteger(
 		: fallback;
 }
 
-export interface PhaseLatencySummary {
+interface PhaseLatencySummary {
 	phase: string;
 	samples: number;
 	p50Ms: number;
@@ -469,7 +473,7 @@ export function renderLatencyPerformanceReport(
 	report: LatencyPerformanceReport,
 ): string {
 	const lines = [
-		"⏱️ PI-LENS PERFORMANCE",
+		"⏱️ DM-LENS PERFORMANCE",
 		`Top ${report.topN} sustained and tail latency phases.`,
 	];
 	renderScope(lines, "Current process session", report.session);

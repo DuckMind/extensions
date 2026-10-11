@@ -7,11 +7,19 @@
  * Approach (inspired by OpenCode's Filesystem.normalizePath):
  * - On Windows: try realpathSync.native() for canonical casing
  * - Falls back to lowercase for files that don't exist yet
- * - On non-Windows: return path as-is (case-sensitive filesystem)
+ * - On non-Windows: adopt the on-disk casing of an existing path (#3098 — a
+ *   case-insensitive POSIX filesystem otherwise derives two Map keys for one
+ *   file); a path that does not exist is returned as-is, case-preserving
  * - Always convert backslashes to forward slashes for Map key consistency
  */
 
-import { type Dirent, existsSync, realpathSync } from "node:fs";
+import {
+	type Dirent,
+	existsSync,
+	readFileSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { win32 } from "node:path";
@@ -101,6 +109,64 @@ export function splitPathSegments(filePath: string): string[] {
 }
 
 /**
+ * Adopt `canonical`'s CASING for the trailing segments of `held`, stopping at
+ * the first segment that differs by more than case.
+ *
+ * `realpathSync.native` answers a different question than the one the POSIX
+ * arm of `normalizeFilePath` asks: it resolves symlinks AND reports on-disk
+ * casing, and we want only the second half. Walking from the tail and halting
+ * at the first structural divergence separates them with no extra syscall:
+ *
+ *   held      /var/folders/T/x/SUB/a.ts   (macOS tmpdir, mis-cased segment)
+ *   canonical /private/var/folders/T/x/sub/a.ts
+ *   result    /var/folders/T/x/sub/a.ts   (case fixed, symlink prefix kept)
+ *
+ * The symlink prefix matters: macOS's `os.tmpdir()` is `/var/folders/...`,
+ * a symlink into `/private/var`, so a whole-string "is this a case variant"
+ * test would decline to canonicalize exactly the paths the #1024 regression
+ * test (and any macOS temp-dir workflow) runs on. Keeping the prefix is also
+ * what bounds this change: on POSIX, `normalizeFilePath` still never resolves
+ * a symlink, so a symlinked monorepo package keeps keying under the path the
+ * caller held (refs #2490 — a cwd fold for its own sake broke every monorepo).
+ *
+ * PURE string algebra: this pins what the rewrite DOES, never what the kernel
+ * reports — and from two strings alone it cannot tell "the same file, spelled
+ * with different case" from "a different file whose name happens to be a case
+ * variant". Any symlink whose BASENAME is a case variant of its target's
+ * basename (`<root>/MyProject` → `work/myproject`, `node_modules/Foo` →
+ * `../pkgs/foo`) has its name replaced while its own parent is kept, so the
+ * result names a different place — or no place at all. Measured in #3159
+ * review round 2 (F1): two different inodes collapsed onto ONE key (the #1024
+ * defect inverted — false suppression), and a symlinked package keyed under a
+ * path that does not exist on disk, breaking the #2490 bound above. The caller
+ * therefore CONFIRMS every rewrite against the filesystem before adopting it
+ * (see `normalizeFilePath`); do not use this function without that step.
+ */
+function adoptCanonicalCasing(held: string, canonical: string): string {
+	const heldParts = held.split("/");
+	const realParts = canonical.split("/");
+	let i = heldParts.length - 1;
+	let j = realParts.length - 1;
+	let changed = false;
+	while (i >= 0 && j >= 0) {
+		const a = heldParts[i] as string;
+		const b = realParts[j] as string;
+		if (a !== b) {
+			if (a.toLowerCase() !== b.toLowerCase()) break;
+			heldParts[i] = b;
+			changed = true;
+		}
+		i--;
+		j--;
+	}
+	// Identity-preserving when nothing moved — this runs on every POSIX map-key
+	// derivation and the overwhelmingly common answer is "already canonical".
+	// NOT a behavioural branch (both arms produce an equal string): it is the
+	// same allocation guard `normalizeEphemeralMapKey` documents below.
+	return changed ? heldParts.join("/") : held;
+}
+
+/**
  * Normalize a file path for consistent Map key usage.
  *
  * On Windows:
@@ -109,16 +175,118 @@ export function splitPathSegments(filePath: string): string[] {
  * - If the file doesn't exist: resolves the path and lowercases
  *   (needed for new files where we haven't written yet)
  *
- * On non-Windows: returns path as-is (case-sensitive filesystem).
+ * On POSIX:
+ * - Folds `.`, `..` and duplicate separators first (#3184, see below).
+ * - If the file exists: adopts the on-disk CASING of the trailing segments
+ *   (see `adoptCanonicalCasing`) — no lowercasing, no symlink resolution.
+ * - If the file doesn't exist: returns the path as-is, case-PRESERVING. On a
+ *   case-sensitive filesystem `SUB/a.ts` and `sub/a.ts` are two different
+ *   files, and nothing may fold one into the other; only the filesystem's own
+ *   answer for a path that EXISTS can tell the two apart, and for a path that
+ *   does not exist there is no such answer to ask for.
+ *
+ * Why the POSIX arm folds dot segments (#3184): the casing arm returns the
+ * caller's own spelling whenever `adoptCanonicalCasing` changes nothing, and
+ * for `<base>/src/../src/a.ts` it always changes nothing — `realpath` answers
+ * a string with FEWER segments, which a casing-only rewrite cannot express, so
+ * it declines and the caller's un-folded spelling came back as the map key.
+ * Every canonical writer keys through `path.resolve` first (`ctx.filePath` =
+ * `normalizeMapKey(resolveAgainstAncestors(...))`, `clients/dispatch/
+ * runner-context.ts:49`), so a consumer that passes an ALREADY-absolute
+ * agent-typed path straight in (`tools/lens-diagnostic-mark.ts`,
+ * `clients/mcp/analyze.ts`) derived an orphan key that no reader could reach.
+ * Folding here is pure string algebra — no cwd, no filesystem — so a relative
+ * path stays relative (`src/../x` → `x`, `../x` → `../x`, never resolved
+ * against `process.cwd()`; refs #2490, where a cwd fold broke every monorepo)
+ * and a symlinked package still keys under the path the caller held. These
+ * are `path.resolve`'s own TEXTUAL `..` semantics, which is exactly what
+ * makes a folded reader key equal to the canonical writer's key: where a
+ * `..` sits right after a symlinked directory, textual folding and the
+ * kernel disagree, and both sides of every comparison take the textual
+ * answer because every canonical writer already resolved that way.
+ *
+ * Why POSIX canonicalizes casing at all (#3098, the #1024 defect's live half):
+ * a case-insensitive POSIX filesystem — macOS's default APFS, `nocase` vfat /
+ * ntfs3 / cifs mounts — makes `SUB/a.ts` and `sub/a.ts` ONE file, so a raw
+ * mis-cased write (`lens_diagnostic_mark` anchors under `path.resolve(cwd,
+ * arg)`) and a `normalizeMapKey` read derived two anchors for one file and the
+ * agent's own disposition mark silently never applied. A case-preserving POSIX
+ * arm cannot close that: the two keys only become one if the normalizer asks
+ * the filesystem which name is really on disk.
+ *
+ * `realpathSync.native` is `realpath(3)`. On Darwin it rebuilds every
+ * component from the filesystem's own `ATTR_CMN_NAME` — Libc-1669.0.4
+ * `stdlib/FreeBSD/realpath.c:233` (`getattrlist(resolved, &_rp_alist, …,
+ * FSOPT_NOFOLLOW)` with `ATTR_CMN_NAME`) and `:348-354` ("attrs already has
+ * the real name") — which is why it returns on-disk casing on APFS/HFS+.
+ * MEASURED counter-example (#3098): a Linux ext4/tmpfs `chattr +F` casefold
+ * directory aliases the two spellings but `realpath(3)` there returns the
+ * spelling the caller asked with, so this arm is a no-op on casefolded Linux
+ * directories — filed with the transcript as #3154.
  *
  * Always converts backslashes to forward slashes for consistent Map keys.
  */
 export function normalizeFilePath(filePath: string): string {
+	if (process.platform === "win32") {
+		// Relative values and the empty sentinel are not filesystem identities.
+		// In particular, win32.resolve() would silently anchor them to the
+		// process cwd, which makes a path-only key depend on the runner's drive
+		// (#2490). Keep this guard inside the Windows arm so POSIX relative
+		// inputs still receive their realpath/casing treatment.
+		if (filePath === "") return "";
+		if (!isFullyQualifiedWin32(filePath)) {
+			return win32.normalize(filePath).replace(/\\/g, "/");
+		}
+	}
+
 	// Convert backslashes to forward slashes first
 	const normalized = filePath.replace(/\\/g, "/");
 
 	if (process.platform !== "win32" && !isWindowsPath(normalized)) {
-		return normalized;
+		// #3184. `path.posix`, not the host default: this branch is already
+		// committed to POSIX parsing of a slash-folded string (shape 2). Only
+		// the POSIX arm needs this — the win32 arm below reaches `realpath` or
+		// `win32.resolve`/`win32.normalize` on every path, all of which fold
+		// dot segments already (measured: `C:\repo\src\..\src\a.ts` →
+		// `c:/repo/src/a.ts` on this POSIX host, before this change) — and
+		// folding BEFORE the arms would also move which arm a degenerate
+		// drive-letter path selects (`path.posix.normalize("C:/repo/../..")`
+		// is `"."`, no longer Windows-shaped).
+		// Two inputs keep the caller's spelling instead:
+		// - "" is a non-path sentinel in this codebase's path-typed fields
+		//   (see `normalizeLoggedPath`'s doc); `posix.normalize("")` invents
+		//   ".", the process cwd.
+		// - a UNC root (`\\server\share`, slash-folded to `//server/share`)
+		//   reaches THIS arm on a POSIX host, because `isWindowsPath` tests
+		//   the already-folded string and sees no backslash; POSIX
+		//   `normalize` collapses its leading `//` to `/`, renaming the path
+		//   to an unrelated local one.
+		const folded =
+			normalized === "" || normalized.startsWith("//")
+				? normalized
+				: path.posix.normalize(normalized);
+		try {
+			const canonical = realpathSync.native(folded);
+			// Fast path, not a guard: both arms answer `folded` when the
+			// strings match, but skipping the two `split`s there is a measured
+			// 1.9 vs 2.3 microseconds per call on the per-edit seam (#3098).
+			if (canonical === folded) return folded;
+			const adopted = adoptCanonicalCasing(folded, canonical);
+			if (adopted === folded) return folded;
+			// The rewrite is string algebra and can land on a DIFFERENT file
+			// (#3159 review round 2, F1 — see `adoptCanonicalCasing`). Adopt it
+			// only once the filesystem agrees it still names the file the caller
+			// held: `canonical` IS `realpath(normalized)`, so this asks exactly
+			// "does the rewritten spelling resolve to the same file?". One extra
+			// syscall, and only on the rare branch where casing actually moved —
+			// never on an already-canonical path. A throw here (the rewritten
+			// path does not exist, the #2490 monorepo case) lands in the catch
+			// below and keeps the caller's spelling, which is the same answer.
+			return realpathSync.native(adopted) === canonical ? adopted : folded;
+		} catch {
+			// Does not exist (or is unreadable): case-preserving, as above.
+			return folded;
+		}
 	}
 
 	// Windows: try realpathSync.native() for canonical casing
@@ -137,6 +305,16 @@ export function normalizeFilePath(filePath: string): string {
 			const resolved = win32.normalize(win32.resolve(filePath));
 			return resolved.replace(/\\/g, "/").toLowerCase();
 		}
+	}
+}
+
+/** Resolve a filesystem identity once, retaining a usable absolute fallback. */
+export function realpathOrResolve(filePath: string): string {
+	const resolved = path.resolve(filePath);
+	try {
+		return realpathSync(resolved);
+	} catch {
+		return resolved;
 	}
 }
 
@@ -296,10 +474,27 @@ export function toProjectRelativePath(
 ): string {
 	const p = isWindowsPath(filePath) ? win32 : path;
 	if (!p.isAbsolute(filePath)) return filePath.replace(/\\/g, "/");
-	const relative = p.relative(p.resolve(projectRoot), filePath);
-	return relative && !relative.startsWith("..") && !p.isAbsolute(relative)
-		? relative.replace(/\\/g, "/")
-		: filePath.replace(/\\/g, "/");
+	const inside = (root: string, file: string): string | undefined => {
+		const relative = p.relative(p.resolve(root), file);
+		return relative &&
+			relative !== ".." &&
+			!relative.startsWith(`..${p.sep}`) &&
+			!p.isAbsolute(relative)
+			? relative.replace(/\\/g, "/")
+			: undefined;
+	};
+	const direct = inside(projectRoot, filePath);
+	if (direct !== undefined) return direct;
+	// #4101: a canonical key (`normalizeMapKey`: realpath on win32, so 8.3 names,
+	// junctions and subst drives are expanded) set against a root the caller
+	// spelled differently. Canonicalize both sides before giving up; a file
+	// that really is outside the root stays outside.
+	const canonical = inside(
+		normalizeFilePath(projectRoot),
+		normalizeFilePath(filePath),
+	);
+	if (canonical !== undefined) return canonical;
+	return filePath.replace(/\\/g, "/");
 }
 
 /**
@@ -453,6 +648,69 @@ export interface FindNearestMarkerRootOptions {
 	boundaries?: readonly string[];
 	/** Override for `os.homedir()`, primarily for tests. */
 	homeDir?: string;
+	/** Further validate a marker path before accepting its containing directory. */
+	markerPredicate?: (markerPath: string) => boolean;
+}
+
+export type GitMarkerResult =
+	| { kind: "valid" | "absent" }
+	| { kind: "unavailable"; cause: unknown };
+
+export type MarkerRootResult =
+	| { kind: "found"; root: string }
+	| { kind: "not-found"; reason: "home-ceiling" | "root" | "depth-limit" }
+	| { kind: "unavailable"; markerPath: string; cause: unknown };
+
+/** Detailed ownership walks require a probe that can distinguish I/O failure. */
+export interface FindNearestMarkerRootDetailedOptions {
+	homeDir?: string;
+	markerPredicate: (markerPath: string) => GitMarkerResult;
+}
+
+/**
+ * Accept only a real Git repository marker: a directory with HEAD, or a
+ * worktree/submodule marker file whose first line starts with `gitdir:`.
+ * Ownership callers request details: absence may permit climbing, but a read
+ * error must not invent an enclosing owner. Legacy callers retain a boolean.
+ */
+export function isRealGitMarker(
+	markerPath: string,
+	details: true,
+): GitMarkerResult;
+export function isRealGitMarker(markerPath: string): boolean;
+export function isRealGitMarker(
+	markerPath: string,
+	details?: true,
+): boolean | GitMarkerResult {
+	// Array callbacks supply an index here; only the documented true opts in.
+	const detailed = details === true;
+	try {
+		const marker = statSync(markerPath);
+		let valid = false;
+		if (marker.isDirectory()) {
+			// existsSync hides EACCES as false. HEAD is part of ownership evidence,
+			// so detailed callers need its failure just as much as the marker's.
+			statSync(path.join(markerPath, "HEAD"));
+			valid = true;
+		} else if (marker.isFile()) {
+			valid = readFileSync(markerPath, "utf8")
+				.split(/\r?\n/, 1)[0]
+				.startsWith("gitdir:");
+		}
+		if (!detailed) return valid;
+		return { kind: valid ? "valid" : "absent" };
+	} catch (cause) {
+		if (!detailed) return false;
+		if (
+			typeof cause === "object" &&
+			cause !== null &&
+			"code" in cause &&
+			(cause.code === "ENOENT" || cause.code === "ENOTDIR")
+		) {
+			return { kind: "absent" };
+		}
+		return { kind: "unavailable", cause };
+	}
 }
 
 /**
@@ -484,16 +742,58 @@ export function findNearestMarkerRoot(
 ): string | null {
 	const boundaries = options.boundaries ?? [];
 	const homeDir = path.resolve(options.homeDir ?? os.homedir());
+	const markerPredicate = options.markerPredicate ?? (() => true);
 	let current = path.resolve(startDir);
 	for (let depth = 0; depth < 64; depth++) {
 		if (isAtOrAboveHomeDir(current, homeDir)) return null;
-		if (markers.some((m) => existsSync(path.join(current, m)))) return current;
+		if (
+			markers.some(
+				(m) =>
+					existsSync(path.join(current, m)) &&
+					markerPredicate(path.join(current, m)),
+			)
+		)
+			return current;
 		if (boundaries.some((m) => existsSync(path.join(current, m)))) return null;
 		const parent = path.dirname(current);
 		if (parent === current) return null;
 		current = parent;
 	}
 	return null;
+}
+
+/**
+ * Ownership walk for callers that must tell "no marker here" from "could not
+ * tell" (refs #3644, #3691). Same climb as `findNearestMarkerRoot` (home
+ * ceiling, 64-step cap) but the predicate returns a `GitMarkerResult`, so an I/O
+ * failure stops the walk as `unavailable` instead of becoming "absent" and
+ * letting an enclosing root be mistaken for the owner. It takes no
+ * `boundaries`, so `"boundary"` is not a reason it can return. Kept separate
+ * from the legacy walker so the legacy callers' `existsSync` precheck and
+ * boolean predicate contract cannot drift with it.
+ */
+export function findNearestMarkerRootDetailed(
+	startDir: string,
+	markers: readonly string[],
+	options: FindNearestMarkerRootDetailedOptions,
+): MarkerRootResult {
+	const homeDir = path.resolve(options.homeDir ?? os.homedir());
+	let current = path.resolve(startDir);
+	for (let depth = 0; depth < 64; depth++) {
+		if (isAtOrAboveHomeDir(current, homeDir))
+			return { kind: "not-found", reason: "home-ceiling" };
+		for (const marker of markers) {
+			const markerPath = path.join(current, marker);
+			const checked = options.markerPredicate(markerPath);
+			if (checked.kind === "unavailable")
+				return { kind: "unavailable", markerPath, cause: checked.cause };
+			if (checked.kind === "valid") return { kind: "found", root: current };
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return { kind: "not-found", reason: "root" };
+		current = parent;
+	}
+	return { kind: "not-found", reason: "depth-limit" };
 }
 
 /**
@@ -591,13 +891,31 @@ export function isUnderDir(child: string, parent: string): boolean {
 	return normChild === normParent || normChild.startsWith(parentPrefix);
 }
 
+/** True when a path is outside the session's project root. */
+export function isOutsideProjectRoot(
+	filePath: string,
+	projectRoot: string,
+): boolean {
+	return !isUnderDir(filePath, projectRoot);
+}
+
 const VENDOR_DIR_NAMES = new Set([
 	"node_modules",
 	"vendor",
 	"vendors",
 	"third_party",
 	"third-party",
+	".venv",
+	"site-packages",
+	"bower_components",
 ]);
+
+/** True when any path segment names an installed or vendored dependency tree. */
+export function isVendorPath(filePath: string): boolean {
+	return normalizeFilePath(filePath)
+		.split("/")
+		.some((segment) => VENDOR_DIR_NAMES.has(segment.toLowerCase()));
+}
 
 /**
  * Returns true when a file should be treated as external/vendor and excluded
@@ -611,13 +929,8 @@ export function isExternalOrVendorFile(
 	filePath: string,
 	projectRoot: string,
 ): boolean {
-	if (!isUnderDir(filePath, projectRoot)) return true;
-	const normalized = normalizeFilePath(filePath);
-	const rootNorm = normalizeFilePath(projectRoot);
-	const rel = normalized.startsWith(rootNorm + "/")
-		? normalized.slice(rootNorm.length + 1)
-		: normalized;
-	return rel.split("/").some((seg) => VENDOR_DIR_NAMES.has(seg));
+	if (isOutsideProjectRoot(filePath, projectRoot)) return true;
+	return isVendorPath(filePath);
 }
 
 /**
@@ -650,6 +963,425 @@ export function direntsHaveMarkerGlobMatch(
 		(entry) =>
 			(entry.isFile() || entry.isSymbolicLink()) &&
 			nameMatchesMarkerGlob(entry.name, pattern),
+	);
+}
+
+/**
+ * The axes on which build tools' workspace-MEMBER glob dialects genuinely
+ * diverge (#2591). Every "does this workspace declare this directory as a
+ * member" matcher in `clients/` routes through
+ * {@link matchesWorkspaceMemberPattern} with one of the dialect constants
+ * below rather than hand-rolling its own segment regex or minimatch options
+ * block — the same single-source-of-truth rule `nameMatchesMarkerGlob` holds
+ * for marker globs.
+ *
+ * Two axes deliberately do NOT appear here because every dialect agrees on
+ * them, and a field with one value across every constant is configuration
+ * that can never be wrong:
+ *
+ * - **Case sensitivity.** Cargo's pre-fold segment regex carried no `i` flag;
+ *   uv matches with `MatchOptions { case_sensitive: true, .. }` on every
+ *   platform (`MatchOptions::new()`'s default, kept by `is_included_in_workspace`).
+ *   Matching is unconditionally case-SENSITIVE here, on Windows too.
+ * - **Leading dots.** Cargo's pre-fold `*` compiled to `[^/]*`, which matches a
+ *   leading `.` like any other character; uv passes `require_literal_leading_dot:
+ *   false` (again the `MatchOptions::new()` default), which dm-lens expressed as
+ *   minimatch's `dot: true`. A `*` matches `.hidden` in every dialect.
+ *
+ * If a fourth dialect ever disagrees on either, it becomes a field then — not
+ * before.
+ */
+export interface WorkspaceMemberGlobDialect {
+	/** Dialect name, for the dialect table in `tests/clients/path-utils.test.ts`. */
+	readonly name: string;
+	/**
+	 * `crosses-components`: a path component that is exactly `**` matches zero
+	 * or more path components (a TRAILING `/**` requires at least one, matching
+	 * minimatch and rust `glob`). `pattern-never-matches`: a pattern containing
+	 * `**` anywhere matches nothing at all.
+	 */
+	readonly globstar: "crosses-components" | "pattern-never-matches";
+	/**
+	 * Whether `*`/`?` may span a `/` — rust `glob`'s `require_literal_separator:
+	 * false`. When false (the common case) a wildcard is confined to one path
+	 * component, which is also what makes a pattern's component COUNT have to
+	 * equal the path's: `crates/*` cannot reach `crates/a/b` because `[^/]*`
+	 * cannot cross the separator. Component-count equality is therefore an
+	 * entailment of this axis, not a separate one — see the dialect table's
+	 * `segment-count mismatch` vectors, which red if `[^/]*` is widened.
+	 */
+	readonly wildcardCrossesSeparator: boolean;
+	/** Whether `[abc]`/`[!abc]` is a character class or a literal bracket run. */
+	readonly characterClasses: boolean;
+	/** Tool-specific pattern normalization, applied before compilation. */
+	readonly normalizePattern: (pattern: string) => string;
+}
+
+/**
+ * Cargo `[workspace] members`/`exclude` entries.
+ *
+ * KNOWN LIMITATION (#1671 F6, documented rather than implemented, preserved
+ * byte-for-byte by #2591's fold): a recursive `**` component is NOT supported
+ * and a pattern containing one never matches — cargo workspaces that rely on
+ * `**` to pull in an arbitrarily-nested crate tree under-hoist (the crate stays
+ * independently rooted instead of joining the workspace). Folding cargo onto
+ * uv's `crosses-components` globstar would silently change Rust-LSP root
+ * selection, so the divergence is kept as a dialect value, not resolved.
+ *
+ * `characterClasses: false` is likewise a preserved divergence, not a
+ * considered choice: cargo's pre-fold segment compiler escaped `[` and `]`
+ * into literals, so `crates/[ab]` names a directory literally called `[ab]`.
+ * Real cargo (the `glob` crate) would read it as a class; changing that here
+ * would be the same unreviewed Rust-hoisting change.
+ */
+export const CARGO_WORKSPACE_MEMBER_DIALECT: WorkspaceMemberGlobDialect = {
+	name: "cargo",
+	globstar: "pattern-never-matches",
+	wildcardCrossesSeparator: false,
+	characterClasses: false,
+	normalizePattern: (pattern) => pattern.replace(/\/+$/, ""),
+};
+
+/**
+ * uv `[tool.uv.workspace] members`, pinned to
+ * `astral-sh/uv@3c979abda4530fe9bf3d92e9bcf5c5575e3b3126`,
+ * `crates/uv-workspace/src/workspace.rs` `is_included_in_workspace`: the glob is
+ * `normalize_path`d first (so a leading `./` and any interior `.` component are
+ * not part of the pattern) and matched with
+ * `MatchOptions { require_literal_separator: true, ..MatchOptions::new() }`.
+ */
+export const UV_WORKSPACE_MEMBERS_DIALECT: WorkspaceMemberGlobDialect = {
+	name: "uv-members",
+	globstar: "crosses-components",
+	wildcardCrossesSeparator: false,
+	characterClasses: true,
+	normalizePattern: (pattern) => path.posix.normalize(toPosix(pattern)),
+};
+
+/**
+ * uv `[tool.uv.workspace] exclude`, same upstream file and SHA
+ * (`WorkspaceExclusions::matches`): an exclusion is matched with
+ * `Pattern::matches_path`, i.e. `MatchOptions::new()` defaults, where
+ * `require_literal_separator` is FALSE — so a `*` in an exclusion DOES cross
+ * `/` (`exclude = ['packages/a*c']` excludes `packages/a/b/c`). Two different
+ * option sets inside one tool, which is why the dialect is an object and the
+ * two uv constants are not one.
+ *
+ * Before #2591 this was a documented limitation: minimatch cannot express a
+ * separator-crossing `*`, so dm-lens under-excluded. The dialect object can, so
+ * it is now implemented rather than documented.
+ */
+export const UV_WORKSPACE_EXCLUDE_DIALECT: WorkspaceMemberGlobDialect = {
+	name: "uv-exclude",
+	globstar: "crosses-components",
+	wildcardCrossesSeparator: true,
+	characterClasses: true,
+	normalizePattern: (pattern) => path.posix.normalize(toPosix(pattern)),
+};
+
+/**
+ * Index of the `]` closing the character class opened at `open`, or `-1` when
+ * the run is unterminated (in which case the `[` is a literal). A leading `!`
+ * or `^` negates, and a `]` in first position is a literal class member — the
+ * shape both minimatch and rust `glob` accept.
+ */
+function findCharacterClassEnd(segment: string, open: number): number {
+	let i = open + 1;
+	if (segment[i] === "!" || segment[i] === "^") i += 1;
+	if (segment[i] === "]") i += 1;
+	for (; i < segment.length; i += 1) if (segment[i] === "]") return i;
+	return -1;
+}
+
+/**
+ * One step of a compiled workspace-member pattern. Every step consumes a
+ * BOUNDED amount of the path (one character, or one character at a time under
+ * its own repeat), which is what makes the evaluator below non-backtracking:
+ * there is no nested quantifier for a backtracking engine to explore.
+ *
+ * - `literal` — this exact code unit, `/` included.
+ * - `one` / `star` — a `?` / `*`, consuming one / any number of characters
+ *   that {@link stepAcceptsChar} admits.
+ * - `class` — a `[abc]`/`[!abc]` run, compiled to a one-character regex. This
+ *   is the only compiled regex left in the matcher, and it is bounded by
+ *   construction: one class, no quantifier, tested against a one-character
+ *   string.
+ * - `split` — an epsilon fork: match from `alternative`, or from the next
+ *   step. Only a `**` emits one, to express "zero or more whole components".
+ */
+type WorkspaceGlobStep =
+	| { readonly kind: "literal"; readonly char: string }
+	| { readonly kind: "one"; readonly crossesSeparator: boolean }
+	| { readonly kind: "star"; readonly crossesSeparator: boolean }
+	| { readonly kind: "class"; readonly match: RegExp }
+	| WorkspaceGlobSplit;
+
+/** The one mutable step: `alternative` is back-patched once the group it skips is emitted. */
+interface WorkspaceGlobSplit {
+	readonly kind: "split";
+	alternative: number;
+}
+
+/**
+ * May a wildcard with this separator policy consume `ch`?
+ *
+ * A separator-confined wildcard (`[^/]` in the regex this replaced) takes
+ * anything but `/`. A separator-CROSSING one — uv `exclude`'s `*`/`?`, and
+ * every `**` in either uv dialect — spelled `.` in that regex, which is every
+ * code unit EXCEPT the four line terminators. That exclusion is preserved
+ * deliberately rather than "fixed": minimatch's globstar is `.`-based too, so
+ * a `\n` inside a directory name has never matched across a `**` in either
+ * implementation, and the differential oracle would flag a change here as a
+ * divergence rather than an improvement (#2603).
+ */
+function stepAcceptsChar(crossesSeparator: boolean, ch: string): boolean {
+	return crossesSeparator
+		? ch !== "\n" && ch !== "\r" && ch !== "\u2028" && ch !== "\u2029"
+		: ch !== "/";
+}
+
+/**
+ * Compile a normalized workspace-member pattern into a step list, or
+ * `undefined` when it cannot be compiled at all.
+ *
+ * A `**` component consumes zero or more path components — except as the LAST
+ * component, where it requires at least one (`a/**` matches `a/b`, not `a`),
+ * reproducing both minimatch's and rust `glob`'s answer. It is emitted as
+ * `split → one → star → literal "/"`, i.e. "nothing, or one-or-more characters
+ * followed by the `/` that ends them", after the separator that precedes it.
+ * That is the same language as the `(?:/.+)?/` group the previous compiler
+ * emitted — `X(?:/.+)?/Y` and `X/(?:.+/)?Y` both denote `X/Y` ∪ `X/.+/Y` — in a
+ * form with no nested quantifier.
+ */
+function compileWorkspaceMemberPattern(
+	pattern: string,
+	dialect: WorkspaceMemberGlobDialect,
+): WorkspaceGlobStep[] | undefined {
+	const isGlobstar = (component: string): boolean =>
+		component === "**" && dialect.globstar === "crosses-components";
+	const components = pattern.split("/");
+	const steps: WorkspaceGlobStep[] = [];
+	let needSeparator = false;
+	for (let c = 0; c < components.length; c += 1) {
+		if (needSeparator) steps.push({ kind: "literal", char: "/" });
+		needSeparator = false;
+		const component = components[c];
+		if (isGlobstar(component)) {
+			if (c === components.length - 1) {
+				// `.+` — a trailing `**` requires at least one character.
+				steps.push({ kind: "one", crossesSeparator: true });
+				steps.push({ kind: "star", crossesSeparator: true });
+				continue;
+			}
+			// `(?:.+/)?` — zero or more whole components. The group already ends
+			// at a `/`, so the next component must NOT emit one.
+			const split: WorkspaceGlobSplit = { kind: "split", alternative: -1 };
+			steps.push(split);
+			steps.push({ kind: "one", crossesSeparator: true });
+			steps.push({ kind: "star", crossesSeparator: true });
+			steps.push({ kind: "literal", char: "/" });
+			split.alternative = steps.length;
+			continue;
+		}
+		for (let i = 0; i < component.length; i += 1) {
+			const ch = component[i];
+			if (ch === "*") {
+				steps.push({
+					kind: "star",
+					crossesSeparator: dialect.wildcardCrossesSeparator,
+				});
+				continue;
+			}
+			if (ch === "?") {
+				steps.push({
+					kind: "one",
+					crossesSeparator: dialect.wildcardCrossesSeparator,
+				});
+				continue;
+			}
+			if (ch === "[" && dialect.characterClasses) {
+				const close = findCharacterClassEnd(component, i);
+				if (close !== -1) {
+					// `\` and a first-position `]` are literal class MEMBERS in glob;
+					// left alone they would be a regex escape and an empty-class
+					// terminator (`[]ab]` is `[]` + `ab]` in JS), so both are escaped.
+					const body = component.slice(i + 1, close).replace(/[\\\]]/g, "\\$&");
+					const source = body.startsWith("!")
+						? `[^${body.slice(1)}]`
+						: `[${body}]`;
+					let match: RegExp;
+					try {
+						match = new RegExp(`^${source}$`);
+					} catch {
+						// A glob character class is not a JS character class: `[z-a]`
+						// is a legal glob (matching nothing, since the range is empty)
+						// and an illegal RegExp ("Range out of order"). Fail CLOSED —
+						// an uncompilable pattern declares no member and excludes
+						// nothing — which is also the answer the deleted minimatch call
+						// gave (#2591 review round 2, F2).
+						return undefined;
+					}
+					steps.push({ kind: "class", match });
+					i = close;
+					continue;
+				}
+			}
+			steps.push({ kind: "literal", char: ch });
+		}
+		needSeparator = true;
+	}
+	return steps;
+}
+
+const WORKSPACE_GLOB_MEMO_CELL_CAP = 2_000_000;
+
+/**
+ * Does the whole of `subject` match the whole of `steps`?
+ *
+ * A memoized (step index, path index) table, filled once, bottom-up:
+ * `table[s][p]` is "steps `s…` match `subject[p…]`". Every cell reads only
+ * cells with a larger step index or a larger path index, so one backward
+ * double loop fills the table with no recursion and no re-entry — the match is
+ * O(steps x characters) in time and space, with no path through it that can
+ * take exponential time (#2603).
+ *
+ * The compiled whole-path regex this replaced was correct but backtracking:
+ * every `**` emitted its own nullable `.+`, and N of them explored 2^N splits
+ * of a non-matching subject. #2591 collapsed CONSECUTIVE `**`s, which is a
+ * normalization that cannot fire across a separating component, so
+ * `("**\/*" x12)/zzz` against a 40-component path still took 124900 ms (#2603);
+ * the same shapes are microseconds here. There is nothing left to collapse for
+ * speed, so no collapse is done: `a/**\/**\/b` compiles to two adjacent
+ * `(?:.+/)?` groups, which denote the same language as one and cost the same
+ * table.
+ */
+
+function matchesWorkspaceMemberSteps(
+	steps: readonly WorkspaceGlobStep[],
+	subject: string,
+	onCap?: () => void,
+): boolean {
+	const stepCount = steps.length;
+	const width = subject.length + 1;
+	// 2,000,000 cells is above real ~8e5-cell globs and below the issue's ~1.6e7-cell row.
+	if ((stepCount + 1) * width > WORKSPACE_GLOB_MEMO_CELL_CAP) {
+		onCap?.();
+		return false;
+	}
+	// One byte per (step, position) cell; `1` means "the rest matches from here".
+	const table = new Uint8Array((stepCount + 1) * width);
+	for (let p = subject.length; p >= 0; p -= 1) {
+		const atEnd = p === subject.length;
+		// The empty step list matches only the empty remainder.
+		table[stepCount * width + p] = atEnd ? 1 : 0;
+		for (let s = stepCount - 1; s >= 0; s -= 1) {
+			const step = steps[s];
+			const next = (s + 1) * width;
+			let matched = 0;
+			switch (step.kind) {
+				case "literal":
+					matched =
+						!atEnd && subject[p] === step.char ? table[next + p + 1] : 0;
+					break;
+				case "one":
+					matched =
+						!atEnd && stepAcceptsChar(step.crossesSeparator, subject[p])
+							? table[next + p + 1]
+							: 0;
+					break;
+				case "class":
+					matched =
+						!atEnd && step.match.test(subject[p]) ? table[next + p + 1] : 0;
+					break;
+				case "star":
+					// Consume nothing, or one more character and stay on this step.
+					matched =
+						table[next + p] === 1 ||
+						(!atEnd &&
+							stepAcceptsChar(step.crossesSeparator, subject[p]) &&
+							table[s * width + p + 1] === 1)
+							? 1
+							: 0;
+					break;
+				case "split":
+					matched =
+						table[step.alternative * width + p] === 1 || table[next + p] === 1
+							? 1
+							: 0;
+					break;
+			}
+			table[s * width + p] = matched;
+		}
+	}
+	return table[0] === 1;
+}
+
+/**
+ * Does `relativePath` — a `/`-separated path relative to the workspace root —
+ * match one declared workspace-member (or workspace-exclude) `pattern` under
+ * `dialect`?
+ *
+ * This is the ONE workspace-member matcher (#2591). `clients/lsp/server.ts`'s
+ * `cargoWorkspaceDeclaresMember` and `clients/python-environment.ts`'s
+ * `isUvWorkspaceMember` are thin callers of it; neither keeps a private segment
+ * compiler or minimatch options block any more.
+ *
+ * `clients/review-graph/workspace-modules.ts`'s `expandWorkspacePattern` is
+ * deliberately NOT a caller: npm/pnpm `workspaces` entries are EXPANDED against
+ * the filesystem (one `readdir` of the directory preceding the first `*`,
+ * yielding the directories that exist and hold a manifest) rather than tested
+ * against a candidate path. It answers "which directories does this pattern
+ * name", not "does this pattern name this directory"; folding it in would mean
+ * giving this pure function a filesystem.
+ *
+ * The supported syntax is the intersection of the two upstream dialects: `*`,
+ * `?`, `**`, `[abc]`/`[!abc]` (dialect-gated), and literals. minimatch-only
+ * extensions the pre-fold uv path inherited by accident — brace expansion,
+ * extglobs, leading-`!` negation, leading-`#` comments — are NOT honored, and
+ * uv's own `glob` crate does not honor them either (same pinned SHA), so
+ * dropping them moves uv toward upstream rather than away from it.
+ *
+ * Matching is NON-BACKTRACKING (#2603): the pattern compiles to a list of
+ * bounded steps and {@link matchesWorkspaceMemberSteps} decides it with one
+ * memoized (step, position) table, O(steps x characters), no matter how many
+ * `**`s the pattern carries. The anchored whole-path regex this replaced was
+ * correct but explored 2^N splits of a non-matching path for N `**`
+ * components — 124900 ms for `("**\/*" x12)/zzz` against a 40-component path,
+ * on a call `detectPythonEnvironment` awaits with no timeout, i.e. a wedged
+ * turn rather than a slow answer. The wall-clock half of that fix lives in
+ * `tests/clients/workspace-glob-nonbacktracking-budget.test.ts`; the answers
+ * are unchanged, pinned by the dialect table and the minimatch differential in
+ * `tests/clients/path-utils.test.ts`.
+ *
+ * A pattern that cannot be compiled at all answers `false` for every path —
+ * it declares no member and excludes nothing (#2591 review round 2, F2). The
+ * only such patterns today carry an empty character-class range (`[z-a]`:
+ * legal glob, illegal JS RegExp). Reachability note, recorded rather than
+ * assumed away: no such pattern can reach here through a manifest right now,
+ * because `parseTomlStringArray` (`clients/cargo-manifest.ts`) captures an
+ * array body non-greedily up to the FIRST `]`, so any entry containing a `]`
+ * loses its closing quote and is dropped before it becomes a pattern. That is
+ * a property of the TOML reader, not of this matcher, and it is not this
+ * function's to rely on — the character-class axis stays because upstream
+ * cargo and uv both support classes, and the reader's gap may be closed later.
+ */
+export function matchesWorkspaceMemberPattern(
+	pattern: string,
+	relativePath: string,
+	dialect: WorkspaceMemberGlobDialect,
+	onCap?: () => void,
+): boolean {
+	const normalized = dialect.normalizePattern(pattern);
+	if (
+		dialect.globstar === "pattern-never-matches" &&
+		normalized.includes("**")
+	) {
+		return false;
+	}
+	const steps = compileWorkspaceMemberPattern(normalized, dialect);
+	return (
+		steps !== undefined &&
+		matchesWorkspaceMemberSteps(steps, relativePath, onCap)
 	);
 }
 

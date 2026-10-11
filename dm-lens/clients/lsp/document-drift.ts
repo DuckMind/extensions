@@ -68,14 +68,19 @@
  * backpressure demotion rather than bypassing them.
  */
 
+import { createHash } from "node:crypto";
 import nodeFs from "node:fs";
 import { normalizeMapKey } from "../path-utils.js";
 import { createSingleFlight, type SingleFlight } from "../single-flight.js";
 
-/** Cheap content fingerprint. Same shape as the touch-debounce fingerprint. */
+/**
+ * Whole-content fingerprint, shared by the touch debounce and this module's
+ * confirmation read. It covers every character: a length + head + tail key
+ * read a same-length middle edit as unchanged (#3480).
+ */
 export function fingerprintDocumentContent(content: string): string {
 	if (content.length <= 96) return `${content.length}:${content}`;
-	return `${content.length}:${content.slice(0, 48)}:${content.slice(-48)}`;
+	return `${content.length}:${createHash("sha256").update(content).digest("hex")}`;
 }
 
 /** What the server was last told, and when. */
@@ -131,6 +136,13 @@ export interface DriftSweepResult {
 	readonly unheld: number;
 	/** Tracked documents at the start of the pass. */
 	readonly tracked: number;
+	/**
+	 * #3828 r3: what this pass did to each queued target it took: `resynced`,
+	 * `failed` or `deferred` (still queued), `vanished` or `unheld` (dropped).
+	 * A target queued after the pass took its snapshot is absent, and is still
+	 * queued for the next pass.
+	 */
+	readonly queued: ReadonlyMap<string, DriftDisposition>;
 }
 
 const SKIPPED: DriftSweepResult = {
@@ -143,10 +155,11 @@ const SKIPPED: DriftSweepResult = {
 	vanished: 0,
 	unheld: 0,
 	tracked: 0,
+	queued: new Map(),
 };
 
 /** Documents stat'd per pass. Bounds the per-pass cost on a large workspace. */
-export const DRIFT_CHECK_BATCH = 64;
+const DRIFT_CHECK_BATCH = 64;
 /** Resyncs issued per pass. Paces the heal so a bulk edit cannot burst. */
 export const DRIFT_RESYNC_BATCH = 4;
 /** Tracked-document ceiling. A workspace sweep can open far more than this. */
@@ -178,6 +191,13 @@ export interface DriftSweepDeps {
 		filePath: string,
 		content: string,
 		driftAgeMs: number,
+		/** #3481: `performance.now()` taken before the sweep read `content`. */
+		readStamp?: number,
+		/**
+		 * #3828 r3: the target was queued as a save (see `enqueueResync`). Unset
+		 * for every resync the stat backstop finds on its own.
+		 */
+		saved?: boolean,
 	): Promise<boolean>;
 	/**
 	 * Does a live language server still hold this document open? A record for a
@@ -201,6 +221,12 @@ export interface DriftSweepDeps {
 export class DocumentDriftTracker {
 	/** Insertion-ordered; the sweep cursor walks it round-robin. */
 	private readonly synced = new Map<string, SyncedDocumentRecord>();
+	/**
+	 * Git/external recovery targets waiting for the same paced resync budget,
+	 * each with whether its push is a save (#3828 r3). The save lives and dies
+	 * with the queue entry, so a deferred target keeps it and a sent one drops it.
+	 */
+	private readonly pendingResync = new Map<string, boolean>();
 	private lastSweepAt = 0;
 	private cursor = 0;
 	/**
@@ -223,13 +249,41 @@ export class DocumentDriftTracker {
 	}
 
 	/**
+	 * Queue known-open targets for the next ordinary paced drift pass.
+	 * `saved` (#3828 r3): the caller wrote these bytes to disk, so the push is a
+	 * save (#3405). A later enqueue without it keeps a save still queued.
+	 */
+	enqueueResync(
+		filePaths: readonly string[],
+		options: { saved?: boolean } = {},
+	): void {
+		for (const filePath of filePaths) {
+			const key = normalizeMapKey(filePath);
+			this.pendingResync.set(
+				key,
+				this.pendingResync.get(key) === true || options.saved === true,
+			);
+		}
+	}
+
+	get pendingResyncCount(): number {
+		return this.pendingResync.size;
+	}
+
+	/**
 	 * Record content that landed on EVERY server holding this document.
 	 *
 	 * The caller owns that coverage judgement — see
 	 * `LSPService.recordFullyCoveredSync`. `now` is the moment the sync STARTED,
 	 * not the moment its write landed; see {@link SyncedDocumentRecord.syncedAt}.
 	 */
-	recordSynced(filePath: string, content: string, now = Date.now()): void {
+	recordSynced(
+		filePath: string,
+		content: string,
+		now = Date.now(),
+		/** #3480: the caller's already-computed fingerprint of `content`. */
+		fingerprint = fingerprintDocumentContent(content),
+	): void {
 		const key = normalizeMapKey(filePath);
 		// Delete first so a re-record moves the entry to the END of the insertion
 		// order. Without this, a hot file keeps an old cursor position and the
@@ -237,7 +291,7 @@ export class DocumentDriftTracker {
 		this.synced.delete(key);
 		this.synced.set(key, {
 			size: Buffer.byteLength(content, "utf8"),
-			fingerprint: fingerprintDocumentContent(content),
+			fingerprint,
 			syncedAt: now,
 		});
 		while (this.synced.size > DRIFT_TRACK_CAP) {
@@ -254,6 +308,7 @@ export class DocumentDriftTracker {
 	/** Drop every record. Used on shutdown/session reset, where the server's view dies with it. */
 	clear(): void {
 		this.synced.clear();
+		this.pendingResync.clear();
 		this.cursor = 0;
 		this.lastSweepAt = 0;
 		this.flight.clear();
@@ -380,12 +435,87 @@ export class DocumentDriftTracker {
 				mtimeMs: entry.stat.mtimeMs,
 			});
 		}
+		const queued = [...this.pendingResync.keys()];
+		const queuedDispositions = new Map<string, DriftDisposition>();
+		for (const key of queued) {
+			if (deps.holdsDocument && !deps.holdsDocument(key)) {
+				this.pendingResync.delete(key);
+				unheld += 1;
+				queuedDispositions.set(key, "unheld");
+				continue;
+			}
+		}
 
 		let resynced = 0;
 		let failed = 0;
 		let unchanged = 0;
 		let deferred = 0;
+		const resyncedKeys = new Set<string>();
+		for (const key of queued) {
+			if (!this.pendingResync.has(key)) continue;
+			if (resynced >= DRIFT_RESYNC_BATCH) {
+				deferred += 1;
+				queuedDispositions.set(key, "deferred");
+				deps.onDrift?.({
+					filePath: key,
+					driftAgeMs: 0,
+					disposition: "deferred",
+					syncedSize: this.synced.get(key)?.size ?? 0,
+					diskSize: -1,
+				});
+				continue;
+			}
+			let content: string;
+			const readStamp = performance.now();
+			try {
+				content = await read(key);
+			} catch {
+				this.pendingResync.delete(key);
+				vanished += 1;
+				queuedDispositions.set(key, "vanished");
+				continue;
+			}
+			let landed = false;
+			try {
+				landed = await deps.resync(
+					key,
+					content,
+					0,
+					readStamp,
+					this.pendingResync.get(key),
+				);
+			} catch {
+				landed = false;
+			}
+			if (!landed) {
+				failed += 1;
+				queuedDispositions.set(key, "failed");
+				deps.onDrift?.({
+					filePath: key,
+					driftAgeMs: 0,
+					disposition: "failed",
+					syncedSize: this.synced.get(key)?.size ?? 0,
+					diskSize: Buffer.byteLength(content, "utf8"),
+				});
+				continue;
+			}
+			this.pendingResync.delete(key);
+			resynced += 1;
+			resyncedKeys.add(key);
+			queuedDispositions.set(key, "resynced");
+			deps.onDrift?.({
+				filePath: key,
+				driftAgeMs: 0,
+				disposition: "resynced",
+				syncedSize: this.synced.get(key)?.size ?? 0,
+				diskSize: Buffer.byteLength(content, "utf8"),
+			});
+		}
 		for (const { key, record, mtimeMs } of drifted) {
+			// A Git recovery target and the ordinary stat backstop can identify the
+			// same file in one pass. One event gets one resync opportunity; otherwise
+			// folding Git recovery onto this scheduler double-counts the same write.
+			if (resyncedKeys.has(key)) continue;
 			const driftAgeMs = Math.max(0, now() - record.syncedAt);
 			if (resynced >= DRIFT_RESYNC_BATCH) {
 				// Paced, not dropped: the cursor already advanced past this file, but
@@ -401,6 +531,7 @@ export class DocumentDriftTracker {
 				continue;
 			}
 			let content: string;
+			const readStamp = performance.now();
 			try {
 				content = await read(key);
 			} catch {
@@ -430,7 +561,7 @@ export class DocumentDriftTracker {
 			const diskSize = Buffer.byteLength(content, "utf8");
 			let landed = false;
 			try {
-				landed = await deps.resync(key, content, driftAgeMs);
+				landed = await deps.resync(key, content, driftAgeMs, readStamp);
 			} catch {
 				landed = false;
 			}
@@ -476,6 +607,7 @@ export class DocumentDriftTracker {
 			vanished,
 			unheld,
 			tracked,
+			queued: queuedDispositions,
 		};
 	}
 }

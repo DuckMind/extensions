@@ -50,6 +50,10 @@ import {
 	type Disposition,
 } from "../clients/diagnostic-dispositions.js";
 import { insertSuppressComment } from "../clients/dispatch/suppress-writer.js";
+import { getMutationBridge } from "../clients/mutation-bridge.js";
+import { normalizeMapKey } from "../clients/path-utils.js";
+import { resolveLensToolName } from "../clients/tool-config.js";
+import type { LineageHandle } from "../clients/session-scope.js";
 import {
 	getFileDiagnostics,
 	type WidgetDiagnostic,
@@ -81,6 +85,17 @@ function isBlank(text: string | undefined): boolean {
  * violation) are ambiguous; per #802 this picks the match CLOSEST to the
  * caller's line rather than guessing — the conservative choice for suppress,
  * which must never place a comment above the wrong site.
+ *
+ * #3160: `getFileDiagnostics` keys with `normalizeEphemeralMapKey` — case-
+ * preserving on POSIX by design (no filesystem I/O on that hot path) — but
+ * the widget's own writers key from `ctx.filePath`, which
+ * `createDispatchContext` already canonicalizes to the on-disk casing
+ * (#2016/#3098). `absPath` here is the caller's RAW spelling, so on a
+ * case-insensitive filesystem a mis-cased mark call must derive the same
+ * canonical key the writers used or it silently misses the live diagnostic
+ * and falls through to the fuzzy fallback below — do NOT case-fold
+ * `normalizeEphemeralMapKey` itself for this: on a case-sensitive filesystem
+ * that would merge two genuinely different files.
  */
 function widgetCrossCheck(
 	absPath: string,
@@ -91,7 +106,7 @@ function widgetCrossCheck(
 ): { line: number; ambiguous: boolean } | undefined {
 	let diagnostics: WidgetDiagnostic[] | undefined;
 	try {
-		diagnostics = getFileDiagnostics(absPath);
+		diagnostics = getFileDiagnostics(normalizeMapKey(absPath));
 	} catch {
 		return undefined;
 	}
@@ -216,23 +231,19 @@ export function createLensDiagnosticMarkTool(
 	/** Runtime telemetry identity, when known (#1448 class sweep) — attributed
 	 * onto the disposition log alongside the mark. */
 	getIdentity?: () => { model?: string; provider?: string },
+	captureLineage?: () => LineageHandle,
 ) {
 	return {
 		name: "lens_diagnostic_mark" as const,
 		label: "Mark Diagnostic",
 		description:
-			"Record a disposition for a lens_diagnostics finding, using the exact filePath/rule/message/line " +
-			"it was reported with. false-positive/suppress persist across sessions; defer lasts only for the " +
-			"current session (resurfaces next time); flagged marks it for you to come back and fix, and shows " +
-			"up tagged in a later lens_diagnostics mode=full. suppress additionally writes a `dm-lens-ignore: " +
-			"<rule>` comment into the source above the flagged line — rule is required for suppress. " +
-			"The line is verified/reanchored against current diagnostics before writing (#802): if a live " +
-			"diagnostic for this tool/rule/message is now at a different line, that line is used instead of " +
-			"the one you passed. When suppressing several findings in the SAME file in one turn, work " +
-			"bottom-up (highest line number first) — each inserted comment shifts later lines down by one, " +
-			"and reanchoring can't always disambiguate two nearby findings.",
-		promptSnippet:
-			"Use lens_diagnostic_mark to dismiss a false-positive, suppress a won't-fix, defer, or flag a finding to fix later",
+			"Record a disposition for a diagnostic. Exact reported identity is required; suppress re-anchors against live diagnostics and writes an inline ignore comment, apply multiple suppressions bottom-up, and defer is session-only. Example: mark a false positive with its reported file, line, rule, and message.",
+		// #2535 F3: this snippet registers on pi only (`lens_diagnostic_mark`
+		// is declared pi-only in PI_ONLY_TOOL_REASONS — MCP has no such
+		// tool), so the host is pinned, not defaulted. The fallback restates
+		// the same pi canonical and can only fire if the registry regresses,
+		// which the adapter-aware guard reds on first.
+		promptSnippet: `Use ${resolveLensToolName("lens_diagnostic_mark", "pi") ?? "lens_diagnostic_mark"} to dismiss a false-positive, suppress a won't-fix, defer, or flag a finding to fix later`,
 		parameters: Type.Object({
 			filePath: Type.String({
 				description:
@@ -274,6 +285,7 @@ export function createLensDiagnosticMarkTool(
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
 		) {
+			const lineage = captureLineage?.();
 			const cwd = ctx.cwd ?? getCwd();
 			const filePathArg = params.filePath;
 			const line = params.line;
@@ -408,6 +420,19 @@ export function createLensDiagnosticMarkTool(
 					};
 				}
 				await fs.writeFile(absPath, updated, "utf-8");
+				getMutationBridge()?.recordMutation({
+					filePath: absPath,
+					kind: "edit",
+					editRanges: [[Math.max(1, verifiedLine - 1), verifiedLine]],
+					consumer: "lens_diagnostic_mark",
+					provenance: "observed",
+					...(lineage && { lineage }),
+					// #4187 R4-1: this suppress wrote the file its own `tool_call`
+					// checked, so it may advance that file's authorship. Without
+					// the id the guard cannot tell it from a write no call
+					// produced, and ends the authorship instead.
+					toolCallId: _toolCallId,
+				});
 			}
 
 			const anchor = markDisposition(

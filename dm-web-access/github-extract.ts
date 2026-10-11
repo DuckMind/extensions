@@ -46,6 +46,9 @@ export interface GitHubUrlInfo {
 interface CachedClone {
 	destination: CloneDestination;
 	clonePromise: Promise<string | null>;
+	/** When a fetch last returned this clone's path. */
+	lastUsedAt: number;
+	settled: boolean;
 }
 
 interface CloneDestination {
@@ -394,14 +397,8 @@ async function removeCloneRuntimeAsync(parentPath: string, runtimePath: string):
 async function sweepStaleCloneRuntimes(parentPath: string): Promise<void> {
 	const normalizedParentPath = resolvePath(parentPath);
 	const bootId = process.platform === "linux" ? await readLinuxBootIdAsync() : null;
-	let directory: Awaited<ReturnType<typeof opendirAsync>>;
 	try {
-		directory = await opendirAsync(normalizedParentPath);
-	} catch {
-		return;
-	}
-
-	try {
+		const directory = await opendirAsync(normalizedParentPath);
 		for await (const entry of directory) {
 			if (!entry.name.startsWith("runtime-")) continue;
 			try {
@@ -422,12 +419,6 @@ async function sweepStaleCloneRuntimes(parentPath: string): Promise<void> {
 	} catch {
 		// Cleanup is opportunistic. A changing or unreadable cache must not stop
 		// GitHub extraction from falling back to the API.
-	} finally {
-		try {
-			await directory.close();
-		} catch {
-			// The directory may already have been closed externally.
-		}
 	}
 }
 
@@ -932,7 +923,10 @@ export async function extractGitHub(
 	const key = cacheKey(owner, repo, info.ref);
 
 	const cached = cloneCache.get(key);
-	if (cached) return awaitCachedClone(cached, url, owner, repo, info, signal);
+	if (cached) {
+		cached.lastUsedAt = Date.now();
+		return awaitCachedClone(cached, url, owner, repo, info, signal);
+	}
 
 	if (info.refIsFullSha) {
 		if (signal?.aborted) return null;
@@ -978,6 +972,7 @@ export async function extractGitHub(
 	// Re-check: another concurrent caller may have started a clone while we awaited the size check
 	const cachedAfterSizeCheck = cloneCache.get(key);
 	if (cachedAfterSizeCheck) {
+		cachedAfterSizeCheck.lastUsedAt = Date.now();
 		const cachedResult = await awaitCachedClone(cachedAfterSizeCheck, url, owner, repo, info, signal);
 		if (signal?.aborted) {
 			activityMonitor.logComplete(activityId, 0);
@@ -997,7 +992,9 @@ export async function extractGitHub(
 		return apiFallback;
 	}
 	const clonePromise = cloneRepo(owner, repo, info.ref, config, destination, signal);
-	cloneCache.set(key, { destination, clonePromise });
+	const entry: CachedClone = { destination, clonePromise, lastUsedAt: Date.now(), settled: false };
+	cloneCache.set(key, entry);
+	void clonePromise.finally(() => { entry.settled = true; });
 
 	const result = await clonePromise;
 	if (signal?.aborted) {
@@ -1027,6 +1024,29 @@ export async function extractGitHub(
 	const content = generateContent(result, info);
 	const title = info.path ? `${owner}/${repo} - ${info.path}` : `${owner}/${repo}`;
 	return { url, title, content, error: null };
+}
+
+/** Mark the clones these URLs name as used now. A session that restores results from history
+ * (its own, or one it was forked from) holds their clone paths without fetching them again. */
+export function touchClones(urls: Iterable<string>): void {
+	const now = Date.now();
+	for (const url of urls) {
+		const info = parseGitHubUrl(url);
+		if (!info) continue;
+		const entry = cloneCache.get(cacheKey(info.owner, info.repo, info.ref));
+		if (entry) entry.lastUsedAt = now;
+	}
+}
+
+/** Remove finished clones no fetch has returned since `time`. A host that runs several
+ * sessions at once passes when its oldest live session started: no live session can have
+ * been given those paths, so they are reclaimed while sessions keep overlapping. */
+export function releaseClonesUnusedSince(time: number): void {
+	for (const [key, entry] of cloneCache) {
+		if (!entry.settled || entry.lastUsedAt >= time) continue;
+		removeCloneDestination(entry.destination);
+		cloneCache.delete(key);
+	}
 }
 
 export function clearCloneCache(): void {

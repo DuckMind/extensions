@@ -6,6 +6,7 @@ import test from "node:test";
 import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import {
 	finalizeProcessTerminal,
+	initializeProcessTerminal,
 	processTerminalPath,
 	readProcessTerminal,
 	sanitizeProcessTerminal,
@@ -54,6 +55,27 @@ test("process-terminal proof requires the matching runner instance and writer cl
 		assert.equal(observed.state, "observed");
 		assert.equal(observed.instances?.length, 2);
 		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8")).processTerminal.state, "observed");
+	} finally {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+	}
+});
+
+test("startup process-terminal candidate does not certify unobserved writers", () => {
+	const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-process-terminal-startup-"));
+	try {
+		initializeProcessTerminal(asyncDir, "run-startup", "runner-startup");
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "run-startup", state: "running", lifecycleArtifactVersion: 3, steps: [{ agent: "worker", status: "running" }] }));
+		fs.writeFileSync(path.join(asyncDir, "events.jsonl"), "");
+
+		const proof = finalizeProcessTerminal(asyncDir, "run-startup", {
+			processInstanceId: "runner-startup",
+			closeObservedAt: 20,
+			exitCode: 1,
+			signal: null,
+		});
+
+		assert.equal(proof.state, "unknown");
+		assert.equal(proof.reason, "writer-close-unverified");
 	} finally {
 		fs.rmSync(asyncDir, { recursive: true, force: true });
 	}
@@ -250,7 +272,23 @@ test("process-terminal reports unknown when the runner candidate is unavailable"
 			runId: "run-2",
 			runnerProcessInstanceId: "runner-2",
 			reason: "runner-candidate-missing",
+			instances: [{ kind: "runner", processInstanceId: "runner-2", closeObservedAt: 40, exitCode: 1, signal: null }],
 		});
+	} finally {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+	}
+});
+
+test("process-terminal adds the observed runner exit to a sticky runner-published unknown proof", () => {
+	const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-process-terminal-"));
+	try {
+		const sticky = { version: 1, state: "unknown", runId: "run-3", runnerProcessInstanceId: "runner-3", reason: "process-tree-unverified", diagnostic: "Worktree setup settlement unknown" };
+		fs.writeFileSync(path.join(asyncDir, "process-terminal.json"), JSON.stringify(sticky));
+		const exit = { processInstanceId: "runner-3", closeObservedAt: 50, exitCode: null, signal: "SIGKILL" };
+		const expected = { ...sticky, instances: [{ kind: "runner", ...exit }] };
+
+		assert.deepEqual(finalizeProcessTerminal(asyncDir, "run-3", exit), expected);
+		assert.deepEqual(readProcessTerminal(asyncDir, { runId: "run-3", runnerProcessInstanceId: "runner-3" }), expected);
 	} finally {
 		fs.rmSync(asyncDir, { recursive: true, force: true });
 	}

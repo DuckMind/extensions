@@ -6,6 +6,7 @@
 
 import { Type } from "../clients/deps/typebox.js";
 import type { AstGrepClient } from "../clients/ast-grep-client.js";
+import type { LineageHandle } from "../clients/session-scope.js";
 import {
 	astGrepRemediationHint,
 	classifyAstGrepError,
@@ -28,7 +29,7 @@ function errorTextWithHint(raw: string): string {
 	const hint = astGrepRemediationHint(classifyAstGrepError(raw));
 	return hint ? `Error: ${raw}\n\n${hint}` : `Error: ${raw}`;
 }
-import { LANGUAGES } from "./shared.js";
+import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
 
 function lineCount(value: string): number {
 	if (!value) return 0;
@@ -39,22 +40,20 @@ function lineCount(value: string): number {
 	return lines;
 }
 
-export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
+/**
+ * `captureLineage`: the host's session capture (#3763). The tool takes it at
+ * `execute` entry, before its first await, and the apply records under it.
+ */
+export function createAstGrepReplaceTool(
+	astGrepClient: AstGrepClient,
+	captureLineage?: () => LineageHandle,
+) {
 	return {
 		name: "ast_grep_replace" as const,
 		label: "AST Replace",
 		description:
-			"Replace code using AST-aware pattern matching. IMPORTANT: Use specific AST patterns, not text. Dry-run by default (use apply=true to apply).\n\n" +
-			"✅ GOOD patterns (single AST node):\n" +
-			"  - pattern='console.log($MSG)' rewrite='logger.info($MSG)'\n" +
-			"  - pattern='var $X' rewrite='let $X'\n" +
-			"  - pattern='function $NAME() { }' rewrite='' (delete)\n\n" +
-			"❌ BAD patterns (will error):\n" +
-			"  - Raw text without code structure\n" +
-			'  - Missing parentheses: use it($TEST) not it"text"\n' +
-			"  - Incomplete code fragments\n\n" +
-			"Always use 'paths' to scope to specific files/folders. Dry-run first to preview changes.",
-		promptSnippet: "AST-aware structural find-and-replace",
+			'Find and rewrite code by AST structure; preview by default. Example: `{pattern: "var $X", rewrite: "let $X", apply: false}`.',
+		promptSnippet: "Preview an AST-aware code rewrite",
 		renderResult: compactRenderResult<{
 			matchCount?: number;
 			applied?: boolean;
@@ -130,8 +129,9 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 			params: Record<string, unknown>,
 			_signal: AbortSignal,
 			_onUpdate: unknown,
-			ctx: { cwd?: string },
+			ctx: { cwd?: string; resultMaxItems?: number },
 		) {
+			const lineage = captureLineage?.();
 			const startedAt = Date.now();
 			const {
 				pattern,
@@ -163,6 +163,9 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 			);
 			const pathsCount = paths?.length ?? 1;
 			const applyFlag = apply ?? false;
+			// MCP passes Infinity so the shared result seam receives the complete
+			// tool rendering. DM keeps the historical 50-item content contract.
+			const resultMaxItems = ctx.resultMaxItems ?? 50;
 
 			function logOutcome(
 				outcome: AstGrepToolOutcome,
@@ -210,7 +213,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 					details: {},
 				};
 			}
-			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
+			const searchPaths = resolveAstGrepPaths(paths, ctx.cwd);
 
 			// Phase 3: structural-intent params → synthesize YAML with fix: field
 			if (
@@ -251,6 +254,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 					ruleYaml,
 					searchPaths,
 					applyFlag,
+					{ lineage, toolCallId: _toolCallId },
 				);
 				if (ruleResult.stalePreview) {
 					logOutcome("error", { errorRaw: "stale_preview" });
@@ -282,6 +286,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 					ruleResult.matches,
 					!applyFlag,
 					true,
+					resultMaxItems,
 				);
 				logOutcome(ruleResult.matches.length === 0 ? "no_matches" : "success", {
 					matchCount: ruleResult.matches.length,
@@ -301,7 +306,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 				lang,
 				searchPaths,
 				applyFlag,
-				{ strictness },
+				{ strictness, lineage, toolCallId: _toolCallId },
 			);
 
 			if (result.stalePreview) {
@@ -334,6 +339,7 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 				result.matches,
 				isDryRun,
 				true, // showModeIndicator
+				resultMaxItems,
 			);
 
 			logOutcome(result.matches.length === 0 ? "no_matches" : "success", {

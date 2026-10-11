@@ -11,12 +11,21 @@ import type {
 export interface LSPCapabilitySnapshot {
 	serverId: string;
 	root: string;
+	customServer?: boolean;
+	/** True after this server published diagnostics for any document this session. */
+	diagnosticsPublished?: boolean;
+	/** True after the session's bounded first-contact wait proved no diagnostics path. */
+	diagnosticsUnsupported?: boolean;
 	operationSupport: LSPOperationSupport;
 	workspaceDiagnosticsSupport: LSPWorkspaceDiagnosticsSupport;
 	/** Commands the server advertised for workspace/executeCommand (the allowlist) */
 	advertisedCommands: string[];
 	/** Top-level keys of the raw ServerCapabilities advertised at initialize. */
 	rawCapabilityKeys: string[];
+	/** #3407: what `textDocumentSync.save` asked for — `none` (no didSave is
+	 *  sent), `save`, or `save+text` (`includeText`). Absent when the client
+	 *  predates the accessor, which consumers must read as unknown. */
+	textDocumentSave?: "none" | "save" | "save+text";
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts) — which concrete
 	 *  binary/protocol variant this server instance is actually running (e.g.
 	 *  classic typescript-language-server vs TS7's native `tsc --lsp --stdio`,

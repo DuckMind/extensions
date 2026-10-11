@@ -16,24 +16,42 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { emitBounded } from "./bounded-telemetry.js";
-import { LEDGER_FIELD_MAX } from "./degradation-ledger.js";
+import {
+	LEDGER_FIELD_MAX,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { minimatch } from "./deps/minimatch.js";
 import { createSubsystemLogger } from "./extension-log.js";
+import { detectFileKind, type FileKind } from "./file-kinds.js";
 import { detectFileRole } from "./file-role.js";
-import { findGlobalBinary } from "./package-manager.js";
+import { resolveLanguageRootForFile } from "./language-profile.js";
+import {
+	findGlobalBinary,
+	findLocalBinAt,
+	localBinPath,
+} from "./package-manager.js";
+import { getIsolatedNpxSpawnOptions } from "./tool-probe.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import {
 	augmentPythonEnvironment,
 	detectPythonEnvironment,
 } from "./python-environment.js";
 import {
+	findNearestMarkerRootDetailed,
+	type MarkerRootResult,
+	isRealGitMarker,
+	isUnderDir,
 	normalizeEphemeralMapKey,
 	normalizeMapKey,
+	pathsEqual,
 	toPosix,
 } from "./path-utils.js";
+import { findNearestDirWithAnyBasename } from "./workspace-topology.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 import { stripAnsi } from "./sanitize.js";
+import { resolveGitCheckout } from "./review-graph/git-identity.js";
+import { resolveToolCwd } from "./tool-cwd.js";
 
 // --- Types ---
 
@@ -66,6 +84,49 @@ export interface TestResult {
 	 */
 	duration?: number; // ms; absent = not measured
 	error?: string; // if runner itself failed
+	/**
+	 * Set when the run was deliberately not started (#3871 r2): the target's
+	 * checkout root has no install of its own for this runner, so running it
+	 * would fetch an unpinned tool or use the wrong environment. Not a pass and
+	 * not a failure; the turn-end consumer counts it and publishes nothing.
+	 */
+	notRun?: "no-runner-install";
+}
+
+/**
+ * #2532: the ONE classification seam for "this `TestResult` carries NO
+ * counted failure the agent needs to fix, even though the runner also
+ * reported an `error`" — i.e. `failed === 0 && !!error`. This is NOT "the
+ * suite never started": a runner can report BOTH counted failures and an
+ * error (pytest exit 2 "Interrupted" after `2 failed, 1 passed` already
+ * printed — `parsePytestOutput` sets `error` from the exit code
+ * independently of the parsed counts, review round 1 S2). The rule is
+ * exactly `failed === 0`, nothing about `error`'s presence or cause: a
+ * result with counted failures stays blocking even when `error` is also
+ * set (`testResultToProjectDiagnostics`/`formatResult` still mention the
+ * error in that case, they just don't let it downgrade the verdict).
+ *
+ * `hasRealFailure`/`runnerErrorOnly` (`runtime-turn.ts`, #2522) key off the
+ * exact same fact for the turn-end delivery framing — a batch made
+ * entirely of `isRunnerErrorResult` results is advisory, one containing
+ * even one counted failure keeps "fix before continuing". Three more
+ * surfaces route through this SAME predicate instead of re-deriving it
+ * (review round 1 S1's class sweep), so the identical `TestResult` cannot
+ * classify differently across them: `testResultToProjectDiagnostics`
+ * (`lens_diagnostics mode=full`), the `--lens-guard` merge call in
+ * `handleTurnEnd`, and `TestRunnerClient.formatResult`/the turn-end dbg
+ * summary (both in this file / `runtime-turn.ts`).
+ *
+ * Two call sites intentionally test the COMPLEMENT (a truly clean result,
+ * no counted failure AND no error) rather than this predicate, and are not
+ * a missed fourth spelling: `runtime-turn.ts`'s `cleanFiles` filter
+ * (`--lens-guard`'s clear-blocker list) and `testResultToProjectDiagnostics`'s
+ * own early "nothing to report" return. Both need "genuinely clean", which
+ * `!isRunnerErrorResult(result)` cannot express (it is also true for a
+ * counted failure).
+ */
+export function isRunnerErrorResult(result: TestResult): boolean {
+	return result.failed === 0 && !!result.error;
 }
 
 export interface TestFailure {
@@ -78,6 +139,47 @@ export interface TestFailure {
 // Runner detection: config file → runner name
 export interface RunnerConfig {
 	configFiles: string[];
+	/**
+	 * #2870: the file kinds this runner can run, in `file-kinds.ts`'s
+	 * vocabulary — the ONE gate that decides whether a runner may be handed
+	 * an edited file. Before this, `detectRunner` answered from the project
+	 * root's config files alone, so in a repo carrying both a `go.mod` and a
+	 * Gradle build every `.java` file went to whichever runner is declared
+	 * first in this table (`go test ./src/test/java/...` → `FAIL [setup
+	 * failed]` on every Java edit).
+	 *
+	 * The kind check is the gate, NOT the resolved language root (AGENTS.md
+	 * defect shape 39): a `.java` file in a go-only repo resolves to the
+	 * workspace root — where `go.mod` lives — and must still get no target.
+	 * A kind no entry claims (markdown, yaml, an unknown extension) has no
+	 * runner, which is what stops a `README.md` under `docs/tests/` from
+	 * becoming its own test target.
+	 */
+	kinds: readonly FileKind[];
+	/**
+	 * #2871: markers that anchor the CHILD's working directory, when they are
+	 * not this runner's own `configFiles` (the default).
+	 *
+	 * A file-scoped runner names the file or its package in `args`, so running
+	 * it from the nearest directory carrying its manifest is exactly right —
+	 * `go test ./internal/lightning` only resolves from the module that owns
+	 * `go.mod`. A WHOLE-PROJECT runner names nothing: moving its cwd changes
+	 * WHICH project is built. `gradle` launches the literal `./gradlew`, so a
+	 * module carrying `build.gradle.kts` but no wrapper would fail with `spawn
+	 * ./gradlew ENOENT` — it anchors on its LAUNCHER: a module that carries
+	 * its own wrapper is a self-contained build and runs there, anything else
+	 * walks up to the build that owns the wrapper, which is what it did
+	 * before #2871. `maven` must NOT launcher-anchor (#2944): its command is
+	 * the PATH binary `mvn`, which never reads `mvnw`, so wrapper-only
+	 * markers left a wrapper-less project with no anchor at all and dropped
+	 * the child on the dispatch root instead of the module's `pom.xml`.
+	 * Maven keeps the default and anchors on the module manifest; a wrapper
+	 * is never a reason to anchor elsewhere, since `mvn` does not invoke it
+	 * and a wrapper without a `pom.xml` beside it has nothing for `mvn` to
+	 * build. `tests/clients/test-runner-spawn-cwd.test.ts` derives this
+	 * contract over the whole `RUNNERS` table.
+	 */
+	spawnCwdMarkers?: readonly string[];
 	command: string;
 	// Name of the binary in node_modules/.bin (and every package manager's
 	// global bin dir) — defaults to the runner key. Must match the ACTUAL
@@ -90,8 +192,8 @@ export interface RunnerConfig {
 	parseJson: boolean;
 }
 
-// Source file → test file patterns (reverse lookup)
-const SOURCE_TO_TEST_PATTERNS: Array<{
+// Discovery table; exported so the #2928 parity test enumerates its conventions.
+export const SOURCE_TO_TEST_PATTERNS: Array<{
 	ext: string;
 	testExts: string[];
 	dirs: string[];
@@ -133,10 +235,29 @@ const SOURCE_TO_TEST_PATTERNS: Array<{
 	{ ext: ".ex", testExts: ["_test.exs"], dirs: ["test"] },
 ];
 
-// Bound for walking up parent directories to find a hoisted node_modules
-// (monorepo workspaces) — deep enough for realistic nesting
-// (repo/packages/scope/pkg-name), never unbounded to the filesystem root.
-const MAX_NODE_MODULES_WALK_UP = 5;
+/**
+ * Nearest `node_modules/<packageName>` at or above `cwd` — monorepo workspace
+ * hoisting (npm/yarn/pnpm), where a workspace package's own `node_modules` may
+ * not exist at all and the runner lives in the workspace root's.
+ *
+ * #2870 net-count: this was a private bounded climb loop of its own (the
+ * fourth walker in this file). It is now the shared workspace-topology
+ * walker every other per-directory marker walk in the codebase goes through
+ * — same `walkUpDirs` primitive, the `$HOME` ceiling the private loop
+ * lacked, the `MAX_WALK_DEPTH` cap with its cap-trip latency record, and the
+ * per-directory marker cache, so a chain already walked for a language root
+ * is not re-`readdir`'d here. Returns the directory CONTAINING
+ * `node_modules` (the private loop returned the `node_modules` path itself;
+ * only the log line reads it).
+ */
+function findHoistedNodeModulesPackage(
+	cwd: string,
+	packageName: string,
+): string | undefined {
+	return findNearestDirWithAnyBasename(path.resolve(cwd), [
+		`node_modules/${packageName}`,
+	]);
+}
 
 // Bound for recursive descent into a Python test directory when the exact
 // same-relative-subdir mirror doesn't match (e.g. tests/unit/ grouping by
@@ -168,18 +289,139 @@ export const TURN_END_EXCLUDED_TEST_GLOBS: readonly string[] = [
 	"**/*.e2e.*",
 ];
 
+/** One hash-before-clipping record for both filesystem and ownership-walk gaps. */
+function recordCheckoutIdentityGap(
+	metadata: {
+		cwd: string;
+		candidate: string;
+		lookup: "filesystem" | "target-root" | "dispatch-root";
+		markerPath?: string;
+	} & (
+		| { detail: "realpath" | "marker-error"; errorCode: string | undefined }
+		| { detail: Extract<MarkerRootResult, { kind: "not-found" }>["reason"] }
+	),
+): void {
+	recordDegradationOnce({
+		kind: "test-checkout-identity-unavailable",
+		subject: createHash("sha256")
+			.update(JSON.stringify(metadata))
+			.digest("hex"),
+		reason: "cannot establish automatic test checkout identity",
+		metadata,
+	});
+}
+
+/** A positively identified foreign checkout, including targets reached via aliases. */
+function foreignGitRoot(testFilePath: string, cwd: string): string | null {
+	let realCwd: string;
+	let realTarget: string;
+	try {
+		// Both sides need filesystem identity. Walking the alias's lexical parents
+		// skips a Git boundary when a file or a directory below that root is linked.
+		realCwd = fs.realpathSync.native(path.resolve(cwd));
+		realTarget = fs.realpathSync.native(
+			path.resolve(cwd, toPosix(testFilePath)),
+		);
+	} catch (error_) {
+		// Missing/unreadable paths do not prove foreign ownership. The existing
+		// missing-target classifier and spawn checks retain their own decisions.
+		const errorCode = filesystemErrorCode(error_);
+		// A deleted or renamed target is ordinary and already reaches
+		// `retired-missing`; recording it would fill the ledger's per-kind cap
+		// and hide a real EACCES identity failure (#3691 F1).
+		if (errorCode === "ENOENT" || errorCode === "ENOTDIR") return null;
+		recordCheckoutIdentityGap({
+			cwd,
+			candidate: testFilePath,
+			lookup: "filesystem",
+			detail: "realpath",
+			errorCode,
+		});
+		return null;
+	}
+	const targetWalk = findNearestMarkerRootDetailed(
+		path.dirname(realTarget),
+		[".git"],
+		{
+			markerPredicate: (marker) => isRealGitMarker(marker, true),
+		},
+	);
+	if (targetWalk.kind !== "found") {
+		if (targetWalk.kind === "unavailable") {
+			recordCheckoutIdentityGap({
+				cwd,
+				candidate: testFilePath,
+				lookup: "target-root",
+				detail: "marker-error",
+				markerPath: targetWalk.markerPath,
+				errorCode: filesystemErrorCode(targetWalk.cause),
+			});
+		} else if (targetWalk.reason === "depth-limit") {
+			recordCheckoutIdentityGap({
+				cwd,
+				candidate: testFilePath,
+				lookup: "target-root",
+				detail: targetWalk.reason,
+			});
+		}
+		// Ordinary Gitless absence is not an incident. Error/cap uncertainty is
+		// disclosed, but neither may delete an otherwise usable own-checkout test.
+		return null;
+	}
+	const root = targetWalk.root;
+	// A root below or disjoint from cwd cannot own cwd, even if cwd is Gitless.
+	if (!isUnderDir(realCwd, root)) return root;
+	// A marker error on EITHER walk must not turn an enclosing root into proof
+	// of foreign ownership. In particular, do not retire cached failures on it.
+	const dispatchWalk = findNearestMarkerRootDetailed(realCwd, [".git"], {
+		markerPredicate: (marker) => isRealGitMarker(marker, true),
+	});
+	if (dispatchWalk.kind !== "found") {
+		recordCheckoutIdentityGap({
+			cwd,
+			candidate: testFilePath,
+			lookup: "dispatch-root",
+			...(dispatchWalk.kind === "unavailable"
+				? {
+						detail: "marker-error",
+						markerPath: dispatchWalk.markerPath,
+						errorCode: filesystemErrorCode(dispatchWalk.cause),
+					}
+				: { detail: dispatchWalk.reason }),
+		});
+		return null;
+	}
+	return !pathsEqual(root, dispatchWalk.root) ? root : null;
+}
+
 /**
- * Whether a resolved test target falls under the built-in turn-end
- * exclusion list (#2522). `testFilePath` may be absolute or relative, and
- * may use either path-separator form — folded through `toPosix` after being
- * made cwd-relative so `\`- and `/`-separated inputs match identically
- * (AGENTS.md cross-form-path screen).
+ * Whether the excluded checkout is another working tree of the dispatch root's
+ * own repository (a sibling linked worktree, #3871) rather than an unrelated
+ * repository: the one fact that tells a maintainer reading the record whether
+ * the exclusion is the #3649 crossover guard or a selection gap. Unresolvable
+ * on either side is `false`, never a guess.
+ */
+function sharesCommonDir(cwd: string, checkoutRoot: string): boolean {
+	const dispatch = resolveGitCheckout(cwd);
+	const excluded = resolveGitCheckout(checkoutRoot);
+	return (
+		dispatch !== null &&
+		excluded !== null &&
+		pathsEqual(dispatch.commonDir, excluded.commonDir)
+	);
+}
+
+/**
+ * Turn-end exclusion policy: out-of-tree files, foreign Git checkouts, and the
+ * built-in integration/e2e globs (#2522). Absolute and cwd-relative inputs
+ * share the same policy; explicit test execution does not use this gate.
  */
 export function isExcludedTestTarget(
 	testFilePath: string,
 	cwd: string,
 ): boolean {
-	const rel = toPosix(path.relative(cwd, path.resolve(cwd, testFilePath)));
+	const absolute = path.resolve(cwd, toPosix(testFilePath));
+	let rel = toPosix(path.relative(cwd, absolute));
 	// #2522 review round 2, F6: a target that resolves OUTSIDE the project root
 	// yields a `..`-leading relative path (or, across Windows drives, a still
 	// absolute one), which matches none of the globs — so the bare `some()`
@@ -191,8 +433,38 @@ export function isExcludedTestTarget(
 		rel === ".." ||
 		rel.startsWith("../") ||
 		path.isAbsolute(rel)
-	)
+	) {
+		// Different aliases can spell an in-tree target as lexically outside cwd.
+		const realTarget = canonicalFailedPath(absolute);
+		const realCwd = canonicalFailedPath(cwd);
+		if (pathsEqual(realTarget, realCwd) || !isUnderDir(realTarget, realCwd))
+			return true;
+		// R4: ../other-spelling/... cannot match the existing globs. Only this
+		// alias exception needs physical policy coordinates; display/cache keys
+		// and ordinary in-tree spelling semantics remain unchanged.
+		rel = toPosix(path.relative(realCwd, realTarget));
+	}
+	// A separate Git checkout remains foreign through an in-tree alias. Explicit
+	// execution does not use this policy, and keeps its original display spelling.
+	const checkoutRoot = foreignGitRoot(testFilePath, cwd);
+	if (checkoutRoot) {
+		// R6: self/deferred targets can reach this gate without discovery or
+		// failed-cache records, and the MCP caller's dbg is deliberately a no-op.
+		recordDegradationOnce({
+			kind: "test-target-foreign-checkout",
+			subject: createHash("sha256")
+				.update(JSON.stringify([cwd, testFilePath, checkoutRoot]))
+				.digest("hex"),
+			reason: "automatic test target belongs to another Git checkout",
+			metadata: {
+				cwd,
+				candidate: testFilePath,
+				checkoutRoot,
+				sameCommonDir: sharesCommonDir(cwd, checkoutRoot),
+			},
+		});
 		return true;
+	}
 	// #2522 review round 2, F5: case-INSENSITIVE. `tests/Integration/`,
 	// `tests/E2E/` and `foo.E2E.test.ts` are the same hazard as their lowercase
 	// spellings, and on the case-insensitive filesystems Windows and macOS ship
@@ -208,6 +480,7 @@ export function isExcludedTestTarget(
 
 export const RUNNERS: Record<string, RunnerConfig> = {
 	vitest: {
+		kinds: ["jsts"],
 		configFiles: ["vitest.config.ts", "vitest.config.js", "vitest.config.mjs"],
 		command: "npx",
 		binName: "vitest",
@@ -221,6 +494,7 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 		parseJson: true,
 	},
 	jest: {
+		kinds: ["jsts"],
 		configFiles: [
 			"jest.config.ts",
 			"jest.config.js",
@@ -239,12 +513,26 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 		parseJson: true,
 	},
 	pytest: {
+		kinds: ["python"],
 		configFiles: ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"],
+		// #2879 review round 3, F7: `pyproject.toml` is CONTENT-conditional in
+		// detection — the Priority-1 loop accepts it only when it carries
+		// `[tool.pytest.ini_options]` — but the cwd seam walks basenames, so
+		// handing `configFiles` over verbatim anchored the child on the very
+		// file detection had refused. Omitting it here makes the spawn walk
+		// stop only on evidence the detector itself would accept; a project
+		// whose ONLY pytest config is a real `[tool.pytest.ini_options]`
+		// section therefore falls back to the dispatch root, which is exactly
+		// where master ran it. (The proper fix is to carry detection's
+		// accepted evidence path into the spawn resolution instead of
+		// re-deriving it from a basename table — filed as a follow-up.)
+		spawnCwdMarkers: ["pytest.ini", "tox.ini", "setup.cfg"],
 		command: "python",
 		args: (testFile, _cwd) => ["-m", "pytest", testFile, "--tb=short", "-q"],
 		parseJson: false, // pytest JSON requires plugin, use text parsing
 	},
 	go: {
+		kinds: ["go"],
 		configFiles: ["go.mod"],
 		command: "go",
 		args: (testFile, cwd) => {
@@ -256,30 +544,50 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 		parseJson: false, // Go test output is text-based
 	},
 	cargo: {
+		kinds: ["rust"],
 		configFiles: ["Cargo.toml"],
 		command: "cargo",
 		args: (_testFile, _cwd) => ["test", "--no-fail-fast"],
 		parseJson: false, // cargo test output is text-based
 	},
 	dotnet: {
+		kinds: ["csharp", "fsharp"],
 		configFiles: ["*.csproj", "*.sln"],
 		command: "dotnet",
 		args: (_testFile, _cwd) => ["test", "--no-build"],
 		parseJson: false,
 	},
 	gradle: {
-		configFiles: ["build.gradle", "build.gradle.kts", "settings.gradle"],
-		command: process.platform === "win32" ? "gradlew.bat" : "./gradlew",
+		kinds: ["java", "kotlin"],
+		// #2870: `settings.gradle.kts` alongside its Groovy sibling — a
+		// Kotlin-DSL build whose root carries only the settings script was
+		// invisible to detection, the same one-spelling gap the java root
+		// markers had.
+		configFiles: [
+			"build.gradle",
+			"build.gradle.kts",
+			"settings.gradle",
+			"settings.gradle.kts",
+		],
+		// #3956: a cwd-relative launcher must carry a separator, or the Windows
+		// resolver treats it as a PATH-only name and never looks in the child cwd
+		// where the wrapper actually lives. Forward slash is the platform-neutral
+		// spelling the resolver accepts on win32 (same #2870 lesson as ./gradlew).
+		command: process.platform === "win32" ? "./gradlew.bat" : "./gradlew",
+		// The child's cwd must be a directory the wrapper actually lives in.
+		spawnCwdMarkers: ["gradlew", "gradlew.bat"],
 		args: (_testFile, _cwd) => ["test", "--no-daemon"],
 		parseJson: false,
 	},
 	maven: {
+		kinds: ["java", "kotlin"],
 		configFiles: ["pom.xml"],
 		command: "mvn",
 		args: (_testFile, _cwd) => ["test", "-q"],
 		parseJson: false,
 	},
 	rspec: {
+		kinds: ["ruby"],
 		configFiles: [".rspec", "spec/spec_helper.rb"],
 		command: "bundle",
 		// The real binary is "bundle" (the command runs `bundle exec rspec
@@ -291,22 +599,33 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 		parseJson: false,
 	},
 	minitest: {
+		kinds: ["ruby"],
 		configFiles: ["Gemfile"],
 		command: "ruby",
 		args: (testFile, _cwd) => ["-Itest", testFile],
 		parseJson: false,
 	},
 	phpunit: {
+		kinds: ["php"],
 		// phpunit.xml(.dist) is the strong signal; composer.json is checked for
 		// a require-dev dependency on phpunit/phpunit (see the special case in
 		// detectRunner's Priority-1 loop, mirroring the pytest/pyproject.toml
 		// handling above).
 		configFiles: ["phpunit.xml", "phpunit.xml.dist", "composer.json"],
+		// #2879 review round 3, F7: same shape as pytest's `pyproject.toml`,
+		// and this one is load-bearing — phpunit reads `phpunit.xml` from its
+		// CWD only, so a child launched in a directory whose `composer.json`
+		// carries no `phpunit/phpunit` dependency runs with no bootstrap and
+		// no autoloader, and the resulting fatal error reaches the agent as a
+		// test failure (measured end to end with a fake phpunit recording its
+		// own cwd). `composer.json` is an anchor, never phpunit evidence.
+		spawnCwdMarkers: ["phpunit.xml", "phpunit.xml.dist"],
 		command: "phpunit",
 		args: (testFile, _cwd) => [testFile],
 		parseJson: false, // PHPUnit's default CLI output is text-based
 	},
 	mix: {
+		kinds: ["elixir"],
 		configFiles: ["mix.exs"],
 		command: "mix",
 		args: (testFile, _cwd) => ["test", testFile],
@@ -356,14 +675,34 @@ interface TestRunRequest {
 	 * ambient turn signal exactly as before.
 	 */
 	signal?: AbortSignal;
+	/**
+	 * #3871 r2: the directory failure locations are rendered relative to. The
+	 * dispatch root is the checkout that owns the test, but the reader is in the
+	 * session checkout, which may hold a file at the same relative path; a
+	 * worktree failure must read `.worktrees/x/tests/a.test.ts:12`. Absent
+	 * renders against the dispatch root, as before.
+	 */
+	displayRoot?: string;
+	/**
+	 * #3871 r2: refuse to start the run when this root has no install of its own
+	 * for the runner (resolution would reach `npx` or a bare interpreter). Set
+	 * for linked-worktree roots only; the session checkout keeps its fallbacks.
+	 */
+	requireOwnInstall?: boolean;
 }
 
 interface FailedTargetStateRecord {
-	outcome: "retired-missing" | "retained-indeterminate" | "capacity-evicted";
+	outcome:
+		| "retired-missing"
+		| "retained-indeterminate"
+		| "capacity-evicted"
+		| "rejected-nested-checkout"
+		| "retired-nested-checkout";
 	runner: string;
 	candidate: string;
 	errorCode?: string;
-	turnIndex?: number;
+	/** Every writer supplies this; explicit runs may have no turn context. */
+	turnIndex: number | undefined;
 }
 
 interface FailedTargetEntry {
@@ -596,16 +935,137 @@ export class TestRunnerClient {
 	}
 
 	/**
+	 * Which runners may be handed `sourceFilePath`, and the directory their
+	 * config files are probed in (#2870).
+	 *
+	 * `eligible === null` means "no file was named" — the session-level
+	 * caller (`runtime-session.ts`'s summary) asks "what runner does this
+	 * project have" and has no file to scope to, so every runner stays a
+	 * candidate and the probe root is the dispatch root, exactly as before.
+	 *
+	 * A named file resolves TWO independent facts, and the order matters:
+	 *  - its KIND decides which runners may claim it at all (the gate), and
+	 *  - `resolveLanguageRootForFile` decides WHERE that kind's config files
+	 *    are looked for (the anchor) — the same per-kind, cached,
+	 *    workspace-clamped walk the dispatch runners already resolve their
+	 *    roots with, not a private walker.
+	 *
+	 * Returning `null` means no runner can own this file (a kind no entry
+	 * claims: markdown, yaml, an unknown extension), so no directory is
+	 * probed at all.
+	 */
+	private resolveDetectionScope(
+		cwd: string,
+		sourceFilePath?: string,
+	): { root: string; eligible: ReadonlySet<string> | null } | null {
+		if (sourceFilePath === undefined) return { root: cwd, eligible: null };
+		const absoluteFile = path.resolve(sourceFilePath);
+		// #2522 (pinned by "fails closed through the REAL getTestRunTarget when
+		// the resolved target is out of tree"): a file OUTSIDE the dispatch root
+		// keeps the pre-#2870 resolution — every runner, probed at the dispatch
+		// root — so `getTestRunTarget` still hands the exclusion layer a target
+		// to fail closed on instead of quietly answering "no runner" for a file
+		// the turn should refuse loudly. Per-file anchoring has nothing to
+		// anchor to out there: the language-root walk is clamped to the
+		// workspace, so every out-of-tree file resolves to the dispatch root
+		// anyway.
+		if (!isUnderDir(absoluteFile, path.resolve(cwd))) {
+			return { root: cwd, eligible: null };
+		}
+		const kind = detectFileKind(absoluteFile);
+		if (!kind) return null;
+		const eligible = new Set(
+			Object.entries(RUNNERS)
+				.filter(([, config]) => config.kinds.includes(kind))
+				.map(([name]) => name),
+		);
+		if (eligible.size === 0) return null;
+		return {
+			root: resolveLanguageRootForFile(absoluteFile, cwd),
+			eligible,
+		};
+	}
+
+	/**
 	 * Check if a test runner is available in the project
 	 * Detection order:
 	 * 1. Config files (vitest.config.ts, jest.config.js, etc.)
 	 * 2. package.json dependencies
 	 * 3. node_modules presence
+	 *
+	 * #2870: when `sourceFilePath` is given, the answer is scoped to that
+	 * file's kind and resolved language root — see `resolveDetectionScope`.
 	 */
 	detectRunner(
-		cwd: string,
+		dispatchRoot: string,
 		sourceFilePath?: string,
 	): { runner: string; config: RunnerConfig } | null {
+		const scope = this.resolveDetectionScope(dispatchRoot, sourceFilePath);
+		if (!scope) return null;
+		const { root, eligible } = scope;
+
+		const anchored = this.probeRunnersAt(root, eligible);
+		if (anchored) return anchored;
+
+		// #2879 review round 2, F1: the anchor is a LANGUAGE root, and
+		// `ROOT_MARKERS_BY_KIND` is deliberately BROADER than any runner's
+		// `configFiles` — `requirements.txt`, `setup.py`, `Pipfile`,
+		// `Rakefile`, `composer.lock`, `.classpath` all anchor a language
+		// without configuring a test runner. Probing the anchored directory
+		// ALONE therefore let any such intermediate marker shadow the
+		// project root's real runner config, and pytest/rspec/minitest/
+		// phpunit have no later priority to rescue them: four single-language
+		// repos went from a working runner to no target at all (measured, the
+		// review's `anchor.mjs` probe), which is exactly what #2870's amended
+		// criterion 4 protects.
+		//
+		// So the anchored probe is a PREFERENCE, not a restriction: on a miss,
+		// re-probe the dispatch root under the SAME kind gate. The gate is
+		// what keeps #2870 fixed — a `.java` file re-probing a polyglot root
+		// still cannot reach `go`, because `go` never claims the `java` kind.
+		const dispatch = path.resolve(dispatchRoot);
+		if (path.resolve(root) !== dispatch) {
+			const atDispatch = this.probeRunnersAt(dispatch, eligible);
+			if (atDispatch) return atDispatch;
+		}
+
+		// Priority 5: Check if pytest is available globally (Python files only)
+		const isPythonSource =
+			typeof sourceFilePath === "string" && sourceFilePath.endsWith(".py");
+		if (!isPythonSource) return null;
+
+		try {
+			const whichCmd = process.platform === "win32" ? "where" : "which";
+			const result = safeSpawn(whichCmd, ["pytest"], {
+				timeout: 2000,
+			});
+			if (result.status === 0) {
+				this.log("Detected pytest globally");
+				return { runner: "pytest", config: RUNNERS.pytest };
+			}
+		} catch (err) {
+			void err;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Priorities 1-4 of the detection ladder, against ONE directory: config
+	 * files, `package.json` dependencies, a hoisted `node_modules`, and the
+	 * glob-capable whole-project runners. `eligible` is the kind gate
+	 * (#2870); `null` means no file was named and every runner is a
+	 * candidate. Returns `null` when this directory configures no eligible
+	 * runner, which is what lets `detectRunner` try the dispatch root next.
+	 */
+	private probeRunnersAt(
+		cwd: string,
+		eligible: ReadonlySet<string> | null,
+	): { runner: string; config: RunnerConfig } | null {
+		// Keyed on the probed directory, not the dispatch root: two modules of
+		// one polyglot repo have different runners available, and a memo keyed
+		// on the shared dispatch root would serve the first module's verdict to
+		// every other module (#2870).
 		const rootKey = this.getCanonicalProjectRoot(cwd);
 		let byRunner = this.availableRunners.get(rootKey);
 		if (!byRunner) {
@@ -614,6 +1074,7 @@ export class TestRunnerClient {
 		}
 		// Priority 1: Config files
 		for (const [name, config] of Object.entries(RUNNERS)) {
+			if (eligible && !eligible.has(name)) continue;
 			const cached = this.getRunnerAvailability(byRunner, name);
 			if (cached !== undefined) {
 				if (cached) {
@@ -674,17 +1135,20 @@ export class TestRunnerClient {
 			};
 
 			// Check for vitest first (more specific than jest)
-			if (allDeps.vitest) {
+			if (allDeps.vitest && (!eligible || eligible.has("vitest"))) {
 				this.log("Detected vitest in package.json");
 				this.setRunnerAvailability(byRunner, "vitest", true, packageJsonPath);
 				return { runner: "vitest", config: RUNNERS.vitest };
 			}
-			if (allDeps.jest) {
+			if (allDeps.jest && (!eligible || eligible.has("jest"))) {
 				this.log("Detected jest in package.json");
 				this.setRunnerAvailability(byRunner, "jest", true, packageJsonPath);
 				return { runner: "jest", config: RUNNERS.jest };
 			}
-			if (allDeps.pytest || allDeps["pytest-cov"]) {
+			if (
+				(allDeps.pytest || allDeps["pytest-cov"]) &&
+				(!eligible || eligible.has("pytest"))
+			) {
 				this.log("Detected pytest in package.json (unusual)");
 				this.setRunnerAvailability(byRunner, "pytest", true, packageJsonPath);
 				return { runner: "pytest", config: RUNNERS.pytest };
@@ -697,22 +1161,18 @@ export class TestRunnerClient {
 		// Priority 3: Check node_modules for installed packages, including a
 		// hoisted monorepo layout where cwd is a workspace package (e.g.
 		// packages/foo) but the runner only lives in node_modules at the
-		// workspace root (npm/yarn/pnpm workspace hoisting). Walk up a
-		// bounded number of parent directories looking for a node_modules
-		// containing the package — never an unbounded walk to the
-		// filesystem root.
-		const hoistedVitest = this.findHoistedNodeModulesPackage(cwd, "vitest");
-		if (hoistedVitest) {
-			this.log(`Detected vitest in node_modules (${hoistedVitest})`);
-			return { runner: "vitest", config: RUNNERS.vitest };
-		}
-		const hoistedJest = this.findHoistedNodeModulesPackage(cwd, "jest");
-		if (hoistedJest) {
-			this.log(`Detected jest in node_modules (${hoistedJest})`);
-			return { runner: "jest", config: RUNNERS.jest };
+		// workspace root (npm/yarn/pnpm workspace hoisting).
+		for (const name of ["vitest", "jest"] as const) {
+			if (eligible && !eligible.has(name)) continue;
+			const hoisted = findHoistedNodeModulesPackage(cwd, name);
+			if (hoisted) {
+				this.log(`Detected ${name} in node_modules (${hoisted})`);
+				return { runner: name, config: RUNNERS[name] };
+			}
 		}
 
 		for (const name of ["go", "cargo", "dotnet", "gradle", "maven"]) {
+			if (eligible && !eligible.has(name)) continue;
 			const config = RUNNERS[name];
 			const found = config.configFiles.some((cf) => {
 				// Handle glob patterns like *.csproj
@@ -734,51 +1194,6 @@ export class TestRunnerClient {
 			}
 		}
 
-		// Priority 5: Check if pytest is available globally (Python files only)
-		const isPythonSource =
-			typeof sourceFilePath === "string" && sourceFilePath.endsWith(".py");
-		if (!isPythonSource) return null;
-
-		try {
-			const whichCmd = process.platform === "win32" ? "where" : "which";
-			const result = safeSpawn(whichCmd, ["pytest"], {
-				timeout: 2000,
-			});
-			if (result.status === 0) {
-				this.log("Detected pytest globally");
-				return { runner: "pytest", config: RUNNERS.pytest };
-			}
-		} catch (err) {
-			void err;
-		}
-
-		return null;
-	}
-
-	/**
-	 * Walk up from `cwd` through parent directories looking for a
-	 * `node_modules/<packageName>` — handles monorepo workspace hoisting
-	 * (npm/yarn/pnpm), where a workspace package's own `node_modules` may
-	 * not exist at all, with dependencies hoisted to the workspace root
-	 * several directories up. Bounded by `MAX_NODE_MODULES_WALK_UP` levels
-	 * and stops at the filesystem root — never an unbounded walk.
-	 * Returns the `node_modules` directory where the package was found, or
-	 * null if not found within the bound.
-	 */
-	private findHoistedNodeModulesPackage(
-		cwd: string,
-		packageName: string,
-	): string | null {
-		let dir = path.resolve(cwd);
-		for (let level = 0; level <= MAX_NODE_MODULES_WALK_UP; level++) {
-			const nodeModulesPath = path.join(dir, "node_modules");
-			if (fs.existsSync(path.join(nodeModulesPath, packageName))) {
-				return nodeModulesPath;
-			}
-			const parent = path.dirname(dir);
-			if (parent === dir) break; // reached filesystem root
-			dir = parent;
-		}
 		return null;
 	}
 
@@ -798,6 +1213,7 @@ export class TestRunnerClient {
 		pattern: string,
 		basename: string,
 		maxDepth: number,
+		acceptCandidate: (testFile: string) => boolean,
 	): string | null {
 		const queue: Array<{ dir: string; depth: number }> = [
 			{ dir: rootDir, depth: 0 },
@@ -819,10 +1235,11 @@ export class TestRunnerClient {
 				const fullPath = path.join(dir, entry.name);
 				if (entry.isFile()) {
 					if (
-						entry.name === pattern ||
-						(entry.name.startsWith("test_") &&
-							entry.name.endsWith(".py") &&
-							entry.name.includes(basename))
+						(entry.name === pattern ||
+							(entry.name.startsWith("test_") &&
+								entry.name.endsWith(".py") &&
+								entry.name.includes(basename))) &&
+						acceptCandidate(fullPath)
 					) {
 						return fullPath;
 					}
@@ -976,7 +1393,8 @@ export class TestRunnerClient {
 	 * file whose *related* test file needs to be discovered).
 	 *
 	 * Primary signal: `detectFileRole` (naming convention: `.test.`/`.spec.`
-	 * basenames, `test_`/`spec_` prefixes, `__tests__/`/`tests/`/`spec/`
+	 * basenames, `_test.`/`_spec.` suffix infixes, `*Test(s).<ext>` CamelCase
+	 * suffixes, `test_`/`spec_` prefixes, `__tests__/`/`tests/`/`spec/`
 	 * directories — shared with the rest of the codebase, not a second
 	 * parallel detector).
 	 *
@@ -1067,12 +1485,15 @@ export class TestRunnerClient {
 
 	/**
 	 * Find test file for a given source file
-	 * Returns the test file path if it exists, null otherwise
+	 * Returns the test file path if it exists, null otherwise.
+	 * Automatic selection supplies eligibility before each first-match return;
+	 * ordinary discovery, existence checks, and suggestions remain unfiltered.
 	 */
 	findTestFile(
 		sourceFilePath: string,
 		cwd: string,
 		runnerOverride?: string,
+		acceptCandidate: (testFile: string) => boolean = () => true,
 	): { testFile: string; runner: string } | null {
 		const ext = path.extname(sourceFilePath);
 		const basename = path.basename(sourceFilePath, ext);
@@ -1118,10 +1539,11 @@ export class TestRunnerClient {
 
 					const match = files.find(
 						(f) =>
-							f === pattern ||
-							(f.startsWith("test_") &&
-								f.endsWith(".py") &&
-								f.includes(basename)),
+							(f === pattern ||
+								(f.startsWith("test_") &&
+									f.endsWith(".py") &&
+									f.includes(basename))) &&
+							acceptCandidate(path.join(searchDir, f)),
 					);
 					if (match) {
 						const testPath = path.join(searchDir, match);
@@ -1143,6 +1565,7 @@ export class TestRunnerClient {
 						pattern,
 						basename,
 						MAX_PYTEST_RECURSE_DEPTH,
+						acceptCandidate,
 					);
 					if (recursiveMatch) {
 						this.log(`Found test file (recursive): ${recursiveMatch}`);
@@ -1173,7 +1596,7 @@ export class TestRunnerClient {
 				];
 
 				for (const testPath of searchPaths) {
-					if (fs.existsSync(testPath)) {
+					if (fs.existsSync(testPath) && acceptCandidate(testPath)) {
 						this.log(`Found test file: ${testPath}`);
 						return { testFile: testPath, runner: detected.runner };
 					}
@@ -1182,7 +1605,11 @@ export class TestRunnerClient {
 		}
 
 		// Basename lookup found nothing — try import scanning as a fallback.
-		const importMatch = this.findTestFileByImport(sourceFilePath, cwd);
+		const importMatch = this.findTestFileByImport(
+			sourceFilePath,
+			cwd,
+			acceptCandidate,
+		);
 		if (importMatch) {
 			return { testFile: importMatch, runner: detected.runner };
 		}
@@ -1219,10 +1646,22 @@ export class TestRunnerClient {
 		const selfIsTest = this.isTestFile(sourceFilePath, cwd, detected.runner);
 		const related = selfIsTest
 			? null
-			: this.findTestFile(sourceFilePath, cwd, detected.runner);
+			: this.findTestFile(sourceFilePath, cwd, detected.runner, (candidate) => {
+					const checkoutRoot = foreignGitRoot(candidate, cwd);
+					if (!checkoutRoot) return true;
+					recordDegradationOnce({
+						kind: "test-discovery-foreign-checkout",
+						subject: createHash("sha256")
+							.update(JSON.stringify([cwd, candidate, checkoutRoot]))
+							.digest("hex"),
+						reason: "automatic test candidate belongs to another Git checkout",
+						metadata: { cwd, candidate, checkoutRoot, runner: detected.runner },
+					});
+					return false;
+				});
 
 		if (failedSet && failedSet.size > 0) {
-			const failedFirst = this.retireMissingFailedTargets({
+			const failedFirst = this.retireIneligibleFailedTargets({
 				cwd,
 				runner: detected.runner,
 				failedTargets: failedSet,
@@ -1260,6 +1699,37 @@ export class TestRunnerClient {
 	}
 
 	/**
+	 * The working directory the test-runner CHILD is spawned in (#2871).
+	 *
+	 * AGENTS.md defect shape 40: `resolveToolCwd` is the one seam for a child
+	 * process's cwd, and this file resolved its own — it handed
+	 * `safeSpawnAsync` the dispatch root, so `RUNNERS.go.args` built
+	 * `./tools/tapctl/internal/lightning` relative to a root module that does
+	 * not own that package. Marker discovery, the `.git` fallback, the
+	 * dispatch-root fallback, the `$HOME` ceiling, the once-per-key `tool-cwd`
+	 * log line and the bounded `tool-cwd-resolution` degradation now all come
+	 * from the seam, with the runner's own table as the markers.
+	 *
+	 * This is a SECOND value, never a reassignment of `cwd`: the failed-target
+	 * ledger (`recordResult` → `getFailedTargets`, read back by
+	 * `getTestRunTarget`) is keyed by the DISPATCH root, and re-keying it per
+	 * module would make a recorded failure unfindable from the turn that
+	 * selects targets.
+	 *
+	 * Review round 2, F6: there is deliberately NO clamp on a resolution that
+	 * lands outside the dispatch root. The seam only answers outside it when
+	 * the FILE is outside it (`tool-cwd.ts`: every in-tree branch is
+	 * `isUnderDir`-checked), and the one production caller —
+	 * `runtime-turn.ts`'s turn-end batch, on both the fresh and the deferred
+	 * path — filters every target through `isExcludedTestTarget`, which fails
+	 * CLOSED out of tree (#2522). Round 1 shipped that clamp plus a
+	 * `tool-cwd-resolution` ledger row for it; neither could fire in a live
+	 * session, so the row was a record nothing could observe and the guard was
+	 * defence against a caller that does not exist. Both are gone. If a second
+	 * caller is ever added that can pass an out-of-tree file, it needs this
+	 * decision made where that caller is, with a test that reaches it.
+	 */
+	/**
 	 * Run tests for a specific file without blocking the event loop, so LSP
 	 * messages, other file writes, and all async operations continue while
 	 * tests run.
@@ -1296,7 +1766,14 @@ export class TestRunnerClient {
 		} else {
 			request = runnerOrRequest;
 		}
-		const { runner, config, turnIndex, signal } = request;
+		const {
+			runner,
+			config,
+			turnIndex,
+			signal,
+			displayRoot,
+			requireOwnInstall,
+		} = request;
 		if (!fs.existsSync(absoluteTestFile)) {
 			return this.emptyResult(
 				absoluteTestFile,
@@ -1307,18 +1784,37 @@ export class TestRunnerClient {
 		}
 
 		try {
-			const { command, args, env } = await this.resolveExec(
+			const spawnCwd = resolveToolCwd("runner", runner, absoluteTestFile, {
+				cwd: path.resolve(cwd),
+				rootMarkers: config.spawnCwdMarkers ?? config.configFiles,
+			}).cwd;
+			const { command, args, env, ownInstall } = await this.resolveExec(
 				runner,
 				config,
 				absoluteTestFile,
 				cwd,
+				spawnCwd,
+				requireOwnInstall,
 			);
-			this.log(`Running (async): ${command} ${args.join(" ")}`);
+			if (requireOwnInstall && !ownInstall) {
+				return {
+					...this.emptyResult(absoluteTestFile, "", runner),
+					notRun: "no-runner-install",
+				};
+			}
+			this.log(
+				`Running (async): ${command} ${args.join(" ")} (cwd ${spawnCwd})`,
+			);
 
 			const result = await safeSpawnAsync(command, args, {
-				cwd,
+				cwd: spawnCwd,
 				timeout: 60000,
 				env,
+				// ONE neutral-cwd seam for npx/bunx fallbacks (#4193, #4268
+				// acceptance 3); a resolved runner binary keeps the project cwd.
+				...(command === "npx" || command === "bunx"
+					? getIsolatedNpxSpawnOptions()
+					: {}),
 				// #2522 R2 F1. `safeSpawnAsync` resolves `options.signal ?? ambient`,
 				// so an absent batch signal keeps the pre-#2522 ambient behaviour.
 				signal,
@@ -1344,7 +1840,7 @@ export class TestRunnerClient {
 						stdout,
 						stderr,
 						absoluteTestFile,
-						cwd,
+						displayRoot ?? cwd,
 						runner,
 					);
 					break;
@@ -1353,7 +1849,7 @@ export class TestRunnerClient {
 						stdout,
 						stderr,
 						absoluteTestFile,
-						cwd,
+						displayRoot ?? cwd,
 						runner,
 					);
 					break;
@@ -1365,6 +1861,8 @@ export class TestRunnerClient {
 						absoluteTestFile,
 						cwd,
 						runner,
+						displayRoot ?? cwd,
+						spawnCwd,
 					);
 					break;
 				case "phpunit":
@@ -1374,6 +1872,9 @@ export class TestRunnerClient {
 						result.status ?? 0,
 						absoluteTestFile,
 						runner,
+						displayRoot ?? cwd,
+						cwd,
+						spawnCwd,
 					);
 					break;
 				case "mix":
@@ -1383,6 +1884,9 @@ export class TestRunnerClient {
 						result.status ?? 0,
 						absoluteTestFile,
 						runner,
+						displayRoot ?? cwd,
+						cwd,
+						spawnCwd,
 					);
 					break;
 				default:
@@ -1392,6 +1896,9 @@ export class TestRunnerClient {
 						result.status ?? 0,
 						absoluteTestFile,
 						runner,
+						displayRoot ?? cwd,
+						cwd,
+						spawnCwd,
 					);
 					break;
 			}
@@ -1533,12 +2040,12 @@ export class TestRunnerClient {
 	}
 
 	/**
-	 * Retire only confirmed-missing failed-first paths, then return one usable
-	 * target. A bounded prefix is checked per selection; remaining candidates
+	 * Retire confirmed-missing or foreign-checkout failed-first entries, then
+	 * return one usable target. A bounded prefix is checked; remaining candidates
 	 * carry over to the next selection instead of adding unbounded synchronous
 	 * filesystem work to turn_end. Related/self targets keep priority.
 	 */
-	private retireMissingFailedTargets(
+	private retireIneligibleFailedTargets(
 		selection: FailedTargetSelection,
 	): string | undefined {
 		const { cwd, runner, failedTargets, relatedAbs, selfAbs, turnIndex } =
@@ -1553,6 +2060,18 @@ export class TestRunnerClient {
 			checked += 1;
 			inspected.add(identity);
 			const candidate = entry.displayPath;
+			// A Git boundary can appear after admission. Retire here, before
+			// selection, so the turn-end spawn gate cannot starve parent failures.
+			if (foreignGitRoot(candidate, cwd)) {
+				failedTargets.delete(identity);
+				this.recordFailedTargetState({
+					outcome: "retired-nested-checkout",
+					runner,
+					candidate,
+					turnIndex,
+				});
+				return undefined;
+			}
 			const verdict = this.classifyFailedTarget(candidate);
 			if (verdict.status === "missing") {
 				failedTargets.delete(identity);
@@ -1825,13 +2344,37 @@ export class TestRunnerClient {
 
 	// --- Pytest Parser (text-based, no JSON dependency) ---
 
+	/**
+	 * #3871: a text runner prints a path relative to the directory it ran in
+	 * (`spawnCwd`, first in `bases`) or to the dispatch root. The first base
+	 * that holds the file wins; a path that resolves nowhere stays as printed,
+	 * and an absent capture is no location.
+	 */
+	private renderTextLocation(
+		displayRoot: string,
+		bases: readonly string[],
+		file: string | undefined,
+		line: string | undefined,
+	): string | undefined {
+		if (file === undefined || line === undefined) return undefined;
+		for (const base of bases) {
+			const resolved = path.resolve(base, file);
+			if (fs.existsSync(resolved)) {
+				return `${toPosix(path.relative(displayRoot, resolved))}:${line}`;
+			}
+		}
+		return `${file}:${line}`;
+	}
+
 	private parsePytestOutput(
 		stdout: string,
 		stderr: string,
 		exitCode: number,
 		testFile: string,
-		_cwd: string,
+		cwd: string,
 		runner: string,
+		displayRoot: string = cwd,
+		spawnCwd: string = cwd,
 	): TestResult {
 		const failures: TestFailure[] = [];
 		const output = `${stdout}\n${stderr}`;
@@ -1844,15 +2387,25 @@ export class TestRunnerClient {
 		const failureRegex = /FAILED\s+(\S+::\S+)\s*-\s*(.+?)(?:\n|$)/g;
 		let match;
 		while ((match = failureRegex.exec(output)) !== null) {
+			const [file, ...testParts] = match[1].split("::");
+			const location = this.renderTextLocation(
+				displayRoot,
+				[spawnCwd, cwd],
+				file,
+				testParts.join("::"),
+			);
 			failures.push({
 				name: match[1],
 				message: match[2].trim().slice(0, 500),
-				location: match[1].replace("::", ":"),
+				...(location === undefined ? {} : { location }),
 			});
 		}
 
 		// Also look for assertion errors with traceback
-		const tracebackRegex = /_{10,}\s*\n\s*(\w+Error:\s*.+?)(?:\n|$)/gs;
+		// #4148: `\s*\n\s*` was ambiguous over a blank run and `_{10,}` rescanned
+		// its run from every offset; same matches, linear time.
+		const tracebackRegex =
+			/(?<!_)_{10,}[^\S\n]*\n\s*(\w+Error:\s*.+?)(?:\n|$)/gs;
 		while ((match = tracebackRegex.exec(output)) !== null) {
 			// Add to last failure if exists, or create generic
 			if (failures.length > 0 && !failures[failures.length - 1].stack) {
@@ -1869,7 +2422,12 @@ export class TestRunnerClient {
 			skipped,
 			failures,
 			duration,
-			error: exitCode === 2 ? "Pytest configuration error" : undefined,
+			error:
+				exitCode === 4
+					? "Pytest configuration error"
+					: exitCode === 2
+						? "Pytest interrupted"
+						: undefined,
 		};
 	}
 
@@ -1881,6 +2439,9 @@ export class TestRunnerClient {
 		exitCode: number,
 		testFile: string,
 		runner: string,
+		displayRoot: string = path.dirname(testFile),
+		cwd: string = path.dirname(testFile),
+		spawnCwd: string = cwd,
 	): TestResult {
 		const output = `${stdout}\n${stderr}`;
 		let passed = 0;
@@ -1915,7 +2476,26 @@ export class TestRunnerClient {
 		const failureRegex = /^\d+\)\s+(\S+)/gm;
 		let match;
 		while ((match = failureRegex.exec(output)) !== null) {
-			failures.push({ name: match[1], message: match[1] });
+			// #3871 r3: `[^\S\n]*`, not `\s*`, after a line anchor. `\s*` crossed
+			// newlines, so every line of a blank run rescanned the whole run.
+			const afterFailure = output.slice(match.index + match[0].length);
+			const nextFailure = afterFailure.search(/(?:^|\n)[^\S\n]*\d+\)\s/);
+			const failureBlock =
+				nextFailure === -1 ? afterFailure : afterFailure.slice(0, nextFailure);
+			const locationMatch = /(?:^|\n)[^\S\n]*([^\s:]+\.php):(\d+)/.exec(
+				failureBlock,
+			);
+			const location = this.renderTextLocation(
+				displayRoot,
+				[spawnCwd, cwd],
+				locationMatch?.[1],
+				locationMatch?.[2],
+			);
+			failures.push({
+				name: match[1],
+				message: match[1],
+				...(location === undefined ? {} : { location }),
+			});
 		}
 
 		// #1452: PHPUnit prints its own elapsed time and this parser dropped it,
@@ -1987,6 +2567,9 @@ export class TestRunnerClient {
 		exitCode: number,
 		testFile: string,
 		runner: string,
+		displayRoot: string = path.dirname(testFile),
+		cwd: string = path.dirname(testFile),
+		spawnCwd: string = cwd,
 	): TestResult {
 		const output = `${stdout}\n${stderr}`;
 		let passed = 0;
@@ -2022,13 +2605,28 @@ export class TestRunnerClient {
 
 		// Individual failures: "  1) test some behavior (MyModuleTest)"
 		const failures: TestFailure[] = [];
-		const failureRegex = /^\s*\d+\)\s+(.+?)\s*\(([^)]+)\)\s*$/gm;
+		// #3871 r3: `^[^\S\n]*`, not `^\s*`: the multiline anchor restarted at
+		// every line of a blank run and `\s*` rescanned the rest of it.
+		const failureRegex = /^[^\S\n]*\d+\)\s+(.+?)\s*\(([^)]+)\)\s*$/gm;
 		let match;
 		while ((match = failureRegex.exec(output)) !== null) {
+			const afterFailure = output.slice(match.index + match[0].length);
+			const nextFailure = afterFailure.search(/(?:^|\n)[^\S\n]*\d+\)\s/);
+			const failureBlock =
+				nextFailure === -1 ? afterFailure : afterFailure.slice(0, nextFailure);
+			const locationMatch = /(?:^|\n)[^\S\n]*([^\s:]+\.exs):(\d+)/.exec(
+				failureBlock,
+			);
 			failures.push({
 				name: match[1].trim(),
 				message: match[1].trim(),
-				location: match[2].trim(),
+				location:
+					this.renderTextLocation(
+						displayRoot,
+						[spawnCwd, cwd],
+						locationMatch?.[1],
+						locationMatch?.[2],
+					) ?? match[2].trim(),
 			});
 		}
 
@@ -2290,6 +2888,9 @@ export class TestRunnerClient {
 		exitCode: number,
 		testFile: string,
 		runner: string,
+		displayRoot: string = path.dirname(testFile),
+		cwd: string = path.dirname(testFile),
+		spawnCwd: string = cwd,
 	): TestResult {
 		const output = `${stdout}\n${stderr}`;
 		const lower = output.toLowerCase();
@@ -2444,7 +3045,26 @@ export class TestRunnerClient {
 			const slash = name.indexOf("/");
 			return slash === -1 || !goFailNameSet.has(name.slice(0, slash));
 		}).length;
+		// #2870: go's own `[setup failed]` verdict line — "there was no package
+		// to test" — the positive twin of the `(?:build|setup) failed`
+		// lookahead below. #1524-r4 stopped it from being counted as a test
+		// failure but left it with no classification of its own, so whether the
+		// agent saw "could not run tests" or a fabricated `✗ 1/1 failed ✗ go
+		// failure` came down to whether go's output happened to contain the
+		// substring "error" (the runner-error condition below): `FAIL <pkg>
+		// [setup failed]` + `error: no packages to test` was advisory, the same
+		// line on its own was a blocking failure the agent could not tell from
+		// a real one (#2870, measured).
+		//
+		// `[build failed]` is deliberately NOT included (review round 2, F5).
+		// The maintainer's amendment on #2870 names `[setup failed]`; a go
+		// COMPILE error is usually one the agent just introduced, and
+		// downgrading it to advisory is a signal change on master's behaviour
+		// that belongs on the issue, not in this fix. Its classification is
+		// still the coin flip described above — see the PR body's follow-ups.
+		let goInfraVerdict = false;
 		if (runner === "go") {
+			goInfraVerdict = /^FAIL[^\S\n]+\S+[^\S\n]+\[setup failed\]/m.test(output);
 			// #1524-r4: `(?![^\n]*\[(?:build|setup) failed\])` rejects go's
 			// INFRASTRUCTURE verdict lines — `FAIL <pkg> [build failed]` (a
 			// compile error) and `FAIL <pkg> [setup failed]` (no packages to
@@ -2496,7 +3116,25 @@ export class TestRunnerClient {
 		];
 		for (const m of otherNames) {
 			if (failures.length >= 5) break;
-			failures.push({ name: m[1].trim(), message: m[1].trim() });
+			const name = m[1].trim();
+			// #3871 r3: `(?<!\S)` starts a location only at a token start. The
+			// unanchored match restarted at every offset of a long token, and
+			// took `//host/a.py:80` out of a prose URL.
+			const locationMatch =
+				/(?<!\S)([^\s:]+\.(?:go|rs|rb|java|kt|cs|fs|py|php|exs)):(\d+)/.exec(
+					name,
+				);
+			const location = this.renderTextLocation(
+				displayRoot,
+				[spawnCwd, cwd],
+				locationMatch?.[1],
+				locationMatch?.[2],
+			);
+			failures.push({
+				name,
+				message: name,
+				...(location === undefined ? {} : { location }),
+			});
 		}
 
 		// #1487: gated on `!matched`, not on `failed === 0`. A non-zero exit
@@ -2522,11 +3160,20 @@ export class TestRunnerClient {
 		// runner error they actually are). They still label a name onto
 		// `failures` above when `matched` or `goFailNames` already settled
 		// the question some other way, but they no longer settle it alone.
+		//
+		// #2870: `goInfraVerdict` is a SECOND sufficient condition, not a
+		// widening of the first. go's `[build failed]`/`[setup failed]` line is
+		// the runner itself saying no test ran, which is exactly what this
+		// branch reports — so it no longer has to also print the word "error"
+		// to be classified as one. The `!matched`/`goFailNames` vetoes still
+		// apply: a run that produced real go counts or a real `--- FAIL:` is a
+		// verdict, never a runner error, even if a later package failed to
+		// build.
 		const runnerError =
 			exitCode !== 0 &&
 			!matched &&
 			goFailNames.length === 0 &&
-			lower.includes("error")
+			(lower.includes("error") || goInfraVerdict)
 				? `Runner ${runner} exited with ${exitCode}`
 				: undefined;
 
@@ -2595,9 +3242,15 @@ export class TestRunnerClient {
 	 * Format test result for LLM consumption
 	 */
 	formatResult(result: TestResult): string {
-		if (result.error && result.passed === 0 && result.failed === 0) {
-			// Runner error, not test failure
-			return `[Tests] ⚠ Could not run tests: ${result.error}`;
+		// #2532 review S1: folded onto `isRunnerErrorResult` instead of the old
+		// local `error && passed === 0 && failed === 0` spelling — that missed a
+		// runner error reported alongside partial passes (pytest `Interrupted`
+		// after some tests already ran clean), which fell through to the normal
+		// "N/N passed" branch below and silently dropped the interruption.
+		if (isRunnerErrorResult(result)) {
+			return result.passed > 0
+				? `[Tests] ⚠ Could not complete tests: ${result.error} (${result.passed} passed before)`
+				: `[Tests] ⚠ Could not run tests: ${result.error}`;
 		}
 
 		const total = result.passed + result.failed + result.skipped;
@@ -2696,6 +3349,7 @@ export class TestRunnerClient {
 	private findTestFileByImport(
 		sourceFilePath: string,
 		cwd: string,
+		acceptCandidate: (testFile: string) => boolean,
 	): string | null {
 		const ext = path.extname(sourceFilePath);
 		const basename = path.basename(sourceFilePath, ext);
@@ -2715,8 +3369,8 @@ export class TestRunnerClient {
 				continue;
 			}
 			for (const entry of entries) {
-				if (!testPattern.test(entry)) continue;
 				const testPath = path.join(dir, entry);
+				if (!testPattern.test(entry) || !acceptCandidate(testPath)) continue;
 				let content: string;
 				try {
 					content = fs.readFileSync(testPath, "utf-8");
@@ -2754,17 +3408,45 @@ export class TestRunnerClient {
 		config: RunnerConfig,
 		testFile: string,
 		cwd: string,
-	): Promise<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> {
+		/**
+		 * #2871: the directory the child will RUN in, which is the only cwd
+		 * `args()` may be built against — go's package path is relative to it.
+		 * Where the binary and the Python environment are INSTALLED is a
+		 * different question with a different answer: they stay resolved from
+		 * the dispatch root, exactly as before, so a workspace package whose
+		 * dependencies are hoisted to the repo root still finds
+		 * `node_modules/.bin/<runner>` instead of falling through to `npx`.
+		 * Defaults to `cwd`, which is every call where the two are the same.
+		 */
+		spawnCwd: string = cwd,
+		requireOwnInstall = false,
+	): Promise<{
+		command: string;
+		args: string[];
+		env?: NodeJS.ProcessEnv;
+		/**
+		 * #3871 r2: false when resolution reached a fallback that needs no
+		 * install under `cwd` because it fetches (`npx`) or borrows (a bare
+		 * interpreter or `phpunit` on PATH) the tool. Toolchain runners
+		 * (`go`, `cargo`, ...) have no per-project install and are always own.
+		 */
+		ownInstall: boolean;
+	}> {
+		const needsInstall =
+			config.command === "npx" || runner === "pytest" || runner === "phpunit";
 		// Run pytest through the project interpreter itself, not a generic `python`
 		// resolved from the host PATH. The child-only environment also keeps tools
 		// spawned by tests inside the same project environment.
 		if (runner === "pytest") {
-			const pythonEnvironment = await detectPythonEnvironment(cwd);
+			const pythonEnvironment = await detectPythonEnvironment(cwd, undefined, {
+				allowAmbient: !requireOwnInstall,
+			});
 			if (pythonEnvironment) {
 				return {
 					command: pythonEnvironment.pythonPath,
-					args: config.args(testFile, cwd),
+					args: config.args(testFile, spawnCwd),
 					env: augmentPythonEnvironment(process.env, pythonEnvironment),
+					ownInstall: true,
 				};
 			}
 		}
@@ -2774,24 +3456,43 @@ export class TestRunnerClient {
 		// explicitly before falling back to a global `phpunit` on PATH.
 		if (runner === "phpunit") {
 			const suffix = process.platform === "win32" ? ".bat" : "";
-			const vendorBin = path.join(cwd, "vendor", "bin", `phpunit${suffix}`);
-			if (fs.existsSync(vendorBin)) {
-				return { command: vendorBin, args: config.args(testFile, cwd) };
+			const vendorBin = localBinPath(
+				findLocalBinAt("phpunit", cwd, {
+					windowsExt: suffix,
+					binDirs: [path.join("vendor", "bin")],
+				}),
+			);
+			if (vendorBin) {
+				return {
+					command: vendorBin,
+					args: config.args(testFile, spawnCwd),
+					ownInstall: true,
+				};
 			}
-			return { command: "phpunit", args: config.args(testFile, cwd) };
+			return {
+				command: "phpunit",
+				args: config.args(testFile, spawnCwd),
+				ownInstall: false,
+			};
 		}
 
 		const binName = config.binName ?? runner;
 		const suffix = process.platform === "win32" ? ".cmd" : "";
-		const localBin = path.join(cwd, "node_modules", ".bin", binName + suffix);
+		const localBin = localBinPath(
+			findLocalBinAt(binName, cwd, {
+				windowsExt: suffix,
+				binDirs: [path.join("node_modules", ".bin")],
+			}),
+		);
 
 		// A resolved binary (local, or any manager's global bin) becomes the command
 		// itself, so the leading wrapper-name arg(s) that named it (e.g. "vitest",
 		// or "-m pytest") are stripped from args() — see stripWrapperArgs.
-		if (fs.existsSync(localBin)) {
+		if (localBin) {
 			return {
 				command: localBin,
-				args: stripWrapperArgs(binName, config.args(testFile, cwd)),
+				args: stripWrapperArgs(binName, config.args(testFile, spawnCwd)),
+				ownInstall: true,
 			};
 		}
 
@@ -2800,11 +3501,16 @@ export class TestRunnerClient {
 		if (globalBin) {
 			return {
 				command: globalBin,
-				args: stripWrapperArgs(binName, config.args(testFile, cwd)),
+				args: stripWrapperArgs(binName, config.args(testFile, spawnCwd)),
+				ownInstall: !needsInstall,
 			};
 		}
 
-		return { command: config.command, args: config.args(testFile, cwd) };
+		return {
+			command: config.command,
+			args: config.args(testFile, spawnCwd),
+			ownInstall: !needsInstall,
+		};
 	}
 
 	private emptyResult(
@@ -2837,6 +3543,17 @@ export class TestRunnerClient {
 	private recordResult(record: TestResultRecord): void {
 		const { cwd, runner, testFile, result, turnIndex } = record;
 		const targetPath = path.resolve(testFile);
+		// Explicit execution still returns the failure, but a separate checkout
+		// must not seed the parent's automatic retry state or evict its failures.
+		if (result.failed > 0 && foreignGitRoot(targetPath, cwd)) {
+			this.recordFailedTargetState({
+				outcome: "rejected-nested-checkout",
+				runner,
+				candidate: targetPath,
+				turnIndex,
+			});
+			return;
+		}
 		const target = canonicalFailedPath(targetPath);
 		let failedTargets = this.getFailedTargets(cwd, runner, result.failed > 0);
 		if (!failedTargets) return;

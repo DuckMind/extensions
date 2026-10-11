@@ -1,6 +1,9 @@
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { pathsEqual } from "../../path-utils.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -102,8 +105,13 @@ const DART_FIXABLE_RULES = new Set<string>([
 
 // dart analyze --format=machine output:
 // severity|type|code|file|line|col|length|message
-function parseDartMachineOutput(raw: string, filePath: string): Diagnostic[] {
+function parseDartMachineOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const line of raw.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		const parts = line.split("|");
@@ -115,15 +123,15 @@ function parseDartMachineOutput(raw: string, filePath: string): Diagnostic[] {
 		const lineNum = parseInt(lineStr, 10);
 		const colNum = parseInt(colStr, 10);
 
-		// Only include diagnostics for the target file
-		if (
-			file &&
-			!path.resolve(file).endsWith(path.resolve(filePath).replace(/\\/g, "/"))
-		) {
-			const resolvedFile = path.resolve(file.trim());
-			const resolvedTarget = path.resolve(filePath);
-			if (resolvedFile !== resolvedTarget) continue;
-		}
+		// #3278: one seam for reported-path attribution — see javac.ts.
+		// The `endsWith` outer arm this replaces was inert on the target (a
+		// string ends with itself) and an over-merge risk everywhere else: any
+		// reported path whose TAIL spelled the absolute target attached to it.
+		// `file` is `parts[3]`, which `tsconfig.strict-indexed.json`
+		// (`noUncheckedIndexedAccess`) types as `string | undefined` even behind the
+		// `parts.length < 8` guard above — the strictness ratchet pins that, so the
+		// optional chain stays.
+		if (!pathsEqual(path.resolve(cwd, file?.trim() ?? ""), absTarget)) continue;
 
 		const severity =
 			severityStr?.trim().toLowerCase() === "error" ? "error" : "warning";
@@ -149,13 +157,6 @@ function parseDartMachineOutput(raw: string, filePath: string): Diagnostic[] {
 	return diagnostics;
 }
 
-function firstOutputLine(result: { stdout?: string; stderr?: string }): string {
-	return `${result.stderr || ""}\n${result.stdout || ""}`
-		.trim()
-		.split(/\r?\n/, 1)[0]
-		.slice(0, 200);
-}
-
 const dartAnalyzeRunner: RunnerDefinition = {
 	id: "dart-analyze",
 	appliesTo: ["dart"],
@@ -163,7 +164,7 @@ const dartAnalyzeRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "dart-analyze");
 		const absPath = path.resolve(cwd, ctx.filePath);
 		const dartAvailable = await dart.isAvailableAsync(cwd);
 		const flutterAvailable =
@@ -180,44 +181,25 @@ const dartAnalyzeRunner: RunnerDefinition = {
 
 		const result = await safeSpawnAsync(cmd, args, { cwd, timeout: 30000 });
 
-		if (result.error && !result.stdout && !result.stderr) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
 		// dart analyze writes diagnostics to stderr in machine format
 		const raw = (result.stderr || "") + (result.stdout || "");
-		const diagnostics = parseDartMachineOutput(raw, ctx.filePath);
-
-		if (diagnostics.length === 0) {
-			if (result.status && result.status !== 0) {
-				return {
-					status: "failed",
-					diagnostics: [
-						{
-							id: "dart-analyze-nonzero-no-diagnostics",
-							message:
-								firstOutputLine(result) ||
-								"dart analyze exited non-zero without machine diagnostics",
-							filePath: ctx.filePath,
-							severity: "warning",
-							semantic: "warning",
-							tool: "dart",
-							rule: "dart-analyze",
-							fixable: false,
-						},
-					],
-					semantic: "warning",
-				};
-			}
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasErrors = diagnostics.some((d) => d.severity === "error");
-		return {
-			status: hasErrors ? "failed" : "succeeded",
-			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
-		};
+		const parsed = parseToolRun(
+			"dart-analyze",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (Dart 3.5 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(out) => parseDartMachineOutput(out, ctx.filePath, cwd),
+		);
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "dart-analyze",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+		});
 	},
 };
 

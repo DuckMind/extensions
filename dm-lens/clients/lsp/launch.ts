@@ -7,6 +7,7 @@
  * - Package manager execution
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	type ChildProcess,
 	execFileSync,
@@ -20,9 +21,22 @@ import { isTestMode } from "../env-utils.js";
 import { getGlobalDmLensDir } from "../file-utils.js";
 import { getGlobalDmLensLogDir } from "../probe-home-state.js";
 import { isFullyQualified } from "../path-utils.js";
-import { findGlobalBinary } from "../package-manager.js";
+import { findGlobalBinary, isProjectLocalBinPath } from "../package-manager.js";
+import {
+	getDegradationLedgerGeneration,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
+import { getProjectTrustState } from "../project-trust.js";
+import { logExtension } from "../extension-log.js";
+import { OWNER_TAG_ENV, ownerTagForChildren } from "../process-snapshot.js";
 import { redactSecrets } from "../redact/secrets.js";
-import { classifySpawnFailure, SpawnFailureError } from "../safe-spawn.js";
+import {
+	classifySpawnFailure,
+	holdOwnChildPid,
+	isOwnLiveChild,
+	resolveWindowsCommandForEnvironment,
+	SpawnFailureError,
+} from "../safe-spawn.js";
 import { getRubyVersionDirNamesAsync } from "./ruby-drive-dirs.js";
 
 export interface LSPProcess {
@@ -40,6 +54,9 @@ export interface LSPProcess {
 }
 
 const isWindows = process.platform === "win32";
+
+/** Bound on the one-time read of this process's start for the owner tag. */
+const OWNER_TAG_READ_MS = 5_000;
 
 /**
  * Whether a resolved command must be spawned through a shell on Windows.
@@ -103,9 +120,29 @@ function splitPathEntries(
 		.filter((entry) => entry.length > 0);
 }
 
+/**
+ * Dedupe key for one PATH entry, under `platform`'s rules.
+ *
+ * #1193 P3: the body used the HOST-DEFAULT `path.normalize` inside a branch
+ * already committed to `platform` (AGENTS.md defect shape 2), so on the ubuntu
+ * lane the win32 arm lowercased without folding separators or dot segments and
+ * `C:\Tools` / `C:/Tools` / `C:\x\..\Tools` were three keys for one directory.
+ * Each arm now parses with its own `path` flavor. That is the whole fix: a
+ * `toPosix` call on the win32 arm would be INERT — `win32.normalize` already
+ * answers backslashes for either input separator (measured: adding it left
+ * every case green) — and the POSIX arm must NOT fold separators at all,
+ * because a backslash is a legal POSIX filename character and `/opt/a\b` and
+ * `/opt/a/b` are two directories there.
+ *
+ * Ephemeral by construction: the key exists only inside one
+ * `combinePathValuesForPlatform` call's `seen` set — the ORIGINAL entry string
+ * is what survives into the joined PATH — so it never reaches a persisted or
+ * cross-process record and `normalizeEphemeralMapKey`'s `process.platform` read
+ * would defeat the explicit-`platform` seam these arms exist for.
+ */
 function normalizePathEntry(entry: string, platform: NodeJS.Platform): string {
-	const normalized = path.normalize(entry);
-	return platform === "win32" ? normalized.toLowerCase() : normalized;
+	if (platform !== "win32") return path.posix.normalize(entry);
+	return path.win32.normalize(entry).toLowerCase();
 }
 
 export function combinePathValuesForPlatform(
@@ -260,6 +297,29 @@ export function isCmdShimValid(cmdPath: string): boolean {
 }
 
 /**
+ * Windows' shell-backed missing commands report exit code 1 instead of ENOENT.
+ * Only classify that startup shape as repairable when the shared Windows
+ * resolver cannot find the command, or an npm shim's target is absent. A
+ * present executable that exits 1 remains a runtime failure (#4263, #1199).
+ */
+function isMissingWindowsStartupCommand(
+	command: string,
+	spawnCommand: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): boolean {
+	if (!isWindows) return false;
+	if (/\.(cmd|bat)$/i.test(spawnCommand) && !isCmdShimValid(spawnCommand)) {
+		return true;
+	}
+	// `findBinaryOnPath`/the global-bin fallback already proved a bare command
+	// resolves to this path. Do not re-resolve the original spelling against a
+	// possibly different PATH representation and misclassify a real binary.
+	if (spawnCommand !== command) return false;
+	return resolveWindowsCommandForEnvironment(command, cwd, env) === null;
+}
+
+/**
  * On Windows, npm creates .ps1 wrappers that hang indefinitely when PowerShell
  * execution policy is Restricted or AllSigned. Bypass by preferring the .cmd
  * sibling (runs under cmd.exe, no execution policy) or falling back to direct
@@ -335,6 +395,150 @@ function findBinaryOnPath(
 	return undefined;
 }
 
+// #4299 R2-F1: every launcher in one service spawn inherits its file's
+// analysis-root permission, including async discovery and repair continuations.
+const lspProjectCodePermission = new AsyncLocalStorage<boolean>();
+
+export function withLspProjectCodePermission<T>(
+	allowed: boolean,
+	spawn: () => Promise<T>,
+): Promise<T> {
+	return lspProjectCodePermission.run(allowed, spawn);
+}
+
+let unknownProjectLocalNoticeGeneration = -1;
+
+type LspExecutionTrustRequest =
+	| {
+			kind: "project-code-server";
+			serverId: string;
+			root: string;
+	  }
+	| {
+			kind: "project-local-binary";
+			command: string;
+			resolvedCommand: string;
+			cwd: string;
+			/** Effective compiler refusal, including foreign-root ownership. */
+			reason?: string;
+	  };
+
+/** Record one bounded trust refusal through the shared lsp-registry seam. */
+function recordUntrustedLspExecution(
+	request: LspExecutionTrustRequest,
+	trust: ReturnType<typeof getProjectTrustState>,
+): void {
+	const generation = getDegradationLedgerGeneration();
+	const subject =
+		request.kind === "project-code-server"
+			? `project-code-server:g${generation}:${request.serverId}:${request.root}`
+			: `project-local-binary:g${generation}:${path.basename(request.command)}`;
+	const metadata =
+		request.kind === "project-code-server"
+			? {
+					field: request.kind,
+					serverId: request.serverId,
+					root: request.root,
+					trust,
+				}
+			: {
+					field: request.kind,
+					trust,
+				};
+	recordDegradationOnce({
+		kind: "lsp-registry-decision",
+		subject,
+		reason:
+			(request.kind === "project-local-binary" ? request.reason : undefined) ??
+			`LSP execution refused: ${request.kind} and project trust is ${trust}`,
+		metadata,
+	});
+	if (unknownProjectLocalNoticeGeneration !== generation) {
+		unknownProjectLocalNoticeGeneration = generation;
+		const label =
+			request.kind === "project-code-server"
+				? "project-code LSP server"
+				: "project-local LSP binary";
+		logExtension({
+			subsystem: "lsp-registry",
+			level: "warn",
+			message: `${label} refused: mark the project trusted in pi or upgrade pi`,
+			metadata: { field: request.kind },
+		});
+	}
+}
+
+/** Refuse project-code servers and project-local binaries through one trust seam. */
+export function refuseUntrustedLspExecution(
+	request: LspExecutionTrustRequest,
+): void {
+	const trust = getProjectTrustState();
+	const needsTrust =
+		request.kind === "project-code-server"
+			? trust !== "trusted"
+			: !admitProjectSuppliedTsserver(
+					request.resolvedCommand,
+					request.cwd,
+					true,
+				);
+	if (!needsTrust) return;
+
+	if (request.kind === "project-code-server")
+		recordUntrustedLspExecution(request, trust);
+	throw new SpawnFailureError(
+		"spawn-failed",
+		`LSP ${request.kind === "project-code-server" ? "project-code server" : "project-local binary"} refused: project trust is ${trust}`,
+		new Error(`project trust is ${trust}`),
+	);
+}
+
+/**
+ * #4296/#4299: admit the effective classic/native compiler or local launcher,
+ * never an unset hint that lets the
+ * wrapper resolve workspace code. Project code also requires session ownership;
+ * pi's trusted answer does not authorize an adopted project's compiler.
+ */
+export function admitProjectSuppliedTsserver(
+	tsserverPath: string | undefined,
+	cwd: string,
+	projectSupplied: boolean,
+	// Outside a spawn scope there is no root permission to read, so deny (#4296 R3-F1).
+	projectCodeAllowed = lspProjectCodePermission.getStore() ?? false,
+): string | undefined {
+	const trust = getProjectTrustState();
+	if (
+		tsserverPath &&
+		(!projectSupplied || (projectCodeAllowed && trust === "trusted"))
+	)
+		return tsserverPath;
+	recordUntrustedLspExecution(
+		{
+			kind: "project-local-binary",
+			command: tsserverPath ?? "tsserver.js",
+			resolvedCommand: tsserverPath ?? "tsserver.js",
+			cwd,
+			reason: tsserverPath
+				? "LSP execution refused: project compiler requires trusted session ownership"
+				: "LSP execution refused: no admitted absolute TypeScript compiler",
+		},
+		trust,
+	);
+	return undefined;
+}
+
+/**
+ * Whether the resolved executable is a project-local installed binary.
+ * `launchLSP` is the one seam that has both the final resolved command and its
+ * spawn cwd; keep the project-local classifier here so PATH, venv, and shim
+ * resolution cannot grow separate trust predicates (#4248).
+ */
+export function isProjectLocalLspBinary(
+	resolvedCommand: string,
+	cwd: string,
+): boolean {
+	return isProjectLocalBinPath(resolvedCommand, cwd);
+}
+
 /**
  * Try to spawn a process, throwing immediately if it fails
  */
@@ -387,13 +591,14 @@ function trySpawn(
 		throw new Error(`Failed to spawn LSP server: ${command}`);
 	}
 
-	// Check if process exited immediately (spawn failure - synchronous check)
-	if (proc.exitCode !== null || proc.killed) {
-		throw new Error(
-			`LSP server ${command} exited immediately (code: ${proc.exitCode}). ` +
-				`The binary may be missing or corrupted.`,
-		);
-	}
+	// #3091 F1-r2: take ownership HERE, while the child is provably alive. LSP
+	// servers are the one long-lived child dm-lens spawns outside
+	// `safeSpawnAsync`, so without this their first offer of verification is
+	// `stopLSP`'s group kill — by which time, on the `processExiting` path, the
+	// leader can already be dead, `/proc` is gone, and the group signal that
+	// reaps surviving grandchildren (#2026) is refused. The verdict is released
+	// by `killProcessTree` when the shutdown ladder is done with the pid.
+	holdOwnChildPid(proc.pid, "lsp-spawn");
 
 	return proc;
 }
@@ -532,11 +737,19 @@ export async function launchLSP(
 	const cwd = String(options.cwd ?? process.cwd());
 	const mergedEnv = { ...process.env, ...options.env };
 	const augmentedPath = await buildAugmentedPath(resolvePathValue(mergedEnv));
+	// #3539: the child names this process's incarnation, so the orphan
+	// backstop can tell whose it is after this process dies and the child is
+	// reparented. With no tag of our own the child gets none (#3986): the
+	// host's inherited DM_LENS_OWNER may name a dead foreign owner, and an
+	// untagged server is spared where a wrongly tagged one is reaped.
+	const ownerTag = await ownerTagForChildren({ timeoutMs: OWNER_TAG_READ_MS });
 	const env: NodeJS.ProcessEnv = {
 		...mergedEnv,
 		PATH: augmentedPath,
 		...(isWindows ? { Path: augmentedPath } : {}),
 	};
+	if (ownerTag === undefined) delete env[OWNER_TAG_ENV];
+	else env[OWNER_TAG_ENV] = ownerTag;
 
 	// Resolve command path
 	// - If already absolute, use as-is
@@ -576,8 +789,23 @@ export async function launchLSP(
 		}
 	}
 
-	// Pre-validate .cmd shims: if the underlying script is missing the shim will
-	// exit with code 1 after a 500ms wait. Catching this early avoids the delay.
+	// Built-in server commands have no config provenance to carry into the
+	// registry. Once PATH resolution selects a project-local installed binary,
+	// trusted session ownership is required (#4248 R2-1, #4299 R2-F1). Global and managed
+	// fallbacks remain compatible because they resolve outside the project root.
+	if (isProjectLocalLspBinary(spawnCommand, cwd)) {
+		refuseUntrustedLspExecution({
+			kind: "project-local-binary",
+			command,
+			resolvedCommand: spawnCommand,
+			cwd,
+		});
+	}
+
+	// Pre-validate .cmd shims only after trust has admitted the candidate: if the
+	// underlying script is missing the shim will exit with code 1 after a 500ms
+	// wait. Catching this early avoids the delay without probing an untrusted
+	// project-local executable.
 	if (
 		isWindows &&
 		/\.(cmd|bat)$/i.test(spawnCommand) &&
@@ -641,10 +869,17 @@ export async function launchLSP(
 
 	// Check if process exited immediately (spawn failure - synchronous check)
 	if (proc.exitCode !== null || proc.killed) {
-		throw new Error(
+		const message =
 			`LSP server ${command} exited immediately (code: ${proc.exitCode}). ` +
-				`The binary may be missing or corrupted.`,
-		);
+			`The binary may be missing or corrupted.`;
+		const failure = new Error(message);
+		if (
+			proc.exitCode === 1 &&
+			isMissingWindowsStartupCommand(command, spawnCommand, cwd, env)
+		) {
+			throw new SpawnFailureError("tool-not-found", message, failure);
+		}
+		throw failure;
 	}
 
 	logSessionStart(
@@ -700,11 +935,16 @@ export async function launchLSP(
 						isWindowsCmd && code === 1
 							? `npm .cmd shim failed (underlying binary not installed). Run 'npm install' in this project or use a global installation.`
 							: `The binary may be missing or corrupted.`;
-					reject(
-						new Error(
-							`LSP server ${command} exited immediately with code ${code}. ${errorMsg}${formatStartupStderr(startupStderr)}`,
-						),
-					);
+					const message = `LSP server ${command} exited immediately with code ${code}. ${errorMsg}${formatStartupStderr(startupStderr)}`;
+					const failure = new Error(message);
+					if (
+						code === 1 &&
+						isMissingWindowsStartupCommand(command, spawnCommand, cwd, env)
+					) {
+						reject(new SpawnFailureError("tool-not-found", message, failure));
+						return;
+					}
+					reject(failure);
 				}
 			});
 
@@ -802,7 +1042,7 @@ export async function stopLSP(handle: LSPProcess): Promise<void> {
 		handle.process.once("error", done);
 
 		const killWindowsTree = (): boolean => {
-			if (!isWindows || handle.pid <= 0) return false;
+			if (!isWindows) return false;
 			// If our child has already exited, its PID is dead and the OS may have
 			// RECYCLED it to an unrelated process. `taskkill /F /T` on a recycled PID
 			// force-kills that process AND its whole tree — in the test suite this
@@ -812,10 +1052,12 @@ export async function stopLSP(handle: LSPProcess): Promise<void> {
 			// tree-kill a PID we no longer own — fall back to handle.process.kill(),
 			// which on Windows signals via the retained process HANDLE (not the raw
 			// PID), so it's a safe no-op on an already-exited child.
-			if (
-				handle.process.exitCode !== null ||
-				handle.process.signalCode !== null
-			)
+			//
+			// #2042 folded the sign check and this exited check into the one
+			// ownership predicate every kill-by-raw-pid now shares; the handle
+			// arm below IS this paragraph, and on Windows it is the only
+			// ownership evidence available (there is no /proc to read).
+			if (!isOwnLiveChild(handle.pid, "lsp-stop-windows-tree", handle.process))
 				return false;
 			try {
 				// Absolute path avoids PATH-resolution substitution on Windows.

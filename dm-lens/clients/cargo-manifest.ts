@@ -174,13 +174,34 @@ export function parseTomlStringArray(
 ): string[] {
 	if (content === undefined) return [];
 	const normalized = normalizeToml(content);
-	const match = normalized.match(
-		new RegExp(`^[ \\t]*${key}[ \\t]*=[ \\t]*\\[([\\s\\S]*?)\\]`, "m"),
+	const open = normalized.match(
+		new RegExp(`^[ \\t]*${key}[ \\t]*=[ \\t]*\\[`, "m"),
 	);
-	if (!match) return [];
-	return [...match[1].matchAll(/"([^"]*)"|'([^']*)'/g)].map((m) =>
-		(m[1] ?? m[2] ?? "").trim(),
+	if (open?.index === undefined) return [];
+	const from = open.index + open[0].length;
+	const to = indexOfArrayEnd(normalized, from);
+	if (to < 0) return [];
+	return [...normalized.slice(from, to).matchAll(/"([^"]*)"|'([^']*)'/g)].map(
+		(m) => (m[1] ?? m[2] ?? "").trim(),
 	);
+}
+
+/**
+ * Index of the `]` that closes an array whose body starts at `from`, skipping
+ * every `]` inside a quoted string (a glob class such as `"legacy_[ab]*"` is
+ * an entry, not the end); -1 when it never closes (#4117).
+ */
+function indexOfArrayEnd(text: string, from: number): number {
+	let quote: '"' | "'" | null = null;
+	for (let i = from; i < text.length; i++) {
+		const ch = text[i];
+		if (quote) {
+			if (ch === "\\" && quote === '"') i++;
+			else if (ch === quote) quote = null;
+		} else if (ch === '"' || ch === "'") quote = ch;
+		else if (ch === "]") return i;
+	}
+	return -1;
 }
 
 /**
@@ -190,7 +211,7 @@ export function parseTomlStringArray(
  * true`) never matches either — the literal key is immediately followed by
  * `=`, not `.`.
  */
-export function parseTomlScalarString(
+function parseTomlScalarString(
 	content: string | undefined,
 	key: string,
 ): string | undefined {
@@ -219,7 +240,25 @@ export function parseTomlScalarString(
  * consolidated the rest of this file's callers onto (#2498).
  */
 export function hasCargoWorkspaceTable(content: string): boolean {
-	return extractTomlTableSection(content, "workspace") !== undefined;
+	return hasTomlTable(content, "workspace");
+}
+
+/**
+ * True when `content` declares the table `tableName` — the yes/no half of
+ * {@link extractTomlTableSection}, for readers that only need presence.
+ * `tableName` is a regex SOURCE (it is interpolated into the heading pattern),
+ * so a dotted table escapes its dots: `"tool\\.uv\\.workspace"`.
+ *
+ * Exists so a second file does not re-derive the `!== undefined` comparison
+ * that {@link hasCargoWorkspaceTable} exists to hold: `clients/
+ * python-environment.ts`'s uv-workspace discovery carried a private
+ * `hasUvWorkspaceTable` that was this function's body with a different table
+ * name (review round 2, F5). The `!== undefined` (not a truthy test) is the
+ * load-bearing part both callers share: an empty table — a heading with no
+ * keys — extracts as `""`, which is falsy but IS "table present".
+ */
+export function hasTomlTable(content: string, tableName: string): boolean {
+	return extractTomlTableSection(content, tableName) !== undefined;
 }
 
 /**
@@ -301,7 +340,7 @@ export function readCargoDependencyNames(content: string): string[] {
  * (`edition.workspace = true`) or the inline-table form
  * (`edition = { workspace = true }`).
  */
-export function isTomlKeyWorkspaceInherited(
+function isTomlKeyWorkspaceInherited(
 	content: string | undefined,
 	key: string,
 ): boolean {

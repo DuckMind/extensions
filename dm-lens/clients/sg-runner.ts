@@ -15,7 +15,9 @@ import {
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
+import { getProjectTrustState } from "./project-trust.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
+import { getIsolatedNpxSpawnOptions, probeToolAsync } from "./tool-probe.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import { createSingleFlight } from "./single-flight.js";
 import {
@@ -186,6 +188,9 @@ export class SgRunner {
 	private log: (msg: string) => void;
 	private sgPath: string | null = null;
 	private sgArgsPrefix: string[] = [];
+	private sgSpawnOptions:
+		| ReturnType<typeof getIsolatedNpxSpawnOptions>
+		| undefined;
 	/**
 	 * Availability memo, backed by the shared transient-aware latch (#1476).
 	 *
@@ -273,17 +278,28 @@ export class SgRunner {
 
 		// Step 1: PATH — canonical binary names + npx fallback.
 		// Prefer ast-grep over sg on Linux: /usr/bin/sg is util-linux, not ast-grep.
+		const trustedProject = getProjectTrustState() === "trusted";
 		const pathCommand = await this.probeCommandCandidates([
-			{ cmd: "ast-grep", argsPrefix: [] },
-			{ cmd: "sg", argsPrefix: [] },
-			// `npx --no -- ast-grep` starts a Node process before it can answer, so
+			...(trustedProject
+				? [
+						{ cmd: "ast-grep", argsPrefix: [] },
+						{ cmd: "sg", argsPrefix: [] },
+					]
+				: []),
+			// The scoped npx fallback starts a Node process before it can answer, so
 			// it is the candidate most likely to blow a 5 s budget on a cold or busy
 			// box. Marked a fallback so its timeout cannot veto the install.
-			{ cmd: "npx", argsPrefix: ["--no", "--", "ast-grep"], fallback: true },
+			{
+				cmd: "npx",
+				argsPrefix: ["--no", "--package", "@ast-grep/cli", "--", "ast-grep"],
+				fallback: true,
+			},
 		]);
 		if (pathCommand) {
 			this.sgPath = pathCommand.cmd;
 			this.sgArgsPrefix = pathCommand.argsPrefix;
+			this.sgSpawnOptions =
+				pathCommand.cmd === "npx" ? getIsolatedNpxSpawnOptions() : undefined;
 			this.noteAvailable(
 				startedAt,
 				`ast-grep found on PATH: ${pathCommand.cmd}`,
@@ -311,7 +327,9 @@ export class SgRunner {
 		// Step 2: platform-specific npm package binaries.
 		// Covers setups where @ast-grep/cli-{os}-{arch} is installed but the binary
 		// directory is not on PATH (common with pnpm, Yarn PnP, or isolated installs).
-		const platformBinary = await this.probePlatformPackageBinary();
+		const platformBinary = trustedProject
+			? await this.probePlatformPackageBinary()
+			: undefined;
 		if (platformBinary) {
 			this.sgPath = platformBinary;
 			this.sgArgsPrefix = [];
@@ -343,7 +361,7 @@ export class SgRunner {
 		//
 		// The npx fallback is deliberately NOT part of this test. Gating the
 		// install on it regressed the very host this change targets: a slow box
-		// with no ast-grep timed out `npx --no -- ast-grep` every sweep, so the
+		// with no ast-grep timed out its npx fallback every sweep, so the
 		// install below was never reached and the slow npx was re-spawned on each
 		// escalating retry instead — worse than the latch it replaced.
 		if (this.sweepSawTransient) {
@@ -389,6 +407,7 @@ export class SgRunner {
 		if (installed.outcome === "success") {
 			this.sgPath = installed.value;
 			this.sgArgsPrefix = [];
+			this.sgSpawnOptions = undefined;
 			this.noteAvailable(
 				startedAt,
 				`ast-grep auto-installed: ${installed.value}`,
@@ -431,7 +450,7 @@ export class SgRunner {
 	 * sweep already asked, and the sweep returns at the first one that answers,
 	 * so at this point the flag means "a tier the winner is supposed to lose to
 	 * never got a fair hearing". Latching that pinned the session to
-	 * `npx --no -- ast-grep` — a Node start per invocation — over a healthy
+	 * `npx` — a Node start per invocation — over a healthy
 	 * ast-grep on PATH, until the next restart. Provisional instead: served now,
 	 * re-swept once the stalled tier's cooldown expires.
 	 *
@@ -613,9 +632,15 @@ export class SgRunner {
 		let result: Awaited<ReturnType<typeof safeSpawnAsync>>;
 		let hostStallMs: number;
 		try {
-			result = await safeSpawnAsync(cmd, [...argsPrefix, "--version"], {
-				timeout: PROBE_TIMEOUT_MS,
-			});
+			result =
+				cmd === "npx"
+					? await safeSpawnAsync(cmd, [...argsPrefix, "--version"], {
+							...getIsolatedNpxSpawnOptions(),
+							timeout: PROBE_TIMEOUT_MS,
+						})
+					: await probeToolAsync(cmd, [...argsPrefix, "--version"], {
+							timeout: PROBE_TIMEOUT_MS,
+						});
 		} finally {
 			hostStallMs = sampler.stop();
 			this.sweepHostStallMs += hostStallMs;
@@ -732,6 +757,7 @@ export class SgRunner {
 			command.cmd,
 			[...command.argsPrefix, ...args],
 			{
+				...this.sgSpawnOptions,
 				timeout,
 				deadlineAt: options.deadlineAt,
 				signal: options.signal,
@@ -768,6 +794,7 @@ export class SgRunner {
 			useBash ? "bash" : command.cmd,
 			useBash ? buildBashRunArgs(command.cmd, allArgs) : allArgs,
 			{
+				...this.sgSpawnOptions,
 				timeout: DEFAULT_EXEC_TIMEOUT_MS,
 				deadlineAt: options.deadlineAt,
 				signal: options.signal,
@@ -854,16 +881,20 @@ export class SgRunner {
 		sessionDir: string;
 		configFile: string;
 	} {
-		const sessionDir = path.join(
-			os.tmpdir(),
-			`dm-lens-temp-${ruleId}-${Date.now()}`,
+		const sessionDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), `dm-lens-temp-${ruleId}-`),
 		);
-		const rulesSubdir = path.join(sessionDir, "rules");
-		const configFile = path.join(sessionDir, ".sgconfig.yml");
-		fs.mkdirSync(rulesSubdir, { recursive: true });
-		fs.writeFileSync(configFile, `ruleDirs:\n  - ./rules\n`);
-		fs.writeFileSync(path.join(rulesSubdir, `${ruleId}.yml`), ruleYaml);
-		return { sessionDir, configFile };
+		try {
+			const rulesSubdir = path.join(sessionDir, "rules");
+			const configFile = path.join(sessionDir, ".sgconfig.yml");
+			fs.mkdirSync(rulesSubdir, { recursive: true });
+			fs.writeFileSync(configFile, `ruleDirs:\n  - ./rules\n`);
+			fs.writeFileSync(path.join(rulesSubdir, `${ruleId}.yml`), ruleYaml);
+			return { sessionDir, configFile };
+		} catch (error) {
+			this.cleanupTempScan(sessionDir);
+			throw error;
+		}
 	}
 
 	private cleanupTempScan(sessionDir: string): void {
@@ -950,8 +981,10 @@ export class SgRunner {
 		timeout = DEFAULT_EXEC_TIMEOUT_MS,
 		options: SgExecutionOptions = {},
 	): Promise<SgScanResult> {
-		const { sessionDir, configFile } = this.prepareTempScan(ruleId, ruleYaml);
+		let sessionDir: string | undefined;
 		try {
+			({ sessionDir } = this.prepareTempScan(ruleId, ruleYaml));
+			const configFile = path.join(sessionDir, ".sgconfig.yml");
 			const { cmd: sgCmd, args: sgPre } = getSgCommand();
 			const result = await safeSpawnAsync(
 				sgCmd,
@@ -965,6 +998,7 @@ export class SgRunner {
 					dir,
 				],
 				{
+					...(sgCmd === "npx" ? getIsolatedNpxSpawnOptions() : {}),
 					timeout,
 					deadlineAt: options.deadlineAt,
 					signal: options.signal,
@@ -973,7 +1007,7 @@ export class SgRunner {
 			);
 			return this.interpretScanResult(result, ["scan"]);
 		} finally {
-			this.cleanupTempScan(sessionDir);
+			if (sessionDir) this.cleanupTempScan(sessionDir);
 		}
 	}
 
@@ -1008,8 +1042,10 @@ export class SgRunner {
 		timeout = DEFAULT_EXEC_TIMEOUT_MS,
 		options: SgExecutionOptions = {},
 	): Promise<{ matches: SgMatch[]; error?: string }> {
-		const { sessionDir, configFile } = this.prepareTempScan(ruleId, ruleYaml);
+		let sessionDir: string | undefined;
 		try {
+			({ sessionDir } = this.prepareTempScan(ruleId, ruleYaml));
+			const configFile = path.join(sessionDir, ".sgconfig.yml");
 			const { cmd: sgCmd, args: sgPre } = getSgCommand();
 			const scanArgs = [
 				...sgPre,
@@ -1021,6 +1057,7 @@ export class SgRunner {
 				dir,
 			];
 			const spawnOptions = {
+				...(sgCmd === "npx" ? getIsolatedNpxSpawnOptions() : {}),
 				timeout,
 				deadlineAt: options.deadlineAt,
 				signal: options.signal,
@@ -1070,7 +1107,7 @@ export class SgRunner {
 		} catch (err) {
 			return { matches: [], error: String(err) };
 		} finally {
-			this.cleanupTempScan(sessionDir);
+			if (sessionDir) this.cleanupTempScan(sessionDir);
 		}
 	}
 

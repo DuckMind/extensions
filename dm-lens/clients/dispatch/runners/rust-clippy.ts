@@ -4,8 +4,8 @@
  * Runs `cargo clippy` for Rust files to catch common mistakes.
  */
 
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { findNearestContaining } from "../../path-utils.js";
+import { isAbsolute, resolve } from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { rustClient } from "../../rust-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
@@ -24,6 +24,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
+import { resolveRunnerCwdWithReason } from "../../tool-cwd.js";
 import { createCwdCachedProbe } from "./utils/runner-helpers.js";
 
 // Cached per-cwd `cargo clippy --version` probe (#120). Before this, the
@@ -125,9 +126,15 @@ const rustClippyRunner: RunnerDefinition = {
 			}
 		}
 
-		// Find the package root (where Cargo.toml is)
-		const cargoToml = findCargoToml(ctx.filePath);
-		if (!cargoToml) {
+		// The package root (where Cargo.toml is), through the shared cwd seam
+		// (#2894): the shared language marker vocabulary includes `Cargo.toml`, so
+		// this IS the walk this runner used to do with `findNearestContaining` — plus
+		// the seam's dispatch-root and `$HOME` ceilings, which the hand-rolled
+		// walk had neither of. The gate then asks about exactly the directory
+		// cargo will run in, rather than about a separately-derived one.
+		const cargoResolution = resolveRunnerCwdWithReason(ctx, "rust-clippy");
+		const cargoDir = cargoResolution.cwd;
+		if (cargoResolution.marker !== "Cargo.toml") {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -137,7 +144,7 @@ const rustClippyRunner: RunnerDefinition = {
 			["clippy", "--message-format=json", "-q"],
 			{
 				timeout: 60000,
-				cwd: cargoToml.replace("Cargo.toml", ""),
+				cwd: cargoDir,
 			},
 		);
 
@@ -149,10 +156,58 @@ const rustClippyRunner: RunnerDefinition = {
 
 		// Parse JSON output. span.file is relative to the package root, so pass
 		// the cargo dir to resolve diagnostics to absolute paths for filtering.
-		const cargoDir = cargoToml.replace("Cargo.toml", "");
 		const allDiagnostics = parseClippyOutput(raw, ctx.filePath, cargoDir);
+		const hasRecognizedCargoOutput = raw.split("\n").some((line) => {
+			try {
+				const reason = JSON.parse(line).reason;
+				return (
+					reason === "build-finished" ||
+					reason === "compiler-artifact" ||
+					reason === "compiler-message" ||
+					reason === "build-script-executed"
+				);
+			} catch {
+				return false;
+			}
+		});
 
-		if (allDiagnostics.length === 0) {
+		// Lint-style policy (#265 B1): `cargo clippy` compiles the whole crate, so
+		// a crate-mate's pre-existing diagnostic must NOT fail the edited file's
+		// turn. Filter to the edited file like golangci-lint — if the edited file
+		// is clean, this turn succeeds even when siblings carry warnings/errors.
+		// #3278: one seam for reported-path attribution — see javac.ts. This
+		// member already had the right BASE (`parseClippyOutput` resolves
+		// `span.file` against `cargoDir`); what it lacked was the on-disk
+		// identity predicate.
+		const absEdited = resolve(ctx.filePath);
+		const diagnostics = allDiagnostics.filter((d) =>
+			pathsEqual(resolve(cargoDir, d.filePath), absEdited),
+		);
+		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
+		const semantic = hasBlocking
+			? "blocking"
+			: diagnostics.length > 0
+				? "warning"
+				: "none";
+
+		if (result.error || result.failure) {
+			return {
+				status: "failed",
+				diagnostics,
+				semantic,
+				failureKind:
+					result.failure === "timeout" ||
+					result.spawnFailure?.kind === "timeout"
+						? "timeout"
+						: "server_error",
+				rawOutput: raw.substring(0, 500),
+			};
+		}
+
+		if (
+			allDiagnostics.length === 0 &&
+			!(result.status === 0 && hasRecognizedCargoOutput)
+		) {
 			// Non-parseable output
 			return {
 				status: "failed",
@@ -162,32 +217,22 @@ const rustClippyRunner: RunnerDefinition = {
 			};
 		}
 
-		// Lint-style policy (#265 B1): `cargo clippy` compiles the whole crate, so
-		// a crate-mate's pre-existing diagnostic must NOT fail the edited file's
-		// turn. Filter to the edited file like golangci-lint — if the edited file
-		// is clean, this turn succeeds even when siblings carry warnings/errors.
-		const absEdited = resolve(ctx.filePath);
-		const diagnostics = allDiagnostics.filter(
-			(d) => resolve(d.filePath) === absEdited,
-		);
-
-		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
+		// #3751: `status` is the execution outcome, not a severity channel. clippy
+		// ran and produced parseable output, so the run succeeded even when a
+		// deny-level lint is present; severity lives in `semantic` and the
+		// diagnostics. The dispatcher derives blocking from `semantic ===
+		// "blocking"` (dispatcher.ts), never from `status`. `status: "failed"` is
+		// reserved for the unparsable-output arm above — a genuine failure to
+		// produce a usable result. Spawn failures remain failed even when their
+		// partial output contains parseable diagnostics, with failureKind preserving
+		// the cause for consumers.
 		return {
-			status: hasErrors ? "failed" : "succeeded",
+			status: "succeeded",
 			diagnostics,
-			semantic: hasErrors
-				? "blocking"
-				: diagnostics.length > 0
-					? "warning"
-					: "none",
+			semantic,
 		};
 	},
 };
-
-function findCargoToml(filePath: string): string | undefined {
-	const dir = findNearestContaining(dirname(filePath), ["Cargo.toml"]);
-	return dir ? join(dir, "Cargo.toml") : undefined;
-}
 
 interface ClippySpan {
 	file?: string;

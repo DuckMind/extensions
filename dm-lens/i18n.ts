@@ -3,7 +3,7 @@ type Params = Record<string, string | number>;
 
 const translations: Record<Exclude<Locale, "en">, Record<string, string>> = {
 	es: {
-		"lens.health.title": "🩺 SALUD DE PI-LENS",
+		"lens.health.title": "🩺 SALUD DE DM-LENS",
 		"lens.health.crashes": "Fallos de pipeline (sesión): {count}",
 		"lens.health.files": "Archivos afectados: {count}",
 		"lens.health.topCrashFiles": "Archivos con más fallos:",
@@ -16,7 +16,7 @@ const translations: Record<Exclude<Locale, "en">, Record<string, string>> = {
 		"lens.health.topNoisyRules": "Reglas más ruidosas:",
 	},
 	fr: {
-		"lens.health.title": "🩺 SANTÉ DE PI-LENS",
+		"lens.health.title": "🩺 SANTÉ DE DM-LENS",
 		"lens.health.crashes": "Plantages du pipeline (session) : {count}",
 		"lens.health.files": "Fichiers concernés : {count}",
 		"lens.health.topCrashFiles": "Fichiers avec le plus de plantages :",
@@ -30,7 +30,7 @@ const translations: Record<Exclude<Locale, "en">, Record<string, string>> = {
 		"lens.health.topNoisyRules": "Règles les plus bruyantes :",
 	},
 	"pt-BR": {
-		"lens.health.title": "🩺 SAÚDE DO PI-LENS",
+		"lens.health.title": "🩺 SAÚDE DO DM-LENS",
 		"lens.health.crashes": "Falhas do pipeline (sessão): {count}",
 		"lens.health.files": "Arquivos afetados: {count}",
 		"lens.health.topCrashFiles": "Arquivos com mais falhas:",

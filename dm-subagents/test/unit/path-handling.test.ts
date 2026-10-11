@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-
 /**
  * Tests for cross-platform path handling patterns used throughout the codebase.
  * These tests document the correct patterns after fixes were applied.
@@ -51,6 +50,7 @@ describe("path.isAbsolute vs startsWith('/')", () => {
 		}
 	});
 });
+
 describe("path.join vs template string concatenation", () => {
 	// settings.ts uses `${chainDir}/${file}` in several places.
 	// This works but produces inconsistent separators on Windows.

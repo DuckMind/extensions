@@ -82,15 +82,15 @@ describe("initializeMcp elicitation config", () => {
     });
   });
 
-  it("binds oauthDir storage to the active context cwd", async () => {
-    mocks.loadMcpConfig.mockReturnValue({ mcpServers: {}, settings: { oauthDir: ".dm/oauth" } });
+  it("binds OAuth storage settings to runtime options", async () => {
+    mocks.loadMcpConfig.mockReturnValue({ mcpServers: {}, settings: { oauthDir: ".dm/oauth", oauthCredentialStore: "encrypted-file" } });
     const { initializeMcp } = await import("../init.ts");
     const ctx = context();
 
     await initializeMcp(extensionApi(), ctx);
 
     expect(mocks.managers[0].setAuthStorageOptions).toHaveBeenCalledWith({
-      baseDir: "/tmp/project/.dm/oauth",
+      credentialStore: "encrypted-file",
     });
   });
 

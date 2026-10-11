@@ -1,94 +1,63 @@
 #!/usr/bin/env node
-
-/**
- * dm-subagents installer
- *
- * Usage:
- *   npx dm-subagents          # Install to ~/.dm/agent/extensions/subagent
- *   npx dm-subagents --remove # Remove the extension
- */
-
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-const EXTENSION_DIR = path.join(os.homedir(), ".dm", "agent", "extensions", "subagent");
-const REPO_URL = "https://github.com/nicobailon/dm-subagents.git";
-
+const repo = "https://github.com/DuckMind/extensions.git";
+const target = path.join(os.homedir(), ".dm", "agent", "extensions", "subagent");
+const marker = ".dm-subagents-source";
 const args = process.argv.slice(2);
-const isRemove = args.includes("--remove") || args.includes("-r");
-const isHelp = args.includes("--help") || args.includes("-h");
 
-if (isHelp) {
-	console.log(`
-dm-subagents - DM extension for delegating tasks to subagents
-
-Usage:
-  npx dm-subagents          Install the extension
-  npx dm-subagents --remove Remove the extension
-  npx dm-subagents --help   Show this help
-
-Installation directory: ${EXTENSION_DIR}
-`);
-	process.exit(0);
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(`dm-subagents: install or update ${target}; --remove removes an installer-managed copy`);
+  process.exit(0);
+}
+if (args.some((arg) => !["--remove", "-r"].includes(arg))) {
+  console.error("Usage: dm-subagents [--remove | --help]");
+  process.exit(1);
+}
+if (fs.existsSync(target) && (!fs.statSync(target).isDirectory() ||
+    !fs.existsSync(path.join(target, marker)) ||
+    fs.readFileSync(path.join(target, marker), "utf8").trim() !== repo)) {
+  console.error(`Refusing to replace an installation not managed by this installer: ${target}`);
+  process.exit(1);
+}
+if (args.includes("--remove") || args.includes("-r")) {
+  if (fs.existsSync(target)) fs.rmSync(target, { recursive: true });
+  console.log("dm-subagents removed");
+  process.exit(0);
 }
 
-if (isRemove) {
-	if (fs.existsSync(EXTENSION_DIR)) {
-		console.log(`Removing ${EXTENSION_DIR}...`);
-		fs.rmSync(EXTENSION_DIR, { recursive: true });
-		console.log("dm-subagents removed");
-	} else {
-		console.log("dm-subagents is not installed");
-	}
-	process.exit(0);
+const parent = path.dirname(target);
+fs.mkdirSync(parent, { recursive: true });
+const scratch = fs.mkdtempSync(path.join(parent, ".dm-subagents-install-"));
+const checkout = path.join(scratch, "checkout");
+const staged = path.join(scratch, "subagent");
+const backup = path.join(scratch, "backup");
+try {
+  execFileSync("git", ["clone", "--depth", "1", "--filter=blob:none", "--sparse", repo, checkout],
+    { stdio: "inherit" });
+  execFileSync("git", ["-C", checkout, "sparse-checkout", "set", "dm-subagents"],
+    { stdio: "inherit" });
+  const source = path.join(checkout, "dm-subagents");
+  if (!fs.existsSync(path.join(source, "package.json"))) {
+    throw new Error("DuckMind/extensions has not exported dm-subagents yet");
+  }
+  fs.cpSync(source, staged, { recursive: true });
+  fs.writeFileSync(path.join(staged, marker), repo + "\n");
+  const hadPrevious = fs.existsSync(target);
+  if (hadPrevious) fs.renameSync(target, backup);
+  try {
+    fs.renameSync(staged, target);
+  } catch (error) {
+    if (hadPrevious) fs.renameSync(backup, target);
+    throw error;
+  }
+  console.log(`dm-subagents ${hadPrevious ? "updated" : "installed"} at ${target}`);
+} catch (error) {
+  console.error(`dm-subagents install failed: ${error.message}`);
+  process.exitCode = 1;
+} finally {
+  fs.rmSync(scratch, { recursive: true, force: true });
 }
-
-// Install
-console.log("Installing dm-subagents...\n");
-
-// Ensure parent directory exists
-const parentDir = path.dirname(EXTENSION_DIR);
-if (!fs.existsSync(parentDir)) {
-	fs.mkdirSync(parentDir, { recursive: true });
-}
-
-// Check if already installed
-if (fs.existsSync(EXTENSION_DIR)) {
-	const isGitRepo = fs.existsSync(path.join(EXTENSION_DIR, ".git"));
-	if (isGitRepo) {
-		console.log("Updating existing installation...");
-		try {
-			execSync("git pull", { cwd: EXTENSION_DIR, stdio: "inherit" });
-			console.log("\ndm-subagents updated");
-		} catch (err) {
-			console.error("Failed to update. Try removing and reinstalling:");
-			console.error("  npx dm-subagents --remove && npx dm-subagents");
-			process.exit(1);
-		}
-	} else {
-		console.log(`Directory exists but is not a git repo: ${EXTENSION_DIR}`);
-		console.log("Remove it first with: npx dm-subagents --remove");
-		process.exit(1);
-	}
-} else {
-	// Fresh install
-	console.log(`Cloning to ${EXTENSION_DIR}...`);
-	try {
-		execSync(`git clone ${REPO_URL} "${EXTENSION_DIR}"`, { stdio: "inherit" });
-		console.log("\ndm-subagents installed");
-	} catch (err) {
-		console.error("Failed to clone repository");
-		process.exit(1);
-	}
-}
-
-console.log(`
-The extension is now available in dm. Tools added:
-  • subagent - Delegate tasks to agents and inspect run status
-  • bg_wait - Wait for background/provider/detached work without native completion notifications
-    (subagent_wait remains a deprecated compatibility alias)
-
-Documentation: ${EXTENSION_DIR}/README.md
-`);

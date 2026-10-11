@@ -7,14 +7,18 @@
 
 import * as path from "node:path";
 import { RuleCache } from "../../cache/rule-cache.js";
-import { minimatch } from "../../deps/minimatch.js";
+import { isRuleIgnoredForPath } from "../rule-ignores.js";
+import { ruleIgnoredForPath } from "../rule-policy.js";
 import { isTestFile } from "../../file-utils.js";
 import {
 	buildOrUpdateGraph,
 	computeImpactCascade,
 	recordEntitySnapshotDiff,
 } from "../../review-graph/service.js";
-import type { TreeSitterClient } from "../../tree-sitter-client.js";
+import {
+	classifyTreeSitterWasmError,
+	type TreeSitterClient,
+} from "../../tree-sitter-client.js";
 import {
 	getSharedTreeSitterClient,
 	isTreeSitterWasmAborted,
@@ -38,6 +42,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 
 const blastCooldownByFile = new Map<string, number>();
 const BLAST_COOLDOWN_MS = 5_000;
@@ -356,30 +361,6 @@ function getTotalLinesChanged(
 /** Threshold: skip entity extraction for changes under 5 lines */
 const ENTITY_EXTRACTION_LINE_THRESHOLD = 5;
 
-/**
- * `filePath` relative to `root`, forward-slashed, for matching a rule's
- * `ignore_paths` globs. Falls back to the absolute (slash-normalized) path
- * when `filePath` isn't under `root` (e.g. an out-of-tree temp file), so a
- * glob like `scripts/**` simply never matches rather than throwing.
- */
-function relativeForIgnoreGlob(filePath: string, root: string): string {
-	const rel = path.relative(root, filePath);
-	const normalized = (rel.startsWith("..") ? filePath : rel)
-		.split(path.sep)
-		.join("/");
-	return normalized;
-}
-
-function matchesIgnorePaths(
-	filePath: string,
-	root: string,
-	patterns: string[] | undefined,
-): boolean {
-	if (!patterns || patterns.length === 0) return false;
-	const rel = relativeForIgnoreGlob(filePath, root);
-	return patterns.some((pattern) => minimatch(rel, pattern, { dot: true }));
-}
-
 const treeSitterRunner: RunnerDefinition = {
 	id: "tree-sitter",
 	appliesTo: [
@@ -540,7 +521,8 @@ const treeSitterRunner: RunnerDefinition = {
 		).filter(
 			(q) =>
 				!(fileIsTest && q.skip_test_files) &&
-				!matchesIgnorePaths(filePath, ignoreRoot, q.ignore_paths),
+				!isRuleIgnoredForPath(filePath, ignoreRoot, q.ignore_paths) &&
+				!ruleIgnoredForPath(q.id, filePath, ignoreRoot, ctx.rulePolicy),
 		);
 
 		logTreeSitter({
@@ -552,6 +534,9 @@ const treeSitterRunner: RunnerDefinition = {
 			cacheHit,
 			metadata: { blockingOnly: !!ctx.blockingOnly },
 		});
+		if (effectiveQueries.length === 0) {
+			return { status: "succeeded", diagnostics: [], semantic: "none" };
+		}
 
 		const contentFromFacts = ctx.facts.getFileFact<string | null>(
 			filePath,
@@ -646,7 +631,7 @@ const treeSitterRunner: RunnerDefinition = {
 			const msg = err instanceof Error ? err.message : String(err);
 			// Emscripten abort() corrupts the entire module-level wasm heap.
 			// Poison the singleton so no further queries attempt to use the dead runtime.
-			if (msg.includes("Aborted") || msg.includes("abort()")) {
+			if (classifyTreeSitterWasmError(err) === "abort") {
 				markTreeSitterWasmAborted();
 				logTreeSitter({
 					phase: "query_error",
@@ -736,6 +721,29 @@ const treeSitterRunner: RunnerDefinition = {
 		}
 
 		if (diagnostics.length === 0) {
+			// #3409: zero diagnostics because the language's GRAMMAR never loaded is
+			// not a clean file, and `runQueriesOnFile` returns [] for both. The
+			// honest discriminator, once the run has already demanded the language,
+			// is the client's own loaded-language map: a grammar that could not be
+			// resolved, fetched, or decoded is absent from it. Reported through this
+			// runner's existing "the analysis did not run" arm (the same
+			// `runner_skip` + `status: "skipped"` shape as client-unavailable,
+			// init-failed and unsupported-extension) instead of as a pass with
+			// nothing found — which is what made a degraded language on a compiled
+			// host indistinguishable from a clean file in `runner_complete`.
+			//
+			// The abort term keeps a mid-run WASM abort (#402, its own
+			// `runtime_abort` record) from being misreported as a missing grammar.
+			if (!isTreeSitterWasmAborted() && !client.getLanguage(languageId)) {
+				logTreeSitter({
+					phase: "runner_skip",
+					filePath,
+					languageId,
+					reason: "grammar_unavailable",
+					status: "skipped",
+				});
+				return { status: "skipped", diagnostics: [], semantic: "none" };
+			}
 			logTreeSitter({
 				phase: "runner_complete",
 				filePath,
@@ -766,11 +774,10 @@ const treeSitterRunner: RunnerDefinition = {
 			effectiveQueryCount: effectiveQueries.length,
 		});
 
-		return {
+		return findingsResult(diagnostics, {
 			status: hasBlocking ? "failed" : "succeeded",
-			diagnostics,
 			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

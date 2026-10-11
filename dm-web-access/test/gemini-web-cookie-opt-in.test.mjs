@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -102,18 +102,58 @@ test("Gemini Web file uploads read the file and reject automatic redirects", asy
 		}
 		if (String(url) === "https://content-push.googleapis.com/upload") {
 			assert.equal(init.redirect, "error");
+			assert.match(Buffer.from(init.body).toString("utf8"), /filename="sample\.txt"\r\nContent-Type: text\/plain\r\n/);
 			throw new Error("upload transport reached");
 		}
 		throw new Error(`Unexpected request: ${url}`);
 	});
 	try {
 		await assert.rejects(
-			queryWithCookies("inspect file", { "__Secure-1PSID": "cookie" }, { files: [filePath], model: "gemini-3.1-pro" }),
+			queryWithCookies("inspect file", { "__Secure-1PSID": "cookie" }, { files: [{ path: filePath, mimeType: "text/plain" }], model: "gemini-3.1-pro" }),
 			/upload transport reached/,
 		);
 	} finally {
 		setGeminiFetchOverrideForTests(null);
+		await rm(dir, { recursive: true, force: true });
 	}
+});
+
+test("Gemini Web file uploads send the file type and reference the file by name", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "dm-web-access-gemini-upload-"));
+	const filePath = join(dir, "recording.mp4");
+	await writeFile(filePath, "fake-mp4-bytes", "utf8");
+	const { queryWithCookies, setGeminiFetchOverrideForTests } = await import(geminiWebUrl);
+	let uploadBody = "";
+	let fReq = "";
+	setGeminiFetchOverrideForTests(async (url, init = {}) => {
+		if (String(url) === "https://gemini.google.com/app") {
+			return new Response('"SNlM0e":"test-token"', { status: 200 });
+		}
+		if (String(url) === "https://content-push.googleapis.com/upload") {
+			uploadBody = Buffer.from(init.body).toString("utf8");
+			return new Response("/contrib_service/upload-id", { status: 200 });
+		}
+		if (String(url).includes("BardFrontendService/StreamGenerate")) {
+			fReq = new URLSearchParams(init.body).get("f.req");
+			throw new Error("generation transport reached");
+		}
+		throw new Error(`Unexpected request: ${url}`);
+	});
+	try {
+		await assert.rejects(
+			queryWithCookies("describe", { "__Secure-1PSID": "cookie" }, {
+				files: [{ path: filePath, mimeType: "video/mp4" }],
+				model: "gemini-3.1-pro",
+			}),
+			/generation transport reached/,
+		);
+	} finally {
+		setGeminiFetchOverrideForTests(null);
+		await rm(dir, { recursive: true, force: true });
+	}
+	assert.match(uploadBody, /filename="recording\.mp4"\r\nContent-Type: video\/mp4\r\n/);
+	const promptPayload = JSON.parse(JSON.parse(fReq)[1])[0];
+	assert.deepEqual(promptPayload, ["describe", 0, null, [[["/contrib_service/upload-id", 1], "recording.mp4"]]]);
 });
 
 test("browser cookie access is disabled unless explicitly allowed", async () => {
@@ -123,8 +163,8 @@ test("browser cookie access is disabled unless explicitly allowed", async () => 
 	assert.equal(child.status, 0, child.stderr);
 	assert.equal(child.stdout.trim(), "false");
 
-	await mkdir(join(home, ".dm"), { recursive: true });
-	await writeFile(join(home, ".dm", "web-search.json"), JSON.stringify({ allowBrowserCookies: true }) + "\n", "utf8");
+	await mkdir(join(home, ".dm", "agent"), { recursive: true });
+	await writeFile(join(home, ".dm", "agent", "web-search.json"), JSON.stringify({ allowBrowserCookies: true }) + "\n", "utf8");
 
 	child = runCookieAccessCheck(home);
 	assert.equal(child.status, 0, child.stderr);
@@ -138,8 +178,8 @@ test("browser cookie access is disabled unless explicitly allowed", async () => 
 
 test("disabled browser cookie access does not validate legacy profile selection", async () => {
 	const home = await mkdtemp(join(tmpdir(), "dm-web-access-cookie-legacy-disabled-"));
-	await mkdir(join(home, ".dm"), { recursive: true });
-	await writeFile(join(home, ".dm", "web-search.json"), JSON.stringify({ chromeProfile: "Profile 1" }) + "\n", "utf8");
+	await mkdir(join(home, ".dm", "agent"), { recursive: true });
+	await writeFile(join(home, ".dm", "agent", "web-search.json"), JSON.stringify({ chromeProfile: "Profile 1" }) + "\n", "utf8");
 
 	const child = runCookieAccessCheck(home);
 	assert.equal(child.status, 0, child.stderr);
@@ -148,8 +188,8 @@ test("disabled browser cookie access does not validate legacy profile selection"
 
 test("browser cookie config validates presets and rejects arbitrary profile paths", async () => {
 	const home = await mkdtemp(join(tmpdir(), "dm-web-access-browser-cookie-config-"));
-	await mkdir(join(home, ".dm"), { recursive: true });
-	const configPath = join(home, ".dm", "web-search.json");
+	await mkdir(join(home, ".dm", "agent"), { recursive: true });
+	const configPath = join(home, ".dm", "agent", "web-search.json");
 	await writeFile(configPath, JSON.stringify({ browserCookies: { browser: "Helium", profile: "Profile 1" } }) + "\n", "utf8");
 
 	let child = runBrowserCookieConfig(home);

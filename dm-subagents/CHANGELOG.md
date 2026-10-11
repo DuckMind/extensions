@@ -1,20 +1,828 @@
 # Changelog
 
-
 ## [Unreleased]
 
 ### Changed
-- Clarify that `fallbackModels` handles provider/model timeouts but not run-level `timeoutMs` / `maxRuntimeMs` expiry. Thanks [@kaplan-shaked](https://github.com/kaplan-shaked) for #1745.
-- Pass the requested session and timestamp as optional context to background-work providers so they can avoid listing unrelated sessions while preserving strict snapshot validation (#1737).
-- Avoid repeating external-run display normalization during Fleet refresh while retaining validation for externally replaced or mutated records (#1736).
-- Clarify that `oracle` and top-reasoning models are escalation tools, not routine fresh-review defaults.
-- Route untargeted RPC status through restored in-memory projections when safe while preserving executor-backed targeted status and transcript options (#1735).
-- Make `bg_wait` the primary background-work wait tool, retain `subagent_wait` as a deprecated compatibility alias, and stop ordinary async handoffs from encouraging redundant wait subscriptions (#1729).
+
+- Pressing `Esc` stopped the parent, but a background subagent that finished or asked for input a moment later started a new parent turn, so the agent the user had just stopped kept working. After `Esc`, background results and requests are now added to the session without starting a turn, and the parent sees them with the user's next prompt. A completion notice added this way tells the parent not to resume the stopped task unless the user asks. Background runs keep running, and the TUI shows how many are still active and points to `/subagents-stop`.
+- Stopping several background runs meant opening `/subagents-stop` once per run. When two or more current-session async runs are active, the picker now starts with a "stop all" row that stops all of them after one confirmation. Scheduled runs are not paused.
 
 ### Fixed
+
+- A parent agent that stopped its own background subagent with `subagent({ action: "stop" })` got a notice saying `Subagent stopped by user.`, so the parent and the operator read it as the user stepping in. Nothing records who asked for a stop, so background runs, attached chain roots, external CLI runs, and workflow children now say `Subagent stopped.`, `Placed external run stopped.`, or `Workflow child '<key>' stopped.`, matching the neutral `Workflow stopped.` from [#1548](https://github.com/nicobailon/pi-subagents/issues/1548). ([#2826](https://github.com/nicobailon/pi-subagents/issues/2826))
+- When an extension loaded in a background child switched its model, such as a model router acting on the child's first input, the run's status and FleetView kept naming the model the child was launched with. In one session, 14 of 15 children ran on a different model than status showed. Status now names the model the child's replies actually came from. Reviving the child still starts it on the launch model that dm-subagents resolved and validated. Thanks to [@dodo-robot](https://github.com/dodo-robot) for the report and the fix. ([#2824](https://github.com/nicobailon/pi-subagents/issues/2824))
+- A child launched on a virtual model that an extension registers with `dm.registerVirtualModel()` failed with "model not found" when that extension was not loaded in the child, and the added explanation said a foreground child inherits the parent's providers, so it read as if the model should have resolved. The explanation now says a foreground child inherits providers but not virtual models, and it names the host-side fix, `registerRequiredChildExtensions`, next to the agent frontmatter options. Thanks to [@toomanyopenfiles](https://github.com/toomanyopenfiles) for the report. ([#2820](https://github.com/nicobailon/pi-subagents/issues/2820))
+- A child resumed for a later stage with a new output path re-sent its whole conversation without the provider prompt cache, because the output path was written into the child's system prompt and changed every stage. Through `dm-claude-bridge`, one staged run re-cached about 1.65M tokens this way. The output path is now given only in the task message, which already said it overrides any other output path, so the system prompt stays the same across stages. Launch contract digests change for runs with an output path.
+- When a background run kept failing to read its control inbox, such as the `EPERM` errors seen on Windows, the runner wrote the same stack trace to `runner.stderr.log` on every retry and filled gigabytes in minutes. A repeating failure is now logged once, then as one line per minute with the number of repeats, and logged in full again if it recurs after the inbox becomes readable. Retries continue, so queued requests are still delivered once the inbox is readable. Thanks to [@infectiousstupidity](https://github.com/infectiousstupidity) for the report. ([#2811](https://github.com/nicobailon/pi-subagents/issues/2811))
+- A child whose structured output used a value outside a schema's `enum` or `const` got only "must be equal to one of the allowed values" or "must be equal to constant", so it had to guess or reread the schema. The error now names the permitted values, up to 20 for a long `enum`. Thanks to [@rtbe](https://github.com/rtbe) for the report. ([#2813](https://github.com/nicobailon/pi-subagents/issues/2813))
+- After a manual `/compact` with background subagents still running, the parent's resume run went out without the prompt sections that extensions set in `before_agent_start`, so the provider re-read the whole conversation without its prompt cache. DM emits `session_compact` before it clears its compaction state, so the resume was sent while the parent still counted as busy and started through `sendMessage` (earendil-works/dm#5581). The resume now waits until the parent is idle and starts through a prompt, and it is dropped if another run starts first, the session ends, or the parent is still busy after 10 seconds. Thanks to [@rnavarro](https://github.com/rnavarro) for [#2812](https://github.com/nicobailon/pi-subagents/pull/2812).
+
+## [0.77.0] - 2026-10-09
+
+### Highlights
+
+- Subagents cost the parent far fewer tokens. The `subagent` tool's schema and description dropped from about 18,700 to 3,300 characters per request, `bg_wait` from about 4,500 to 1,100, and the bundled role prompts are about 20% shorter. Long child reports and guide pages now arrive as a short preview plus a file path instead of the full text.
+- Upgrading dm-subagents no longer costs resumed sessions their prompt cache, and upgrading under a running DM no longer breaks every child launch.
+- Fewer wasted parent turns: launch an agent by name and a wrong agent or model name comes back with suggestions, the new built-in `parallel` workflow runs a batch of children without a script, and a parent woken by a result handles it instead of going quiet.
+- Background children can run inside a sandbox with `launcher:`, terminals such as Ghostty show each run's state, and tmux users get a bundled inspector pane.
+- A session that declined project trust no longer takes models, agents, or settings from that project.
+
+### Added
+
+- Running independent subagents in parallel needed a JavaScript workflow script that the model had to write in its reply, and some parents had to save it to a file first. The built-in `parallel` workflow takes the children as data: `subagent({ workflow: "parallel", args: { tasks: [{ agent, task }, ...] } })` runs them in one batch and returns each child's output in order. The tool schema is unchanged. ([#2773](https://github.com/nicobailon/pi-subagents/issues/2773))
+- Background children could run in a sandbox only through an external CLI runner, which loses native steering and results. An agent can now set `launcher:` to a command from the user config's `runnerLaunchers`, such as a sandbox, and that command wraps its background runner. Steering, supervisor questions, stop, resume and results keep working. Thanks to [@aaronkyriesenbach](https://github.com/aaronkyriesenbach) for the idea, design and nono testing. ([#2577](https://github.com/nicobailon/pi-subagents/issues/2577))
+- A terminal could not tell which background subagent runs were working, waiting on you, finished, or failed without reading the screen. Each run's state is now reported with OSC 7501, the Program Status Protocol, which terminals such as Ghostty can show next to DM's own status. Set `programStatus: false` or `PI_PROGRAM_STATUS=0` to turn it off. ([#2724](https://github.com/nicobailon/pi-subagents/issues/2724))
+- Fleet's `Enter`/`H` inspector needed Herdr or Ghostty, so tmux users had to write their own provider. A bundled `tmux` inspector now opens the read-only inspector in a split pane of the current tmux window, with status and close support. Thanks to [@tobymao](https://github.com/tobymao) for the plugin. ([#2719](https://github.com/nicobailon/pi-subagents/pull/2719))
+- The async widget under the editor gives each active background run two or more lines while the terminal has room, and `asyncWidgetCollapsed: true` folds it to a count that names no run. Set `asyncWidgetLayout: "rows"` to show a header and one line per run; clicking the header still folds the widget, and DM's expand key still shows the details. Thanks to [@pwguler](https://github.com/pwguler) for [#2738](https://github.com/nicobailon/pi-subagents/pull/2738).
+- Session browsers and usage tools could link a subagent run to the session that launched it only by parsing the directory layout. A new child session's header now records the launching session's file as `parentSession`, the same field DM writes for forks, and the run's `_meta.json` records `parentSessionId`. Thanks to [@yingzhi0808](https://github.com/yingzhi0808) for the request. ([#2763](https://github.com/nicobailon/pi-subagents/issues/2763))
+- A host that shows subagent activity could not tell which run a `subagent-notify` completion notice belonged to without parsing its text. Each entry in the notice's `details.runs` now carries the run id (`runId`, plus `workflowRunId` and per-child `childRuns` for workflows), status, duration and saved paths. The text the model sees is unchanged. Thanks to [@kushaldotdev](https://github.com/kushaldotdev) for the request. ([#2788](https://github.com/nicobailon/pi-subagents/issues/2788))
+
+### Changed
+
+- The `subagent` tool sent about 13,000 characters of parameter schema on every model request, mostly for management fields a typical delegation never uses. The schema now lists `agent`, `task`, `workflow`, `args`, `async`, `model`, `cwd`, `worktree`, `output`, `action`, `id` and `message` at the top level and every other field inside one `options` object, which cuts it to about 2,100 characters. Management fields and the `runId`, `maxRuntimeMs` and `isolation` aliases still work at the top level, so existing calls and resumed sessions are unaffected. An unknown `options` key gets the closest valid name, and a field given in both places with different values is rejected. Docs, guides, skills and the run hints in tool results now show `options`. ([#2767](https://github.com/nicobailon/pi-subagents/issues/2767))
+- The default `subagent` tool description took about 5,700 characters on every model request, and the rule about when delegation is allowed appeared three times. The description is now about 1,200 characters and states each rule once: how to call the tool, that async runs wake the parent on their own, one writer per worktree, and not to silently switch to another runner after a failure. It points to the guide for workflow scripts, resume and external CLIs. The tool no longer registers a prompt guideline, and its prompt snippet no longer repeats the delegation rule. `toolDescriptionMode: "full"` keeps the old detail inline. ([#2768](https://github.com/nicobailon/pi-subagents/issues/2768))
+- The `bg_wait` tool's description and parameters took about 4,500 characters on every model request, and each of its five parameters repeated that ordinary async runs already wake the session. They now take about 1,100 characters: the description says it once and lists the call shapes, and each parameter has a short label. ([#2769](https://github.com/nicobailon/pi-subagents/issues/2769))
+- The `subagent` tool description told the parent to call `{action:"list"}` before delegating and `{action:"models"}` before choosing a model, which cost an extra parent turn each time plus 1,300–2,000 tokens that stayed in history. It now says to launch by name with an exact `provider/id`. An unknown or disabled agent fails with a "did you mean" and the available agents with one-line descriptions (at most 30). An unknown or ambiguous model fails with up to 5 of the closest model ids. `list` and `models` still work on demand. ([#2771](https://github.com/nicobailon/pi-subagents/issues/2771))
+- The catalog of agents marked `advertise: true` also told the parent to call `{action:"list"}` before every delegation. Now that a launch with an unknown agent returns the available agents, new sessions no longer get that instruction. A resumed session keeps the catalog text it already has, so the upgrade does not change its prompt or cost it the provider's prompt cache. ([#2791](https://github.com/nicobailon/pi-subagents/issues/2791))
+- Changing a dm-subagents tool description, schema, prompt snippet, or guideline made every resumed or reloaded session re-declare that tool before its next request, so the provider re-read the whole conversation without its prompt cache. The `subagent`, `bg_wait` and `subagents_enable` tools, and a child session's `bg_wait` and fanout `subagent`, now keep the definition and prompt text the session already declared. Only sessions that never declared a tool get its current definition. ([#2778](https://github.com/nicobailon/pi-subagents/issues/2778))
+- Every turn of a child launched with a bundled role resent its full role prompt, and those prompts repeated their own rules and the supervisor instructions that are already appended. The `oracle`, `reviewer`, `worker`, `researcher` and `scout` prompts drop the repeats and keep every rule, going from 21,283 to 17,139 characters in total (oracle 6,059 → 4,789, reviewer 5,211 → 4,443, worker 4,296 → 3,083). ([#2775](https://github.com/nicobailon/pi-subagents/issues/2775))
+- Async completion notices, completed-run `status` and foreground results put a child's whole output into the parent's context (about 38,000 characters for one long report), and every async launch receipt repeated about 870 characters of waiting guidance. They now show the first 2,000 characters of a longer output followed by the path, size and line count of the file that holds all of it; output with no such file stays whole. Workflow child previews are capped at 2,000 characters, structured-output previews in `status` at 500 when a path line follows, failure notices now include an `Error:` line even when the child produced output, and the receipt guidance is two short lines. ([#2774](https://github.com/nicobailon/pi-subagents/issues/2774))
+- `subagent({action:"guide",topic})` returned a whole document, up to 62 KB for `tool-reference`, and that text stayed in the parent's history for every later turn. A docs-backed topic now returns its intro and a list of sections, and `topic: "<topic>/<section>"` returns one section of at most 8,000 characters. `overview` and `council` are unchanged. ([#2772](https://github.com/nicobailon/pi-subagents/issues/2772))
+- Each message dm-subagents put in the main chat had its own look: bordered cards for supervisor requests, replies and attention notices, `✓`/`✗` lines for completions, plain colored lines for steering, and DM's default block with raw labels such as `[subagent-wait-subscription]` for reminders and wakes. They now all use DM's own message block, the one behind `[skill]`: a single `[subagent]` line whose label color names the kind (supervisor question or attention, reply, result, or watchdog) and whose status word uses the theme's status color. A click opens one block and DM's expand key opens them all, showing the text the main agent read. Thanks to [@pwguler](https://github.com/pwguler) for [#2753](https://github.com/nicobailon/pi-subagents/pull/2753).
+- Subagent model displays (Fleet, the async widget, run status, nested renders and result cards) showed only the model id, so two providers or logins serving the same model looked identical. They now show `provider/model`. Thanks to [@IdrisGit](https://github.com/IdrisGit) for [#2734](https://github.com/nicobailon/pi-subagents/pull/2734).
+
+### Fixed
+
+- A session that declined DM project trust still took subagent models, `modelScope` and agent definitions from the project, although DM loads nothing from an untrusted project's `.dm` directory. Such a session now ignores project subagent settings, project agents and chains, and agents from packages installed for the project or declared in its `package.json`. The default scope behaves as `user`, and an explicit `agentScope: "project"` is rejected. Public preflight takes `projectTrusted` to match. Thanks to [@Saturnoon](https://github.com/Saturnoon) for the report. ([#2764](https://github.com/nicobailon/pi-subagents/issues/2764))
+- In a session that declined project trust, a malformed project `.dm/settings.json` still made subagent discovery and launch checks fail with "Failed to parse settings file", and a project's `agentExcludeDirs` could still hide user agents. An untrusted lookup now reads nothing from the project's settings; trusted lookups still report a broken file. ([#2804](https://github.com/nicobailon/pi-subagents/issues/2804))
+- After dm-subagents was upgraded under a running DM session, every child launch could fail at once with "Extension path does not exist" or MODULE_NOT_FOUND, because the paths of the child runtime extensions and the async runner kept the file extension (`.ts` or `.js`) of the copy loaded at startup. They are now found on disk at each launch, preferring `.js`. Thanks to [@barjatiyasaurabh](https://github.com/barjatiyasaurabh) for the fix ([#2761](https://github.com/nicobailon/pi-subagents/pull/2761)) and [@gitwyy](https://github.com/gitwyy) for the report. ([#2780](https://github.com/nicobailon/pi-subagents/issues/2780))
+- A parent could wake for a supervisor decision or a finished workflow, reply with nothing, and leave the delegated work unhandled until you sent another message. The wake message now asks the parent to handle the result within the authority it already has. If it still replies with nothing, it gets one more turn and then a short notice that the work is unhandled, never an automatic approval. A visible reply, including a question to you, does not force another turn. Thanks to [@CamAnNguyen](https://github.com/CamAnNguyen) for [#2716](https://github.com/nicobailon/pi-subagents/pull/2716).
+- When a subagent notice and an intercom message reached an idle parent at the same moment, both extensions started a turn, and the second failed with `Extension "<runtime>" error: Agent is already processing a prompt`. dm-subagents and dm-intercom now share one wake per session, so the second message joins the turn the first one starts. This needs the matching dm-intercom release.
+- A message you typed while a blocking `bg_wait` was open sat in DM's queue until the wait ended, which could take the whole wait window (30 minutes by default). A steer or follow-up from you now ends the wait with a non-error `user_input` result that lists the work still running; the work keeps going. Messages sent by extensions do not end the wait. Thanks to [@nuzayets](https://github.com/nuzayets) for [#2736](https://github.com/nicobailon/pi-subagents/pull/2736).
+- A scheduled run whose async runner died before writing a final status kept its schedule's claim, so every later fire was recorded as `skipped_overlap` and the schedule did nothing until someone deleted its `active.lock`. A fire that overlaps an active run, and a session that restores the schedule, now check whether that run is still alive: when its process is gone, or its status has not changed for 24 hours, the run is recorded as `failed_run` with the reason and the due fire launches. A run whose runner is alive is still skipped. Thanks to [@kmatzen](https://github.com/kmatzen) for the report and the first fix. ([#2806](https://github.com/nicobailon/pi-subagents/issues/2806))
+- Starting DM in the home directory failed with "Project schedule root ... resolves outside the real project" when `~/.dm` was a symlink to a directory outside home, such as a mounted drive. When the project is the home directory, the real user config directory is now accepted as a schedule root; a project `.dm` that links outside its project is still rejected. Thanks to [@mecha](https://github.com/mecha) for the report. ([#2737](https://github.com/nicobailon/pi-subagents/issues/2737))
+- A host still handling a background run's paused result could delete or overwrite the final result written after it under the same run id, or remove that run's session, run and mission indexes. When the final result could not replace the paused file (EPERM/EACCES), it was delivered over and over without completing. Results are now written and consumed under a per-run lock, and a consumer leaves alone any result written after it read the run, along with its indexes. ([#2744](https://github.com/nicobailon/pi-subagents/issues/2744))
+- When a workflow awaited an async child, it could read the child's result before the child had written its index entries, so those entries were written after the workflow cleaned up and stayed behind in the child's run directory. A child now writes all index entries before its result becomes readable. ([#2741](https://github.com/nicobailon/pi-subagents/issues/2741))
+- A foreground child that detached to ask its supervisor kept running after a reload or session switch. Status and resume then said "Async run not found", and its workflow showed as stopped. Reloading dm-subagents now stops each detached foreground child and records it as stopped, so status shows the stop and its cause, resume works from its session, and its pending supervisor question is closed. Thanks to [@Saturnoon](https://github.com/Saturnoon) for the report. ([#2762](https://github.com/nicobailon/pi-subagents/issues/2762))
+- Interrupting a run id that could not be resolved interrupted the newest unrelated running job instead, and a nested async child whose owner had no foreground route to it could not be interrupted at all. An explicit interrupt id now fails when it does not resolve (a bare interrupt still picks the newest run), and an interrupt the owner cannot route now goes to the nested child directly. Thanks to [@leopepe](https://github.com/leopepe) for the fix ([#2760](https://github.com/nicobailon/pi-subagents/pull/2760)).
+- RPC stop refused queued and paused async runs, which the `subagent` tool's own stop action already handles. RPC stop now follows the tool's stop rules, with the same session and process checks. Thanks to [@alexei-led](https://github.com/alexei-led) for the fix (split from [#2717](https://github.com/nicobailon/pi-subagents/pull/2717)).
+- An RPC client that lost the spawn reply for a direct async run could not find the run by its tool-call ID once the result was delivered. Direct runs now keep the tool-call ID for status lookup after delivery, and an ID shared by a live run and a finished run is reported as ambiguous. Thanks to [@alexei-led](https://github.com/alexei-led) for [#2717](https://github.com/nicobailon/pi-subagents/pull/2717).
+- Over DM's RPC mode, the `/subagents` admin screen's "Change model" and "Change thinking level", `/subagents-fleet` and `/subagents-stop` closed with no screen and no message, because RPC mode has no custom UI. These screens now use their component only in the TUI; elsewhere they use a select prompt or text instead. Thanks to [@gelubodrug](https://github.com/gelubodrug) for the report. ([#2766](https://github.com/nicobailon/pi-subagents/issues/2766))
+- A mission created through one path to a project was "not found" by `mission.show`, `mission.list` or a `missionId` launch through another path to the same directory, such as `/tmp/x` and its real path `/private/tmp/x` on macOS. The default mission store is now keyed by the project's real path, so symlinks, junctions and, on case-insensitive filesystems, letter case no longer split it; a configured `directory` or `globalIndexDir` still expands against the path as given. Missions created before this change through a path other than the real one stay on disk but are no longer found through that path. Thanks to [@hughy](https://github.com/hughy) for the report and the fix ([#2785](https://github.com/nicobailon/pi-subagents/pull/2785)). ([#2783](https://github.com/nicobailon/pi-subagents/issues/2783))
+- When TypeBox was installed only in DM's own dependencies, every `structured_output` call failed with "Cannot load typebox/compile for structured output validation" unless `DM_SUBAGENTS_DM_CODING_AGENT_PACKAGE_ROOT` was set. Validation now also looks for TypeBox in the running DM's package. Thanks to [@Saturnoon](https://github.com/Saturnoon) for the report. ([#2765](https://github.com/nicobailon/pi-subagents/issues/2765))
+- Pruned fork context failed with `400 MissingSessionID` when `forkContext.model` was an OpenCode or OpenCode Go model, because the summary request carried no session id. It now sends the parent session id and the `x-opencode-session` header, as the watchdog and prompt-audit requests do. ([#2759](https://github.com/nicobailon/pi-subagents/issues/2759))
+- The `subagent` tool schema marked the `reviewed` value of `acceptance` with `deprecated: true`, which strict tool-schema validators reject with HTTP 400, so the tool failed on those providers. The schema no longer includes `deprecated`. Thanks to [@kingofdies](https://github.com/kingofdies) for the report. ([#2713](https://github.com/nicobailon/pi-subagents/issues/2713))
+- Background children failed within a second with "Request timed out" on networks where connecting to the provider takes longer than 250 ms. The background runner used Node's 250 ms per-address connection limit, while DM uses 2 s; the runner now uses 2 s too. Thanks to [@robinchm](https://github.com/robinchm) for the report and the fix. ([#2758](https://github.com/nicobailon/pi-subagents/issues/2758))
+- A foreground child whose model comes from a provider that a parent extension registered gets the provider but not that extension's session hooks, so a provider that needs those hooks failed the first request with an error only the provider understood. That failure now also says the child ran in the foreground without the extension and names the fixes: `async: true`, or loading the extension for that agent. Thanks to [@tharanee-bit](https://github.com/tharanee-bit) for the report. ([#2730](https://github.com/nicobailon/pi-subagents/issues/2730))
+- Prompt sections that other extensions add in `before_agent_start` reached a child's transcript but not its provider requests, because the child prompt was finished before those extensions ran. The child's prompt now keeps their sections and adds its own boundary after every other extension. Thanks to [@adameq](https://github.com/adameq) for the report. ([#2745](https://github.com/nicobailon/pi-subagents/issues/2745))
+- Every workflow script failed before its first line with "Cannot redefine property: then" (or "Attempting to change value of a readonly property") when the host DM build froze `Promise.prototype` everywhere, including the workflow sandbox. The runner now works with a frozen `Promise.prototype` and still catches children that were never awaited. Thanks to [@albertgwo](https://github.com/albertgwo) for [#2793](https://github.com/nicobailon/pi-subagents/pull/2793).
+- A workflow script failed with "emit.<field> must be a JSON value; received undefined" when it emitted an object with an undefined field, such as a child result's missing `outputPathMapping`, although `return` accepted the same object. `emit` now drops undefined object fields and turns undefined array entries into `null`, as `return` does, and workflow script errors report the script's own line numbers instead of one line later. Thanks to [@vip0351](https://github.com/vip0351) for [#2751](https://github.com/nicobailon/pi-subagents/issues/2751).
+- A workflow stage that resumed an earlier stage without its own `output` reused the earlier stage's report path, so it failed before launch when the earlier stage ran in the background, and overwrote the earlier report otherwise. It now writes to its own default report path. ([#2711](https://github.com/nicobailon/pi-subagents/issues/2711))
+- A background workflow's child rows showed no token usage or turn count, although each child's own status had them and the workflow total was their sum. Each child row now shows the usage and turn count from that child's result. Thanks to [@moxuun](https://github.com/moxuun) for the report. ([#2715](https://github.com/nicobailon/pi-subagents/issues/2715))
+- A long-running foreground child re-formatted every past tool call on each progress update, although progress shows only the latest 64, so each update got slower as the child's history grew. Progress updates now format only those 64 calls. ([#2704](https://github.com/nicobailon/pi-subagents/issues/2704))
+- Fleet reread and re-rendered the selected transcript every 750 ms even when it had not changed, which took hundreds of milliseconds per refresh for a long transcript. It now reuses the rendered transcript until the file, selection, width or tool view changes. ([#2705](https://github.com/nicobailon/pi-subagents/issues/2705))
+- A Herdr-placed DM child's bridge kept every frame it received, so a healthy run failed and started reconnecting after its 1,024th frame. Frames are now released once the session has taken them. ([#2706](https://github.com/nicobailon/pi-subagents/issues/2706))
+- Two inspector opens for the same run or child at once, for example from Fleet and a tool call or from two DM processes, could each open a pane and save a binding, so one pane could no longer be reached by `inspector.status` or `inspector.close`, and a close racing an open could miss the pane the open created. Open and close for the same run or child now wait for each other, across processes too. ([#2727](https://github.com/nicobailon/pi-subagents/issues/2727))
+
+## [0.76.1] - 2026-10-05
+
+### Highlights
+
+- When a subagent result wakes an idle parent, that run keeps the subagent list, MCP servers, and other extensions' prompt sections, and no longer churns the provider's prompt cache.
+- Updating dm-subagents while DM is running now stops `/reload` with a clear "restart DM" error instead of running a mix of old and new code.
+- In Herdr, a child asking its parent agent for help no longer turns the pane red.
+- `stop` works on a paused run whose result was already delivered, and `subagent doctor` now shows the same async capacity that launches use.
+- Reloading extensions while a child's result is waiting no longer lets a host such as dm-web lose that result.
+
+### Changed
+
+- The npm package now has the `extension` keyword, so DM's extension catalog lists dm-subagents under Extensions instead of Unlabelled.
+
+### Fixed
+
+- When a subagent result, supervisor question, or other notice woke an idle parent, the run it started skipped DM's normal prompt setup. From its second request on, it lost the subagent list, the MCP server list, and other extensions' prompt sections, and the changing prompt could invalidate the provider's prompt cache. The parent now gets the notice followed by a short `Subagent updates above.` message, which starts the run the normal way. Thanks to [@ashlineldridge](https://github.com/ashlineldridge) for [#2688](https://github.com/nicobailon/pi-subagents/issues/2688).
+- Reloading extensions while a child's result was waiting in DM's queue made the session look idle, so a host such as dm-web could replace the session and lose the result. The session now stays busy until DM picks up the result. Thanks to [@brettinternet](https://github.com/brettinternet) for [#2687](https://github.com/nicobailon/pi-subagents/pull/2687).
+- After dm-subagents was updated while DM was running, `/reload` ran a mix of old and new code and failed with errors such as `completionNotifier.messageStarted is not a function`. Node cannot reload a module it has already imported, so loading now stops with an error that names both versions and asks you to restart DM. Thanks to [@TheAsda](https://github.com/TheAsda) for [#2695](https://github.com/nicobailon/pi-subagents/issues/2695).
+- Child system prompts started with dm-subagents' own instructions instead of DM's base prompt. Providers and extensions that recognize DM's default prompt by its first sentence then sent `systemPromptMode: append` children DM's whole prompt unchanged. DM's prompt now comes first. ([#2692](https://github.com/nicobailon/pi-subagents/issues/2692))
+- When a per-tool timeout stopped a foreground child, its output said `Subagent timed out after <run timeout>ms.` (or `0ms` when no run timeout was set), naming a deadline that never fired. It now names the tool timeout, for example `Tool 'find' exceeded its timeout of 300000ms.` Thanks to [@mannainsect](https://github.com/mannainsect) for [#2691](https://github.com/nicobailon/pi-subagents/issues/2691).
+- `stop` failed with `paused result is missing` on a paused run whose result had already been delivered or was never written, and a finished parent workflow kept that run's async capacity slot. When the run's process has exited, `stop` now marks it stopped and the slot is freed. Thanks to [@builtroller](https://github.com/builtroller) for reporting [#2699](https://github.com/nicobailon/pi-subagents/issues/2699).
+- `subagent doctor` could report `usage: 0/3 used` while launches were rejected with `3/3 used`, for example in a session resumed with `dm --session <id>`, because doctor counted a different capacity pool than launches do. It now reads the same pool for both active async capacity and the spawn budget. Thanks to [@builtroller](https://github.com/builtroller) for reporting [#2698](https://github.com/nicobailon/pi-subagents/issues/2698).
+- In Herdr, the pane turned red, which means a person needs to act, whenever an async child needed attention, including a child waiting for its parent agent's answer. Those requests go to the parent agent, so dm-subagents no longer marks the pane blocked; the `⚠` in the pane's subagent label still shows it. Thanks to [@nateberkopec](https://github.com/nateberkopec) for reporting [#2702](https://github.com/nicobailon/pi-subagents/issues/2702).
+
+## [0.76.0] - 2026-10-04
+
+### Highlights
+
+- Schedules can run every day or every week at a local time, in a timezone you choose, and on the weekdays you choose.
+- `worktree.cleanup` can now delete the worktrees in a plan you reviewed and saved. Before, it could only list them.
+- Background results are no longer lost in headless sessions (`dm -p`, SDK hosts) or when dm-web replaces a session it thinks is idle.
+- Two DM sessions running at the same time no longer overwrite each other's settings changes, schedules, or schedule history.
+- A child that times out or crashes now returns the text it had written so far. A child with `outputSchema` now saves its structured result to the output file, not a closing sentence.
+
+### Added
+
+- Schedules accept `every: "day"` or `every: "week"` with a local `HH:mm` time and an IANA timezone, plus the weekdays to run on for weekly schedules. If a daylight-saving change skips the time, that run is skipped. If the time happens twice, it runs once. After a restart, the next run is calculated again from the local date. Overlap, catch-up, quiet, and mission options work the same as on other schedules. Thanks to [@quifox](https://github.com/quifox) for [#815](https://github.com/nicobailon/pi-subagents/issues/815).
+
+### Changed
+
+- `worktree.cleanup` can now apply a plan you saved and reviewed, once you authorize discarding those worktrees. Before it deletes anything, it checks Git state and ownership again. It keeps any worktree whose path now points outside the directory it was created in, any worktree that is locked or has been resumed, and any ignored files. It never deletes local branches, and each plan can be applied only once. Worktrees created before this version are always kept. Thanks to [@quifox](https://github.com/quifox) for [#1622](https://github.com/nicobailon/pi-subagents/issues/1622).
+
+### Fixed
+
+- In a headless session (`dm -p`, or an SDK host without a UI), a background run's completion message could be lost. The turn could end before the message was sent, and the host then closed the session. Finished results are now handed to DM before the turn ends, and DM runs the completion turn next. Thanks to [@felores](https://github.com/felores) for [#2644](https://github.com/nicobailon/pi-subagents/issues/2644).
+- dm-web could see a session as idle while a child's result was still on its way to the parent, so it could replace the session and lose the result. The session now counts as busy until DM starts processing the result. Thanks to [@brettinternet](https://github.com/brettinternet) for [#2674](https://github.com/nicobailon/pi-subagents/pull/2674).
+- A child with `outputSchema` and an `output` path wrote its final text to that file whenever the text was not empty. A short closing line such as "Enough; writing up." could replace the structured result. If the child returns a structured result and does not write the file itself, the file now holds that result as indented JSON. The child's returned output and output artifact show the same JSON. Thanks to [@tara-marchand](https://github.com/tara-marchand) for [#2672](https://github.com/nicobailon/pi-subagents/issues/2672).
+- A child that timed out or crashed partway through a reply lost the text it was still writing. The parent now gets that text, labeled `Partial output before timeout:` or `Partial output before child error:`, and the result has `outputPartial: true`. The run still fails. The partial text is never saved as the output file and never counts as acceptance evidence. Runs that are stopped, interrupted, aborted, or exit with an ordinary error are unchanged. Thanks to [@yanqianglu](https://github.com/yanqianglu) for [#2653](https://github.com/nicobailon/pi-subagents/pull/2653) (#2549).
+- An async workflow could keep its `maxActiveAsyncRunsPerSession` slot forever after it ended. This happened when one of its async children failed and there was no record that the child's process had exited, for example after a reload. The new `capacity.abandonedSlotReleaseAfterMs` setting frees the slot once the workflow has been over for longer than that time and each such child has failed, has no running runner, and has been inactive for a while. Set it to `false` to keep the slot. Thanks to [@jihunkim0](https://github.com/jihunkim0) for [#2658](https://github.com/nicobailon/pi-subagents/issues/2658).
+- Two DM sessions that changed extension settings at the same time could lose one of the changes. Agent override saves, `/subagents-load-profile`, and Watchdog setting changes now lock `settings.json.write-lock` beside the settings file while they read and save, so the second session waits for the first. If the settings directory is read-only, the lock cannot be created and the save fails with an error. Thanks to [@quifox](https://github.com/quifox) for [#2676](https://github.com/nicobailon/pi-subagents/pull/2676).
+- Two sessions recording runs for the same schedule could each rewrite its run history from an old copy. A run could disappear from the history and its completion was never recorded, so the schedule stayed marked as running. History updates now use a short lock. Completion, restore, and delete now read the record of the run that is actually active. Thanks to [@quifox](https://github.com/quifox) for [#2677](https://github.com/nicobailon/pi-subagents/pull/2677).
+- A session that lost the race to start a scheduled run could save its outdated copy of the schedule over the copy used by the session running it. That no longer happens. The session that lost still protects the active run from being deleted, and only postpones its own timer while the other session starts the run. Thanks to [@quifox](https://github.com/quifox) for [#2675](https://github.com/nicobailon/pi-subagents/pull/2675).
+- If a session claimed a scheduled run but could not write the run id into the claim, for example because the disk was full, the empty claim file stayed behind. Every later run of that schedule was then skipped. The failed claim is now removed unless another session has already replaced it, and the original error is reported. Thanks to [@quifox](https://github.com/quifox) for [#2678](https://github.com/nicobailon/pi-subagents/pull/2678).
+- On Windows, some file checks lost precision on large file ids, so two different files or folders could look like the same one. A schedule claim that failed to write could then delete another session's lock, and the agent-memory and worktree-cleanup checks could treat two directories as one. File ids are now compared exactly. ([#2679](https://github.com/nicobailon/pi-subagents/pull/2679), [#2685](https://github.com/nicobailon/pi-subagents/issues/2685))
+- An agent that named a built-in MCP server with `_` in place of `-`, such as `mcp:codebase_memory` for the server `codebase-memory`, got none of the server's tools. The launch failed 10 seconds later saying the tools did not register. Both spellings now work, the same way DM's MCP treats `-` and `_` as the same server. Thanks to [@trellis-zz](https://github.com/trellis-zz) for [#2668](https://github.com/nicobailon/pi-subagents/issues/2668).
+- `workflow: true` failed with "found 0" when the model marked its script as plain ```` ```js ```` instead of ```` ```js workflow ````. If a reply has exactly one plain `js` block and no `js workflow` block, that block now runs. When no block is found, the error shows the exact opening line it looked for and suggests passing a script file path instead. Thanks to [@thetechpadawan](https://github.com/thetechpadawan) for [#2659](https://github.com/nicobailon/pi-subagents/issues/2659).
+- `workflow: true` also said "found 0" when the model's reply reached the session with no text at all, which made it look as if the model had left out the script. Some providers drop the reply's visible text before DM saves it. The error now says the reply text never arrived and suggests passing a script file path. ([#2669](https://github.com/nicobailon/pi-subagents/issues/2669))
+- Creating an agent with a description longer than one line, or updating only the prompt of such an agent, saved only the first line of the description. The description is now saved as a YAML block, so every line is kept. Thanks to [@March-7](https://github.com/March-7) for [#2681](https://github.com/nicobailon/pi-subagents/pull/2681).
+- When jobs leave a crowded async widget, it now shrinks to fit the jobs that remain instead of keeping blank rows. While the same jobs are listed, its height still stays fixed. Thanks to [@tara-marchand](https://github.com/tara-marchand) for [#2651](https://github.com/nicobailon/pi-subagents/issues/2651).
+- The main watchdog no longer flags work you asked for mid-run as scope drift. Messages you send while the agent is running (steer or follow-up) now count as part of the task. Its review and `watchdog_diff` now also say that the list of changed paths covers the whole working tree. That list can include edits made before the session or by another session in the same checkout. Thanks to [@tara-marchand](https://github.com/tara-marchand) for [#2652](https://github.com/nicobailon/pi-subagents/issues/2652).
+
+## [0.75.0] - 2026-10-02
+
+### Highlights
+
+- Background subagents work on DM 1.0.0 again. In 0.74.0 they failed to start with "does not provide @duckmind/dm-agent-core/node".
+- The built-in `claude-code` and `claude-code-writer` agents can pick a Claude model and effort level per launch, for example `model: "claude-opus-5.5:high"`.
+- On Windows, `claude-code`, `codex-exec`, and `cursor-agent` can now launch CLIs installed with npm.
+- Children on a virtual model from an extension, such as a model router set as `subagents.defaultModel`, now launch and pass model verification.
+- An invalid config value no longer silently turns off `authorityPolicy`, `permissions`, or `toolBudget`. Loading the config fails instead.
+
+### Added
+
+- The built-in `claude-code` and `claude-code-writer` agents accept a model and thinking level per launch or in agent frontmatter, and pass them to Claude Code as `--model` and `--effort`. Before, the model could only be set in your global Claude Code settings. `model: "claude-opus-5.5:high"` sets both; `model: ":high"` sets only the effort. An unknown model or level fails the launch and names it. `subagents.maxThinking` and an enforced `subagents.modelScope` apply to these launches; with an enforced scope, a launch that sets no model fails, because Claude Code's default model cannot be checked. Other external runners still reject both fields. See [agents](docs/agents.md). Thanks to [@lexxbyte](https://github.com/lexxbyte) for [#2602](https://github.com/nicobailon/pi-subagents/issues/2602).
+- The parent can now manage a long `bash` command inside a native DM child that is granted both `bash` and `subagent_command`: `command.status` shows it, `command.yield` lets the child continue while the command keeps running, and `command.cancel` stops only that command. The child can do the same itself with `bash`'s `yieldTimeMs` and the `subagent_command` tool. Commands use DM's own shell and are stopped when the child exits, and a child that finishes with a command still running fails. Thanks to [@jiuai233](https://github.com/jiuai233) for [#2598](https://github.com/nicobailon/pi-subagents/pull/2598).
+- Hosts that require child extensions with `registerRequiredChildExtensions` can pass `requireForAllRunners: true`. Only local DM children can load those extensions, so with this flag a launch on an external CLI, an external job, or another machine is refused before it starts instead of running without them. The requirement stays with the run, including nested, resumed, and workflow children, even after the host removes its registration. Without the flag, external runners are skipped as before. See [agents](docs/agents.md). Thanks to [@doc-krieger](https://github.com/doc-krieger) for [#2639](https://github.com/nicobailon/pi-subagents/issues/2639).
+- `schedule.create` accepts an existing `missionId`, so a scheduled workflow keeps the same mission state across runs and session restarts. Schedules with a mission are saved in a new format that older dm-subagents versions reject instead of silently dropping the mission; other schedules keep the old format. Thanks to [@quifox](https://github.com/quifox) for [#2616](https://github.com/nicobailon/pi-subagents/pull/2616).
+- `asyncWidgetCollapsed: true` starts the async widget under the editor folded to one line. Clicking its header still unfolds it, and the default is unchanged. Thanks to [@unrelentingfox](https://github.com/unrelentingfox) for [#2621](https://github.com/nicobailon/pi-subagents/pull/2621).
+
+### Changed
+
+- CI now runs the clean-install test against both DM `0.86.1` and `1.0.0`, as separate jobs with separate logs. Thanks to [@EightDoor](https://github.com/EightDoor) for [#2648](https://github.com/nicobailon/pi-subagents/pull/2648).
+
+### Fixed
+
+- Background subagents failed to start on DM 1.0.0 with "does not provide @duckmind/dm-agent-core/node", because DM 1.0.0 no longer ships that module. They now start without it, and still fail if DM includes the module but the file is missing. Thanks to [@albertgwo](https://github.com/albertgwo) for [#2634](https://github.com/nicobailon/pi-subagents/pull/2634).
+- An invalid value for any config key no longer silently drops `authorityPolicy`, `permissions`, or `toolBudget`. If the config file sets any of them, loading now fails instead of continuing with an empty config that would allow what those settings forbid. (#2622)
+- A required child extension (`registerRequiredChildExtensions`) that throws during `session_start` now stops the launch. Before, DM only reported the error, so the child still started and could send model requests without the policy the extension was meant to set up. Ordinary extensions are unchanged: their startup errors are reported and the child still starts. Thanks to [@doc-krieger](https://github.com/doc-krieger) for reporting [#2639](https://github.com/nicobailon/pi-subagents/issues/2639).
+- On Windows, external-CLI agents such as `claude-code`, `codex-exec`, and `cursor-agent` failed with `EINVAL` when the CLI was installed with npm, because npm installs it as a `.cmd` file that Node cannot start without a shell. The runner now runs the CLI's script with Node directly, still without a shell, and refuses any other `.cmd` or `.bat` file. Thanks to [@lexxbyte](https://github.com/lexxbyte) for tracing the cause in [#2631](https://github.com/nicobailon/pi-subagents/issues/2631).
+- A child could not launch on a virtual model that an extension registers with `dm.registerVirtualModel()`, such as a router set as `subagents.defaultModel`. The child looked up its model before the extension's virtual models were registered, so the name matched a model on another provider and the launch failed on that provider's missing API key. Virtual models are now registered first, and a required extension whose registration fails stops the launch. Thanks to [@mauroziux](https://github.com/mauroziux) for [#2636](https://github.com/nicobailon/pi-subagents/pull/2636) (#2635).
+- A child on a virtual model failed with `model_verification_failed` even when it ran correctly, because the check compared the launch model with the real model the router picked. For virtual models, the check now compares the child's selected model with the launch model. Other children are checked as before. Thanks to [@mauroziux](https://github.com/mauroziux) for reporting [#2637](https://github.com/nicobailon/pi-subagents/issues/2637) (#2635).
+- A background chain whose `expand` step runs an external-CLI agent such as `claude-code` failed with "Dynamic chain step N parallel does not support field 'runner'". Each item now runs through that agent's runner, and its output is collected like any parallel child. Thanks to [@lexxbyte](https://github.com/lexxbyte) for reporting [#2629](https://github.com/nicobailon/pi-subagents/issues/2629).
+- Saving builtin agent overrides no longer risks a half-written settings file: if the save is interrupted, the previous settings stay readable. Thanks to [@quifox](https://github.com/quifox) for [#2627](https://github.com/nicobailon/pi-subagents/pull/2627).
+- Codex children now keep tool-call IDs in the `call_id|item_id` form when both parts are at most 64 characters and use only letters, digits, `_`, or `-`. Other IDs are shortened as before. Thanks to [@jtabke](https://github.com/jtabke) for [#2628](https://github.com/nicobailon/pi-subagents/pull/2628) (#2623).
+- With DM's built-in MCP, `mcp:` entries whose server or tool name contains `-`, such as `mcp:srv/get-item`, failed with "selects MCP tools that DM's built-in MCP does not offer". dm-subagents now converts `-` to `_` the same way DM names the tool, so you keep writing names as the server reports them. Thanks to [@sheurich](https://github.com/sheurich) for [#2607](https://github.com/nicobailon/pi-subagents/issues/2607).
+- Some MCP clients, such as dm-claude-bridge, send `workflow: true` as the string `"true"`, which failed with an error asking for `workflow: true`. The string now works the same as the boolean (#2600).
+- `action: "validate"` now checks workflow `args` against the same limits as a launch: 16 fields per object, 64 items per array, depth 8, and 16 KiB total. A script that validates no longer fails at launch because of its `args`. ([#2608](https://github.com/nicobailon/pi-subagents/issues/2608))
+- The parent is now told about every tool call that stays open past the attention threshold, not only the first one in each child. Thanks to [@jiuai233](https://github.com/jiuai233) for [#2598](https://github.com/nicobailon/pi-subagents/pull/2598).
+- Async runs now reach `run-history.jsonl`. Before, only foreground runs were recorded, so per-agent lookups missed every background launch. Single-step runs record the same row as a foreground run, multi-step runs record one row per child step, and a paused run records as `interrupted`, with a later resume recording again. Thanks to [@limin411](https://github.com/limin411) for [#2620](https://github.com/nicobailon/pi-subagents/pull/2620).
+- `/subagent-cost` and the RPC `cost` method now count every round of a resumed foreground workflow child. Before, every round after the first was dropped as a duplicate, so totals came out low with no warning. Results recorded before this fix still undercount. Thanks to [@chagwood](https://github.com/chagwood) for [#2601](https://github.com/nicobailon/pi-subagents/issues/2601).
+- `/subagent-cost` and the RPC `cost` method no longer log a missing-receipt error on every call for foreground workflows. An async workflow that has no receipt yet, such as one still running, is now listed as `Async child usage unavailable` instead of being left out of the total without notice. (#2614)
+- The global mission list now takes title, status, update time, and latest run from each mission's own record, so a mission no longer looks out of date because its index entry is stale. Thanks to [@quifox](https://github.com/quifox) for [#2618](https://github.com/nicobailon/pi-subagents/pull/2618).
+- Headless sessions now deliver goal-mission notices even when finishing background work fails. The failure is still reported to the caller. Thanks to [@quifox](https://github.com/quifox) for [#2605](https://github.com/nicobailon/pi-subagents/pull/2605).
+- One mission with a damaged run status or state no longer stops continuation notices for healthy goal missions. The damaged mission is reported separately. Thanks to [@quifox](https://github.com/quifox) for [#2604](https://github.com/nicobailon/pi-subagents/pull/2604).
+- On Linux, a runner process that exited but was not yet cleaned up by the system no longer leaves its run marked as running, or a workflow waiting for a result that will never arrive. Thanks to [@quifox](https://github.com/quifox) for [#2606](https://github.com/nicobailon/pi-subagents/pull/2606).
+- Saved subagent profiles with an invalid `machine` value are now rejected when loaded or checked, before any settings are written. `machine: false` still clears a pin. Thanks to [@quifox](https://github.com/quifox) for [#2619](https://github.com/nicobailon/pi-subagents/pull/2619).
+
+## [0.74.0] - 2026-09-30
+
+### Highlights
+
+- Workflow scripts are now written as a normal ```` ```js workflow ```` code block in the reply and run with `workflow: true`, with no JSON escaping. This replaces `workflowScript` and `workflowScriptPath`.
+- On models that cannot add a tool mid-conversation, `subagent` is now available from the start, so turning it on no longer reprocesses the whole conversation at full price.
+- The new `disabledFeatures` setting hides parts of the `subagent` tool you do not use, and with `workflow-scripts` turned off you can run children with simple `chain` and `tasks` lists.
+- `/reload` and session resumes no longer kill running background workflows, and relaunching one reuses the children that already finished.
+- Subagent children now respect an untrusted project the same way the main session does.
+
+### Added
+
+- `disabledFeatures` in `config.json` removes feature groups you do not use from the `subagent` tool, such as agent management, watchdog, panes, missions, lane management, and per-call options like `toolBudget` or `machine`. Their parameters disappear from the tool, the tool description stops mentioning them, and calls that still use them fail with an error that names the setting. `scheduledRuns.enabled: false` now removes the schedule parameters the same way, and a malformed `scheduledRuns` value is now a config error. Nothing changes unless you opt in. With everything disabled, the tool declaration shrinks from 18,239 to 10,263 characters. See [configuration](docs/configuration.md#disabledfeatures). Thanks to [@tmustier](https://github.com/tmustier) for [#2542](https://github.com/nicobailon/pi-subagents/pull/2542).
+- `disabledFeatures` also accepts `workflow-scripts`. It removes the `workflow`, `args`, `preflight`, `globalConcurrencyLimit`, and `maxSubagentSpawnsPerRun` parameters and the `validate` action, and the tool description no longer explains how to write scripts. In their place, the tool takes `tasks: [{ agent, task }]` to run children in parallel and `chain: [{ agent, task?, as? } | { parallel: [{ agent, task }] }]` to run steps in order. Chain tasks can use `{task}` (the top-level `task`), `{previous}`, and `{outputs.name}`. If a child fails, the run fails but still returns the results of the children that finished. Scripts that still arrive from RPC, `/prompt-workflow`, saved schedules, or delegated launches fail with an error that names the setting; `/run` still works. This mode saves about 2,000 more characters of tool declaration. Without it, the tool is unchanged. In both modes, extensions can no longer register workflow resources named `chain` or `tasks`. See [configuration](docs/configuration.md#chain-and-tasks-without-workflow-scripts).
+- On DM 0.99 and later without dm-mcp-adapter, `mcp:server` and `mcp:server/tool` entries in an agent's `tools` now select tools from DM's built-in MCP, and the child gets exactly those tools. Servers from `mcp.json` work in foreground and background children; servers that extensions add with `dm.registerMcpServer()` work in background children. With dm-mcp-adapter installed, nothing changes. Thanks to [@fmoda3](https://github.com/fmoda3) for [#2555](https://github.com/nicobailon/pi-subagents/issues/2555).
+- `subagents.modelScope` allow lists accept a `scoped` token, which stands for the parent session's scoped models (DM's `/scoped-models`). Subagent model limits then follow DM's model scoping without a second copy of the list. In an unscoped session, `scoped` means the same as `inherit`. Error messages list at most 8 patterns before summarizing the rest. Thanks to [@coreyryanhanson](https://github.com/coreyryanhanson) for [#2538](https://github.com/nicobailon/pi-subagents/pull/2538).
+- `subagents.agentOverrides.<name>.advertise` lists an agent in the parent's agent catalog from settings, so you no longer have to copy a builtin agent file just to advertise it. Agents registered at runtime still cannot be advertised. Thanks to [@strive-run](https://github.com/strive-run) for [#2534](https://github.com/nicobailon/pi-subagents/pull/2534).
+- Native DM subagents can use DM's built-in `codemode` tool when their tool selection allows it. It is loaded only in the child, so the main session can keep codemode off. Older DM versions without codemode still report it as unavailable when an agent asks for it. Thanks to [@albertgwo](https://github.com/albertgwo) for [#2574](https://github.com/nicobailon/pi-subagents/pull/2574).
+- After you upgrade dm-subagents, your first interactive session shows a short notice with the highlights of each new version and a link to the changelog. It is shown once and never enters the conversation, so it does not affect the model's context or prompt cache. Fresh installs and child sessions show nothing.
+
+### Changed
+
+- **Breaking:** Workflow scripts had to be passed to the `subagent` tool as a JSON string, so every quote and newline was escaped. The tool now takes one `workflow` field with three forms: `workflow: true` runs the single ```` ```js workflow ```` code block written in the same reply; a string containing `/` (such as `"./ci/sweep.js"`) loads a script file relative to `cwd`; any other string runs a named workflow. The `workflowScript` and `workflowScriptPath` parameters were removed, and calls that still pass them fail with an error that shows the new forms. RPC `spawn` takes inline script text as `script` and a path or workflow name as `workflow`. Saved schedules and run records keep working.
+- On models that cannot take a new tool mid-conversation, calling `subagents_enable` made the provider reprocess the whole conversation at the uncached price. New sessions on those models now start with `subagent` already available. Models that can add tools mid-conversation still start with `subagents_enable`. Resumed sessions keep the tools they had, and switching models mid-session does not change them. The new `toolActivation` setting in `config.json` chooses `"auto"` (the default), `"dynamic"` (always start with `subagents_enable`, the old behavior), or `"eager"` (always start with `subagent`, like `--exclude-tools subagents_enable`). See [configuration](docs/configuration.md#toolactivation). Thanks to [@tinoy1336](https://github.com/tinoy1336) for [#2589](https://github.com/nicobailon/pi-subagents/issues/2589).
+- After `subagents_enable`, the model was sometimes told to wait for the next prompt even when `subagent` was already usable. It is now told to check its tool list: use `subagent` if it is there, otherwise wait for the next prompt instead of retrying.
+- CI now runs the tool-activation smoke test as a required check. Thanks to [@quifox](https://github.com/quifox) for [#2528](https://github.com/nicobailon/pi-subagents/pull/2528).
+
+### Fixed
+
+- Subagent children now follow the parent session's project trust. Before, a child in an untrusted project still loaded that project's settings, system prompt files, skills and, for background children, its extensions. Fixes [#2569](https://github.com/nicobailon/pi-subagents/issues/2569).
+- `/reload`, a session resume, or a dm-web project switch stopped running background workflows and their children, and relaunching the script ran every child again, including ones that had already finished. Background children now keep running, the workflow's notice says to relaunch it, and relaunching the same script with the same args reuses finished children and waits for running ones. Failed children run again. The stop is recorded as `workflow.stopCause: "runtime-replaced"`. Fixes [#2546](https://github.com/nicobailon/pi-subagents/issues/2546).
+- Stopping a background workflow by a short id, its tool-call id, its run directory, or from the Fleet view did nothing, so the workflow and its children kept running. These stops now work, and the workflow ends as stopped. Fixes [#2571](https://github.com/nicobailon/pi-subagents/issues/2571).
+- Reviving a failed background workflow child with `subagent({ action: "resume", id })` did not show up in the workflow: its status, receipt and keyed `latest: true` resume still pointed at the failed run. Workflow `status` now shows `Revived → <run>: <state>` under the failed key, keyed resume continues from the revived run, and a workflow that finishes afterwards records the revival in its receipt and completion notice. The workflow's return value is unchanged. Thanks to [@l3gz](https://github.com/l3gz) for reporting [#2579](https://github.com/nicobailon/pi-subagents/issues/2579).
+- When a workflow script failed and stopped a sibling that was still running, the sibling got a "Workflow child failed" notice whose error began with a "Run fan-out: N/M used, K remaining" line. The notice now says the child was stopped and gives only the reason. Fixes [#2562](https://github.com/nicobailon/pi-subagents/issues/2562) and [#2567](https://github.com/nicobailon/pi-subagents/issues/2567).
+- After dm-subagents was updated on disk while DM was running, for example by `git pull` in a local checkout or a package update, the first `subagent` call could fail with an error such as `(0 , _publicExecution.isWorkflowScriptPath) is not a function`, because it mixed new and old code. dm-subagents now loads all of its code shortly after a session starts, without slowing startup. After an update, run `/reload` or restart DM to use the new version.
+- With DM 0.99's `codemode` turned on, codemode scripts could call `subagent`, `subagents_enable`, `subagent_supervisor`, `contact_supervisor` and `structured_output`, none of which work from a script: a `subagent` run there had no progress card and was cancelled unless awaited, `contact_supervisor` blocked the script, and `structured_output` had no effect. Codemode also added the whole `subagent` schema to its own description, about 2,200 extra tokens per request. The model can still call these tools directly, but scripts can no longer call them. Older DM versions are unaffected.
+- With the `subagent` tool registered, every request to llama.cpp (`llama-server --jinja`) failed with a 400 error because one parameter's pattern was not anchored at both ends, which llama.cpp requires. The pattern is now anchored and accepts the same values. Thanks to [@tychart](https://github.com/tychart) for reporting [#2581](https://github.com/nicobailon/pi-subagents/issues/2581).
+- With dm-mcp-adapter 3.x on DM 0.99 or later, `mcp:` entries in an agent's `tools` looked up DM's built-in MCP instead of the adapter, so choosing an adapter server failed the launch. The adapter now takes priority whenever it is loaded. Fixes [#2575](https://github.com/nicobailon/pi-subagents/issues/2575).
+- After upgrading dm-mcp-adapter to 3.1.0, `mcp:` tool selections for stdio servers stopped resolving, because the adapter started including `inheritEnv` and `literalEnv` in its config hash. dm-subagents now computes the same hash. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for [#2539](https://github.com/nicobailon/pi-subagents/pull/2539).
+- When the async widget did not have room for its full view, its compact card showed one line per run and filled the rest with blank rows, hiding a workflow's lanes. The card now shows the lanes in that space and is only as tall as its content. Thanks to [@l3gz](https://github.com/l3gz) for reporting [#2578](https://github.com/nicobailon/pi-subagents/issues/2578).
+- The async widget and the Fleet view counted running agents differently: with a 4-lane workflow and one other run, the widget said `2 agents running` and the Fleet view said `5 active agents`. The widget now counts each running workflow lane and each agent of a parallel run, like the Fleet view. Thanks to [@l3gz](https://github.com/l3gz) for reporting [#2578](https://github.com/nicobailon/pi-subagents/issues/2578).
+- Herdr's subagent count no longer counts a workflow's coordinator as a child, and it updates as soon as a foreground workflow child starts or finishes instead of up to 45 seconds later. Thanks to [@xadips](https://github.com/xadips) for [#2556](https://github.com/nicobailon/pi-subagents/pull/2556).
+- Dynamic tool activation now works when DM runs inside another app, such as dm-web. Those hosts no longer print "Could not locate the running DM installation" and no longer fall back to keeping `subagent` always loaded. Thanks to [@q107580018](https://github.com/q107580018) for [#2526](https://github.com/nicobailon/pi-subagents/issues/2526).
+- Answering a background subagent's supervisor request no longer triggers a stale "needs attention" notice afterwards. The notice now waits 60 seconds and is sent only if the request is still unanswered and the run is still active. Status views still show the request right away.
+- `inheritSkills: false` now also removes skills that extensions add to a child session (for example through `subagents.defaultExtensions`), so they no longer appear next to the agent's own skills. Thanks to [@zeezooz](https://github.com/zeezooz) for [#2540](https://github.com/nicobailon/pi-subagents/issues/2540).
+- A child that was aborted by compaction now recovers when DM reports the compaction late. Thanks to [@jiuai233](https://github.com/jiuai233) for [#2537](https://github.com/nicobailon/pi-subagents/pull/2537).
+- Old background runs that belong to a finished or deleted mission are now cleaned up like other old runs instead of being kept forever. Fixes [#2535](https://github.com/nicobailon/pi-subagents/issues/2535). Thanks to [@LCorleone](https://github.com/LCorleone) for [#2536](https://github.com/nicobailon/pi-subagents/pull/2536).
+- On Windows, the DM interface froze for about 0.45 seconds once per process while background run cleanup waited on a PowerShell query. The query no longer blocks the interface. Thanks to [@localhedge](https://github.com/localhedge) for reporting [#2559](https://github.com/nicobailon/pi-subagents/issues/2559).
+- On Windows, an idle session no longer checks for supervisor requests every 250 ms for its whole lifetime. Checking stops when no subagent work is pending and starts again when new work begins, as it already did on macOS. Thanks to [@localhedge](https://github.com/localhedge) for reporting [#2558](https://github.com/nicobailon/pi-subagents/issues/2558).
+- Starting, reloading, resuming, or forking a session no longer pauses DM while the watchdog records the current Git commit (about 50 ms per session start on Windows, even with the watchdog off). The check now runs in the background. Thanks to [@localhedge](https://github.com/localhedge) for reporting [#2560](https://github.com/nicobailon/pi-subagents/issues/2560).
+- Worktree diffs now work with older Git versions that lack the `--default-prefix` option. Thanks to [@quifox](https://github.com/quifox) for [#2527](https://github.com/nicobailon/pi-subagents/pull/2527).
+- Updated `undici` from 8.10.0 to 8.10.2, outside the range of [GHSA-3wwx-pv8p-q78v](https://github.com/advisories/GHSA-3wwx-pv8p-q78v), so projects that install dm-subagents no longer fail `npm audit` because of it. dm-subagents does not use the affected WebSocket client. Thanks to [@advaitpaliwal](https://github.com/advaitpaliwal) for [#2548](https://github.com/nicobailon/pi-subagents/pull/2548).
+- A package-discovery test no longer fails when the system temp directory is inside a DM project. Thanks to [@abdwhb-png](https://github.com/abdwhb-png) for [#2553](https://github.com/nicobailon/pi-subagents/pull/2553).
+
+## [0.73.1] - 2026-09-27
+
+### Highlights
+
+- Turning on `subagent` mid-session no longer throws away the prompt cache, so the next message no longer resends the whole conversation.
+
+### Fixed
+
+- Turning on `subagent` no longer throws away the prompt cache. The catalog of advertised agents is now sent as its own `advertised_subagents` prompt section, which DM adds at the end of the conversation. Before, dm-subagents rewrote the whole system prompt, so the first message after `subagents_enable` resent the entire conversation to the cache. Fixes [#2518](https://github.com/nicobailon/pi-subagents/issues/2518). Thanks to [@javapacr](https://github.com/javapacr) for [#2519](https://github.com/nicobailon/pi-subagents/pull/2519).
+- Stopping a background run while it was shutting down could report "Stop requested" even though the runner never read the stop, so an interrupted run finished as paused instead of stopped. The stop now fails with a message to retry once the runner has exited, and that retry stops a paused run.
+
+## [0.73.0] - 2026-09-27
+
+### Highlights
+
+- Failed workflows now say what kind of failure happened, such as a bad script, a failed child, or a timeout, so callers can react without parsing error text.
+- Huge workflow results no longer flood the parent's context. Output is capped, every cut is marked, and the full text is saved to a file.
+- A typo in a workflow's agent name now stops the workflow before any child starts, and `validate` suggests the name you probably meant.
+- Running subagent spinners now use the same thinking-level colors as DM's prompt box.
+- `mcp:` tool selections work with dm-mcp-adapter 3.0's `mcp-adapter.json` files.
+
+### Changed
+
+- Failed workflows now include a `failureKind` in foreground details and async status: `validation`, `script`, `child`, `return-serialization`, `timeout`, `detached-child`, or `runtime`. Callers no longer need to parse the error text to tell these apart. Fixes [#2506](https://github.com/nicobailon/pi-subagents/issues/2506).
+- A running subagent's spinner now uses DM's prompt-box thinking color. A spinner for one child uses that child's thinking level, or the main session's level when the child has none. A spinner for several children, such as a widget header, a parallel or chain card, or a workflow phase, uses the main session's level. `thinking` labels still show the configured level. Thanks to [@pwguler](https://github.com/pwguler) for [#2512](https://github.com/nicobailon/pi-subagents/pull/2512).
+
+### Fixed
+
+- `mcp:` direct-tool selections now read dm-mcp-adapter 3.0's `mcp-adapter.json` files (the global one and a project's `.dm/mcp-adapter.json`), so a migrated setup no longer fails to launch children with `Unresolved MCP direct-tool selectors`. DM's own `mcp.json` files are no longer read, because they belong to DM's built-in MCP support. If your adapter servers are still listed there, move them to `mcp-adapter.json`. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for [#2511](https://github.com/nicobailon/pi-subagents/pull/2511).
+- Large workflow results no longer flood the parent's context. A foreground workflow caps its Return, Emitted, and Console sections and its failure error at 200 KB or 5000 lines (or your `maxOutput`), shortens each call-trace error to 500 characters, marks each cut, and saves the full text to a file. Async completion notices and `action: "status"` now end cut text in `…` and point to the run's `status.json`. Before, they cut the return value without saying so and showed the full error however long it was. Fixes [#2505](https://github.com/nicobailon/pi-subagents/issues/2505).
+- A workflow script with a misspelled agent name now fails before any child starts, instead of running the earlier children first. `action: "validate"` reports the same error with its line, column, and the closest agent name when there is one (for example `Did you mean 'reviewer'?`). Names built at runtime, and children with their own `cwd`, `agentScope`, or `resume`, are still checked when they launch. Fixes [#2504](https://github.com/nicobailon/pi-subagents/issues/2504).
+- On providers that fix the tool list for a whole prompt, such as bridges to another agent SDK, `subagent` only appears after the next user prompt. The `subagents_enable` result now says so, which stops the model from retrying `subagent` in the same prompt, and it names `--exclude-tools subagents_enable` for keeping `subagent` always available. Fixes [#2513](https://github.com/nicobailon/pi-subagents/issues/2513).
+- A `timeoutMs` or `maxRuntimeMs` above 2,147,483,647 ms (about 24.8 days), the longest delay Node.js timers support, is now rejected before launch, and `action: "resume"` checks its `timeoutMs` the same way. Node shortened such a timer to about 1 ms, so the run timed out almost immediately. Thanks to [@quifox](https://github.com/quifox) for [#2517](https://github.com/nicobailon/pi-subagents/pull/2517).
+
+## [0.72.1] - 2026-09-26
+
+### Fixed
+
+- dm-subagents is published with npm provenance again, so pnpm's `trustPolicy: no-downgrade` accepts it. Releases now go out only through the GitHub `Release` workflow after maintainer approval. The code is the same as 0.72.0, which was published without provenance. Thanks to [@williameckert1](https://github.com/williameckert1) for [#2453](https://github.com/nicobailon/pi-subagents/issues/2453).
+
+## [0.72.0] - 2026-09-26
+
+### Highlights
+
+- DM starts faster with dm-subagents installed: startup no longer waits on global agent discovery, and the executor and Fleet load the first time you use them.
+- The package no longer bundles its own copy of TypeBox, so installs are smaller and DM stops warning about the manifest.
+- Models from complete provider extensions now work everywhere dm-subagents calls a model, including the watchdog, permission checks, and Prompt Audit.
+- Other extensions can plug their own inspectors into Fleet.
+- Async runs are more dependable: child sessions can start and resume their own external jobs, `/subagent-cost` counts every async launch, and live runs are no longer marked failed when containers share a temp directory.
+
+### Added
+
+- Extensions can register their own inspector providers with the `dm-subagents/inspectors` helper or the `dm-subagents:inspector-register:v1` event. Fleet uses them for inspector actions, while the built-in inspectors and runner controls keep working as before. Thanks to [@ninjapenguin](https://github.com/ninjapenguin) for [#2482](https://github.com/nicobailon/pi-subagents/pull/2482).
+
+### Changed
+
+- DM starts faster with dm-subagents enabled. The foreground executor and the Fleet view now load on first use, which cuts the extension's own startup modules from 264 to 199. Tools, commands, and prompts are registered exactly as before. Thanks to [@h4yfans](https://github.com/h4yfans) for the measurements in [#2480](https://github.com/nicobailon/pi-subagents/issues/2480).
+- TypeBox is now provided by DM instead of bundled with the package. DM no longer warns about the manifest, and the extension, its children, and background runners all use DM's copy. Thanks to [@felipemm](https://github.com/felipemm) for [#2454](https://github.com/nicobailon/pi-subagents/issues/2454) and [#2455](https://github.com/nicobailon/pi-subagents/pull/2455).
+
+### Fixed
+
+- The watchdog, permission checks, and Prompt Audit now reach models from complete provider extensions (`dm.registerProvider(provider)`). They used an older lookup that only knew config-style providers, so these calls failed even though ordinary children could use the same model. Thanks to [@chem](https://github.com/chem) for [#2496](https://github.com/nicobailon/pi-subagents/issues/2496).
+- Model names such as `openrouter/auto-beta` now resolve when the provider's own model id already starts with the provider name. They used to fail with `Unknown subagent model`. Thanks to [@schmlblk](https://github.com/schmlblk) for [#2487](https://github.com/nicobailon/pi-subagents/issues/2487).
+- `fast: true` accepts any `openai-codex/*` model instead of only two named models, so newer Codex models no longer fail before launch. Other providers are still rejected. Thanks to [@jtabke](https://github.com/jtabke) for [#2452](https://github.com/nicobailon/pi-subagents/issues/2452).
+- Async status shows a child's real context limit once its session starts, including a limit raised by an extension. Thanks to [@johnhenaot](https://github.com/johnhenaot) for [#2448](https://github.com/nicobailon/pi-subagents/pull/2448).
+- Session startup no longer freezes while dm-subagents looks for globally installed agents. The first agent prompt and `subagents_enable` still wait until discovery finishes. Thanks to [@trading-bl](https://github.com/trading-bl) for [#2474](https://github.com/nicobailon/pi-subagents/issues/2474).
+- `subagents_enable` ignores extra arguments instead of rejecting the call. DeepSeek V4.1 Flash sends `subagents_enable({ action: "enable" })`, which used to fail every time. Thanks to [@crusaderky](https://github.com/crusaderky) for [#2483](https://github.com/nicobailon/pi-subagents/issues/2483).
+- An older `dm-ai` installed next to the package no longer turns off on-demand tool loading, so `subagent` stays hidden behind `subagents_enable` until it is needed. Thanks to [@abdwhb-png](https://github.com/abdwhb-png) for [#2471](https://github.com/nicobailon/pi-subagents/pull/2471).
+- `/council` works when DM runs with `--no-skills`. It now loads its instructions through `subagent({ action: "guide", topic: "council" })`. Thanks to [@felipemm](https://github.com/felipemm) for [#2467](https://github.com/nicobailon/pi-subagents/issues/2467).
+- External-job runs that a child session launches now start instead of staying queued. Thanks to [@juanpprieto](https://github.com/juanpprieto) for [#2449](https://github.com/nicobailon/pi-subagents/issues/2449).
+- A child session can follow up its own external-job runs with `resume`, and a repeated resume no longer sends the follow-up twice. Thanks to [@juanpprieto](https://github.com/juanpprieto) for [#2465](https://github.com/nicobailon/pi-subagents/issues/2465).
+- A background run that is still working is no longer reported failed when DM processes in different containers share one `DM_SUBAGENTS_TEMP_ROOT`. DM could not see the runner's process from another container and treated it as gone. Such runs now fall back to the usual 24-hour stale check. Thanks to [@zeezooz](https://github.com/zeezooz) for [#2494](https://github.com/nicobailon/pi-subagents/issues/2494) and [#2495](https://github.com/nicobailon/pi-subagents/issues/2495).
+- `/subagent-cost` includes async single, chain, and parallel launches, which it used to report as having no child usage. Thanks to [@zeezooz](https://github.com/zeezooz) for [#2484](https://github.com/nicobailon/pi-subagents/issues/2484).
+- Awaited workflow children send the `subagent:async-complete` event without an extra child notification. Thanks to [@mmarabel](https://github.com/mmarabel) for [#2456](https://github.com/nicobailon/pi-subagents/issues/2456).
+- Worktree labels stay within 256 bytes when shortened in the middle of a multi-byte character, so async status stays readable. Thanks to [@chenhaoxiang](https://github.com/chenhaoxiang) for [#2446](https://github.com/nicobailon/pi-subagents/pull/2446).
+- A launch blocked by the session's capability ceiling now fails before any fork work starts. It used to branch the parent session or prepare the fork summary first. Thanks to [@antonioc-cl](https://github.com/antonioc-cl) for [#2481](https://github.com/nicobailon/pi-subagents/pull/2481).
+- The `subagent` schema and guides describe preflight, timeout aliases, budget limits, and child extension bindings accurately, and an empty `usageBudget` is now rejected. Thanks to [@amchen2310](https://github.com/amchen2310) for [#2473](https://github.com/nicobailon/pi-subagents/issues/2473).
+- The async workflow widget no longer flickers while the inline Fleet roster is open. Thanks to [@gustavo-neiva](https://github.com/gustavo-neiva) for [#2468](https://github.com/nicobailon/pi-subagents/pull/2468).
+- `subagent_supervisor` `pending` shows each request's question, so you can answer a request after missing its notice ([#2460](https://github.com/nicobailon/pi-subagents/issues/2460)).
+
+## [0.71.0] - 2026-09-23
+
+### Highlights
+
+- Other extensions can read subagent spend and follow async workflow progress as data, without scraping terminal output.
+- Workflow status can now confirm that every child process has actually exited.
+- Child sessions keep readable names such as `worker: fix auth refresh` in `/resume` and Herdr.
+- The full `subagent` tool loads only when a request needs it, which keeps unrelated prompts smaller.
+- Background runners, reviewers, and Bun, pnpm, and symlinked installs are more reliable.
+
+### Added
+
+- In-process RPC `cost` method. It returns the same parent-plus-child spend that `/subagent-cost` shows, as versioned data (`{ version: 1, parent, children, childTotal, total, unresolvedAsyncChildren }`). `ping.capabilities.cost` advertises `{ version: 1 }`. `/subagent-cost` output is unchanged. Thanks to [@raymondtri](https://github.com/raymondtri) for [#2378](https://github.com/nicobailon/pi-subagents/pull/2378).
+- Async `workflowScript` runs and the children they launch now emit public lifecycle events, so companion UIs can follow them without scraping terminal output. Thanks to [@navidemad](https://github.com/navidemad) for [#2382](https://github.com/nicobailon/pi-subagents/pull/2382).
+- Status for an async workflow now includes `details.workflowTerminalProof`. It reports `observed`, with each child's exit evidence, only after the workflow has stopped launching children and every async child has exited or failed to start. Otherwise it reports `pending` or `unknown` with a reason, including when the saved child list is missing. A finished workflow frees its capacity slot using the same check, so the two always agree. Thanks to [@alexei-led](https://github.com/alexei-led) for [#2436](https://github.com/nicobailon/pi-subagents/issues/2436) and [#2442](https://github.com/nicobailon/pi-subagents/pull/2442).
+
+### Changed
+
+- Packaged `worker` agents now start with fresh context instead of forking the parent's conversation. You can still request fork context per call or set it globally. Thanks to [@eduardopicolo-cb](https://github.com/eduardopicolo-cb) for [#2384](https://github.com/nicobailon/pi-subagents/issues/2384).
+- The full `subagent` tool stays hidden until a request activates it through the small `subagents_enable` loader, which keeps unrelated prompt context smaller. Direct commands, RPC, the TUI, and nested children work as before. Thanks to [@Knimoms](https://github.com/Knimoms) for [#2380](https://github.com/nicobailon/pi-subagents/pull/2380).
+- Child sessions keep a readable name (for example `worker: fix auth refresh`) in session lists, `/resume`, and Herdr while the intercom bridge is active. Nested children now reach their supervisor through the child's intercom ID instead of its session name. This needs a dm-intercom version that supports the `intercom:session-identity` claim; with an older dm-intercom, children keep the previous naming so routing still works. Thanks to [@Q-xuan](https://github.com/Q-xuan) for raising the problem in [#2432](https://github.com/nicobailon/pi-subagents/pull/2432).
+- The optional `@duckmind/dm-ai` peer dependency now requires 0.86.1 or later, matching the oldest supported DM host. Thanks to [@samuela](https://github.com/samuela) for [#2373](https://github.com/nicobailon/pi-subagents/issues/2373).
+- When a child's `structured_output` call is rejected, the result now includes a short summary of the validation errors. The missing-structured-output error is used only when the child never called the tool. Thanks to [@rtbe](https://github.com/rtbe) for [#2407](https://github.com/nicobailon/pi-subagents/issues/2407).
+
+### Fixed
+
+- `subagent` is available again after switching from an inactive session branch to one where it was activated.
+- Background runners and external CLI agents no longer inherit Git's repository variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, and the rest of `git rev-parse --local-env-vars`). When DM was started from a Git hook or with `git --git-dir`, these made a child's Git commands act on the parent's repository instead of the child's working directory. Other variables such as `GIT_AUTHOR_*` still pass through, and an external agent's explicit environment allowlist is unchanged. Thanks to [@alexei-led](https://github.com/alexei-led) for [#2437](https://github.com/nicobailon/pi-subagents/issues/2437) and [#2440](https://github.com/nicobailon/pi-subagents/pull/2440).
+- Retained background runs no longer time out while the packaged runner is still starting. Thanks to [@muermaru](https://github.com/muermaru) for [#2403](https://github.com/nicobailon/pi-subagents/issues/2403), and to [@qsgy-edge](https://github.com/qsgy-edge) for the independent diagnosis and timing evidence in [#2415](https://github.com/nicobailon/pi-subagents/pull/2415).
+- When a background runner exits without writing a result, the failure notice now includes its exit code and signal. Thanks to [@grahama1970](https://github.com/grahama1970) for [#2423](https://github.com/nicobailon/pi-subagents/issues/2423).
+- A child that produced valid structured output keeps it as evidence when a later provider error or abort fails the run. Thanks to [@grahama1970](https://github.com/grahama1970) for [#2411](https://github.com/nicobailon/pi-subagents/issues/2411).
+- Completion notifications are no longer sent twice when the extension is registered more than once for the same session. Thanks to [@hongchu098](https://github.com/hongchu098) for [#2389](https://github.com/nicobailon/pi-subagents/issues/2389).
+- The bundled reviewer works in directories without Git: `watchdog_diff` reports that no baseline is available instead of failing the review. Thanks to [@matthewmathistrellys](https://github.com/matthewmathistrellys) for [#2422](https://github.com/nicobailon/pi-subagents/issues/2422).
+- The bundled reviewer's `watchdog_diff` counts as read-only, so a reviewer given a single output path returns its full report for the runtime to save, as introduced in [#426](https://github.com/nicobailon/pi-subagents/issues/426), with thanks to Alexander Gerdes ([@Avg8888](https://github.com/Avg8888)). Thanks to [@riskywhat](https://github.com/riskywhat) for [#2405](https://github.com/nicobailon/pi-subagents/issues/2405).
+- Watchdog reviews and permission checks work again on the DM 0.86.1 package layout. Thanks to [@zieglar](https://github.com/zieglar) for the reproduction and version comparison in [#2377](https://github.com/nicobailon/pi-subagents/issues/2377).
+- A workflow child with no `agent` now fails with an error that names it (`Workflow child 'r1' has no agent…`) instead of the generic "Provide exactly one mode" message. Thanks to [@matthewmathistrellys](https://github.com/matthewmathistrellys) for raising the confusing error in [#2422](https://github.com/nicobailon/pi-subagents/issues/2422).
+- `/prompt-workflow` finds prompt files that are symlinks (as installed by dotfile managers such as GNU Stow or homeshick) and skips broken links instead of failing. Thanks to [@nietaki](https://github.com/nietaki) for [#2430](https://github.com/nicobailon/pi-subagents/issues/2430).
+- Completed retained agents can resume even when their own list of allowed child agents excludes them. Parent authority and that restriction both still apply; older retained children without the needed recovery data fail closed. Thanks to [@riskywhat](https://github.com/riskywhat) for [#2379](https://github.com/nicobailon/pi-subagents/issues/2379), building on the allowlist work in [#2338](https://github.com/nicobailon/pi-subagents/pull/2338) credited to [@shkrabov](https://github.com/shkrabov).
+- Guidance now says the list of retained workflow children is not complete: when you know a run's exact id, check its status and try resuming it before falling back to a labeled agent with the same role. Thanks to [@riskywhat](https://github.com/riskywhat) for [#2406](https://github.com/nicobailon/pi-subagents/issues/2406).
+- Skills marked `disable-model-invocation: true` are no longer shown to child agents, even when requested by name, and are no longer suggested to the model. Thanks to [@toRolex](https://github.com/toRolex) for [#2400](https://github.com/nicobailon/pi-subagents/pull/2400).
+- DM hosts compiled with Bun are found from DM's package directory or its bundled `share/dm-coding-agent` layout, while unrelated extension dependencies still cannot turn on dynamic tools. Thanks to [@fmoda3](https://github.com/fmoda3) for [#2417](https://github.com/nicobailon/pi-subagents/issues/2417).
+- pnpm installs follow npm-hosted peer aliases through their symlinks to the real package, so the package is not loaded twice. Thanks to [@henriquebastos](https://github.com/henriquebastos) for [#2409](https://github.com/nicobailon/pi-subagents/pull/2409).
+- npm and git installs detect dynamic tool support from the running DM installation and keep the compact `subagents_enable` loader instead of an always-loaded `subagent` tool. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for [#2398](https://github.com/nicobailon/pi-subagents/pull/2398).
+- MCP direct tool names now match what dm-mcp-adapter registers, including servers whose tool names already start with the server name, the adapter's `mcp` prefix mode, and per-server `toolPrefix`. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for [#2395](https://github.com/nicobailon/pi-subagents/pull/2395).
+- Logs from running and failed external CLI agents can be viewed in Fleet, tool status, and the TUI. Thanks to [@Shujakuinkuraudo](https://github.com/Shujakuinkuraudo) for [#2375](https://github.com/nicobailon/pi-subagents/issues/2375).
+- Structured delegation updates report cumulative usage and no longer count missing provider cache numbers as zero. Thanks to [@bioShaun](https://github.com/bioShaun) for [#2374](https://github.com/nicobailon/pi-subagents/pull/2374).
+- Forked sessions keep DM 0.87 context edits, including replaced content and signed Anthropic thinking blocks.
+## [0.70.1] - 2026-09-20
+
+### Highlights
+
+- Delegated tasks no longer fail solely because they finish without editing files.
+- Runtime-added agents now honor configured model, provider, and thinking preferences.
+- Foreground children launch reliably when DM is installed outside the extension's own dependency tree.
+- DM 0.86.1 support improves watchdog checks, provider-backed summaries, packaging, and standalone use.
+
+### Changed
+
+- Stop guessing whether task wording requires file edits. Successful tasks now follow their process result and explicitly configured output and acceptance checks. The `completionGuard` setting and `DM_SUBAGENTS_LLM_INTENT_ARBITER` switch have been removed. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for the reproduction that led to this change in [#2351](https://github.com/nicobailon/pi-subagents/issues/2351).
+- Clarify that a custom agent file fully replaces a bundled agent with the same name. Custom implementation agents must declare `acceptanceRole: writer` to receive writer acceptance defaults.
+- Update delegation guidance so large changes are split only when they contain independently testable parts.
+
+### Fixed
+
+- Apply `subagents.defaultModel`, `defaultProvider`, `defaultThinking`, and model-tier overrides to runtime-registered agents. Thanks to [@bioShaun](https://github.com/bioShaun) for [#2368](https://github.com/nicobailon/pi-subagents/pull/2368).
+- Show each workflow child's resolved model and thinking level in parent status output. Thanks to [@grahama1970](https://github.com/grahama1970) for [#2364](https://github.com/nicobailon/pi-subagents/pull/2364).
+- Preserve watchdog working-directory context and authenticated provider behavior for pruned-fork overflow summaries on DM 0.86.1. Thanks to [@chem](https://github.com/chem) for [#2362](https://github.com/nicobailon/pi-subagents/issues/2362).
+- Launch the packaged inspector bootstrap from its compiled JavaScript instead of an absent TypeScript source. Thanks to [@pablog12](https://github.com/pablog12) for [#2360](https://github.com/nicobailon/pi-subagents/issues/2360).
+- Resolve the host `dm-coding-agent` package and its exports from the DM installation that owns the session, so foreground children work across npm-hosted layouts without loading a second SDK instance. Thanks to [@nazerim](https://github.com/nazerim) for [#2348](https://github.com/nicobailon/pi-subagents/issues/2348).
+- Show an actionable expand shortcut when a host cannot provide its configured keybinding label.
+- Stop test-only background runners when their owning test process exits, and isolate test temporary data to reduce filesystem and Spotlight load.
+
+## [0.70.0] - 2026-09-19
+
+### Highlights
+
+- Control which extensions children load and which agents descendants may launch without widening their permissions.
+- Background workflows remain visible and recoverable through detaches, interruptions, restarts, and supervisor handoffs.
+- Invalid workflows, unsafe worktree launches, and blocked tool budgets now fail earlier with clearer results.
+- Linked worktrees, Windows supervisor polling, source-layout runners, and Orca progress tabs are more reliable.
+
+### Added
+
+- Add `subagents.defaultSubagentOnlyExtensions` for loading shared child-only extensions without disabling ambient extension discovery. Thanks to [@Shujakuinkuraudo](https://github.com/Shujakuinkuraudo) for #2284.
+- Allow agent frontmatter and `subagents.agentOverrides.<name>.allowedAgents` to restrict which canonical agents a child may launch without granting delegation or widening capability ceilings. Thanks to [@shkrabov](https://github.com/shkrabov) for #2312.
+
+### Changed
+
+- Document `/subagent-cost` as the combined accounting view for parent and asynchronous child usage. Thanks to [@swarajban](https://github.com/swarajban) for #2313.
+
+### Fixed
+
+- Wake root `bg_wait` calls when an owned nested child is waiting on `contact_supervisor`. Thanks to [@geril07](https://github.com/geril07) for #2344.
+- Keep explicitly detached workflow children visible, preserve their result lookup after the coordinator exits, and avoid treating launch receipts as completed results. Thanks to [@shaharmor](https://github.com/shaharmor) for #2299.
+- Settle interrupted, stopped, or timed-out background runs even when child session creation hangs. Thanks to [@onorua](https://github.com/onorua) for #2320.
+- Prevent concurrent workflow observers from overwriting retained-session startup confirmation and stranding resumed children. Thanks to [@luigiplr](https://github.com/luigiplr) for #2292.
+- Let children use the tools declared by their own agent configuration instead of incorrectly narrowing them to the parent's `--tools` selection. Thanks to [@carlesba](https://github.com/carlesba) for #2289.
+- Report foreground hard tool-budget blocks as `tool_budget_exhausted`, including calls blocked before execution starts. Thanks to [@kylerberry](https://github.com/kylerberry) for #2302.
+- Keep permission forwarding scoped to the validated launch parent instead of sharing an identity between independent root sessions. Thanks to [@kasumikira](https://github.com/kasumikira) for #2321.
+- Reject malformed inline and file-backed workflow scripts before creating asynchronous run state or launching children. Thanks to [@rtbe](https://github.com/rtbe) for #2309.
+- Reject direct asynchronous managed-worktree launches from a dirty source before creating run state or returning a receipt. Thanks to [@rtbe](https://github.com/rtbe) for #2311.
+- Avoid rejecting keyed property access after a mutable `runs.all(...)` result binding is reassigned.
+- Report useful rooted field paths for failed structured-output `if`/`then`/`else` schemas while preserving root `$defs`. Thanks to [@peedrr](https://github.com/peedrr) for #2317.
+- Give the bundled reviewer a bounded, read-only view of staged, unstaged, and untracked working-tree changes from its launch `HEAD`. Thanks to [@nateberkopec](https://github.com/nateberkopec) for #2306.
+- Show the correct child transcript when inspecting an indexed asynchronous workflow step. Thanks to [@swarajban](https://github.com/swarajban) for #2304.
+- Reconcile foreground and background child usage from terminal session messages when live usage events are missing or incomplete. Thanks to [@riique](https://github.com/riique) for #2295 and #2296.
+- Keep project-scoped agent memory stable across linked Git worktrees. Thanks to [@freezscholte](https://github.com/freezscholte) for #2293.
+- Keep Fleet workflow coverage stable during heartbeat, counter, and token updates without resetting an unchanged layout. Thanks to [@swarajban](https://github.com/swarajban) for #2305.
+- Continue supervisor polling on Windows when a temporary channel directory disappears during a scan. Thanks to [@asher-aqi](https://github.com/asher-aqi) for #2303.
+- Keep source-layout asynchronous runners on native Node TypeScript when child extensions are configured, with consistent peer-module resolution. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2314.
+- Make Orca progress tabs work under `fish`. Thanks to [@yourfriendaaron](https://github.com/yourfriendaaron) for #2294.
+- Prevent publishing the TypeScript source checkout directly to npm; only the compiled package is publishable. Thanks to [@niko-operal](https://github.com/niko-operal) for #2300.
+
+## [0.69.0] - 2026-09-18
+
+### Highlights
+- Gates can now return a JSON verdict. Point `gate` at a script that prints JSON, and its output becomes the child's structured output, so workflows can branch on a post-run check without the parent reading the child's report.
+- Ghostty detection no longer misfires inside terminals like cmux that embed Ghostty, so you stop seeing AppleScript `-1728`/`-2741` errors or the wrong window being targeted.
+- Hosts without `npm` start up quietly instead of printing `npm: command not found`.
+
+### Added
+
+- Typed gates: `gate` accepts `{ command, output: "json", schema?, timeoutMs? }` alongside the plain string form. When the command passes, its JSON stdout becomes the child's `structuredOutput` (validated against `schema` when given). Empty, truncated, or invalid output fails the gate rather than silently dropping the verdict. Typed gates always run (they are never cached), and a run cannot combine one with an `outputSchema`. See `docs/` for using command-runner agents as typed workflow steps and `examples/typed-gate` for a runnable example.
+
+### Fixed
+
+- The Ghostty inspector only activates when the macOS host bundle id identifies the standalone Ghostty app. Terminals that embed Ghostty (such as cmux) set `TERM_PROGRAM=ghostty` too, which previously targeted an unrelated Ghostty window or emitted `-1728`/`-2741` AppleScript errors; those hosts now fall back to the `inspector.command` hint. Thanks to [@wangpi26](https://github.com/wangpi26) for #2281.
+- Hosts without `npm` no longer print `/bin/sh: npm: command not found` during startup; global package-root discovery is optional and now stays silent when the package manager is missing. Thanks to [@PhrZer](https://github.com/PhrZer) for #2287.
+- Fixed `docs/tool-reference.md`, which claimed a default `maxOutput` cap of 200 KB / 5,000 lines. The cap applies only when `maxOutput` is set.
+
+## [0.68.0] - 2026-09-15
+
+### Highlights
+- Run DM, Claude Code, Codex, and Cursor subagents on saved remote machines through Herdr.
+- Reuse workflow scripts with different JSON inputs, including scheduled runs.
+- Start npm-installed children much faster and let slow local models use DM's configured HTTP timeout.
+- Keep local foreground children on the same extension-provided models as their parent without sharing provider state between sessions.
+- Ask async agents to checkpoint before a hard deadline, giving long-running work a chance to return useful progress instead of being killed.
+
+### Added
+
+- Accept bounded JSON `args` for inline, file-backed, validated, and scheduled workflow scripts. Scripts receive immutable arguments, and schedules retain them for later runs (#2233).
+- Left-click the async widget header in mouse-enabled DM fullscreen mode to fold it into a live status summary and unfold it again, independently of global tool expansion. Progress updates preserve the fold state; run execution and notifications are unchanged. Thanks to [@pstanton237](https://github.com/pstanton237) for #2235.
+- Allow agents to declare an inline JSON Schema `outputSchema` default, with launch objects overriding it and explicit `false` opting out. Thanks to [@peedrr](https://github.com/peedrr) for #2180.
+- Add `DM_SUBAGENT_CACHE_RETENTION` to set a prompt-cache retention tier for child sessions only, so a parent on the 1h tier can keep children on the cheaper-to-write 5m tier they are too short-lived to benefit from. Unset by default, leaving children on the parent's retention. Spawned children take it through the launch environment; in-process children pin it per request on their own session rather than on shared process state. Thanks to [@johnwards](https://github.com/johnwards) for #2190.
+- Add a session-scoped host API for extensions that every native child must load. Required extensions survive agent overrides and nested launches, and child startup fails clearly when one is denied or cannot load. Thanks to [@gkoreli](https://github.com/gkoreli) for #2153.
+- Run DM, Claude Code, Codex, and Cursor subagents on another computer by setting `machine` to a saved Herdr machine.
+- Add `checkpointBeforeDeadlineMs` for async single-agent runs. It asks the child to checkpoint and stop before the hard `timeoutMs` deadline; without it, timeout behavior is unchanged. Thanks to [@freezscholte](https://github.com/freezscholte) for #2141.
+- Add `subagents.agentExcludeDirs` to exclude directory trees from agent discovery, including nested plugin sources and symlink aliases. Thanks to [@xarillian](https://github.com/xarillian) for #2131.
+
+### Changed
+
+- Add `inspectorOpen` and `projectOpen` to `authorityPolicy`. Inspector opening remains automatic by default, while project opening now asks for confirmation because it starts Herdr and opens another DM session. Set `"projectOpen": "auto"` to restore unprompted project opening. The Fleet TUI is unchanged. Thanks to [@kevthedawg](https://github.com/kevthedawg) for #2269.
+- Ship compiled JavaScript in the npm package so DM no longer transpiles the extension and detached runner when they load. On the reported cold-start path, the extension entry loaded in about 226 ms instead of 2,831 ms. Thanks to [@821869798](https://github.com/821869798) for #2248.
+
+### Removed
+
+- Remove `fallbackModels`, all same-launch model switching (including read-only HTTP 429 continuation), and persistent model exclusions. Retry another model only with a later explicit launch; guarded retained-session compaction recovery may continue once on the already resolved model.
+- Drop the bundled `@earendil-works/dm-server` copy that filled in the dependency DM 0.85.0 forgot to ship. Background children on a DM 0.85.0 host now fail to launch with a clear error; upgrade to DM 0.85.1 or newer, which ships the package itself. Foreground children on 0.85.0 are unaffected.
+
+### Fixed
+
+- Fail managed worktree setup before child launch when a required shared `node_modules` link cannot be created and verified, while preserving absent sources and preexisting destinations (#2283).
+- Allow checked writers to explicitly preserve a host-bound staged index while still rejecting child-created index changes (#2280).
+
+- Preserve the main watchdog's user scope across session compaction while clearing temporary activity state. Thanks to [@nimeetshah0](https://github.com/nimeetshah0) for #2263.
+- Resolve provider-extension models in local, in-process foreground children. Such a child never loads the parent's ambient extensions, so its model runtime only knew DM's built-in providers and every model from an extension-registered provider failed with `Model "…" not found`; the child now inherits the providers registered in the parent session before resolving its model. Pane-native remote foreground children continue to use the remote machine's provider discovery and configuration. Builtin agents on such a model no longer need `async: true`. Thanks to [@lallenlowe](https://github.com/lallenlowe) for #2274.
+- Preserve a readable async result when result indexing or archiving fails, then retry saving it without delivering it twice. Thanks to [@shaharmor](https://github.com/shaharmor) for #2267 and #2266.
+- Honor `DM_SUBAGENTS_DM_CODING_AGENT_PACKAGE_ROOT` for background children, fixing launches from wrapper installs and other non-standard DM layouts. Thanks to [@Yaphet2015](https://github.com/Yaphet2015) for #2254.
+- Keep a foreground child's report available when acceptance rejects saved output instead of replacing it with only a file reference. Thanks to [@pgoodjohn](https://github.com/pgoodjohn) for #2255.
+- Add the ambient-extension rule to DM's model-not-found error when a child's model comes from an extension-registered provider that was not loaded for it: a foreground child now reports that agents needing a provider extension's models must run as background children (`async: true`) or load the extension explicitly through `subagentOnlyExtensions`/`extensions`, and a background child launched without the ambient extensions gets the matching remedies. When `capabilityCeiling.denyExtensions` blocks every extension, both hosts report the policy instead of remedies the ceiling discards. The core error, exit code, and failure detection are unchanged. Thanks to [@pwguler](https://github.com/pwguler) for #2240.
+- Remote Herdr bridge discovery no longer blocks the parent session while waiting for the remote DM to start.
+- Recognize Windows Bun virtual entrypoints when launching standalone background children, retaining the existing Linux and npm paths. Windows coverage remains experimental; see `docs/standalone-background.md`. Thanks to [@JohnsonRan](https://github.com/JohnsonRan) for #2241.
+- Keep supervisor progress updates out of parent model turns while still waking for decisions and structured questions. Thanks to [@moofone](https://github.com/moofone) for #2229 and [@dajiaohuang](https://github.com/dajiaohuang) for #2230.
+- Keep routine successful child updates out of parent model turns, and wake the parent when saving an async workflow result fails. Thanks to [@moofone](https://github.com/moofone) for #2262.
+- Start background cleanup, wait reconciliation, and retention timers with the session and clear them during shutdown. Thanks to [@freezscholte](https://github.com/freezscholte) for #2244.
+- Apply DM's `httpIdleTimeoutMs` setting to the detached async runner's HTTP dispatcher on both the Node and standalone binary host launch paths (project `.dm/settings.json` over `~/.dm/agent/settings.json`, `0` disables; an invalid value warns and falls back to 300s). The runner previously kept undici's 300s header/body defaults, so async children against a slow local model were cut at about five minutes while foreground children waited as configured. Thanks to [@JordiPosthumus](https://github.com/JordiPosthumus) for the incident analysis in #2199.
+- Restore direct parent ownership as the default. The bundled skill delegates only when the operator asks; complexity alone no longer starts child workflows. Thanks to [@AlexDochioiu](https://github.com/AlexDochioiu) for #2216.
+- Stop external runs from leaving Windows worktrees locked by Git fsmonitor processes after cancellation (#2207 recurrence).
+- Include each agent's acceptance policy and role in `capabilities: true` results. Thanks to [@Alice39s](https://github.com/Alice39s) for #2210.
+- Recover when a parent workflow's previous checkout directory was removed before another child starts. Thanks to [@trewwwsec](https://github.com/trewwwsec) for #2211.
+- Keep resumed-run startup non-blocking and fail clearly when the runner exits before it is ready. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2219.
+- Prefer exact agent names over packaged short-name matches, and never treat home-level agent directories as project configuration. This prevents names such as `scout` and `code-analysis.scout` from becoming ambiguous. Thanks to [@ton77v](https://github.com/ton77v) for #2214.
+- Avoid Jiti for native async runner startup on supported Node versions. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2220.
+- Stop registering and advertising a default global `Ctrl+Alt+F` Fleet shortcut; `/subagents-fleet` and FleetView remain available. Thanks to [@miaomiaozii](https://github.com/miaomiaozii) for #2196.
+- Require low, medium, or high importance on watchdog findings. Low and medium stay visible to the user without entering model context; high findings still reach the model (#2201).
+- Let headless parents and nested coordinators answer blocking child questions without deadlocking shutdown. Thanks to [@ProDrifterDK](https://github.com/ProDrifterDK) for #2185.
+- Keep nested stop, interrupt, and timeout propagation inside the issuing run's descendant subtree while preserving root-wide controls. Thanks to [@freezscholte](https://github.com/freezscholte) for #2243.
+- Keep read-only reviews free of implementation acceptance requirements when their topic mentions releases, migrations, or security. Explicit acceptance and write tasks are unchanged. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #2191.
+- Include async result, output, and structured-output paths in completion notices. Thanks to [@peedrr](https://github.com/peedrr) for #2181.
+- Remove one-shot workflow result files and their indexes after successful consumption. Thanks to [@peedrr](https://github.com/peedrr) for #2182.
+- Show runtime-registered agents in `/subagents` while keeping their extension-owned definitions read-only and rejecting collisions with disabled configured agents. Thanks to [@mystery4f](https://github.com/mystery4f) for #2169.
+- Save readable JSON to configured background output files when a successful child returns structured output without final prose. Thanks to [@rtbe](https://github.com/rtbe) for #2163.
+- Surface the provider error text of a failed watchdog review in `/subagents-watchdog status` `Last error` (bounded to 600 chars). Previously only `stop reason 'error'` was recorded, so a watchdog failing every review (rate limit, rejected model, auth) was indistinguishable from a clean one. Thanks to [@freezscholte](https://github.com/freezscholte) for #2166.
+- Finalize paused async runs after the runner has actually stopped, while keeping them resumable until then. Thanks to [@neruok](https://github.com/neruok) for #2170.
+- Keep explicitly stopped aggregate children non-resumable while allowing completed siblings to resume. Thanks to [@freezscholte](https://github.com/freezscholte) for #2242.
+- Group workflow children under their status rows without duplicate entries and show reliable completion times. Thanks to [@niko-operal](https://github.com/niko-operal) for #2168.
+- Refresh external-run activity from stdout, stderr, and Git changes without repeatedly polling Git. Thanks to [@DeLuke84](https://github.com/DeLuke84) for #2167.
+- Remove expired partial and rejected jobs from the widget while preserving live nested children. Thanks to [@ashlineldridge](https://github.com/ashlineldridge) for #2159.
+- Reject unsupported bare acceptance strings at the provider schema boundary while preserving shorthand levels and JSON-encoded acceptance objects. Thanks to [@vrolok](https://github.com/vrolok) for #2152.
+- Let DM finish automatic compaction without an extra extension resume while preserving manual continuation for active async work. Thanks to [@mxp7064](https://github.com/mxp7064) for #2144.
+- Preserve wrapped DM core tools and explicitly requested non-core tools in child launches. Core slots still respect host availability; non-core tools are validated in the child's runtime after ceilings and exclusions (#2132, #2133, #2134, #2135, #2140). Thanks to [@carlesba](https://github.com/carlesba) for #2137 and [@clementprevot](https://github.com/clementprevot) for #2138.
+
+## [0.67.0] - 2026-09-10
+
+### Highlights
+- Launch previews now match what actually runs, including Intercom and prompt and tool customization.
+- Parallel workflows are easier to write and follow, with natural promise composition and per-child completion updates.
+- Child-facing tool instructions use less context, leaving more of the token budget available for the task itself.
+- Steering, follow-ups, resumed work, and detached processes finish more reliably.
+- FleetView and workflow status are clearer, with better grouping, timing, usage, and colors.
+
+### Added
+- Add optional watchdog fallback models for the main session, children, and individual agents. Fallback happens only for provider failures before tool use and within the existing review timeout. Thanks to [@dwizzle204](https://github.com/dwizzle204) for #2075.
+- Add portable Inspect commands and a terminal-neutral integration point, including open-only Ghostty 1.3+ right splits on macOS. Thanks to [@tiratatp](https://github.com/tiratatp) for #2046.
+- Add `quiet: true` for recurring schedules. Successful automatic runs stay visible without waking the parent; failures, stops, and pauses still wake it. One-shot and manually started schedules remain noisy unless explicitly made quiet. Thanks to [@pablontiv](https://github.com/pablontiv) for #2055.
+- Add optional watchdog questions that flag possible task drift before a main-session change finishes (#2010).
+- Add the built-in `evidence-auditor` for checking whether important research claims are supported by their sources. Thanks to [@Muskos](https://github.com/Muskos) for #2023.
+- Notify the parent as each asynchronous workflow child finishes instead of waiting for every sibling. Notifications include the workflow, child, outcome, and result location (#2027).
+- Add per-launch `intercomBridge` overrides to delegation and preflight, plus `orchestratorTarget` for custom bridge templates that name the parent. Invalid overrides now fail clearly (#2127). Thanks to [@Yivas](https://github.com/Yivas) for the instrumented reproduction.
+
+### Changed
+- Make the default Intercom bridge prompt independent of the parent session while preserving `{orchestratorTarget}` in custom templates. Launch contracts are now version 3 and launch-binding projections version 2, so launch-contract digests change in this release; existing saved runs still resume (#2127). Thanks to [@Yivas](https://github.com/Yivas) for the instrumented reproduction.
+- Include removed child tools and their active restrictions in launch warnings without changing launch behavior. Follow-up for #2058.
+- Shorten the default child-facing instructions while keeping the full typed API and detailed guides. Thanks to [@Whamp](https://github.com/Whamp) for the prompt-footprint measurements and proposal in #2048.
+- Give FleetView agents stable identity colors. Thanks to [@savinofiore](https://github.com/savinofiore) for #2056.
+- Preserve a forked child's requested thinking level after incompatible signed Anthropic thinking blocks are removed. This requires DM 0.85.0 or newer. Thanks to [@hank-warren](https://github.com/hank-warren) for #2021.
+- Scope parallel-review findings to the requested target, while diff reviews continue to report only issues caused or exposed by the diff. Thanks to [@jmclaughlin724](https://github.com/jmclaughlin724) for #2042.
+- Simplify watchdog clarification to one visible question followed by native continuation, removing reply tracking and mandatory follow-up reviews.
+- Show task-based labels for workflow launches, reviews, and continued child work.
+
+### Fixed
+- Accept `runs.run(...)` promises in `runs.all(...)`, including the natural `items.map(...)` form, instead of reporting an invalid key. A one-time warning explains when config objects are still required for batch validation, grouping, and `collectFailure`. Thanks to [@karandhillon1995](https://github.com/karandhillon1995) for #2128.
+- Make Intercom-aware preflight produce the same launch digest as foreground and background execution, while keeping the parsed agent definition independent of runtime bridge changes (#2127 and #2112). Thanks to [@Yivas](https://github.com/Yivas) for the instrumented reproduction.
+- Apply project refinements during preflight so its launch digest matches the completed run. Thanks to [@Yivas](https://github.com/Yivas) for #2112.
+- Report steering and follow-up requests as delivered only after the child consumes them, and report unconsumed requests accurately when the child finishes (#2116 and #2121). Thanks to [@yanqianglu](https://github.com/yanqianglu) for #2057.
+- Keep native children alive during final shutdown when queued steering or follow-up work is still pending (#2117). Thanks to [@yanqianglu](https://github.com/yanqianglu) for #2057.
+- Prevent stale shutdown timers from aborting resumed foreground or background work. Thanks to [@harche](https://github.com/harche) for #2025.
+- Wait for remembered detached descendants before their parent finishes, without aborting children that already produced a result. Thanks to [@shaharmor](https://github.com/shaharmor) for #2051.
+- Keep paused background runs from failing on checks that apply only at completion. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #2022.
+- Report process-tree cleanup as complete only after detached descendants have actually stopped. Thanks to [@rtbe](https://github.com/rtbe) for #2053.
+- Let approved child coordinators answer supervisor questions from their own children while preserving immediate-parent ownership and tool restrictions. Thanks to [@shaharmor](https://github.com/shaharmor) for #2087.
+- Allow read-only reviewers to quote phrases such as “must fix before” without being mistaken for implementation requests. Thanks to [@freezscholte](https://github.com/freezscholte) for #2079.
+- Preserve explicitly read-only requests after tool restrictions are applied, while still rejecting implementation work without write tools. Thanks to [@stekman08](https://github.com/stekman08) for #2060.
+- Stop review and scout launches before startup when requested repository tools are unavailable. Explicitly empty or restricted tool sets remain valid. Follow-up for #2058.
+- Keep workflow child tools aligned with the selected agent when extensions wrap DM built-ins, and place automatic extension-repository worktrees outside extension discovery (#2059).
+- Validate worktree repositories and cleanliness before starting parallel workflow children. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #2076.
+- Reject workflows whose known child count exceeds `maxSubagentSpawnsPerRun` before starting any child; dynamic counts remain limited at runtime. Thanks to [@ton77v](https://github.com/ton77v) for #2101.
+- Show workflow usage on child rows instead of displaying overlapping or misleading wrapper totals. Thanks to [@expoli](https://github.com/expoli) for #2085.
+- Keep live workflow timers advancing, nest loaded children correctly, collapse only fully represented duplicate groups, and freeze completed durations accurately. Thanks to [@expoli](https://github.com/expoli) for #2085.
+- Preserve the parent's theme in foreground children, initialize themes in detached children, and refresh command-result rendering. Thanks to [@kubahasek](https://github.com/kubahasek) for #2089.
+- Parse complete Orca creation output so observer handles, tab IDs, and titles are stored correctly. Thanks to [@G0-0000](https://github.com/G0-0000) for #2063.
+- Keep the configured watchdog model and thinking level when recommending models. Thanks to [@freezscholte](https://github.com/freezscholte) for #2078.
+- Recognize OpenRouter's status-prefixed 401 response as eligible for configured fallback before tool use. Thanks to [@freezscholte](https://github.com/freezscholte) for #2077.
+- Keep internal OpenCode helper requests in the same provider session as normal DM traffic. Thanks to [@IdrisGit](https://github.com/IdrisGit) for #2041.
+- Run the child prompt filter before extensions inspect the final prompt, preserving intentional global-context and parent-only skill exclusions. Thanks to [@leftytennis](https://github.com/leftytennis) for #2043.
+- Intersect agent tool declarations with tools available from the host, so restricted hosts reject unavailable tools before starting a child. Thanks to [@BioInfo](https://github.com/BioInfo) for #2034.
+- Allow `fast` to round-trip through background recovery and follow-up. Thanks to [@isty2e](https://github.com/isty2e) for #2045.
+- Use the detected npm DM package root in detached runners instead of an inherited host path. Thanks to [@alvarosevilla95](https://github.com/alvarosevilla95) for #2050.
+- Restore background SDK sessions for the official DM 0.85.1 Linux standalone while retaining DM 0.85.0 support. Thanks to [@xz-dev](https://github.com/xz-dev) for #2049.
+- Resolve DM TUI aliases correctly in unusual package layouts. Thanks to [@kroediger](https://github.com/kroediger) for #2020.
+- Avoid requiring newer chord aliases on DM versions before 0.85 while keeping required runtime aliases strict. Thanks to [@samuela](https://github.com/samuela) for #2026.
+- Use `git wt` for Worktrunk on Windows to avoid the Windows Terminal `wt.exe` conflict. Thanks to [@Zethu5](https://github.com/Zethu5) for #2033.
+- Prevent manually started schedules from firing again at their next natural time. Thanks to [@brandonmwest](https://github.com/brandonmwest) for #2052.
+- Allow terminal schedules owned by an earlier session to be deleted when their exact run is known to have finished (#2125).
+- Show exact child IDs and usable steering guidance in workflow status when a workflow no longer has a foreground route (#2011).
+- Ignore action-like words inside filenames and paths when deciding whether a task requests implementation. Thanks to [@SiebertLanhove](https://github.com/SiebertLanhove) for #2039.
+- Bound transcript previews by line and total size while preserving recent context and artifact links. Thanks to [@rtbe](https://github.com/rtbe) for #2015.
+- Refresh the local model registry before opening model and thinking selectors, and warn when refresh fails. Thanks to [@ianbmacdonald](https://github.com/ianbmacdonald) for #2008.
+- Preserve string, string-array, and undefined system-prompt shapes in `before_agent_start`. Thanks to [@luqman-v1](https://github.com/luqman-v1) for #2107.
+
+## [0.66.0] - 2026-09-06
+
+### Highlights
+- Background results and completion notifications arrive more reliably, including after storage problems.
+- Steering and supervisor replies reach the right run, with clearer guidance when a reply is needed first.
+- Read-only tasks can continue after a rate limit on a compatible fallback model without starting over.
+- Live progress, transcripts, and stable status displays make ongoing work easier to follow.
+- Custom agents can opt into discovery, and trusted extensions can provide named workflows.
+
+### Added
+- Let agents appear in the parent prompt with `advertise: true`. Thanks to [@nwalke](https://github.com/nwalke) for #1972.
+- Allow one read-only continuation after an HTTP 429 rate limit on a compatible fallback model from the same configured provider. Keep the session without replaying the task, within existing recovery, time, and budget limits (#1936). Thanks to [@peedrr](https://github.com/peedrr).
+- Add targeted source checks and clearer evidence, confidence, and uncertainty reporting to researcher responses (#1932). Thanks to [@Muskos](https://github.com/Muskos).
+- Let trusted extensions register session-scoped named workflows with validated arguments and permission to run specific host commands (#1907).
+- Add opt-in completion notification diagnostics with `NODE_DEBUG=dm-subagents-notify` (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the report and diagnostic sessions.
+
+### Changed
+- Explain model-verification failures and how to configure exact `modelResponseAliases` (#1922). Thanks to [@sixtus](https://github.com/sixtus).
+- Clarify when startup fallback and read-only rate-limit continuation are supported (#1936). Thanks to [@peedrr](https://github.com/peedrr).
+- Document steering delivery modes and `scheduledRuns.storeRoot` (#1933). Thanks to [@G0-0000](https://github.com/G0-0000).
+- Remove generation suffixes from developer-facing types and helpers without changing request shapes, saved formats, or behavior (#1913).
+
+### Fixed
+- Deliver background results and completion notices reliably after early failures, delayed publication, or storage-capacity recovery. Save results before reporting successful completion, without adding idle polling (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Keep completion requirements intact when child sessions compact their context (#1996). Thanks to [@Zsbyqx20](https://github.com/Zsbyqx20).
+- Correct supervisor action names and reply and steering guidance. Thanks to [@rtbe](https://github.com/rtbe) for #2002.
+- Require an explicit answer to a pending supervisor question before steering or following up on a single background run; include the request ID in the response (#1980). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Detect supervisor questions when background or scheduled workflows start, including after earlier work finishes, while keeping macOS idle polling disabled (#1977). Thanks to [@brandonmwest](https://github.com/brandonmwest) and [@youlikemodernart](https://github.com/youlikemodernart) for #1220 and #1228.
+- Queue steering for workflows owned by another runtime without incorrectly claiming delivery or taking over the run (#1978). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Find supervisor questions without a UI, keep notification failures from interrupting discovery, and require explicit answers (#1975, #1982). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Deliver background workflow steering to the intended child and report requests that cannot be delivered before shutdown (#1976, #1983). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the diagnosis, reproduction, implementation, and tests.
+- Leave the prompt runtime inactive when it is not configured. Thanks to [@lertian](https://github.com/lertian) for #1973.
+- Return `invalid_state` instead of queuing stop requests that cannot reach a live workflow (#1965).
+- Retain unreadable stop requests for retry, reject invalid workflow arguments even when validation returns an empty error message, and preserve worktree timeout details.
+- Show live tool activity, timing, model, effort, and counters for foreground workflow children without forwarding full transcripts (#1964).
+- Allow `action: "status", view: "transcript"` to inspect live foreground child output on demand (#1963).
+- Keep the background status widget in place during progress updates (#1931). Thanks to [@DraconDev](https://github.com/DraconDev).
+- Recognize `REQUEST_LIMIT_EXCEEDED` rate limits and avoid excluding healthy models because of invalid requests or context overflow (#1955, #1957). Thanks to [@slyons-vamp](https://github.com/slyons-vamp).
+- Wait for resumed workflow results to be saved before reporting them missing on Windows (#1906).
+- Send foreground workflow progress to RPC, headless, and cross-repository hosts even when the live chat card is off (#1951). Thanks to [@yanqianglu](https://github.com/yanqianglu).
+- Resolve undici from the official npm registry for npm 12 compatibility (#1935). Thanks to [@chem](https://github.com/chem).
+- Fix background launches on stable DM 0.85.1 without experimental packages, while retaining DM 0.85.0 support (#1944). Thanks to [@geril07](https://github.com/geril07).
+- Include the saved workflow receipt path in wait results, notifications, and status and debug responses (#1938).
+- Show structured output in completion notices when text is blank or contains only a closing think-tag (#1945). Thanks to [@npfedwards](https://github.com/npfedwards).
+- Validate workflow `baseRef` values before execution and clarify supported refs (#1934, #1937). Thanks to [@jeanduplessis](https://github.com/jeanduplessis).
+- Make boolean tool options compatible with restricted Gemini schema converters without changing which values are accepted (#1950). Thanks to [@Biaogo94](https://github.com/Biaogo94).
+- Keep Fleet runs in start-time order instead of reshuffling them as activity changes (#1923, #1924). Thanks to [@expoli](https://github.com/expoli).
+- Preserve links to previous runs when continuing a workflow by its string ID (#1920).
+- Clear recovered errors after successful tool use or structured output (#1919). Thanks to [@Jonathanm10](https://github.com/Jonathanm10).
+- Report empty final responses as empty-output failures instead of blaming earlier tool errors (#1921).
+- Avoid missing-edit failures for successful read-only background tasks misclassified as implementation work (#1911). Thanks to [@yanqianglu](https://github.com/yanqianglu).
+- Batch background streaming updates while showing child activity changes immediately (#1901).
+- Honor new output paths on workflow follow-ups without overwriting the original report (#1903).
+- Keep worktree setup responsive and cancellable, and preserve uncertain allocations for manual inspection (#1902).
+
+## [0.65.1] - 2026-09-04
+
+### Highlights
+- Background sessions stay alive until their work and result delivery finish.
+- Background runs work on DM 0.85.0 without missing-package errors.
+- Custom-provider models and proxy connections work more reliably in background runs.
+- Parallel children keep separate session logs, even with a shared log directory.
+- Worktree cleanup preserves changes until a complete, usable patch has been saved.
+
+### Changed
+- Clarify that switching execution modes after a failed run requires your approval (#1879).
+
+### Fixed
+- Accept configured model aliases returned by gateways without changing the requested model. Thanks to [@drudko-ias](https://github.com/drudko-ias) for #1897.
+- Hide the empty, unlimited async capacity summary in Fleet. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1892.
+- Fix missing-server import errors in DM 0.85.0 background runs, including runs that load extensions.
+- Remove repeated metadata and reply instructions from supervisor request cards. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1893.
+- Stop foreground runs before contacting a provider when required tools are missing. Respect workflow async defaults and show each failure once. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1891.
+- Keep dm-web parent sessions alive while subagent work or completion delivery remains active. Thanks to [@vcing](https://github.com/vcing) for #1857.
+- Avoid unnecessary startup delays and preserve active locks when process IDs are reused. Thanks to [@ducaoya](https://github.com/ducaoya) for #1878.
+- Make extension-provided models available before starting child sessions, including on DM versions without native provider queues. Thanks to [@kevinkirkup](https://github.com/kevinkirkup) for #1885.
+- Handle long or unusual workflow IDs without creating invalid file paths. Thanks to [@jstillwa](https://github.com/jstillwa) for #1875.
+- Avoid startup import errors when optional DM packages are not installed beside the extension. Thanks to [@VladimirGVP](https://github.com/VladimirGVP) for #1860.
+- Use custom provider streams for task classification only when they match the selected model's API. Thanks to [@pwguler](https://github.com/pwguler) for #1874.
+- Give concurrent children separate session files under an explicit `sessionDir`. Thanks to [@dat9uy](https://github.com/dat9uy) for #1859 and #1858.
+- Honor proxy environment variables in detached background runs. Thanks to [@jasonrale](https://github.com/jasonrale) for #1867 and #1866.
+- Allow previously unavailable models to run once they reappear in the model registry. Thanks to [@x1prog](https://github.com/x1prog) for #1862.
+- Resolve DM package imports correctly in detached runs, including subpath imports. Thanks to [@plopezlpz](https://github.com/plopezlpz) for #1871 and [@pwguler](https://github.com/pwguler) for #1880.
+- Initialize the theme before child extensions access `ctx.ui.theme`. Thanks to [@danielmarbach](https://github.com/danielmarbach) for #1865.
+- Save complete worktree patches, including binary changes, regardless of Git display settings. Validate them before removing worktrees. Thanks to [@jeanduplessis](https://github.com/jeanduplessis) for #1868.
+- Accept `acceptance: false` alongside `gate`, treating it as omitted.
+
+## [0.65.0] - 2026-09-04
+
+### Highlights
+- Subagents now run through native DM sessions instead of spawning separate `dm` processes, making delegation simpler and less fragile.
+- Workflow status is easier to scan with compact lane summaries and clearer supervisor messages.
+- Model selection fails clearly when configured models are unavailable, instead of silently using a provider default.
+- Managed worktrees are safer and more flexible, with validated `baseRef` support and per-project nesting.
+- Background children can use provider-extension models reliably, including dynamically registered models such as router providers.
+
+### Added
+- Include sanitized model, provider, reason, and expiry details when no usable subagent model candidates remain. Thanks [@AlexKucera](https://github.com/AlexKucera) for #1841.
+- Allow managed worktrees to start from a validated `baseRef` instead of always using `HEAD`. Thanks [@jaudiger](https://github.com/jaudiger) for #1842.
+
+### Changed
+- Run subagents as native DM `AgentSession`s instead of spawned `dm` CLI processes (#1844). Foreground children run in the parent process, and background children run in the detached runner.
+- Foreground children no longer load ambient extensions. Use background children for agents that need MCP tools or provider-extension models. Background children require DM from the installed `@duckmind/dm-coding-agent` package, not a standalone `dm` binary.
+- Rename package subpath `dm-subagents/dm-args` to `dm-subagents/child-tool-plan`; `DM_SUBAGENT_PI_BINARY` now applies only to Herdr project panes and the profile model probe.
+- Replace collapsed async workflow role summaries with a compact lane view while keeping full details available when expanded (#1827).
+- Add `contact_supervisor` to the bundled reviewer and scout tool allowlists without adding mutation tools (#1846).
+
+### Fixed
+- Drop only malformed persisted model-exclusion entries and rewrite the cleaned cache.
+- Stop live workflow children when a run-level stop targets an in-memory async workflow controller.
+- Fail closed when a fallback-only model configuration resolves no launch candidates. Thanks [@AdenosineTP](https://github.com/AdenosineTP) for #1853.
+- Resolve native child models after child extensions register provider models. Thanks [@mystery4f](https://github.com/mystery4f) for #1855.
+- Ignore stale authentication-related model exclusions after DM's `auth.json` is refreshed, while preserving quota, rate-limit, overload, and model-unavailable exclusions. Thanks [@wesleyfei1](https://github.com/wesleyfei1) for #1835.
+- Show native supervisor requests and outbound replies as bounded TUI cards in parent sessions (#1845).
+- Suppress stale async supervisor-request notices after the native request has already been answered (#1838). Thanks [@VladimirGVP](https://github.com/VladimirGVP).
+- Flush async workflow result assembly after session replacement when every child is already terminal, without permitting stale-context launches (#1833). Thanks [@redcomet168](https://github.com/redcomet168).
+- Accept calendar/platform `claude --version` output during Claude Code adapter preflight while retaining required launch-flag validation. Thanks [@drouhard](https://github.com/drouhard).
+- Show passive local command availability for external CLI agents in capability listings without replacing launch preflight (#1829). Thanks [@drouhard](https://github.com/drouhard).
+- Nest native managed worktrees under per-project directories while preserving unsafe-location checks (#1831). Thanks [@moofone](https://github.com/moofone).
+
+## [0.64.0] - 2026-09-02
+
+### Highlights
+- Watchdog can now warn or block child launches before they start, based on role and model rules.
+- Watchdog reviews are easier to guide with safe diff access, reusable `WATCHDOG.md` instructions, and configurable child review cadence.
+- Watchdog findings are easier to see in parent results, completion notices, acceptance evidence, and Fleet.
+- Workflow status and async results are less noisy and more accurate.
+
+### Added
+- Add watchdog launch rules under `subagents.watchdog.rules`, with per-role model allow and deny globs that warn or block before a child starts.
+- Give watchdog reviewers a read-only `watchdog_diff` tool for session-start diffs, untracked paths, path narrowing, and stat summaries.
+- Run child watchdog reviews on a configurable cadence with `children.cadence` and `children.overrides.<agent>.cadence`.
+- Show child watchdog warnings in parent results, acceptance evidence, completion notices, and Fleet `wd:<n>` chips.
+- Load watchdog reviewer instructions from project and agent `WATCHDOG.md` files.
+
+### Changed
+- Reject unsupported watchdog settings that never took effect: `delivery`, `showDuringRun`, `syncBacklog`, `lateWarningPolicy`, `compactAtPercent`, `reviewRetryDelayMs`, `maxReviewFailures`, `asyncCompletion`, and `guidance.systemPromptPath`.
+- Remove watchdog auto-follow. DM 0.84+ already continues after displayed boundary warnings, and repeated identical warnings now stop after `subagents.watchdog.stalemateRepeats`. The `autoFollow` settings block is now unknown.
+
+### Fixed
+- Keep advisory preflight checks out of runtime workflow rows and queued checklist counts (#1821). Thanks [@stekman08](https://github.com/stekman08).
+- Preserve effective thinking in completed async step results. Thanks to [@Nickonomic](https://github.com/Nickonomic) for #1823.
+- Forward workflow child control overrides through new and retained launches, and suppress idle needs-attention notices before the first assistant turn (#1817). Thanks [@rrocxela](https://github.com/rrocxela).
+
+## [0.63.0] - 2026-09-01
+
+### Highlights
+- Workflow progress is easier to scan in status, Fleet, and live widgets.
+- Additional agent folders can now be configured without copying definitions into one directory.
+- Worktrunk users get managed worktrees automatically, with native Git available as the fallback.
+- Fleet can jump straight into the selected child run's Herdr inspector.
+- Async runs clean up and report edge cases more reliably.
+
+### Added
+- Show workflow progress as stacked checklist summaries in status, Fleet, and live widget views (#1806).
+- Add configurable extra agent scan directories with one-segment wildcard expansion. Thanks to [@mystery4f](https://github.com/mystery4f) for #1801.
+- Make Worktrunk a first-class managed worktree provider, selected automatically when available with native Git as the fallback (#1800).
+- Let Fleet open the selected async child in its child-specific Herdr inspector. Thanks to [@stekman08](https://github.com/stekman08) for #1790.
+
+### Changed
+- Show workflow checklist phases first in collapsed views, while keeping child details available when expanded (#1810).
+
+### Fixed
+- Keep isolated test runs from writing agent definitions into an inherited `DM_CODING_AGENT_DIR`. Thanks to [@mapleluvr](https://github.com/mapleluvr) for #1809.
+- Prevent nested tool-availability diagnostics from failing an otherwise valid parent result. Thanks to [@robertvangor](https://github.com/robertvangor) for #1802.
+- Free async capacity correctly after workflows finish, even when saved step status is stale. Thanks to [@boggylp](https://github.com/boggylp) for #1804.
+- Make `subagents.agentOverrides.<name>` replace matching custom-agent frontmatter fields, consistently with builtin agents. Thanks to [@expoli](https://github.com/expoli) for #1796.
+- Strip the trailing DM turn-timing footer from child output. Thanks to [@fkhawajagh](https://github.com/fkhawajagh) for #1792.
+- Keep inferred acceptance reports out of reviewer and read-only child prompts. Thanks to [@expoli](https://github.com/expoli) for #1797.
+- Preserve coordinated read-only intent when direct async children resume, and show captured structured output in completion and status evidence. Thanks to [@fkhawajagh](https://github.com/fkhawajagh) for #1788.
+- Keep macOS subagent tasks out of argv by delivering them through temporary files. Thanks to [@josephkallas](https://github.com/josephkallas) for #1793.
+
+## [0.62.0] - 2026-08-31
+
+### Highlights
+- Child agents can report completion evidence more cleanly and stay away from tools they should not use.
+- Session-only schedules keep personal scheduled work tied to the session that created it.
+- Async forked runs now start and resume in the working directory you requested.
+- Windows child launches are more reliable, with clearer errors when DM cannot find a valid CLI.
+- External CLI and read-only recovery paths are sturdier when workers disappear or prompts include unusual line separators.
+
+### Added
+- Let native children with `outputSchema` include required acceptance evidence in the same `structured_output` call with `acceptance.report: "on"`; `acceptance.report: "off"` keeps fenced acceptance reports. Thanks [@mapleluvr](https://github.com/mapleluvr) for #1770.
+- Add per-agent `excludeTools` deny-lists that compose with DM's ambient or explicit child tool selection. Thanks [@expoli](https://github.com/expoli) for #1776.
+- Add session-only durable schedules that only run in the session that created them. Thanks [@yangfeng20](https://github.com/yangfeng20) for #1777.
+
+### Fixed
+- Keep async forked runs in the requested child `cwd` when they start or resume. Thanks [@stekman08](https://github.com/stekman08) for #1785.
+- Accept JSON-encoded acceptance objects from model tool calls, while still failing clearly for malformed strings. Thanks [@mapleluvr](https://github.com/mapleluvr) for #1781.
+- Keep steer and follow-up receipt statuses separate from their redacted message previews (#1773).
+- Create async lifecycle sidecars before external CLI workers begin worktree changes, so disappeared runners are reported as failed runs. Thanks [@fkhawajagh](https://github.com/fkhawajagh) for #1764.
+- Preserve explicit read-only intent when escaped line separators surround no-edit wording. Thanks [@fkhawajagh](https://github.com/fkhawajagh) for #1765.
+- Launch child DM processes through the resolved CLI JavaScript on Windows, and run JavaScript `DM_SUBAGENT_PI_BINARY` overrides with Node. Thanks [@caohuipeng](https://github.com/caohuipeng) for #1768.
+- Resolve the installed DM CLI on Windows wrapper hosts from the forwarded package root, and report a clear error when no verified CLI can be found. Thanks [@lux032](https://github.com/lux032) for #1780.
+
+## [0.61.0] - 2026-08-31
+
+### Highlights
+- Subagent runs use less context and repeat less status text, so everyday delegation is cheaper and easier to scan.
+- Status, Fleet, widgets, RPC, and background-work views refresh with less duplicated work.
+- Async recovery is more reliable when active status files, child reports, or provider fallback attempts go wrong.
+- Workflow permissions are clearer with named workflow resources and `bg_wait` as the primary background wait tool.
+- Model listings now show effective models for discovered and runtime-registered agents.
+
+### Added
+- Add extension-owned named workflow resources so permission and policy extensions can distinguish trusted workflow resources from raw scripts. Thanks [@mathiasloh](https://github.com/mathiasloh) for #1751.
+- Add workflow-only `globalConcurrencyLimit` and `maxSubagentSpawnsPerRun` overrides for top-level `workflowScript` calls. Thanks [@RapierCraft](https://github.com/RapierCraft) for #1760.
+- Remove the deprecated compatibility wait alias; use `bg_wait` instead (#1729).
+
+### Changed
+- Show effective model mappings for discovered and runtime-registered subagents through management and `/subagents-models`. Thanks [@RapierCraft](https://github.com/RapierCraft) for #1732.
+- Trim default subagent prompt guidelines to five parent-facing entries while keeping advanced workflow details in the packaged guide. Thanks [@Ran-Xing](https://github.com/Ran-Xing) for #1746.
+- Reduce repeated heartbeat status updates during delegated runs while keeping foreground progress and complete terminal responses (#1739).
+- Clarify that `fallbackModels` handles provider/model timeouts but not run-level `timeoutMs` / `maxRuntimeMs` expiry. Thanks [@kaplan-shaked](https://github.com/kaplan-shaked) for #1745.
+- Pass requested session and timestamp context to background-work providers so they can avoid listing unrelated sessions while preserving strict validation (#1737).
+- Avoid repeated external-run display normalization during Fleet refresh while still validating externally replaced or mutated records (#1736).
+- Clarify that `oracle` and top-reasoning models are escalation tools, not routine defaults.
+- Serve broad RPC status requests from restored in-memory state when safe, while preserving targeted status and transcript behavior (#1735).
+
+### Fixed
+- Isolate corrupt active async status files during restoration so valid runs remain available and corrupt run artifacts are preserved. Thanks [@zhexulong](https://github.com/zhexulong) for #1756.
 - Reduce async widget update churn during running workflows by repainting animation ticks without reinstalling the widget and coalescing close status refreshes (#1726).
 - Avoid repeated staged workflow projection during widget rendering. Thanks [@kkkhs](https://github.com/kkkhs) for #1730.
 - Preserve durable file-only child reports and continue read-only workflow review after malformed acceptance metadata (#1724).
+- Preserve model origins across fallback and fork preparation, so eligible fallbacks work for unavailable configured primaries while invalid explicit models still fail closed. Thanks [@xz-dev](https://github.com/xz-dev) for #1747.
+- Stop hidden 125ms spinner redraws while keeping progress refreshes and one-second animation frames (#1747).
 
 ## [0.60.0] - 2026-08-30
 

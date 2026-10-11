@@ -22,12 +22,17 @@ import {
 } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { BoundedFifoMap } from "./bounded-cache.js";
+import { BoundedFifoMap, BoundedSet } from "./bounded-cache.js";
 import { logLatency } from "./latency-logger.js";
-import { recordDegradation } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradation,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
 import { isFullyQualifiedWin32 } from "./path-utils.js";
 import { startSpawnUsageSampler } from "./resource-sampler.js";
+import { DEFAULT_MAX_OUTPUT_BYTES } from "./spawn-output-cap.js";
 import { compareOrdinal } from "./string-utils.js";
 
 export interface SpawnResourceUsage {
@@ -153,6 +158,14 @@ export interface SpawnResult {
 	outputTruncated?: boolean;
 	/** True when the output cap started terminating the child. */
 	killedForOutputCap?: boolean;
+	/**
+	 * #3375 round 2 (H3384-1): every signal available for this spawn's teardown
+	 * was refused by the OS, so the child may STILL BE RUNNING. Present only on
+	 * that path — absent means teardown was never attempted or it succeeded, so
+	 * a 4.2.1 result parses unchanged. `killedForOutputCap` keeps its meaning
+	 * (we STARTED terminating the child); this field says the attempt failed.
+	 */
+	killFailed?: boolean;
 	/** True when the optional streaming matcher saw a matching chunk. */
 	streamingMatch?: boolean;
 	/** Peak/average CPU%+RSS sampled across this spawn's lifetime (#620).
@@ -331,6 +344,16 @@ export interface SafeSpawnOptions {
 	deadlineAt?: number;
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
+	/**
+	 * Drop every inherited `npm_config_*` variable (case-insensitive) from the
+	 * child environment AFTER the ambient merge (#4268). An `env` override
+	 * alone cannot remove a variable, because {@link getSpawnEnvironment}
+	 * merges `process.env` underneath it; this flag is the deletion the
+	 * override cannot express. Used by the cache-only package-runner seam so a
+	 * project's `.npmrc` and the shell's npm config never reach `npx`/`bunx`.
+	 * Never mutates `process.env`.
+	 */
+	stripNpmConfig?: boolean;
 	signal?: AbortSignal;
 	/**
 	 * Opt out of the ambient turn abort signal (which is otherwise the default).
@@ -348,7 +371,12 @@ export interface SafeSpawnOptions {
 	 * affects spawn behavior.
 	 */
 	resourceLabel?: string;
-	/** Maximum bytes retained across stdout and stderr for this child. */
+	/**
+	 * Maximum bytes retained across stdout and stderr for this child.
+	 * Omitted, zero, negative or non-finite falls back to
+	 * `DEFAULT_MAX_OUTPUT_BYTES` (#3375) — there is deliberately no way to opt
+	 * out of a cap, because an absent cap is what crashed the host.
+	 */
 	maxOutputBytes?: number;
 	/** Match output chunks before output-cap truncation can discard them. */
 	matchWhileStreaming?: RegExp;
@@ -381,6 +409,234 @@ const lifetimeState =
 		installed: false,
 	});
 
+/**
+ * THE ownership predicate for every kill-by-raw-pid in this repo (#2042).
+ *
+ * A pid is signalable only when it is a LIVE DIRECT CHILD of this process.
+ * `tests/clients/lsp/launch.test.ts` mocked `node:child_process` with a fake
+ * child carrying the literal pid `2468`; `safeSpawnAsync` registered it in
+ * `lifetimeState.pids`, the fake never emitted `close` so nothing removed it,
+ * and at fork teardown `installLifetimeCleanup()` fired
+ * `process.kill(-2468, "SIGKILL")`. On ~10 % of GitHub runners pid 2468 was
+ * one of the job's own long-lived processes — that is the whole of #2042:
+ * exit 137, no failing assertion, no kernel record, five weeks of "infra
+ * kill" reruns. A `pid <= 0` guard would not have stopped it; 2468 is a
+ * perfectly plausible pid. The defect is OWNERSHIP, not sign.
+ *
+ * Three guards fold into this one (net-count rule): `lsp/client.ts`'s
+ * `pid <= 0`, `lsp/launch.ts`'s `handle.pid <= 0` plus its already-exited
+ * recycled-pid check, and `killTree`'s `child.pid > 0` below. It closes
+ * fabricated, stale and recycled pids together.
+ *
+ * NOT folded: `instance-reaper.ts#killPidTree`. Its pids come from OTHER
+ * dm-lens instances' registries and from an OS scan of managed binaries with
+ * confirmed-dead parents — deliberately NOT our children. Its `!isFinite ||
+ * pid <= 0` guard is well-formedness on a different axis, and applying this
+ * predicate there would turn the orphan reaper into a no-op.
+ *
+ * Platform behaviour, stated rather than implied:
+ *  - Linux (the authoritative lane, and the one that lost five weeks):
+ *    `/proc/<pid>/status` is the kernel's own answer. Missing entry = the pid
+ *    does not exist, so there is nothing of ours to kill; `PPid` other than
+ *    ours = someone else's process, which is recorded and never signalled.
+ *  - Windows and macOS have no `/proc` (and neither does a Linux host with
+ *    `/proc` unmounted — probed once, not assumed from `process.platform`),
+ *    so ownership is unverifiable from a raw pid and the predicate keeps
+ *    today's best-effort behaviour. The `handle` arm applies THERE and only
+ *    there: it is the only ownership evidence Windows has, and it is what
+ *    `killWindowsTree` already used. It must not gate the POSIX group kill,
+ *    which legitimately runs after its leader has died (#3091 F1).
+ */
+/**
+ * Whether `/proc/<pid>/status` can actually be read here, probed ONCE against
+ * this process's own entry (#3091 F4). `process.platform === "linux"` is not
+ * the same question: a container or a hardened host can run Linux with no
+ * `/proc` mounted, and there the per-pid read fails exactly the way a dead pid
+ * does. Without this probe that silently refused every registration, so
+ * `lifetimeState.pids` stayed empty and the host-exit tree kill stopped working
+ * with no record anywhere.
+ */
+const PROC_PPID_READABLE = ((): boolean => {
+	if (process.platform !== "linux") return false;
+	try {
+		return /^PPid:\s*\d+$/m.test(fs.readFileSync("/proc/self/status", "utf8"));
+	} catch {
+		return false;
+	}
+})();
+
+/**
+ * Pids this process has PROVEN, from the kernel, to be its own live children.
+ * FIFO-bounded (`BoundedFifoMap`, not a wholesale clear): a process that spawns
+ * more than the cap drops its OLDEST verdicts, where a wholesale clear would
+ * drop the one it is about to need.
+ */
+export const VERIFIED_OWN_PID_CAP = 512;
+const verifiedOwnPids = new BoundedFifoMap<number, true>(VERIFIED_OWN_PID_CAP);
+
+/**
+ * Pids whose OWNERSHIP IS HELD for the lifetime of a long-lived resource —
+ * today, the LSP children `clients/lsp/launch.ts` spawns with `nodeSpawn`
+ * (#3091 F1-r2b).
+ *
+ * These deliberately do NOT live in `verifiedOwnPids`. Age is the wrong
+ * retirement axis for a resource-scoped verdict: an LSP leader is verified once
+ * at spawn and then sits untouched for the whole session, so in a FIFO that
+ * every `safeSpawnAsync` writes to it is the OLDEST entry and therefore the
+ * FIRST evicted — measured, 520 later verdicts were enough — and its group kill
+ * at host exit is refused precisely because the server was long-lived enough to
+ * matter. Retirement here is by RESOURCE STATE instead: `releaseOwnChildPid`
+ * when the shutdown ladder is done with the pid, plus the confirmed-dead sweep
+ * below for the paths that never reach a ladder (a server that crashes, or a
+ * host killed mid-session).
+ *
+ * The bound that remains, stated rather than implied: at most
+ * `HELD_OWN_PID_SWEEP_AT` entries — the confirmed-dead sweep below runs before
+ * every insert, and `BoundedSet`'s own FIFO overflow is the last resort for the
+ * case where every held group really is still alive. A crash-looping server cannot grow it without bound
+ * because each sweep drops every pid whose process GROUP no longer exists,
+ * which is exactly the condition under which the entry can never be needed
+ * again.
+ */
+const HELD_OWN_PID_SWEEP_AT = 256;
+const heldOwnPids = new BoundedSet<number>(HELD_OWN_PID_SWEEP_AT);
+
+/** A process group that no longer exists can never need another signal. */
+function groupIsGone(pid: number): boolean {
+	try {
+		process.kill(-pid, 0);
+		return false;
+	} catch (error) {
+		return errorCode(error as Error) === "ESRCH";
+	}
+}
+
+function sweepHeldOwnPids(): void {
+	if (heldOwnPids.size < HELD_OWN_PID_SWEEP_AT) return;
+	// Deleting the current entry mid-iteration is well-defined for a Set, so
+	// no snapshot copy is needed.
+	for (const pid of heldOwnPids) {
+		if (groupIsGone(pid)) heldOwnPids.delete(pid);
+	}
+	// No hand-rolled "drop the oldest" block (#2442 / #3091 round 4): the
+	// last-resort eviction, for the case where every held group is still alive
+	// at the ceiling, is `BoundedSet.add`'s own FIFO overflow.
+}
+
+/**
+ * Verify a pid at ADMISSION and hold the verdict for the resource's lifetime.
+ *
+ * This is AGENTS.md shape 50's own rule, which #3091 round 1 broke at the site
+ * it was fixing: `isOwnLiveChild`'s three call sites were the `safeSpawnAsync`
+ * registration, the Windows tree kill, and the SHUTDOWN group kill — so for an
+ * LSP child, spawned with `nodeSpawn`, the first offer of verification was also
+ * the last, and on the `processExiting` path the leader could already be dead
+ * by then (`/proc` gone, nothing on record, signal refused, grandchildren
+ * orphaned).
+ */
+export function holdOwnChildPid(
+	pid: number | undefined,
+	site: string,
+): boolean {
+	const owned = isOwnLiveChild(pid, site);
+	if (!owned || !PROC_PPID_READABLE || typeof pid !== "number") return owned;
+	// Exactly one home: the verification above filed the verdict in the
+	// age-bounded FIFO, and leaving a copy there would make BOTH the held set
+	// and its release mutation-inert — the FIFO copy would answer for them.
+	verifiedOwnPids.delete(pid);
+	sweepHeldOwnPids();
+	heldOwnPids.add(pid);
+	return true;
+}
+
+/**
+ * Retire a held pid once nothing will signal it again — the end of the
+ * shutdown ladder. Idempotent.
+ */
+export function releaseOwnChildPid(pid: number | undefined): void {
+	if (typeof pid === "number") heldOwnPids.delete(pid);
+}
+
+/** Once per session: a Linux host whose `/proc` cannot answer the question. */
+function recordProcUnavailable(site: string): void {
+	if (process.platform !== "linux") return;
+	recordDegradationOnce({
+		kind: "kill-ownership-unverifiable",
+		subject: site,
+		reason:
+			"/proc/self/status is unreadable on this Linux host; kill-by-pid ownership falls back to best-effort",
+	});
+}
+
+export function isOwnLiveChild(
+	pid: number | undefined,
+	site: string,
+	handle?: { exitCode?: number | null; signalCode?: NodeJS.Signals | null },
+): boolean {
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
+		return false;
+	if (!PROC_PPID_READABLE) {
+		// No `/proc` to consult. A handle that has already reported exit is then
+		// the ONLY ownership evidence available, and it is exactly what
+		// `killWindowsTree` used before this predicate existed: a dead pid may
+		// have been recycled, and `taskkill /F /T` on a recycled pid destroys an
+		// unrelated tree. It overrides the memo below deliberately.
+		if (handle && (handle.exitCode != null || handle.signalCode != null))
+			return false;
+		recordProcUnavailable(site);
+		return true;
+	}
+	let status: string;
+	try {
+		status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
+	} catch {
+		// The pid does not exist. Not a degradation — a child that exited before
+		// the teardown signal is the ordinary case — but not automatically a
+		// refusal either: a POSIX process GROUP outlives its leader, and #2026's
+		// whole point is that the escalation must still reach a SIGTERM-hardy
+		// grandchild after the direct child has died. Ownership verified while
+		// the leader was alive is what answers that; a pid this process never
+		// owned is still refused.
+		return heldOwnPids.has(pid) || verifiedOwnPids.has(pid);
+	}
+	const parent = /^PPid:\s*(\d+)$/m.exec(status);
+	if (!parent) return true;
+	if (Number(parent[1]) === process.pid) {
+		// Memoized only on a KERNEL-verified verdict, and only here: a pid we
+		// never proved was ours can never enter the memo, and a pid that is
+		// alive under a different parent is refused above regardless of what the
+		// memo holds — so a recycled pid cannot be signalled on the strength of
+		// its previous owner.
+		//
+		// Never for a pid already HELD, though: the shutdown ladder verifies a
+		// still-live leader on its way to the group signal, and filing that
+		// verdict in the FIFO too would put a held pid back in both stores —
+		// which outlives `releaseOwnChildPid` (the FIFO copy would keep
+		// answering for a pid this process has explicitly stopped claiming) and
+		// makes the held store's own tests unable to fail.
+		if (!heldOwnPids.has(pid)) verifiedOwnPids.set(pid, true);
+		return true;
+	}
+	// Alive AND someone else's: the dangerous case, and the only one worth a
+	// record. Subject is the SITE (a fixed, tiny set), never the pid, so the
+	// ledger stays bounded however often it fires.
+	incrementDegradationCount({
+		kind: "kill-foreign-pid-refused",
+		subject: site,
+		reason: `pid ${pid} has parent ${parent[1]}, not this process — signal refused`,
+	});
+	return false;
+}
+
+/**
+ * Kill one registered pid's tree at host exit. Deliberately NOT re-checked
+ * against `isOwnLiveChild` here: `lifetimeState.pids` has exactly one writer
+ * (the registration below), that writer is now gated, and a second gate on
+ * the same feeder would make BOTH mutation-inert — remove either one and the
+ * other still blocks the kill, so neither would have a test that reds. The
+ * gate lives where the pid enters, which is also where ownership is a fact
+ * rather than a stale reading (#2042).
+ */
 function killPidTreeSync(pid: number): void {
 	if (process.platform === "win32") {
 		try {
@@ -421,7 +677,49 @@ function installLifetimeCleanup(): void {
 	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as NodeJS.Signals[]) {
 		process.once(signal, () => {
 			for (const pid of lifetimeState.pids) killPidTreeSync(pid);
-			process.kill(process.pid, signal);
+			if (process.platform === "win32" && signal === "SIGHUP") {
+				// Windows emits SIGHUP when its console closes, but libuv cannot
+				// self-send it (process.kill(..., "SIGHUP") throws ENOSYS). The
+				// child cleanup above remains the required shutdown action; record
+				// the intentional decline synchronously and let the host exit cleanly.
+				recordDegradationOnce({
+					kind: "safe-spawn-signal-reraise-unsupported",
+					subject: `${process.platform}:${signal}`,
+					reason: `${process.platform} ${signal}: self signal re-raise is unsupported by the Windows libuv signal capability`,
+					metadata: {
+						platform: process.platform,
+						signal,
+						reason: "unsupported",
+					},
+				});
+				return;
+			}
+			try {
+				process.kill(process.pid, signal);
+			} catch (error) {
+				// #3383: this runs inside a `process.once(signal)` handler, so a
+				// throw here is an uncaughtException DURING SHUTDOWN, not a
+				// rejection anyone can see. The one failure measured in the field
+				// (Windows SIGHUP ENOSYS) is declined in advance just above; this
+				// covers every other platform/signal/errno pair the OS can refuse —
+				// same ledger kind, `reason: "refused"` instead of "unsupported",
+				// because a reader of either row wants the same fact: the host
+				// exited without the signal's default disposition. The child
+				// cleanup above has already run either way.
+				recordDegradationOnce({
+					kind: "safe-spawn-signal-reraise-unsupported",
+					subject: `${process.platform}:${signal}`,
+					reason: `${process.platform} ${signal}: self signal re-raise was refused (${
+						(error as { code?: string }).code ?? (error as Error).message
+					})`,
+					metadata: {
+						platform: process.platform,
+						signal,
+						reason: "refused",
+						code: (error as { code?: string }).code ?? null,
+					},
+				});
+			}
 		});
 	}
 }
@@ -1004,10 +1302,22 @@ function resolveWindowsCommand(
 
 function getSpawnEnvironment(
 	overrides: NodeJS.ProcessEnv | undefined,
+	stripNpmConfig: boolean | undefined,
 ): NodeJS.ProcessEnv {
-	return process.platform === "win32"
-		? mergeWindowsEnvironment(process.env, overrides)
-		: { ...process.env, ...overrides };
+	const merged =
+		process.platform === "win32"
+			? mergeWindowsEnvironment(process.env, overrides)
+			: { ...process.env, ...overrides };
+	if (!stripNpmConfig) return merged;
+	// A copy loop rather than `Object.fromEntries(…filter(…))`: `filter` is a
+	// retired glossary identifier and a new use would move the census. This runs
+	// only on the flagged cache-only package-runner spawns, never the hot
+	// default path.
+	const stripped: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(merged)) {
+		if (!/^npm_config_/i.test(key)) stripped[key] = value;
+	}
+	return stripped;
 }
 
 /**
@@ -1111,6 +1421,18 @@ export function resetUtf8ConsoleCodePageStateForTests(): void {
 const EXIT_PIPE_IDLE_GRACE_MS = 100;
 const EXIT_PIPE_IDLE_MAX_WAIT_MS = 2000;
 
+/**
+ * #2968: how long past its own deadline this spawn's CPU/RSS sampler may keep
+ * polling. Everything this function does to end a child after the deadline
+ * fits inside it: `killTree`'s SIGTERM plus its 1000ms SIGKILL escalation (or
+ * Windows' `taskkill /F /T`), then at most EXIT_PIPE_IDLE_MAX_WAIT_MS of
+ * pipe-idle wait. A child still alive past deadline + this grace has outlived
+ * every teardown available here, so polling it further only buys the Windows
+ * process pile-up the report measured — and `stop()` still returns whatever
+ * the sampler gathered before the cap.
+ */
+const SPAWN_SAMPLER_TEARDOWN_GRACE_MS = 5_000;
+
 // ============================================================================
 // ASYNC VERSION (Recommended - Non-blocking)
 // ============================================================================
@@ -1208,6 +1530,24 @@ export async function safeSpawnAsync(
 		let killed = false;
 		let outputTruncated = false;
 		let killedForOutputCap = false;
+		// #3375: bytes the child actually EMITTED (not what survived the cap) —
+		// the one number the field crash report could not supply, so the ledger
+		// row below can name how chatty the offending command really was.
+		let observedOutputBytes = 0;
+		// #3375: bytes RETAINED so far, kept incrementally. The cap check used to
+		// re-measure `Buffer.byteLength(stdout) + Buffer.byteLength(stderr)` on
+		// every chunk, which flattens both accumulated strings each time — O(n^2)
+		// in total output. Harmless while only 12 of 110 call sites passed a cap;
+		// with the cap now on by default it would tax every spawn (measured: a
+		// 32 MiB child resolved in 7944 ms before this counter, 469 ms after).
+		// Equal to the two byte lengths by construction: before
+		// truncation `stdout`/`stderr` are exactly the appended texts, and after
+		// it the branch that renders from the retained head/tail never reads it.
+		let retainedOutputBytes = 0;
+		// #3375: latched the first time a chunk handler throws. Later chunks
+		// return immediately, so the same fault cannot be re-entered and
+		// `refreshRetainedOutputs` can never overwrite the bytes already kept.
+		let outputHandlerFailed = false;
 		let streamingMatch = false;
 		// #1651 review: a single boolean the close/error handlers both check
 		// AND set, so whichever one decides the outcome first wins outright —
@@ -1250,12 +1590,15 @@ export async function safeSpawnAsync(
 		// re-arm the grace timer on every chunk. `undefined` before exit / after
 		// the wait settles, so the calls below are no-ops outside that window.
 		let rearmIdleGrace: (() => void) | undefined;
-		const maxOutputBytes =
-			options?.maxOutputBytes !== undefined &&
-			Number.isFinite(options.maxOutputBytes) &&
-			options.maxOutputBytes > 0
-				? Math.floor(options.maxOutputBytes)
-				: undefined;
+		// #3375: never `undefined`. An omitted or unusable cap resolves to the
+		// module default instead of to unbounded retention, so `appendOutput`
+		// below has no arm that concatenates without a ceiling.
+		const callerCap = options?.maxOutputBytes;
+		const capFromCaller =
+			callerCap !== undefined && Number.isFinite(callerCap) && callerCap > 0;
+		const maxOutputBytes: number = capFromCaller
+			? Math.floor(callerCap)
+			: DEFAULT_MAX_OUTPUT_BYTES;
 		const outputTruncationMarker = "\n...[output truncated]...\n";
 		type OutputStream = "stdout" | "stderr";
 		type OutputPart = { stream: OutputStream; text: string };
@@ -1317,15 +1660,16 @@ export async function safeSpawnAsync(
 			chunk: string | Buffer,
 		): string => {
 			const text = typeof chunk === "string" ? chunk : chunk.toString();
-			if (maxOutputBytes === undefined || outputTruncated) {
-				if (maxOutputBytes === undefined) return current + text;
+			if (outputTruncated) {
 				appendTail({ stream, text }, retainedTailLimit);
 				truncationStream = stream;
 				return renderOutput(stream);
 			}
-			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
 			const bytes = Buffer.byteLength(text);
-			if (used + bytes <= maxOutputBytes) return current + text;
+			if (retainedOutputBytes + bytes <= maxOutputBytes) {
+				retainedOutputBytes += bytes;
+				return current + text;
+			}
 			outputTruncated = true;
 			truncationStream = stream;
 			const available = Math.max(
@@ -1395,7 +1739,7 @@ export async function safeSpawnAsync(
 		//   - unresolvable → synthesize an ENOENT-shaped error instead of
 		//     letting cmd.exe report "not recognized" from inside a shell.
 		const isWindows = process.platform === "win32";
-		const spawnEnv = getSpawnEnvironment(options?.env);
+		const spawnEnv = getSpawnEnvironment(options?.env, options?.stripNpmConfig);
 		// The cwd handed to the CHILD process doesn't need OUR validation —
 		// Windows resolves it natively, exactly as it did before #817 ever
 		// touched this file. A drive-relative cwd (`D:work`) without a
@@ -1528,12 +1872,19 @@ export async function safeSpawnAsync(
 			child.stdin?.on("error", () => {});
 			child.stdin?.end(options.input);
 		}
-		if (child.pid && (posixProcessGroup || options?.lifetimeCoupled)) {
+		// #2042: ownership is a SPAWN-TIME fact — a real child is alive with
+		// `PPid == ours` the instant `spawn` returns, while a test double's
+		// invented pid never is. Resolve it once, here, and reuse the verdict:
+		// the group escalation below must still fire after the direct child
+		// dies (#2027: a SIGTERM-hardy grandchild keeps the group alive), so it
+		// cannot re-read `/proc` at kill time.
+		const ownsChildPid = isOwnLiveChild(child.pid, "safe-spawn-register");
+		if (ownsChildPid && (posixProcessGroup || options?.lifetimeCoupled)) {
 			// #2026: POSIX registers unconditionally - detached children no
 			// longer receive terminal signals directly, so the lifetime
 			// cleanup's signal forwarding IS their die-with-host path.
 			installLifetimeCleanup();
-			lifetimeState.pids.add(child.pid);
+			lifetimeState.pids.add(child.pid as number);
 		}
 
 		// #620: bracket this spawn's lifetime with a short-interval CPU/RSS poll
@@ -1544,18 +1895,80 @@ export async function safeSpawnAsync(
 		// best-effort/never-throws by design, but this call site wraps it anyway
 		// (belt and suspenders: the sampling seam must never be the reason a real
 		// spawn fails) with a no-op fallback sampler.
+		//
+		// #2968: the sampler's polling lifetime is bounded by THIS spawn's own
+		// deadline plus the teardown grace, not by the child's willingness to
+		// exit. `finalize`/the `error` handler still stop it on every settle
+		// path, but none of those paths exist for a child that never settles —
+		// a hung `.cmd` shim whose tree survives `taskkill /F /T` kept polling
+		// for 5-6 hours in the report.
 		let usageSampler: { stop: () => SpawnResourceUsage | null };
 		try {
-			usageSampler = startSpawnUsageSampler(child.pid);
+			usageSampler = startSpawnUsageSampler(
+				// The poll CADENCE is the sampler's own policy (it owns the backoff
+				// too); the DEADLINE is this function's. Passing `undefined` rather
+				// than importing the cadence constant keeps this module's view of
+				// the sampler at one export, which is also what every existing
+				// `vi.mock` of it provides.
+				child.pid,
+				undefined,
+				timeout + SPAWN_SAMPLER_TEARDOWN_GRACE_MS,
+			);
 		} catch {
 			usageSampler = { stop: () => null };
 		}
 		const resourceLabel = options?.resourceLabel ?? command;
 
+		// #3375 round 2 (H3384-1). `killTree`'s promise is AWAITED by `finalize`
+		// from a `void finalize(...)` callback, FIRED AND FORGOTTEN by `onAbort`
+		// (`void killTree()`), and its escalation runs in a bare `setTimeout`
+		// callback — three structurally different ways a throwing `kill` escaped
+		// this spawn: as a rejection that left the public promise pending
+		// forever, as an `unhandledRejection`, and (from the timer) as an
+		// uncaught exception, which is the very shape #3375 exists to close.
+		// So no signal is sent except through `trySend`, which cannot throw.
+		type KillPhase = "abort" | "output-cap" | "handler-fault" | "timeout";
+		let killFailed = false;
+		/** Send one signal. INVARIANT (#3375 r3 / M3384-2): every signal SEND in
+		 *  `killTree` goes through this function. Exactly two `try`/`catch`
+		 *  blocks remain in there and neither contains a bare send: the Windows
+		 *  `await` guard around the taskkill child (its `catch` body sends only
+		 *  through `trySend`), and the group LIVENESS PROBE, whose `catch`
+		 *  computes a predicate rather than sending anything — the same shape as
+		 *  the module-level `groupIsGone`. Returns false instead of throwing, and
+		 *  records nothing itself: a refused signal is often ORDINARY (a negative-pid
+		 *  ESRCH means the group already exited and the direct-child fallback
+		 *  takes over), so only a send with no fallback left behind it pairs
+		 *  with `noteKillFailure`. */
+		const trySend = (send: () => void): boolean => {
+			try {
+				send();
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		/** Every signal for this teardown was refused, so the child may still be
+		 *  running. One record per spawn — the reviewer's reproduction refused
+		 *  two kills (the fault's and then the timeout's) and a row per attempt
+		 *  would be a flood. A kind of its own rather than a field on
+		 *  `spawn-output-cap-truncated`: this fires on the abort and timeout
+		 *  teardowns too, which have nothing to do with an output cap. */
+		const noteKillFailure = (phase: KillPhase): void => {
+			if (killFailed) return;
+			killFailed = true;
+			incrementDegradationCount({
+				kind: "spawn-kill-failed",
+				subject: resourceLabel,
+				reason: `every signal available for the ${phase} teardown was refused; the child may still be running`,
+				metadata: { phase, pid: child.pid },
+			});
+		};
+
 		// On Windows, shell:true means child.pid is cmd.exe — child.kill() only
 		// kills the wrapper, leaving the actual subprocess (e.g. knip/npx) alive
 		// as an orphan. Use taskkill /F /T to kill the full process tree instead.
-		const killTree = async (): Promise<void> => {
+		const killTree = async (phase: KillPhase): Promise<void> => {
 			if (isWindows && child.pid && child.pid > 0) {
 				const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
 				try {
@@ -1571,22 +1984,31 @@ export async function safeSpawnAsync(
 						);
 						killer.once("close", () => done());
 						killer.once("error", () => {
-							child.kill("SIGKILL");
+							// E4: a throw HERE would leave the EventEmitter as an
+							// uncaught exception, not a rejection.
+							if (!trySend(() => child.kill("SIGKILL"))) noteKillFailure(phase);
 							done();
 						});
 					});
 				} catch {
-					child.kill("SIGKILL");
+					if (!trySend(() => child.kill("SIGKILL"))) noteKillFailure(phase);
 				}
-			} else if (posixProcessGroup && child.pid && child.pid > 0) {
+			} else if (posixProcessGroup && ownsChildPid) {
 				// #2026: signal the whole process group. Grandchildren spawned
 				// by the tool share its group, so one signal reaches the whole
 				// tree; a negative-pid ESRCH means it already exited.
-				const pgid = -child.pid;
-				try {
-					process.kill(pgid, "SIGTERM");
-				} catch {
-					child.kill("SIGTERM");
+				const pgid = -(child.pid as number);
+				// #3375 round 3 (M3384-2): through the one sink, like every other
+				// send. A second ad-hoc `try`/`catch` here would be a rival
+				// signal-safety mechanism inside the same teardown — the shape this
+				// change deleted four of — and a later edit to this branch would not
+				// inherit `trySend`'s total send or its failure accounting.
+				// `trySend` returning false here is ORDINARY, not a failure: #2026's
+				// negative-pid ESRCH means the group already exited, so the direct
+				// child below is the normal fallback and nothing is recorded. Only
+				// the last-resort send can fail the teardown.
+				if (!trySend(() => process.kill(pgid, "SIGTERM"))) {
+					if (!trySend(() => child.kill("SIGTERM"))) noteKillFailure(phase);
 				}
 				// #2027 round-1: gate the SIGKILL escalation on GROUP liveness,
 				// not direct-child death - a tool can exit instantly on SIGTERM
@@ -1595,34 +2017,42 @@ export async function safeSpawnAsync(
 				// it is the only backstop for this group once finalize deletes
 				// the pid from lifetimeState.
 				escalationTimer = setTimeout(() => {
-					let groupAlive = true;
-					try {
-						process.kill(pgid, 0);
-					} catch {
-						groupAlive = false;
-					}
-					if (!groupAlive) return;
-					teardownEscalated = true;
-					logLatency({
-						type: "phase",
-						phase: "spawn_group_kill_escalation",
-						filePath: "",
-						durationMs: 0,
-						metadata: { pgid: child.pid },
+					// The WHOLE body, not just the signal: this runs in a bare
+					// timer callback, where any throw is an uncaught exception.
+					const escalated = trySend(() => {
+						let groupAlive = true;
+						try {
+							process.kill(pgid, 0);
+						} catch {
+							groupAlive = false;
+						}
+						if (!groupAlive) return;
+						teardownEscalated = true;
+						logLatency({
+							type: "phase",
+							phase: "spawn_group_kill_escalation",
+							filePath: "",
+							durationMs: 0,
+							metadata: { pgid: child.pid },
+						});
+						// Through the sink too (#3375 r3 / M3384-2): one vocabulary
+						// for every send in this function. A false here is ORDINARY
+						// — the group raced its own exit — so it is deliberately not
+						// escalated to `noteKillFailure`; the enclosing `trySend`
+						// already guarantees nothing escapes this timer callback.
+						trySend(() => process.kill(pgid, "SIGKILL"));
 					});
-					try {
-						process.kill(pgid, "SIGKILL");
-					} catch {
-						// Raced with group exit.
-					}
+					if (!escalated) noteKillFailure(phase);
 				}, 1000);
 			} else {
-				child.kill("SIGTERM");
+				// E2/E3. This branch runs whenever `/proc` cannot prove pid
+				// ownership — every macOS host, and any Linux host with an
+				// unreadable `/proc` — so it is not a hypothetical path.
+				if (!trySend(() => child.kill("SIGTERM"))) noteKillFailure(phase);
 				escalationTimer = setTimeout(() => {
-					if (!closed) {
-						teardownEscalated = true;
-						child.kill("SIGKILL");
-					}
+					if (closed) return;
+					teardownEscalated = true;
+					if (!trySend(() => child.kill("SIGKILL"))) noteKillFailure(phase);
 				}, 1000);
 			}
 		};
@@ -1632,7 +2062,7 @@ export async function safeSpawnAsync(
 			aborted = true;
 			if (!killed && !child.killed) {
 				killed = true;
-				void killTree();
+				void killTree("abort");
 			}
 		};
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
@@ -1653,27 +2083,99 @@ export async function safeSpawnAsync(
 			) {
 				killedForOutputCap = true;
 				killed = true;
-				killPromise = killTree();
+				killPromise = killTree("output-cap");
+			}
+		};
+
+		// #3375: one bounded, counted ledger row per command label the moment the
+		// cap first bites - the crash report named no command, no byte count and
+		// no cap value, so nothing in it could identify the chatty producer.
+		// `incrementDegradationCount` keeps one latest-reason entry per subject
+		// with an exact tally and writes durable rows only at powers of two, so a
+		// tool that trips the cap on every dispatch cannot flood the sink.
+		const recordOutputCapTrip = (): void => {
+			incrementDegradationCount({
+				kind: "spawn-output-cap-truncated",
+				subject: resourceLabel,
+				reason: `retained output reached the ${maxOutputBytes}-byte ${
+					capFromCaller ? "caller" : "default"
+				} cap after ${observedOutputBytes} bytes; child ${
+					killedForOutputCap ? "terminated" : "left running"
+				}`,
+				metadata: {
+					capBytes: maxOutputBytes,
+					capSource: capFromCaller ? "caller" : "default",
+					observedBytes: observedOutputBytes,
+					killed: killedForOutputCap,
+				},
+			});
+		};
+
+		// #3375: the fault path for a chunk handler that threw. Every statement
+		// here is total by construction - plain assignments, a ledger call that
+		// swallows its own failures, and `killTree()`, which is `async` so a
+		// synchronous fault inside it becomes a rejected promise rather than a
+		// throw - because a throw raised HERE would escape the same way the
+		// original RangeError did.
+		const failOutputHandler = (stream: OutputStream, error: Error): void => {
+			outputHandlerFailed = true;
+			// Retention is over. The bytes already in `stdout`/`stderr` stay as
+			// the bounded output: nothing renders from the retained head/tail
+			// again, because the re-entry guard returns before that can happen.
+			// That is also why `truncationStream` is deliberately NOT set here —
+			// only `renderOutput` reads it, and nothing renders after a fault, so
+			// the assignment was mutation-inert (removing it reds nothing).
+			outputTruncated = true;
+			incrementDegradationCount({
+				kind: "spawn-output-handler-fault",
+				subject: resourceLabel,
+				reason: `${stream} chunk handling threw ${error.name} after ${observedOutputBytes} bytes; retention stopped and the child was terminated`,
+				metadata: {
+					stream,
+					error: error.name,
+					capBytes: maxOutputBytes,
+					observedBytes: observedOutputBytes,
+				},
+			});
+			if (!killed && !child.killed) {
+				killedForOutputCap = true;
+				killed = true;
+				killPromise = killTree("handler-fault");
 			}
 		};
 
 		// Collect output
 		child.stdout?.setEncoding("utf-8");
 		child.stderr?.setEncoding("utf-8");
-		child.stdout?.on("data", (data) => {
-			matchStreamingChunk("stdout", data);
-			stdout = appendOutput("stdout", stdout, data);
-			if (outputTruncated) refreshRetainedOutputs();
-			stopForOutputLimit();
-			rearmIdleGrace?.();
-		});
-		child.stderr?.on("data", (data) => {
-			matchStreamingChunk("stderr", data);
-			stderr = appendOutput("stderr", stderr, data);
-			if (outputTruncated) refreshRetainedOutputs();
-			stopForOutputLimit();
-			rearmIdleGrace?.();
-		});
+		// #3375: a throw raised inside a stream `data` handler is delivered to
+		// the process, not to the caller awaiting this spawn - no `try`/`catch`
+		// around `await safeSpawnAsync(...)` can contain it, which is why a
+		// `RangeError: Invalid string length` from `appendOutput` terminated the
+		// DM host on 2026-09-22. Every statement the handler runs lives inside
+		// this `try`, so ANY fault in the retention path (not just that one
+		// RangeError) becomes the bounded output-cap result the caller already
+		// knows how to read.
+		const onOutputChunk = (
+			stream: OutputStream,
+			data: string | Buffer,
+		): void => {
+			if (outputHandlerFailed) return;
+			try {
+				observedOutputBytes += Buffer.byteLength(data);
+				const wasTruncated = outputTruncated;
+				matchStreamingChunk(stream, data);
+				if (stream === "stdout") stdout = appendOutput(stream, stdout, data);
+				else stderr = appendOutput(stream, stderr, data);
+				if (outputTruncated) refreshRetainedOutputs();
+				stopForOutputLimit();
+				if (!wasTruncated && outputTruncated) recordOutputCapTrip();
+				rearmIdleGrace?.();
+			} catch (error) {
+				failOutputHandler(stream, toError(error));
+			}
+		};
+		child.stdout?.on("data", (data) => onOutputChunk("stdout", data));
+		child.stderr?.on("data", (data) => onOutputChunk("stderr", data));
 
 		// #1673 review round 3 (F2): registered HERE, at spawn time, alongside
 		// the other handlers above — not inside `waitForPipeIdle`. Real Node
@@ -1704,7 +2206,7 @@ export async function safeSpawnAsync(
 			if (!killed && !child.killed) {
 				killed = true;
 				teardownStartedAtMs = Date.now();
-				killPromise = killTree();
+				killPromise = killTree("timeout");
 			}
 		}, timeout);
 
@@ -1872,6 +2374,7 @@ export async function safeSpawnAsync(
 			const outputInfo = {
 				...(outputTruncated ? { outputTruncated: true } : {}),
 				...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+				...(killFailed ? { killFailed: true } : {}),
 			};
 			const streamingMatchInfo = streamingMatch ? { streamingMatch: true } : {};
 			// #1816: surface the signal name as a field on every path where one
@@ -2012,6 +2515,7 @@ export async function safeSpawnAsync(
 					spawnFailure,
 					...(outputTruncated ? { outputTruncated: true } : {}),
 					...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+					...(killFailed ? { killFailed: true } : {}),
 					...(streamingMatch ? { streamingMatch: true } : {}),
 					resourceUsage,
 				});
@@ -2116,7 +2620,7 @@ export function safeSpawn(
 	args: string[],
 	options?: SafeSpawnOptions,
 ): SpawnResult {
-	const spawnEnv = getSpawnEnvironment(options?.env);
+	const spawnEnv = getSpawnEnvironment(options?.env, options?.stripNpmConfig);
 	if (process.platform === "win32") {
 		// See the matching comment in safeSpawnAsync: the child's cwd doesn't
 		// need OUR validation (Windows resolves it natively), so an unprovable

@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -8,6 +10,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
@@ -79,17 +82,28 @@ interface ValeAlert {
 
 type ValeOutput = Record<string, ValeAlert[]>;
 
-export function parseValeOutput(raw: string, filePath: string): Diagnostic[] {
+export function parseValeOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 
 	if (!raw.trim()) return diagnostics;
+	const absTarget = path.resolve(cwd, filePath);
 
 	try {
 		const parsed = JSON.parse(raw) as ValeOutput;
 		if (!parsed || typeof parsed !== "object") return diagnostics;
 
-		for (const alerts of Object.values(parsed)) {
+		// #3295: vale's top level is keyed BY the linted file's path — the only
+		// place the reported path appears. `Object.values` dropped it, so a
+		// `.vale.ini` glob or a directory argv charged a second file's alerts to
+		// the dispatched one.
+		for (const [reported, alerts] of Object.entries(parsed)) {
 			if (!Array.isArray(alerts)) continue;
+			if (reported && !pathsEqual(path.resolve(cwd, reported), absTarget))
+				continue;
 
 			for (const alert of alerts) {
 				if (!alert.Message) continue;
@@ -132,7 +146,7 @@ const valeRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "vale");
 
 		// Config-gated: skip unless a .vale.ini is found
 		if (!findValeConfig(cwd)) {
@@ -164,8 +178,14 @@ const valeRunner: RunnerDefinition = {
 		// #1948: `parseToolRun` adds the second gate. Vale's `Data.Files`
 		// envelope bug produced exactly this shape — exit 1, a full JSON
 		// report on stdout, zero alerts parsed — and left no record.
-		const run = parseToolRun("vale", { result }, (raw) =>
-			parseValeOutput(raw, ctx.filePath),
+		const run = parseToolRun(
+			"vale",
+			{
+				result,
+				// EXIT TABLE (Vale 3.9.6 docs https://vale.sh/docs/topics/metrics/): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(raw) => parseValeOutput(raw, ctx.filePath, cwd),
 		);
 		if (run.skipped) return run.skipped;
 
@@ -177,11 +197,10 @@ const valeRunner: RunnerDefinition = {
 
 		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
 
-		return {
+		return findingsResult(diagnostics, {
 			status: hasBlocking ? "failed" : "succeeded",
-			diagnostics,
 			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

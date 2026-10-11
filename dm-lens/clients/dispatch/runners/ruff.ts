@@ -21,10 +21,12 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 import { parseRuffOutput } from "./utils/diagnostic-parsers.js";
 import {
 	createAvailabilityChecker,
 	resolveAvailableOrInstall,
+	resolveRunnerCwd,
 } from "./utils/runner-helpers.js";
 
 const ruff = createAvailabilityChecker("ruff", ".exe");
@@ -76,7 +78,7 @@ const ruffRunner: RunnerDefinition = {
 	priority: PRIORITY.FORMAT_AND_LINT_PRIMARY,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "ruff");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("ruff-lint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -94,34 +96,30 @@ const ruffRunner: RunnerDefinition = {
 		const checkResult = await safeSpawnAsync(
 			cmd,
 			["check", "--output-format", "json", ...configArgs, ctx.filePath],
-			{ timeout: 30000 },
+			{ cwd, timeout: 30000 },
 		);
 
 		const raw = stripAnsi(checkResult.stdout + checkResult.stderr);
-		const diagnostics = parseRuffJson(checkResult.stdout || "", ctx.filePath);
-		const parsedDiagnostics =
-			diagnostics.length > 0 ? diagnostics : parseRuffOutput(raw, ctx.filePath);
-
-		if (checkResult.status === 0 && parsedDiagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		if (parsedDiagnostics.length === 0) {
-			return {
-				status: "failed",
-				diagnostics: [],
-				semantic: "warning",
-				rawOutput: raw.slice(0, 500),
-			};
-		}
-
-		const hasErrors = parsedDiagnostics.some((d) => d.severity === "error");
-
-		return {
-			status: hasErrors ? "failed" : "succeeded",
-			diagnostics: parsedDiagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
-		};
+		// EXIT TABLE (Ruff 0.6 docs https://docs.astral.sh/ruff/linter/): 0 = clean, 1 = findings, 2 = findings/error or
+		// tool error. A nonzero exit with valid findings stays findings; empty or
+		// unparsable output must never become clean (#1816).
+		const run = parseToolRun(
+			"ruff",
+			{ result: checkResult, output: raw, exitCodes: { ran: [1, 2] } },
+			(output) => {
+				const diagnostics = parseRuffJson(output, ctx.filePath);
+				return diagnostics.length > 0
+					? diagnostics
+					: parseRuffOutput(output, ctx.filePath, cwd);
+			},
+		);
+		if (run.skipped) return run.skipped;
+		return finishParsedRun({
+			tool: "ruff",
+			ctx,
+			result: checkResult,
+			diagnostics: run.diagnostics,
+		});
 	},
 };
 

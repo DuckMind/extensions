@@ -18,8 +18,10 @@ import { resolveWorkflowForegroundSteeringTarget, steerWorkflowForegroundTarget 
 import { contextModeBadge, contextModeLabel } from "../runs/shared/context-mode.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "./fleet-status.ts";
 import { readFleetTranscript, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
-import { handleHerdrInspectorAction } from "../inspectors/herdr/actions.ts";
-import type { HerdrClient } from "../inspectors/herdr/client.ts";
+import { runningTone } from "./running-tone.ts";
+import { childThinkingLevel, type ThinkingLevel } from "../shared/model-info.ts";
+import { handleInspectorAction } from "../inspectors/actions.ts";
+import type { InspectorPlugin } from "../inspectors/types.ts";
 import { getLivePromptAudit, type LivePromptAudit, type PromptAuditView } from "../runs/foreground/prompt-audit.ts";
 
 const REFRESH_MS = 750;
@@ -42,7 +44,7 @@ export const DEFAULT_FLEET_KEYBINDINGS: Record<FleetKeybindingAction, string[]> 
 	pageDown: ["pageDown"],
 	refresh: ["r", "R"],
 	steer: ["s"],
-	inspect: ["H"],
+	inspect: ["return", "H"],
 	stop: ["D"],
 	toggleTools: ["x", "X", "ctrl+o"],
 };
@@ -110,7 +112,8 @@ export interface FleetViewOptions {
 	fleetKeybindings?: FleetKeybindingsConfig;
 	actions?: FleetActionHandlers;
 	copyText?: (text: string) => Promise<void> | void;
-	herdrClient?: HerdrClient;
+	inspectorPlugins?: () => readonly InspectorPlugin[];
+	inspectorEnv?: NodeJS.ProcessEnv;
 }
 
 function belongsToCurrentSession(sessionId: string | undefined, currentSessionId: string | null): boolean {
@@ -179,10 +182,16 @@ function asyncItems(run: AsyncRunSummary, description?: string): FleetItem[] {
 	}));
 }
 
-function orderFleetAsyncRuns(runs: AsyncRunSummary[], terminalLimit: number): AsyncRunSummary[] {
+function orderFleetAsyncRuns(runs: AsyncRunSummary[], terminalLimit: number, trackedJobs: Map<string, AsyncJobState>): AsyncRunSummary[] {
 	const updatedAt = (run: AsyncRunSummary) => run.lastUpdate ?? run.endedAt ?? run.startedAt;
 	const byNewest = (left: AsyncRunSummary, right: AsyncRunSummary) => updatedAt(right) - updatedAt(left);
-	const active = runs.filter((run) => run.state === "queued" || run.state === "running").sort(byNewest);
+	// Missing tracked starts must not inherit the summary's heartbeat-based display fallback.
+	const startedAt = (run: AsyncRunSummary) => {
+		const job = trackedJobs.get(run.id);
+		return job ? job.startedAt ?? 0 : run.startedAt;
+	};
+	const byStartedAt = (left: AsyncRunSummary, right: AsyncRunSummary) => startedAt(left) - startedAt(right) || left.id.localeCompare(right.id);
+	const active = runs.filter((run) => run.state === "queued" || run.state === "running").sort(byStartedAt);
 	const terminal = runs.filter((run) => run.state !== "queued" && run.state !== "running").sort(byNewest);
 	return [...active, ...terminal.slice(0, terminalLimit)];
 }
@@ -204,12 +213,11 @@ export function collectFleetSnapshot(
 		if (!control.parentWorkflowRunId
 			|| !workflowParentIds.has(control.parentWorkflowRunId)
 			|| !belongsToCurrentSession(control.sessionId, state.currentSessionId)
-			|| !control.workflowSteeringDir
 			|| activeChildCount === 0) continue;
 		liveWorkflowForegroundControls.add(control);
 		workflowForegroundChildCounts.set(control.parentWorkflowRunId, (workflowForegroundChildCounts.get(control.parentWorkflowRunId) ?? 0) + activeChildCount);
 	}
-	for (const control of [...state.foregroundControls.values()].sort((left, right) => right.updatedAt - left.updatedAt)) {
+	for (const control of [...state.foregroundControls.values()].sort((left, right) => left.startedAt - right.startedAt || left.runId.localeCompare(right.runId))) {
 		activeForegroundIds.add(control.runId);
 		if (control.parentWorkflowRunId && workflowParentIds.has(control.parentWorkflowRunId)
 			&& ((workflowForegroundChildCounts.get(control.parentWorkflowRunId) ?? 0) <= 1 || !liveWorkflowForegroundControls.has(control))) continue;
@@ -250,7 +258,7 @@ export function collectFleetSnapshot(
 		const tracked = [...trackedJobs.values()]
 			.filter((job) => belongsToCurrentSession(job.sessionId, state.currentSessionId));
 		const byUpdate = (left: AsyncJobState, right: AsyncJobState) => (right.updatedAt ?? right.startedAt ?? 0) - (left.updatedAt ?? left.startedAt ?? 0);
-		const active = tracked.filter((job) => job.status === "queued" || job.status === "running").sort(byUpdate);
+		const active = tracked.filter((job) => job.status === "queued" || job.status === "running");
 		const recent = tracked.filter((job) => job.status !== "queued" && job.status !== "running").sort(byUpdate).slice(0, options.limit ?? MAX_RECENT_ASYNC_RUNS);
 		const trackedRuns: AsyncRunSummary[] = [];
 		for (const job of [...active, ...recent]) {
@@ -273,7 +281,7 @@ export function collectFleetSnapshot(
 		} else {
 			runs = trackedRuns;
 		}
-		for (const run of orderFleetAsyncRuns(runs, options.limit ?? MAX_RECENT_ASYNC_RUNS)) {
+		for (const run of orderFleetAsyncRuns(runs, options.limit ?? MAX_RECENT_ASYNC_RUNS, trackedJobs)) {
 			items.push(...asyncItems(run, descriptions.get(run.id)));
 		}
 	} catch (cause) {
@@ -342,8 +350,18 @@ function visibleWorkflowParentKeyForForegroundKey(state: SubagentState, key: str
 	return undefined;
 }
 
+/** The recorded level of the one child a running Fleet row stands for; a whole run or an external run has none. */
+function fleetItemThinkingLevel(item: FleetItem): ThinkingLevel | undefined {
+	switch (item.kind) {
+		case "foreground-active": return childThinkingLevel(item.activeChild ?? item.control);
+		case "foreground-recent": return childThinkingLevel(item.child);
+		case "async": return childThinkingLevel(item.step);
+		case "external": return undefined;
+	}
+}
+
 function statusGlyph(item: FleetItem, theme: Theme): string {
-	if (item.state === "running") return theme.fg("accent", "●");
+	if (item.state === "running") return runningTone(theme, fleetItemThinkingLevel(item))("●");
 	if (item.state === "queued" || item.state === "pending") return theme.fg("muted", "◦");
 	if (item.state === "complete" || item.state === "completed") return theme.fg("success", "✓");
 	if (item.state === "paused" || item.state === "stopped" || item.state === "detached") return theme.fg("warning", "■");
@@ -567,7 +585,8 @@ function asyncDetail(item: Extract<FleetItem, { kind: "async" }>, state: Subagen
 		}
 		return lines;
 	}
-	const outputPath = item.index !== undefined ? path.join(item.run.asyncDir, `output-${item.index}.log`) : undefined;
+	const outputIndex = item.index ?? (item.run.steps.length === 1 ? 0 : undefined);
+	const outputPath = outputIndex !== undefined ? path.join(item.run.asyncDir, `output-${outputIndex}.log`) : undefined;
 	return [
 		`Run: ${item.runId}`,
 		"Source: async",
@@ -661,6 +680,9 @@ function transcriptTarget(item: FleetItem, state: SubagentState): { path: string
 		};
 	}
 	const step = item.step ?? (item.run.steps.length === 1 ? item.run.steps[0] : undefined);
+	// External CLI logs are plain text, not structured session JSONL. Let the
+	// bounded async detail formatter select final output/stderr/stdout instead.
+	if (step?.runner?.type === "external-cli") return undefined;
 	const recordedSessionFile = step?.sessionFile ?? item.run.sessionFile;
 	const recordedPath = step?.transcriptPath ?? recordedSessionFile;
 	if (!recordedPath) return undefined;
@@ -775,8 +797,10 @@ interface FleetTranscriptCache {
 
 function transcriptFingerprint(filePath: string): string {
 	try {
-		const stat = fs.statSync(filePath);
-		return `${stat.size}:${stat.mtimeMs}`;
+		// ino and ctime catch a same-size, same-mtime replacement. Bigint keeps
+		// Windows file ids, which exceed 2^53, exact.
+		const stat = fs.statSync(filePath, { bigint: true });
+		return `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 	} catch {
 		return "missing";
 	}
@@ -838,7 +862,7 @@ export class SubagentFleetComponent implements Component {
 			this.refreshTimer = undefined;
 			if (this.disposed) return;
 			try {
-				this.invalidate();
+				this.refresh();
 				this.tui.requestRender();
 			} finally {
 				this.scheduleRefresh();
@@ -938,18 +962,24 @@ export class SubagentFleetComponent implements Component {
 		return { runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}) };
 	}
 
-	private selectedHerdrInspectAction(): { runId: string; asyncDir: string; index?: number } | { reason: string } {
+	private selectedInspectAction(): { runId: string; asyncDir: string; index?: number } | { reason: string } {
 		const item = this.snapshot.items[this.selected];
 		if (!item) return { reason: "No child is selected." };
-		if (item.kind === "external") return { reason: "External jobs are display-only and have no Herdr controls." };
+		if (item.kind === "external") return { reason: "External jobs are display-only and have no inspector controls." };
 		if (item.kind === "async") {
 			if (!isActionableAsyncState(item.run.state) || !isActionableAsyncState(item.state)) return { reason: `Selected child is ${item.state}; controls require a running or queued async child.` };
 			return { runId: item.runId, asyncDir: item.run.asyncDir, ...(item.index !== undefined ? { index: item.index } : {}) };
 		}
 		if (item.kind !== "foreground-active" || !item.control.parentWorkflowRunId) return { reason: "Fleet controls are available for current-session top-level async runs only." };
 		const parent = this.state.asyncJobs.get(item.control.parentWorkflowRunId) ?? this.state.fleetJobs?.get(item.control.parentWorkflowRunId);
-		if (!parent || !isActionableAsyncState(parent.status)) return { reason: "The parent workflow is no longer available for Herdr inspection." };
+		if (!parent || !isActionableAsyncState(parent.status)) return { reason: "The parent workflow is no longer available for inspection." };
 		return { runId: parent.asyncId, asyncDir: parent.asyncDir };
+	}
+
+	private inspectSelected(): void {
+		const target = this.selectedInspectAction();
+		if ("reason" in target || !this.options.actions?.inspect) this.setActionNotice({ text: "reason" in target ? target.reason : "Inspector controls are unavailable in this context.", isError: true });
+		else this.runAction(() => this.options.actions!.inspect!(target));
 	}
 
 	private actionLines(): string[] {
@@ -1179,12 +1209,6 @@ export class SubagentFleetComponent implements Component {
 			}
 			return;
 		}
-		if (matchesFleetAction(data, this.keybindings, "inspect")) {
-			const target = this.selectedHerdrInspectAction();
-			if ("reason" in target || !this.options.actions?.inspect) this.setActionNotice({ text: "reason" in target ? target.reason : "Herdr inspector controls are unavailable in this context.", isError: true });
-			else this.runAction(() => this.options.actions!.inspect!(target));
-			return;
-		}
 		if (matchesFleetAction(data, this.keybindings, "stop")) {
 			const target = this.selectedAsyncAction();
 			if ("reason" in target || !this.options.actions) this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
@@ -1201,6 +1225,11 @@ export class SubagentFleetComponent implements Component {
 			this.expandedTools = !this.expandedTools;
 			this.transcriptCache = undefined;
 			this.tui.requestRender();
+			return;
+		}
+		if (matchesFleetAction(data, this.keybindings, "inspect")) {
+			this.inspectSelected();
+			return;
 		}
 	}
 
@@ -1235,7 +1264,10 @@ export class SubagentFleetComponent implements Component {
 		const body = transcript.events.length > 0
 			? renderFleetTranscript(transcript, width, this.theme, this.markdownTheme, { expandedTools: this.expandedTools })
 			: [];
-		this.transcriptCache = { path: target.path, fingerprint, width, expandedTools: this.expandedTools, transcript, body };
+		// A failed read (refused path, read error) may recover without a metadata change, so retry it.
+		this.transcriptCache = transcript.readFailed
+			? undefined
+			: { path: target.path, fingerprint, width, expandedTools: this.expandedTools, transcript, body };
 		return { transcript, body: [...body] };
 	}
 
@@ -1354,7 +1386,7 @@ export class SubagentFleetComponent implements Component {
 			? ` j/k child · 1/2/3 view · g redo with guidance · c copy · Esc close Prompt Audit · ${position}`
 			: selected?.kind === "external"
 				? ` ${bindingLabel(this.keybindings, "selectUp")}/${bindingLabel(this.keybindings, "selectDown")} job · display-only · ${bindingLabel(this.keybindings, "refresh")} refresh · ${bindingLabel(this.keybindings, "close")} close · ${position}`
-				: ` ${bindingLabel(this.keybindings, "selectUp")}/${bindingLabel(this.keybindings, "selectDown")} agent · p Prompt Audit · ${bindingLabel(this.keybindings, "inspect")} Herdr · ${bindingLabel(this.keybindings, "steer")} steer · ${bindingLabel(this.keybindings, "stop")} stop · ${bindingLabel(this.keybindings, "toggleTools")} tools · ${bindingLabel(this.keybindings, "refresh")} refresh · ${bindingLabel(this.keybindings, "close")} close · ${position}`;
+				: ` ${bindingLabel(this.keybindings, "selectUp")}/${bindingLabel(this.keybindings, "selectDown")} agent · p Prompt Audit · ${bindingLabel(this.keybindings, "inspect")} Inspect · ${bindingLabel(this.keybindings, "steer")} steer · ${bindingLabel(this.keybindings, "stop")} stop · ${bindingLabel(this.keybindings, "toggleTools")} tools · ${bindingLabel(this.keybindings, "refresh")} refresh · ${bindingLabel(this.keybindings, "close")} close · ${position}`;
 		lines.push(this.theme.fg("border", "│") + fit(this.theme.fg("dim", footer), innerWidth) + this.theme.fg("border", "│"));
 		lines.push(this.theme.fg("border", `╰${"─".repeat(innerWidth)}╯`));
 		return lines.map((line) => truncateToWidth(line, width));
@@ -1403,7 +1435,7 @@ export async function openSubagentFleet(ctx: ExtensionContext, state: SubagentSt
 			}), `Failed to steer async run ${input.runId}.`);
 		},
 		stop: (input: { runId: string; asyncDir: string; index?: number }) => firstToolResultText(stopAsyncRun(state, input.runId, undefined, { asyncDir: input.asyncDir, resolvedId: input.runId }), `Failed to stop async run ${input.runId}.`),
-		inspect: async (input: { runId: string; asyncDir: string; index?: number }) => firstToolResultText(await handleHerdrInspectorAction("inspector.open", {
+		inspect: async (input: { runId: string; asyncDir: string; index?: number }) => firstToolResultText(await handleInspectorAction("inspector.open", {
 			id: input.runId,
 			dir: input.asyncDir,
 			focus: true,
@@ -1412,10 +1444,11 @@ export async function openSubagentFleet(ctx: ExtensionContext, state: SubagentSt
 			state,
 			sessionRoots: state.trustedSessionRoots,
 			cwd: state.baseCwd,
-			...(options.herdrClient ? { client: options.herdrClient } : {}),
 			...(state.authorityPolicy ? { authorityPolicy: state.authorityPolicy } : {}),
 			...(state.missionStoreConfig ? { missions: state.missionStoreConfig } : {}),
-		}), `Failed to open Herdr inspector for async run ${input.runId}.`),
+			plugins: options.inspectorPlugins?.(),
+			...(options.inspectorEnv ? { env: options.inspectorEnv } : {}),
+		}), `Failed to open inspector for async run ${input.runId}.`),
 		redoPrompt: async (input: { runId: string; index: number; guidance: string; control?: ForegroundRunControl }) => {
 			const control = input.control ?? state.foregroundControls.get(input.runId);
 			if (!control?.promptAuditRedo) return { text: "Redo is not available for this live child.", isError: true };

@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 import { emitBounded } from "../bounded-telemetry.js";
 import { withTimeout } from "../deadline-utils.js";
 import { minimatch } from "../deps/minimatch.js";
+import { mapWithConcurrency } from "../map-with-concurrency.js";
 import {
 	incrementDegradationCount,
 	recordDegradationOnce,
@@ -38,7 +39,11 @@ import {
 	newLspMutationCorrelationId,
 } from "../lsp-mutation.js";
 import { getProcessSingleton } from "../process-singletons.js";
-import { getAmbientAbortSignal } from "../safe-spawn.js";
+import {
+	getAmbientAbortSignal,
+	isOwnLiveChild,
+	releaseOwnChildPid,
+} from "../safe-spawn.js";
 import { raceToCompletion } from "./aggregation.js";
 import {
 	hashDiagnosticContent,
@@ -55,11 +60,14 @@ import {
 	type PositionEncoding,
 } from "./position-encoding.js";
 import {
+	negotiateSaveOptions,
 	negotiateSyncKind,
 	TEXT_DOCUMENT_SYNC_KIND_FULL,
 	TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL,
+	type TextDocumentSaveOptions,
 	type TextDocumentSyncKind,
 } from "./sync-kind.js";
+import { exceedsLspSyncLimits } from "./content-limits.js";
 import { probeTsserverProjectIdentity } from "./tsserver-sync.js";
 import { getStrategy } from "./wait-policy/index.js";
 import { WatchedFilesQueue } from "./watch-queue.js";
@@ -114,6 +122,8 @@ export interface LSPDiagnostic {
 	};
 	code?: string | number;
 	source?: string;
+	/** Registered server that delivered this diagnostic. Not LSP protocol data. */
+	serverId?: string;
 }
 
 export interface LSPPullFailure {
@@ -324,8 +334,22 @@ export interface LSPClientInfo {
 			languageId: string,
 			preserveDiagnostics?: boolean,
 			silent?: boolean,
-		): Promise<void>;
-		change(filePath: string, content: string): Promise<void>;
+			/**
+			 * #3405: the pushed bytes are this file's saved on-disk state and the
+			 * caller wants it diagnosed now — follow the didOpen/didChange with
+			 * `textDocument/didSave` when the server declared `save`. Only the
+			 * post-write sync and the explicit `lsp_diagnostics` query set it; warm
+			 * reads, cascade neighbours, desync repairs and bulk sweeps do not.
+			 */
+			saved?: boolean,
+			/**
+			 * #3481: `performance.now()` taken before the caller read `content`.
+			 * The per-path queue then sends the latest READ, not the latest
+			 * enqueued, and resolves `false` when a later read superseded this one.
+			 */
+			readStamp?: number,
+		): Promise<boolean | void>;
+		change(filePath: string, content: string): Promise<boolean | void>;
 		/**
 		 * #1668: queue a `workspace/didChangeWatchedFiles` entry for a disk
 		 * change this client did not learn about through didOpen/didChange —
@@ -359,6 +383,12 @@ export interface LSPClientInfo {
 	 * per path.
 	 */
 	getDiagnosticsVersionForPath(filePath: string): number;
+	/** #3482: see {@link publicationCountsForPath}. Optional so a client double
+	 *  that predates it only loses the late-auxiliary backlog binding. */
+	getPublicationCountsForPath?(filePath: string): {
+		sent: number;
+		published: number;
+	};
 	waitForDiagnostics(
 		filePath: string,
 		timeoutMs?: number,
@@ -425,6 +455,11 @@ export interface LSPClientInfo {
 	/** Top-level keys of the raw ServerCapabilities advertised at initialize —
 	 *  the full advertised surface (incl. providers dm-lens does not parse). */
 	getRawCapabilityKeys(): string[];
+	/** #3407: the `textDocumentSync.save` options negotiated at initialize, or
+	 *  `undefined` when the server declared none (see `negotiateSaveOptions`).
+	 *  Optional so hand-written client doubles need not implement it; the
+	 *  capability inventory reads it to answer "which servers get didSave". */
+	getSaveOptions?(): TextDocumentSaveOptions | undefined;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts) — which concrete
 	 *  binary/protocol variant this client instance is actually running.
 	 *  Undefined = single-variant server or not yet reported (fail-safe:
@@ -505,6 +540,23 @@ export interface LSPClientInfo {
 	 * that cannot enumerate simply contributes no paths.
 	 */
 	openDocumentPaths?(): string[];
+	/**
+	 * #3601: the fingerprint (`hashDiagnosticContent`) of the last didOpen or
+	 * didChange payload this client sent for an open document, and when a send
+	 * last changed those bytes, or `undefined` for a document it does not track
+	 * (never opened, or closed). It is the bytes the server answers from, read
+	 * from state already held in memory. Optional for the same reason
+	 * `openDocumentPaths` is.
+	 */
+	getSentContent?(filePath: string):
+		| {
+				hash: string;
+				changedAtMs?: number | undefined;
+				openedAtMs?: number | undefined;
+				openedHash?: string | undefined;
+				clientStartedAtMs?: number | undefined;
+		  }
+		| undefined;
 	/** Whether this client currently has an LSP request in flight. */
 	isBusy?(): boolean;
 	/** URI spelling used when this document was opened. */
@@ -570,12 +622,34 @@ export interface LSPClientInfo {
  * document state waits behind it and supersedes only the still-pending entry.
  */
 interface PendingDocumentNotify {
-	run: (coalescedCount: number) => Promise<void>;
+	/** Resolves `false` when it sent nothing for the path (#3477). */
+	run: (coalescedCount: number, saved: boolean) => Promise<boolean | void>;
 	waiters: Array<{
-		resolve: () => void;
+		/**
+		 * `false`: this caller's content was not sent, because a later read
+		 * superseded it (#3481) or the path was closed first (#3477).
+		 */
+		resolve: (sent: boolean) => void;
 		reject: (error: unknown) => void;
+		/** #3481: kept out by a pending entry that was read later. */
+		stale?: boolean;
 	}>;
 	coalescedCount: number;
+	/**
+	 * #3481: when the caller read the content (`performance.now()` taken
+	 * before the read). Undefined for a caller that does not say.
+	 */
+	readStamp?: number | undefined;
+	/**
+	 * #3405: sticky across coalescing. A superseded entry's save intent carries
+	 * onto its replacement — otherwise the post-write sync's save is silently
+	 * dropped whenever the dispatch runner's unsaved touch for the same path
+	 * replaces it before it starts writing, which is the common case when the
+	 * pipeline's write has not landed yet (so no debounce entry exists to skip
+	 * the runner's notify). The replacement carries NEWER disk bytes, which is
+	 * exactly what the save should describe.
+	 */
+	saved: boolean;
 }
 
 /**
@@ -583,9 +657,22 @@ interface PendingDocumentNotify {
  * effectively (client, normalized path). Different files retain independent
  * queues and therefore retain the existing parallel-send behavior.
  */
+/** #3484: one outstanding diagnostics fence for a path. */
+interface DiagnosticFence {
+	/** Version-less publishes dropped while this fence was out. */
+	dropped: number;
+	/** End it early (a newer fence for the path): cancel the request, record. */
+	supersede: () => void;
+}
+
 interface DocumentNotifyQueue {
 	pending?: PendingDocumentNotify;
 	running: boolean;
+	/**
+	 * #3477: a close was queued. Touches that arrive before the queue drains
+	 * are for a document being closed (renamed away) and are not sent.
+	 */
+	closing?: boolean;
 }
 
 // --- Constants ---
@@ -762,27 +849,6 @@ const WORKSPACE_PULL_SCOPE = "*workspace*";
 // protocol reply, never something worth tuning per project.
 const REFRESH_REPULL_CONCURRENCY = 4;
 
-/** Run `mapper` over `items` with at most `concurrency` in flight at once.
- *  Same shape as `dependency-checker.ts`'s helper of the same name — a
- *  worker-pool pattern repeated per-file by design in this codebase rather
- *  than shared, so each caller can keep it un-exported and file-local. */
-async function mapWithConcurrency<T>(
-	items: readonly T[],
-	concurrency: number,
-	mapper: (item: T) => Promise<void>,
-): Promise<void> {
-	if (items.length === 0) return;
-	let nextIndex = 0;
-	const workerCount = Math.max(1, Math.min(concurrency, items.length));
-	const worker = async (): Promise<void> => {
-		while (true) {
-			const index = nextIndex++;
-			if (index >= items.length) return;
-			await mapper(items[index]);
-		}
-	};
-	await Promise.all(Array.from({ length: workerCount }, () => worker()));
-}
 // Anti-deadlock backstop for workspace/executeCommand. Deliberately generous
 // (30s): the command is mutating and legitimately long-running (a real server
 // refactor / organize-imports), so this must not truncate valid work — it only
@@ -945,9 +1011,29 @@ export interface LSPClientState {
 	 *  for the same hot-receive-path reason as `diagnosticPublicationCounts`
 	 *  above; readers fold their input through `normalizeMapKey`. */
 	readonly diagnosticsVersionsByPath: Map<string, number>;
+	/** #3482: how many publications each path received, capped at the
+	 *  publications it expects (`publicationCountsForPath`'s `sent`). Counted
+	 *  when a receipt is stored (`bumpDiagnosticsVersion`) or superseded
+	 *  unstored (resync clear, debounce replacement, a receipt for a closed
+	 *  path), never at raw receipt; not reset by a resync clear or a close;
+	 *  reset on the first open of a path never closed; one taken back per
+	 *  `semgrep/rulesRefreshed` (#3490), so an entry can be 0 or below. */
+	readonly publicationStoreCountsByPath: Map<string, number>;
+	/** #3482: publications a path expects beyond its open lifetime's sends:
+	 *  one per didSave to a `rescansOnSave` server, plus every one its closed
+	 *  lifetimes expected, since their queued scans still publish. Set at
+	 *  close, kept across the reopen. */
+	readonly expectedPublicationsBeyondSends: Map<string, number>;
 	readonly documentVersions: Map<string, number>;
 	/** #2113/#2357: latest-pending same-path document sends; different paths stay parallel. */
 	readonly notifyChangeQueues: Map<string, DocumentNotifyQueue>;
+	/**
+	 * #3481: read stamp of the entry the notify queue last ran for a path. It
+	 * outlives the queue object, so a stale entry that arrives after a newer
+	 * one was sent and its queue retired is still dropped. An unstamped send
+	 * leaves it unchanged; it is cleared with the document on close.
+	 */
+	readonly sentReadStamps: Map<string, number>;
 	/** The LSP document version (`publishDiagnostics.version`) the cached
 	 *  diagnostics for a path were computed against. Only set when the server
 	 *  reports a version; absent entries mean "version unknown" and are treated
@@ -975,6 +1061,20 @@ export interface LSPClientState {
 		{
 			version: number;
 			hash: string;
+			/** #3601: `Date.now()` when a send last CHANGED this document's bytes
+			 *  on the server (a re-send of the same bytes keeps it), so a caller
+			 *  can tell whether the server's copy changed after a request it made. */
+			changedAtMs?: number | undefined;
+			/** #3827: `Date.now()` of the FIRST send in this record's life (a
+			 *  re-send and a change keep it; a close drops the record). A caller
+			 *  that asks what the server held at an earlier instant reads it to
+			 *  tell a file this client first opened after that instant: the
+			 *  server's copy then was not this client's send. */
+			openedAtMs?: number | undefined;
+			/** #3827 verify r2: the hash of that first send's bytes, kept with
+			 *  `openedAtMs`. A record whose `hash` differs from it changed after
+			 *  its first send, which the first send's own stamp cannot show. */
+			openedHash?: string | undefined;
 			text?: string;
 			lastLine?: LastLinePosition;
 		}
@@ -1056,6 +1156,24 @@ export interface LSPClientState {
 		}
 	>;
 	readonly openDocuments: Set<string>;
+	/**
+	 * #3310: whether this client's ONE-SHOT empty-first-publish hold has been
+	 * spent. Only ever set for a server the matrix measures as
+	 * `emptyFirstPublish: "indexing"`. The cold whole-workspace index builds once
+	 * per session, so holding at most one publish bounds the hold's cost to that
+	 * one index window: every later touch — warm, or a server that never
+	 * re-publishes — resolves on its first publish exactly as before.
+	 */
+	emptyFirstPublishHoldSpent: boolean;
+	/**
+	 * #3484: paths with a diagnostics fence outstanding. Each entry is its own
+	 * object, so an older fence's reply cannot lift a newer one, and counts the
+	 * version-less publishes it dropped. Every entry is removed by its reply,
+	 * its error, a newer fence for the path, or the fence bound.
+	 */
+	readonly diagnosticFences: Map<string, DiagnosticFence>;
+	/** #3484: the fence-skipped record was written for this client. */
+	fenceSkipRecorded?: boolean;
 	/** Paths explicitly closed during this client lifetime; late publishes are dropped. */
 	readonly closedDocuments?: Set<string>;
 	/** Original URI spelling for each open document; path keys are normalized. */
@@ -1090,6 +1208,12 @@ export interface LSPClientState {
 	 *  `{ text }` shape dm-lens has always sent — an absent value never changes
 	 *  behavior. Set once at initialize, next to `positionEncoding`. */
 	syncKind?: TextDocumentSyncKind;
+	/** #3405: `textDocumentSync.save` the server negotiated at initialize, or
+	 *  `undefined` when it declared none — see `negotiateSaveOptions`. Absent by
+	 *  default (the initial state literal below never sets it), so a server that
+	 *  never advertised `save`, and every hand-written test double, receives no
+	 *  `textDocument/didSave`. Set once at initialize, next to `syncKind`. */
+	saveOptions?: TextDocumentSaveOptions | undefined;
 	/** Baseline mode from static initResult — used to revert on unregister */
 	staticDiagnosticsMode: "pull" | "push-only";
 	/** Live dynamic registrations from client/registerCapability: id → record.
@@ -1133,6 +1257,12 @@ export interface LSPClientState {
 	mutationContextOwner?: LspMutationContext;
 	activeMutationDepth?: number;
 	readonly serverId: string;
+	/** #3827: `Date.now()` when `createLSPClient` built this state, before the
+	 *  `initialize` handshake, so before the server could read any project file.
+	 *  A file whose mtime sits before it (by more than the filesystem's timestamp
+	 *  granularity) holds bytes the server could only have read as they are now.
+	 *  Optional for mock states; unset means no such claim. */
+	readonly startedAtMs?: number;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts). Undefined =
 	 *  single-variant server or not yet reported. */
 	readonly launchVariant?: "classic" | "native-ts7";
@@ -1288,6 +1418,9 @@ export async function killProcessTree(
 		(proc.exitCode != null || proc.signalCode != null) &&
 		!options.processExiting
 	) {
+		// #3091 F1-r2b: this pid will never be signalled again, so retire the
+		// ownership hold taken at spawn rather than leaving it to age out.
+		releaseOwnChildPid(pid);
 		proc.unref?.();
 		return;
 	}
@@ -1362,7 +1495,20 @@ export async function killProcessTree(
 	}
 
 	const killPosixProcessGroup = (signal: NodeJS.Signals): boolean => {
-		if (pid <= 0) return false;
+		// #2042: one ownership predicate for every kill-by-raw-pid, replacing
+		// the `pid <= 0` sign check that let a test double's invented pid
+		// through. A pid we do not own falls back to `killDirectChild` below,
+		// which signals through the retained handle and can only ever reach
+		// our own child.
+		//
+		// #3091 F1: `proc` is deliberately NOT passed. The handle arm means
+		// "already exited ⇒ refuse", and this group kill must still fire when
+		// the direct child is dead — the early return at :1269 is skipped under
+		// `options.processExiting`, and a POSIX group outlives its leader, so
+		// the group signal is the only thing that reaps surviving grandchildren
+		// at host exit (#2026). Ownership here comes from the kernel and, once
+		// the leader is gone, from the verdict recorded while it was alive.
+		if (!isOwnLiveChild(pid, "lsp-stop-posix-group")) return false;
 		try {
 			process.kill(-pid, signal);
 			return true;
@@ -1418,6 +1564,11 @@ export async function killProcessTree(
 						killDirectChild("SIGKILL");
 					}
 				}
+				// AFTER the escalation, never before it: this tick issues the
+				// last signal this pid can receive, and retiring the ownership
+				// hold first would make that very SIGKILL the thing that gets
+				// refused (#3091 F1-r2b).
+				releaseOwnChildPid(pid);
 			}, 1500);
 			timer.unref?.();
 			proc.unref?.();
@@ -1455,6 +1606,7 @@ export async function killProcessTree(
 				killDirectChild("SIGKILL");
 			}
 		}
+		releaseOwnChildPid(pid);
 	} catch {
 		// ignore
 	}
@@ -1744,6 +1896,79 @@ export function bumpDiagnosticsVersion(
 		normalizedPath,
 		state.diagnosticsVersion,
 	);
+	countPublication(state, normalizedPath);
+}
+
+/** #3482: count one publication for the path: stored, or superseded before it
+ * could be (a resync clear, or a newer receipt inside the debounce window).
+ * Capped at the publications the path expects, so a surplus publish while
+ * nothing is outstanding is absorbed instead of shortening every later
+ * backlog; the republish after `semgrep/rulesRefreshed` is rebaselined instead
+ * ({@link rebaselineForRulesRefresh}). Nothing is counted for a path that
+ * expects none. */
+function countPublication(state: LSPClientState, normalizedPath: string): void {
+	const counts = state.publicationStoreCountsByPath;
+	if (!counts) return;
+	const { sent } = publicationCountsForPath(state, normalizedPath);
+	if (sent === 0) return;
+	counts.set(
+		normalizedPath,
+		Math.min((counts.get(normalizedPath) ?? 0) + 1, sent),
+	);
+}
+
+/** #3490: opengrep sends `semgrep/rulesRefreshed` once its rules are loaded,
+ * then republishes every file it has a scan recorded for (opengrep@1a5fd9d
+ * `Scan_helpers.refresh_rules`). That republish answers no send, so take one
+ * publication back from every path that already received one, a closed path
+ * included (any publish means a recorded scan, so the republish will come,
+ * and a closed path counts it as it is dropped, #3482), counted or
+ * still inside the debounce; the republish then restores the count instead of
+ * answering an outstanding send. A path with no receipt yet is left alone:
+ * whether the refresh reaches it is not observable, and a publication taken
+ * back for good would hold every later late-auxiliary delivery for it. The
+ * same harm follows if the refresh scan itself fails and never republishes
+ * (residual). */
+export function rebaselineForRulesRefresh(state: LSPClientState): void {
+	const counts = state.publicationStoreCountsByPath;
+	for (const [normalizedPath, published] of counts) {
+		counts.set(normalizedPath, published - 1);
+	}
+	// A first receipt still in the debounce is counted when it flushes.
+	for (const normalizedPath of state.pendingDiagnostics.keys()) {
+		if (
+			counts.has(normalizedPath) ||
+			publicationCountsForPath(state, normalizedPath).sent === 0
+		)
+			continue;
+		counts.set(normalizedPath, -1);
+	}
+	logLatency({
+		type: "phase",
+		phase: "lsp_rules_refreshed",
+		filePath: state.root,
+		durationMs: 0,
+		metadata: { serverId: state.serverId, rebaselinedPaths: counts.size },
+	});
+}
+
+/** #3482: expected and counted publications for a path. `sent` is the open
+ * lifetime's sends, derived from `documentVersions` (0 on the first open, +1
+ * per resync), plus {@link LSPClientState.expectedPublicationsBeyondSends},
+ * so the late-auxiliary drain can bind a mark to the scanner's backlog: the
+ * publications still due at the mark must land first. Both counts span a
+ * close and reopen, so a mark keeps its frame across one. */
+export function publicationCountsForPath(
+	state: LSPClientState,
+	normalizedPath: string,
+): { sent: number; published: number } {
+	const lastSent = state.documentVersions.get(normalizedPath);
+	return {
+		sent:
+			(lastSent === undefined ? 0 : lastSent + 1) +
+			(state.expectedPublicationsBeyondSends?.get(normalizedPath) ?? 0),
+		published: state.publicationStoreCountsByPath?.get(normalizedPath) ?? 0,
+	};
 }
 
 /** #1531: the global counter's value when diagnostics were last stored for
@@ -1774,7 +1999,12 @@ export function clearDiagnosticsForPath(
 	};
 	state.pushDiagnostics?.delete(normalizedPath);
 	const pending = state.pendingDiagnostics?.get(normalizedPath);
-	if (pending) clearTimeout(pending);
+	if (pending) {
+		clearTimeout(pending);
+		// #3482: the scan answered; its receipt is dropped with the cache it
+		// would have filled, so it still counts toward the backlog.
+		countPublication(state, normalizedPath);
+	}
 	state.pendingDiagnostics?.delete(normalizedPath);
 	state.pushDiagnosticTimestamps?.delete(normalizedPath);
 	state.documentPullDiagnostics?.delete(normalizedPath);
@@ -1996,9 +2226,13 @@ function recordSentContent(
 	// this map in insertion order still reads "most recently sent last",
 	// matching the aux set it mirrors, rather than a stale mixed order.
 	state.documentContentHashes.delete(normalizedPath);
+	const hash = hashDiagnosticContent(content);
 	state.documentContentHashes.set(normalizedPath, {
 		version,
-		hash: hashDiagnosticContent(content),
+		hash,
+		changedAtMs: previous?.hash === hash ? previous.changedAtMs : Date.now(),
+		openedAtMs: previous?.openedAtMs ?? Date.now(),
+		openedHash: previous === undefined ? hash : previous.openedHash,
 		// #1669: retain the full text only for Incremental — the sole reader
 		// (`buildContentChanges`) needs it to compute the NEXT change against
 		// what the server last saw; Full/None never read this field.
@@ -2041,6 +2275,9 @@ function recordSentContent(
 			state.documentContentHashes.set(oldestPath, {
 				version: binding.version,
 				hash: binding.hash,
+				changedAtMs: binding.changedAtMs,
+				openedAtMs: binding.openedAtMs,
+				openedHash: binding.openedHash,
 			});
 			state.incrementalTextRetainedEntries = Math.max(
 				0,
@@ -2212,8 +2449,29 @@ export function applyDynamicCapabilities(state: LSPClientState): void {
  * e.g. "scan.jobs") against the server's `initializationOptions` blob.
  * - No section (undefined/empty) → the whole blob, per spec ("if a scope
  *   isn't asked for" the client returns the full settings for that scope).
- * - An unresolvable path → `null`, never the whole blob — a server asking
- *   for a section it doesn't get must not silently receive unrelated config.
+ * - An unresolvable path → an EMPTY settings object, never the whole blob — a
+ *   server asking for a section it doesn't get must not silently receive
+ *   unrelated config.
+ *
+ * #3217: that second case used to answer `null`, and a server that reads the
+ * answer without a null guard loses its diagnostics or dies outright. Both
+ * shapes are live in the nightly LSP fixture set:
+ *   - vscode-css-language-server hands the answer to
+ *     `new LintConfigurationSettings(settings && settings.lint)` whose
+ *     `constructor(conf = {})` default only fires for `undefined`, then throws
+ *     `Cannot read properties of null (reading 'validProperties')` INSIDE its
+ *     own diagnostics computation and answers the pull with an empty report —
+ *     visible to a client only as a `window/logMessage`. Every `.css`/`.scss`/
+ *     `.less`/`.sass` file was silently undiagnosed, which is why the #2780
+ *     clean gate read "0 diagnostic(s)" for css on every nightly since it
+ *     landed.
+ *   - @prisma/language-server reads `settings.enableDiagnostics` in
+ *     `validateTextDocument` with no guard and the whole SERVER PROCESS exits
+ *     on the uncaught `TypeError`.
+ * `{}` is what a client with no value for that section actually means ("no
+ * settings here"), it is already what this function answers for an item with
+ * no section at all against an absent blob, and it leaves the "never the whole
+ * blob" invariant #983 added untouched.
  * Exported for the #983 regression test.
  */
 export type ConfigurationSection =
@@ -2228,12 +2486,12 @@ export function resolveConfigurationSection(
 	initialization: Record<string, unknown> | undefined,
 	section: string | undefined,
 ): ConfigurationSection {
-	if (!initialization) return section ? null : {};
+	if (!initialization) return {};
 	if (!section) return initialization;
 	let cur: unknown = initialization;
 	for (const part of section.split(".")) {
 		if (typeof cur !== "object" || cur === null || !Object.hasOwn(cur, part)) {
-			return null;
+			return {};
 		}
 		cur = (cur as Record<string, unknown>)[part];
 	}
@@ -2246,6 +2504,7 @@ export function resolveConfigurationSection(
 export function setupIncomingHandlers(
 	state: LSPClientState,
 	initialization: Record<string, unknown> | undefined,
+	onDiagnosticsPublished?: (serverId: string) => void,
 ): void {
 	state.connection.onNotification(
 		"textDocument/publishDiagnostics",
@@ -2262,12 +2521,81 @@ export function setupIncomingHandlers(
 			const publishReceivedAt = Date.now();
 			const filePath = uriToPath(params.uri);
 			const normalizedPath = normalizeMapKey(filePath);
+			const docVersion = params.version;
+			// #3548 review r2: a `publishesOnClose` server's own close-triggered
+			// publish (typos' `did_close`: an empty, version-less set on every
+			// close) is the ONLY version-less publish it ever sends — every real
+			// scan answer, `did_open`/`did_change` alike, carries a version, a
+			// genuinely clean one included (tekumara/typos-lsp
+			// `crates/typos-lsp/src/lsp.rs`, verified against upstream `main`:
+			// the sole version-less `publish_diagnostics` call is `did_close`'s).
+			// It answers no send, so it is pure noise: dropped before storage or
+			// counting, in EITHER arrival order relative to the reopen — unlike a
+			// counting adjustment scoped to the closedDocuments branch (round 1's
+			// `closePublishSkipsRemaining`), this also stops it from overwriting
+			// a real, already-stored answer once it arrives late, after a
+			// reopen, through the ordinary open-document publish path (review
+			// r2: PROBE-STALE-EMPTY-OVERWRITES-REAL). A server this marker is
+			// not set for is unaffected — the required inverse.
+			if (
+				docVersion === undefined &&
+				getStrategy(state.serverId, state.launchVariant).publishesOnClose
+			) {
+				return;
+			}
 			// A server can flush a queued publish after didClose during teardown.
 			// Do not resurrect diagnostics or their content binding for a document
 			// that is no longer open on this client.
-			if (state.closedDocuments?.has(normalizedPath)) return;
+			if (state.closedDocuments?.has(normalizedPath)) {
+				// #3482: a scan the closed lifetime was owed; it answered.
+				countPublication(state, normalizedPath);
+				return;
+			}
+			onDiagnosticsPublished?.(state.serverId);
 			const newDiags = normalizeLspDiagnostics(params.diagnostics || []);
-			const docVersion = params.version;
+			// #3484: a version-less publish received before the fence's reply may
+			// be for the content before the latest send; it cannot say which.
+			// Dropped unstored, it still answers a send (#3482's backlog).
+			const fence = state.diagnosticFences.get(normalizedPath);
+			if (docVersion === undefined && fence) {
+				fence.dropped += 1;
+				countPublication(state, normalizedPath);
+				// #3310: the one-shot hold skips the empty first publish that precedes
+				// the cold index. A fence-dropped one was skipped already; holding the
+				// next one as well would swallow the server's real answer. Only the
+				// hold's own shape spends it: a dropped non-empty publish leaves the
+				// hold armed (a timeout, never a false clean).
+				if (
+					getStrategy(state.serverId, state.launchVariant).emptyFirstPublish ===
+						"indexing" &&
+					!state.emptyFirstPublishHoldSpent &&
+					newDiags.length === 0 &&
+					!state.pushDiagnostics.has(normalizedPath) &&
+					!state.pendingDiagnostics.has(normalizedPath)
+				) {
+					state.emptyFirstPublishHoldSpent = true;
+					// One record per client session, as for the held path: without it
+					// a hold spent here reads as a hold that never engaged.
+					logLatency({
+						type: "phase",
+						phase: "lsp_empty_first_publish_held",
+						filePath: normalizedPath,
+						durationMs: Math.max(
+							0,
+							publishReceivedAt -
+								(state.documentOpenedAt.get(normalizedPath) ??
+									publishReceivedAt),
+						),
+						metadata: {
+							serverId: state.serverId,
+							emptyFirstPublish: "indexing",
+							via: "fence-drop",
+							pubVersion: "push-unversioned",
+						},
+					});
+				}
+				return;
+			}
 			if (PUB_DEBUG) {
 				// #1333: PUB_DEBUG gate preserved; sink is extension.log.
 				logExtension({
@@ -2409,13 +2737,78 @@ export function setupIncomingHandlers(
 				return currentVersion !== undefined && docVersion < currentVersion;
 			};
 
+			// #3310: HOLD the empty first publish of an asynchronously-indexing
+			// server. Measured (docs/lsp-capability-matrix.md's `first-publish`
+			// column): intelephense answers `didOpen` with `[]` while its
+			// whole-workspace index builds and publishes the real set once
+			// indexing ends, so letting that first publish through cached an empty
+			// set, bumped the publication stamp and emitted — which resolved the
+			// push wait AND satisfied the "answered" evidence check in
+			// `clients/lsp/index.ts`, rendering a file with an error as "confirmed
+			// clean". A timeout is not a false clean; an empty pre-index publish
+			// must not become one either.
+			//
+			// Held means: not cached, no version bump, no emit — so it can neither
+			// resolve a wait nor count as evidence. Nothing is scheduled and
+			// nothing is awaited: the server's OWN next publish releases the hold
+			// (it is no longer a first publish), and the existing per-server budget
+			// stays the only bound, so there is no new timer, listener or
+			// cancellation path. A genuinely clean file still gets an affirmative
+			// clean, because the measured server re-publishes `[]` at the end of
+			// indexing.
+			//
+			// Three conditions, each load-bearing:
+			//  - the MEASURED class (never every push server): a Tier 2/2* server
+			//    that publishes `[]` once for a clean file keeps resolving the wait
+			//    on it, with no added latency (#3310 AC2);
+			//  - one-shot per client session: the cold index builds once, so a warm
+			//    touch — or a class server that never re-publishes — pays nothing;
+			//  - FIRST publication for this document: no cached push AND no pending
+			//    debounce timer. An empty publish that CLEARS an earlier non-empty
+			//    one (a fix landing) is never held, in either arrival order.
+			if (
+				strategy.emptyFirstPublish === "indexing" &&
+				!state.emptyFirstPublishHoldSpent &&
+				newDiags.length === 0 &&
+				!state.pushDiagnostics.has(normalizedPath) &&
+				!state.pendingDiagnostics.has(normalizedPath)
+			) {
+				state.emptyFirstPublishHoldSpent = true;
+				// Bounded by construction: one record per client session, because
+				// the hold itself is one-shot.
+				logLatency({
+					type: "phase",
+					phase: "lsp_empty_first_publish_held",
+					filePath: normalizedPath,
+					durationMs: Math.max(
+						0,
+						publishReceivedAt -
+							(state.documentOpenedAt.get(normalizedPath) ?? publishReceivedAt),
+					),
+					metadata: {
+						serverId: state.serverId,
+						emptyFirstPublish: strategy.emptyFirstPublish,
+						// `pubVersion`, the `[lsp-pub]` trace's own field name for the
+						// publish's LSP document version — not a lifecycle identity, and
+						// not the retired glossary spelling (AGENTS.md "generation").
+						pubVersion: docVersion ?? "push-unversioned",
+					},
+				});
+				return;
+			}
+
 			// Seed on first push for servers whose first push is known complete.
 			// Bypasses the debounce timer entirely — resolves waiting promises immediately.
 			if (
 				strategy.seedFirstPush &&
 				!state.pushDiagnostics.has(normalizedPath)
 			) {
-				if (isSupersededPush()) return;
+				// #3482 r2: a superseded answer is a scan that answered and is never
+				// stored; count it so the backlog binding is not left one short.
+				if (isSupersededPush()) {
+					countPublication(state, normalizedPath);
+					return;
+				}
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
 				recordDocVersion();
@@ -2429,11 +2822,19 @@ export function setupIncomingHandlers(
 			logSequence(false, "publication", 0);
 
 			const existingTimer = state.pendingDiagnostics.get(normalizedPath);
-			if (existingTimer) clearTimeout(existingTimer);
+			if (existingTimer) {
+				clearTimeout(existingTimer);
+				// #3482: the replaced receipt is a scan that answered and will never
+				// be stored; count it so the backlog is not left one short.
+				countPublication(state, normalizedPath);
+			}
 
 			const timer = setTimeout(() => {
 				state.pendingDiagnostics.delete(normalizedPath);
-				if (isSupersededPush()) return;
+				if (isSupersededPush()) {
+					countPublication(state, normalizedPath);
+					return;
+				}
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
 				recordDocVersion();
@@ -2592,7 +2993,9 @@ export function setupIncomingHandlers(
 	// dot-path into the server's config, e.g. "scan.jobs") — not a fixed
 	// single-element array duplicating the whole blob for every item. An item
 	// with no `section` gets the whole blob (that's what "no section" means
-	// per spec); an unresolvable section gets `null`, never the whole blob.
+	// per spec); an unresolvable section gets `{}` (never `null`: strict consumers such as
+	// vscode-css-language-server and @prisma/language-server throw or exit on
+	// null), never the whole blob.
 	state.connection.onRequest(
 		"workspace/configuration",
 		async (params: { items?: Array<{ section?: string }> }) => {
@@ -2603,6 +3006,9 @@ export function setupIncomingHandlers(
 		},
 	);
 	state.connection.onRequest("window/workDoneProgress/create", async () => {});
+	state.connection.onNotification("semgrep/rulesRefreshed", () =>
+		rebaselineForRulesRefresh(state),
+	);
 	// #1669: a server can send `workspace/diagnostic/refresh` (typically after a
 	// project-wide config change) to say every pull result it has already
 	// reported may be stale. Left unhandled, vscode-jsonrpc replies
@@ -3491,6 +3897,8 @@ export async function clientRequestWorkspaceDiagnostics(
 		items?: Array<{
 			uri?: string;
 			kind?: string;
+			/** The document version the report is for; null when not open. */
+			version?: number | null;
 			resultId?: string;
 			items?: LSPDiagnostic[];
 		}>;
@@ -3602,15 +4010,21 @@ export async function clientRequestWorkspaceDiagnostics(
 			// "full" (or a non-conforming server omitting `kind`, per the LSP
 			// default) — recompute and re-fingerprint.
 			const diagnostics = normalizeLspDiagnostics(item.items ?? []);
-			// #1104: fingerprint the file bytes active AT REQUEST TIME. Best-effort —
-			// a read failure (deleted/unreadable mid-sweep) just leaves contentHash
-			// undefined, so the binding reads honestly "unknown", never fabricated.
-			let contentHash: string | undefined;
-			try {
-				contentHash = hashDiagnosticContent(await readFile(filePath, "utf-8"));
-			} catch {
-				contentHash = undefined;
-			}
+			// #3505 (b): bind the answer to the bytes dm-lens SENT the server, the
+			// same `documentContentHashes` record the push binding (#1095) uses.
+			// The #1104 disk read after the answer described the post-edit bytes
+			// whenever the file was written while the server was answering, so the
+			// pre-edit verdict was cached as bound to them. Only an open document
+			// whose reported version is the one dm-lens last sent is bound; any
+			// other answer (a file the server read itself, a lagging version) is
+			// unbound, and the sweep does not cache it.
+			const sent = state.openDocuments.has(normalizedPath)
+				? state.documentContentHashes.get(normalizedPath)
+				: undefined;
+			const contentHash =
+				sent !== undefined && sent.version === item.version
+					? sent.hash
+					: undefined;
 			if (item.resultId !== undefined) {
 				if (
 					state.workspacePullResultCache.size >= WORKSPACE_PULL_RESULT_CACHE_MAX
@@ -3834,6 +4248,108 @@ export function handleNotifyExternalChange(
 	state.watchQueue.enqueue(uri, type);
 }
 
+/** #3482: a didSave to a `rescansOnSave` server (opengrep) brings one more
+ * publication that answers no send, so the path expects it. Raised before the
+ * save is written, so the rescan can never land first and be absorbed by the
+ * cap. A save that fails to leave does so because the connection is gone,
+ * and a dead client's backlog no longer binds (`captureAuxPublicationBacklog`),
+ * so nothing is given back. */
+function expectSaveRescan(state: LSPClientState, normalizedPath: string): void {
+	if (!getStrategy(state.serverId, state.launchVariant).rescansOnSave) return;
+	const beyond = state.expectedPublicationsBeyondSends;
+	beyond?.set(normalizedPath, (beyond.get(normalizedPath) ?? 0) + 1);
+}
+
+/**
+ * #3405: tell the server the document it just received is the file's saved
+ * on-disk state.
+ *
+ * dm-lens has no unsaved-buffer concept — every notification it sends carries
+ * bytes read from disk — so a save-triggered server is the one class of server
+ * this client could never reach: `CLIENT_CAPABILITIES` has advertised
+ * `synchronization.didSave` since #278 and no caller emitted one, so Expert
+ * (whose ONLY whole-project recompile trigger is didSave —
+ * `expert-lsp/expert@6bbad8c` `apps/expert/lib/expert/state.ex:243-257`)
+ * published nothing for an edit made through dm-lens.
+ *
+ * Sent ONLY when the caller declared this touch a save (`saved`) AND the server
+ * declared `textDocumentSync.save`; `includeText` decides whether the text
+ * rides along. Both gates fail closed: an undeclared notification is the #278
+ * class of hazard, and a save claimed for content whose didOpen/didChange never
+ * left the process would tell the server to diagnose bytes it does not have —
+ * so every call site below sends this only after its own content notification
+ * returned `true` from `safeSendNotification`, and never for a document this
+ * client has not opened.
+ */
+async function sendDidSave(
+	state: LSPClientState,
+	normalizedPath: string,
+	uri: string,
+	content: string,
+): Promise<void> {
+	const save = state.saveOptions;
+	if (!save) return;
+	if (!isClientAlive(state)) return;
+	expectSaveRescan(state, normalizedPath);
+	// #3405 r2 (M3406-1): `text` is a SECOND full copy of bytes the server was
+	// just handed, so it is the one payload here that can be file-sized. The
+	// explicit `lsp_diagnostics` writer reads whole files with no bound of its
+	// own, so without this the same 32MB string would be framed twice. Bound it
+	// at the shared seam both writers pass through rather than at either caller.
+	//
+	// Omitting `text` is what the contract tolerates, and it is not a lost save:
+	// `DidSaveTextDocumentParams.text` is OPTIONAL ("Optional the content when
+	// saved") in the spec, FsAutoComplete — the one `includeText: true` server in
+	// the registry — types it `string option` and, given `None`, keeps the source
+	// it already holds and still runs its re-check
+	// (ionide/FsAutoComplete@85886b1, AdaptiveServerState.fs lines 2649-2673),
+	// and dm-lens only ever sends this after a landed didOpen/didChange for the
+	// same document, so the server has these bytes either way. Skipping the save
+	// outright would instead drop the diagnose trigger this PR exists to restore.
+	const limit = save.includeText
+		? exceedsLspSyncLimits(content)
+		: { tooLarge: false, reason: "" };
+	if (limit.tooLarge) {
+		recordDegradationOnce({
+			kind: "lsp-did-save-text-omitted",
+			subject: state.serverId,
+			reason: limit.reason,
+		});
+	}
+	await safeSendNotification(state.connection, "textDocument/didSave", {
+		textDocument: { uri },
+		...(save.includeText && !limit.tooLarge ? { text: content } : {}),
+	});
+}
+
+/**
+ * #3481 round 1: a save carried by a queue entry that was dropped for an older
+ * read. `text` is optional in `DidSaveTextDocumentParams`, and the server
+ * already holds the newer bytes, so the save is sent without it.
+ */
+async function sendDidSaveForHeldDocument(
+	state: LSPClientState,
+	normalizedPath: string,
+): Promise<void> {
+	if (!state.saveOptions || !isClientAlive(state)) return;
+	if (!state.openDocuments.has(normalizedPath)) return;
+	const uri = state.openDocumentUris?.get(normalizedPath);
+	if (uri === undefined) return;
+	expectSaveRescan(state, normalizedPath);
+	try {
+		await safeSendNotification(state.connection, "textDocument/didSave", {
+			textDocument: { uri },
+		});
+	} catch {
+		// A failed save notify must not stop the queue runner.
+	}
+}
+
+/**
+ * #3543: resolves `true` only when the content went on the wire. The queue
+ * hands this to the touch's callers, and `touchFile` records a landed write
+ * on it.
+ */
 async function handleNotifyOpenOnce(
 	state: LSPClientState,
 	filePath: string,
@@ -3842,8 +4358,9 @@ async function handleNotifyOpenOnce(
 	preserveDiagnostics = false,
 	silent = false,
 	coalescedCount = 0,
-): Promise<void> {
-	if (!isClientAlive(state)) return;
+	saved = false,
+): Promise<boolean> {
+	if (!isClientAlive(state)) return false;
 	const normalizedPath = normalizeMapKey(filePath);
 	const uri =
 		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
@@ -3887,7 +4404,7 @@ async function handleNotifyOpenOnce(
 			state.documentVersions.set(normalizedPath, version);
 			state.documentOpenedAt.set(normalizedPath, Date.now());
 			state.diagnosticPublicationCounts.set(normalizedPath, 0);
-			if (!isClientAlive(state)) return;
+			if (!isClientAlive(state)) return false;
 			const reopenSent = await safeSendNotification(
 				state.connection,
 				"textDocument/didOpen",
@@ -3905,10 +4422,14 @@ async function handleNotifyOpenOnce(
 				);
 			state.openDocuments.add(normalizedPath);
 			state.openDocumentUris?.set(normalizedPath, uri);
-			return;
+			if (saved && reopenSent)
+				await sendDidSave(state, normalizedPath, uri, content);
+			return reopenSent;
 		}
-		const changeSent = await safeSendNotification(
-			state.connection,
+		const changeSent = await sendFenced(
+			state,
+			normalizedPath,
+			uri,
 			"textDocument/didChange",
 			{
 				textDocument: { uri, version },
@@ -3923,14 +4444,21 @@ async function handleNotifyOpenOnce(
 				content,
 				coalescedCount,
 			);
-		return;
+		if (saved && changeSent)
+			await sendDidSave(state, normalizedPath, uri, content);
+		return changeSent;
 	}
 
+	if (await closedAndGone(state, filePath, normalizedPath)) return false;
 	state.pendingOpens.add(normalizedPath);
 	state.documentVersions.set(normalizedPath, 0);
 	state.documentOpenedAt.set(normalizedPath, Date.now());
 	state.diagnosticPublicationCounts.set(normalizedPath, 0);
 	clearDiagnosticsForPath(state, normalizedPath); // always clear for initial open
+	// #3482: after the clear, which counts a dropped pre-open receipt. A
+	// reopened path keeps its counts: its closed lifetime's scans still land.
+	if (!state.expectedPublicationsBeyondSends?.has(normalizedPath))
+		state.publicationStoreCountsByPath?.delete(normalizedPath);
 
 	// Send workspace notification first (like opencode does).
 	// Skipped in silent mode — cascade reads a file for diagnostics,
@@ -3955,10 +4483,12 @@ async function handleNotifyOpenOnce(
 		state.watchQueue.enqueue(uri, fileExists ? 2 : 1);
 	}
 
-	if (!isClientAlive(state)) return;
+	if (!isClientAlive(state)) return false;
 
-	const openSent = await safeSendNotification(
-		state.connection,
+	const openSent = await sendFenced(
+		state,
+		normalizedPath,
+		uri,
 		"textDocument/didOpen",
 		{ textDocument: { uri, languageId, version: 0, text: content } },
 	);
@@ -3968,6 +4498,7 @@ async function handleNotifyOpenOnce(
 	state.openDocuments.add(normalizedPath);
 	state.closedDocuments?.delete(normalizedPath);
 	state.openDocumentUris?.set(normalizedPath, uri);
+	if (saved && openSent) await sendDidSave(state, normalizedPath, uri, content);
 	// Telemetry is deliberately detached after didOpen succeeds.
 	// #1412 H1: routed through runReadOnlyServerCommand, NOT runServerCommand —
 	// the probe must never open the serverEditsAllowed/activeMutationContext
@@ -3988,6 +4519,7 @@ async function handleNotifyOpenOnce(
 				runReadOnlyServerCommand(state, command, args),
 		},
 	});
+	return openSent;
 }
 
 /**
@@ -4001,24 +4533,63 @@ async function handleNotifyOpenOnce(
 function enqueueDocumentNotify(
 	state: LSPClientState,
 	normalizedPath: string,
-	run: (coalescedCount: number) => Promise<void>,
-): Promise<void> {
+	run: (coalescedCount: number, saved: boolean) => Promise<boolean | void>,
+	saved = false,
+	readStamp?: number,
+	close = false,
+): Promise<boolean> {
 	let queue = state.notifyChangeQueues.get(normalizedPath);
 	if (!queue) {
 		queue = { running: false };
 		state.notifyChangeQueues.set(normalizedPath, queue);
 	}
-	return new Promise<void>((resolve, reject) => {
+	return new Promise<boolean>((resolve, reject) => {
+		// #3477: sending this touch after the queued close would re-open the
+		// path, or reach the server as a didChange for a closed document.
+		if (queue!.closing && !close) {
+			resolve(false);
+			return;
+		}
 		const previous = queue?.pending;
 		// Keep superseded callers attached to the replacement's completion. The
 		// notification is dropped, but callers such as the auxiliary backlog
 		// ledger must not observe completion before the newest content is sent.
 		const waiters = previous?.waiters ?? [];
-		waiters.push({ resolve, reject });
+		if (close) {
+			// The close supersedes unsent touches: their content is never sent.
+			for (const waiter of waiters) waiter.stale = true;
+			queue!.closing = true;
+		}
+		// #3481: last-READ-wins. An entry read before the pending one does not
+		// replace it; its caller waits on the newer send and learns it was stale.
+		// #3544: nor does one read before the content this path last sent. The
+		// runner drops it, and with it the unstamped touch it would replace.
+		const lastSent = state.sentReadStamps.get(normalizedPath);
+		const before = (a: number | undefined, b: number | undefined) =>
+			a !== undefined && b !== undefined && a < b;
+		const stale =
+			previous !== undefined &&
+			(before(readStamp, previous.readStamp) || before(readStamp, lastSent));
+		// #3544: a pending stamp older than the last send belongs to bytes the
+		// runner drops; an unstamped replacement must not inherit it.
+		const heldStamp = before(previous?.readStamp, lastSent)
+			? undefined
+			: previous?.readStamp;
+		waiters.push({ resolve, reject, stale });
 		queue!.pending = {
-			run,
+			run: stale ? previous!.run : run,
 			waiters,
 			coalescedCount: (previous?.coalescedCount ?? 0) + (previous ? 1 : 0),
+			saved: saved || previous?.saved === true,
+			// An unstamped replacement cannot say how old its bytes are; keeping the
+			// pending stamp keeps an older read arriving next out (#3481 round 1).
+			// A close carries no content, so it never inherits a stamp: the
+			// runner's stale-read drop must not drop the didClose (#3477).
+			readStamp: close
+				? undefined
+				: stale
+					? previous!.readStamp
+					: (readStamp ?? heldStamp),
 		};
 		if (queue!.running) return;
 		queue!.running = true;
@@ -4030,9 +4601,30 @@ function enqueueDocumentNotify(
 					const next = queue!.pending;
 					if (!next) break;
 					queue!.pending = undefined;
+					// #3481: an entry read before the content this path last sent
+					// would replace newer bytes with older ones. Drop it; its
+					// callers resolve without claiming a send.
+					const lastSent = state.sentReadStamps.get(normalizedPath);
+					if (
+						next.readStamp !== undefined &&
+						lastSent !== undefined &&
+						next.readStamp < lastSent
+					) {
+						// #3405: the save still happened. The server holds newer bytes,
+						// so the save goes out for the document it holds.
+						if (next.saved)
+							await sendDidSaveForHeldDocument(state, normalizedPath);
+						for (const waiter of next.waiters) waiter.resolve(false);
+						continue;
+					}
+					// An unstamped send (a warm-up, an explicit query) cannot say how
+					// old its bytes are, so it leaves the last stamp in place.
+					if (next.readStamp !== undefined)
+						state.sentReadStamps.set(normalizedPath, next.readStamp);
 					try {
-						await next.run(next.coalescedCount);
-						for (const waiter of next.waiters) waiter.resolve();
+						const sent = await next.run(next.coalescedCount, next.saved);
+						for (const waiter of next.waiters)
+							waiter.resolve(sent !== false && !waiter.stale);
 					} catch (error) {
 						for (const waiter of next.waiters) waiter.reject(error);
 					}
@@ -4053,7 +4645,8 @@ function enqueueDocumentNotify(
 /** Drop unwritten document notifications when a client is torn down. */
 function cancelDocumentNotifyQueues(state: LSPClientState): void {
 	for (const queue of state.notifyChangeQueues.values()) {
-		for (const waiter of queue.pending?.waiters ?? []) waiter.resolve();
+		// Never sent: not a landed write, so `touchFile` records nothing for it.
+		for (const waiter of queue.pending?.waiters ?? []) waiter.resolve(false);
 		queue.pending = undefined;
 	}
 	state.notifyChangeQueues.clear();
@@ -4066,38 +4659,58 @@ export function handleNotifyOpen(
 	languageId: string,
 	preserveDiagnostics = false,
 	silent = false,
-): Promise<void> {
-	if (!isClientAlive(state)) return Promise.resolve();
+	saved = false,
+	readStamp?: number,
+): Promise<boolean> {
+	// #3543: no dead-client check here. The queued run makes it and resolves
+	// false; an early return only duplicated that answer.
 	const normalizedPath = normalizeMapKey(filePath);
-	return enqueueDocumentNotify(state, normalizedPath, (coalescedCount) =>
-		handleNotifyOpenOnce(
-			state,
-			filePath,
-			content,
-			languageId,
-			preserveDiagnostics,
-			silent,
-			coalescedCount,
-		),
+	return enqueueDocumentNotify(
+		state,
+		normalizedPath,
+		(coalescedCount, queuedSaved) =>
+			handleNotifyOpenOnce(
+				state,
+				filePath,
+				content,
+				languageId,
+				preserveDiagnostics,
+				silent,
+				coalescedCount,
+				queuedSaved,
+			),
+		saved,
+		readStamp,
 	);
 }
 
+/**
+ * #3543: resolves `true` only when the content went on the wire.
+ *
+ * #3545: `saved` is a save this entry carries for a touch it replaced, or
+ * for an older saved read kept out behind it. The save happened, so it goes
+ * out for the bytes this run left the server holding, as the open path does.
+ */
 async function handleNotifyChangeOnce(
 	state: LSPClientState,
 	filePath: string,
 	content: string,
 	normalizedPath: string,
 	coalescedCount = 0,
-): Promise<void> {
-	if (!isClientAlive(state)) return;
+	saved = false,
+): Promise<boolean> {
+	if (!isClientAlive(state)) return false;
 	const uri =
 		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
 	if (!state.openDocuments.has(normalizedPath)) {
+		if (await closedAndGone(state, filePath, normalizedPath)) return false;
 		// Safety fallback: keep protocol ordering valid even if caller sends
 		// didChange before first didOpen for this document.
-		const fallbackOpenSent = await safeSendNotification(
-			state.connection,
+		const fallbackOpenSent = await sendFenced(
+			state,
+			normalizedPath,
+			uri,
 			"textDocument/didOpen",
 			{
 				textDocument: {
@@ -4114,8 +4727,13 @@ async function handleNotifyChangeOnce(
 		if (fallbackOpenSent)
 			recordSentContent(state, normalizedPath, 0, content, coalescedCount);
 		state.openDocuments.add(normalizedPath);
+		// #3549: a re-open, like the main didOpen's. Left set, the publish
+		// handler dropped every later answer for the path.
+		state.closedDocuments?.delete(normalizedPath);
 		state.openDocumentUris?.set(normalizedPath, uri);
-		return;
+		if (saved && fallbackOpenSent)
+			await sendDidSave(state, normalizedPath, uri, content);
+		return fallbackOpenSent;
 	}
 
 	const version = (state.documentVersions.get(normalizedPath) ?? 0) + 1;
@@ -4123,8 +4741,10 @@ async function handleNotifyChangeOnce(
 	// Clear stale diagnostics before sending new content so waitForDiagnostics
 	// doesn't return immediately with the previous edit's results.
 	clearDiagnosticsForPath(state, normalizedPath);
-	const changeSent = await safeSendNotification(
-		state.connection,
+	const changeSent = await sendFenced(
+		state,
+		normalizedPath,
+		uri,
 		"textDocument/didChange",
 		{
 			textDocument: { uri, version },
@@ -4133,6 +4753,9 @@ async function handleNotifyChangeOnce(
 	);
 	if (changeSent)
 		recordSentContent(state, normalizedPath, version, content, coalescedCount);
+	if (saved && changeSent)
+		await sendDidSave(state, normalizedPath, uri, content);
+	return changeSent;
 }
 
 /**
@@ -4144,28 +4767,81 @@ export function handleNotifyChange(
 	state: LSPClientState,
 	filePath: string,
 	content: string,
-): Promise<void> {
-	if (!isClientAlive(state)) return Promise.resolve();
+): Promise<boolean> {
+	// #3543: the queued run makes the dead-client check and resolves false.
 	const normalizedPath = normalizeMapKey(filePath);
-	return enqueueDocumentNotify(state, normalizedPath, (coalescedCount) =>
-		handleNotifyChangeOnce(
-			state,
-			filePath,
-			content,
-			normalizedPath,
-			coalescedCount,
-		),
+	// #3405: no `saved` argument — `LSPService.updateFile` is this path's only
+	// entry point and no caller declares a save through it, so a change never
+	// originates one. #3545: it still sends the save its entry inherited.
+	return enqueueDocumentNotify(
+		state,
+		normalizedPath,
+		(coalescedCount, queuedSaved) =>
+			handleNotifyChangeOnce(
+				state,
+				filePath,
+				content,
+				normalizedPath,
+				coalescedCount,
+				queuedSaved,
+			),
 	);
 }
 
-/** Close a document through the same lifecycle path exposed by the client. */
+/**
+ * #3477: a touch of a path this client closed, whose file is gone. It carries
+ * bytes read before a rename moved the file (a carried-over cascade), and
+ * opening them would leave the server a document for a file that no longer
+ * exists. A file there again (renamed back, recreated) re-opens normally.
+ */
+async function closedAndGone(
+	state: LSPClientState,
+	filePath: string,
+	normalizedPath: string,
+): Promise<boolean> {
+	if (!state.closedDocuments?.has(normalizedPath)) return false;
+	try {
+		await access(filePath);
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * Close a document through the same lifecycle path exposed by the client.
+ *
+ * #3477: an entry on the path's notify queue, so it waits for a send in flight
+ * and reads `openDocuments` when it runs. Unsent touches queued before it, or
+ * arriving before it drains, are not sent.
+ */
 export async function closeDocument(
 	state: LSPClientState,
 	filePath: string,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
 	const normalizedPath = normalizeMapKey(filePath);
-	if (!state.openDocuments.has(normalizedPath)) return;
+	await enqueueDocumentNotify(
+		state,
+		normalizedPath,
+		() => closeDocumentOnce(state, filePath, normalizedPath),
+		false,
+		undefined,
+		true,
+	);
+}
+
+async function closeDocumentOnce(
+	state: LSPClientState,
+	filePath: string,
+	normalizedPath: string,
+): Promise<void> {
+	if (!isClientAlive(state)) return;
+	if (!state.openDocuments.has(normalizedPath)) {
+		// Not open here, but still closed for this client: see closedAndGone.
+		state.closedDocuments?.add(normalizedPath);
+		return;
+	}
 	await safeSendNotification(state.connection, "textDocument/didClose", {
 		textDocument: {
 			uri:
@@ -4176,7 +4852,14 @@ export async function closeDocument(
 	state.openDocuments.delete(normalizedPath);
 	state.closedDocuments?.add(normalizedPath);
 	state.openDocumentUris?.delete(normalizedPath);
+	// #3482: the scans this lifetime expected still publish, after the close
+	// (counted as they are dropped) or after a reopen, so the counts span it.
+	state.expectedPublicationsBeyondSends?.set(
+		normalizedPath,
+		publicationCountsForPath(state, normalizedPath).sent,
+	);
 	state.documentVersions.delete(normalizedPath);
+	state.sentReadStamps.delete(normalizedPath);
 	state.documentOpenedAt.delete(normalizedPath);
 	state.diagnosticPublicationCounts.delete(normalizedPath);
 	// #1412 L1: projectIdentityProbedFiles is a claim-once memo scoped to the
@@ -5123,6 +5806,7 @@ export async function createLSPClient(options: {
 	 *  single-variant server or not yet reported; consumers must treat that as
 	 *  the classic/default behavior (fail-safe). */
 	launchVariant?: "classic" | "native-ts7";
+	onDiagnosticsPublished?: (serverId: string) => void;
 }): Promise<LSPClientInfo> {
 	installCrashGuard();
 
@@ -5134,6 +5818,7 @@ export async function createLSPClient(options: {
 		initialization,
 		initializeTimeoutMs = INITIALIZE_TIMEOUT_MS,
 		launchVariant,
+		onDiagnosticsPublished,
 	} = options;
 
 	// #449/#472: register this LSP child in the cross-process instance registry
@@ -5283,6 +5968,7 @@ export async function createLSPClient(options: {
 	const state: LSPClientState = {
 		isConnected: true,
 		isDestroyed: false,
+		startedAtMs: Date.now(),
 		shutdownRequested: false,
 		shutdownPromise: undefined,
 		shutdownOptions: undefined,
@@ -5301,8 +5987,11 @@ export async function createLSPClient(options: {
 		diagnosticEmitter,
 		diagnosticsVersion: 0,
 		diagnosticsVersionsByPath: new Map(),
+		publicationStoreCountsByPath: new Map(),
+		expectedPublicationsBeyondSends: new Map(),
 		documentVersions: new Map(),
 		notifyChangeQueues: new Map(),
+		sentReadStamps: new Map(),
 		diagnosticDocVersions: new Map(),
 		documentContentHashes: new Map(),
 		incrementalTextRetainedEntries: 0,
@@ -5315,6 +6004,9 @@ export async function createLSPClient(options: {
 		pullRequestSequences: new Map(),
 		workspacePullResultCache: new Map(),
 		openDocuments: new Set(),
+		// #3310: one-shot, per client session.
+		emptyFirstPublishHoldSpent: false,
+		diagnosticFences: new Map(),
 		closedDocuments: new Set(),
 		openDocumentUris: new Map(),
 		pendingOpens: new Set(),
@@ -5353,7 +6045,7 @@ export async function createLSPClient(options: {
 		);
 	});
 
-	setupIncomingHandlers(state, initialization);
+	setupIncomingHandlers(state, initialization, onDiagnosticsPublished);
 	connection.listen();
 	setupConnectionLifecycle(state, recentStderr);
 
@@ -5494,6 +6186,9 @@ export async function createLSPClient(options: {
 	state.syncKind = negotiateSyncKind(
 		(initResult as { capabilities?: unknown })?.capabilities,
 	);
+	state.saveOptions = negotiateSaveOptions(
+		(initResult as { capabilities?: unknown })?.capabilities,
+	);
 	state.rawCapabilityKeys = Object.keys(
 		(initResult as { capabilities?: Record<string, unknown> })?.capabilities ??
 			{},
@@ -5545,7 +6240,15 @@ export async function createLSPClient(options: {
 		getProcessPid: () => lspProcess.pid,
 
 		notify: {
-			async open(filePath, content, languageId, preserveDiagnostics, silent) {
+			async open(
+				filePath,
+				content,
+				languageId,
+				preserveDiagnostics,
+				silent,
+				saved,
+				readStamp,
+			) {
 				return handleNotifyOpen(
 					state,
 					filePath,
@@ -5553,6 +6256,8 @@ export async function createLSPClient(options: {
 					languageId,
 					preserveDiagnostics,
 					silent,
+					saved,
+					readStamp,
 				);
 			},
 			async change(filePath, content) {
@@ -5573,6 +6278,10 @@ export async function createLSPClient(options: {
 
 		getDiagnosticsVersionForPath(filePath) {
 			return diagnosticsVersionForPath(state, normalizeMapKey(filePath));
+		},
+
+		getPublicationCountsForPath(filePath) {
+			return publicationCountsForPath(state, normalizeMapKey(filePath));
 		},
 
 		getAllDiagnostics() {
@@ -5653,6 +6362,10 @@ export async function createLSPClient(options: {
 
 		getRawCapabilityKeys() {
 			return state.rawCapabilityKeys ?? [];
+		},
+
+		getSaveOptions() {
+			return state.saveOptions ? { ...state.saveOptions } : undefined;
 		},
 
 		getLaunchVariant() {
@@ -5785,8 +6498,21 @@ export async function createLSPClient(options: {
 			return [...state.openDocuments];
 		},
 
+		getSentContent(filePath) {
+			const sent = state.documentContentHashes.get(normalizeMapKey(filePath));
+			return (
+				sent && {
+					hash: sent.hash,
+					changedAtMs: sent.changedAtMs,
+					openedAtMs: sent.openedAtMs,
+					openedHash: sent.openedHash,
+					clientStartedAtMs: state.startedAtMs,
+				}
+			);
+		},
+
 		isBusy() {
-			return (activeRequestsByConnection.get(connection) ?? 0) > 0;
+			return isConnectionBusy(connection);
 		},
 
 		getDocumentUri(filePath) {
@@ -5994,6 +6720,118 @@ export async function createLSPClient(options: {
  * it (the next Incremental range would be computed against content the
  * server never saw).
  */
+/**
+ * #3484: send a document notification and, for a server whose strategy
+ * carries the measured `diagnosticsFence: "reply-first"` marker, a fence
+ * request in the same synchronous tick.
+ * vscode-jsonrpc orders messages when they are sent, so the fence reaches the
+ * server after the notification and its reply comes after every publish the
+ * server sent before reading it. Until then the publish handler drops
+ * version-less publishes for the path. A server that answers the fence and
+ * THEN publishes an older analysis still defeats it (the model's
+ * `FenceAsyncServer`); no client-side ordering can rule that out.
+ */
+function sendFenced(
+	state: LSPClientState,
+	normalizedPath: string,
+	uri: string,
+	method: string,
+	params: unknown,
+): Promise<boolean> {
+	const sent = safeSendNotification(state.connection, method, params);
+	armDiagnosticsFence(state, normalizedPath, uri);
+	return sent;
+}
+
+function armDiagnosticsFence(
+	state: LSPClientState,
+	normalizedPath: string,
+	uri: string,
+): void {
+	// Only a server measured to answer the fence BEFORE it publishes for the
+	// new content: fencing one that publishes first (docker-langserver) drops
+	// its only fresh answer.
+	if (
+		getStrategy(state.serverId, state.launchVariant).diagnosticsFence !==
+		"reply-first"
+	) {
+		return;
+	}
+	if (state.operationSupport?.documentSymbol !== true) {
+		// No cheap request the server answers in order: keep today's behaviour
+		// (the binding reads "unknown"), and say so once per client.
+		if (!state.fenceSkipRecorded) {
+			state.fenceSkipRecorded = true;
+			logLatency({
+				type: "phase",
+				phase: "lsp_diagnostics_fence",
+				filePath: normalizedPath,
+				durationMs: 0,
+				metadata: { serverId: state.serverId, outcome: "no-request" },
+			});
+		}
+		return;
+	}
+	const armedAt = Date.now();
+	const cancellation = new CancellationTokenSource();
+	// Ends this fence once. It is still the path's current fence here: a newer
+	// fence supersedes (ends) it before taking its place. Cancelling after a
+	// reply sends nothing (vscode-jsonrpc drops the listener on the response).
+	const end = (outcome: "reply" | "timeout" | "superseded"): void => {
+		if (ended) return;
+		ended = true;
+		clearTimeout(bound);
+		state.diagnosticFences.delete(normalizedPath);
+		cancellation.cancel();
+		cancellation.dispose();
+		if (outcome === "timeout" || fence.dropped > 0) {
+			logLatency({
+				type: "phase",
+				phase: "lsp_diagnostics_fence",
+				filePath: normalizedPath,
+				durationMs: Date.now() - armedAt,
+				metadata: {
+					serverId: state.serverId,
+					outcome,
+					droppedPublishes: fence.dropped,
+				},
+			});
+		}
+	};
+	let ended = false;
+	const fence: DiagnosticFence = {
+		dropped: 0,
+		supersede: () => end("superseded"),
+	};
+	state.diagnosticFences.get(normalizedPath)?.supersede();
+	state.diagnosticFences.set(normalizedPath, fence);
+	// Bounded by the client's diagnostics wait ceiling: a server that never
+	// answers cannot hold the path's publishes back past it. Publishes are then
+	// accepted as they were before #3484.
+	const bound = setTimeout(() => end("timeout"), DIAGNOSTICS_WAIT_TIMEOUT_MS);
+	bound.unref?.();
+	// Sent directly, not through safeSendRequest: a fence is bookkeeping, so it
+	// must not count toward isBusy() (capacity and idle eviction read it), and a
+	// wedged server's unanswered fence would otherwise hold it busy forever.
+	// An error reply is still a reply, ordered after the earlier publishes.
+	let reply: Promise<unknown>;
+	try {
+		reply = Promise.resolve(
+			state.connection.sendRequest(
+				"textDocument/documentSymbol" as never,
+				{ textDocument: { uri } } as never,
+				cancellation.token as never,
+			),
+		);
+	} catch (thrown) {
+		reply = Promise.reject(thrown);
+	}
+	reply.then(
+		() => end("reply"),
+		() => end("reply"),
+	);
+}
+
 async function safeSendNotification(
 	connection: MessageConnection,
 	method: string,
@@ -6012,6 +6850,11 @@ async function safeSendNotification(
 }
 
 const activeRequestsByConnection = new WeakMap<MessageConnection, number>();
+
+/** A request dm-lens sent on this connection is still unanswered. */
+export function isConnectionBusy(connection: MessageConnection): boolean {
+	return (activeRequestsByConnection.get(connection) ?? 0) > 0;
+}
 
 // Helper to safely send requests - catches stream destruction
 async function safeSendRequest<T>(

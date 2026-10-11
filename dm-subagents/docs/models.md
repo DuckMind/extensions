@@ -11,7 +11,11 @@ Builtin agents inherit your current DM default model. This keeps new installs fr
 - `subagents.agentOverridesByProvider.<provider>.<name>` — layer role fields for the active parent provider.
 - Per-run overrides — for one launch only.
 
-Precedence, strongest first: per-run override → agent frontmatter `model` → provider-scoped role override → `agentOverrides.<name>.model` → `subagents.defaultModel` → the parent session model. A provider preference does not replace this order; it only resolves bare model ids when the active registry has more than one match. Fully qualified `provider/model` strings still win exactly.
+Precedence, strongest first: per-run override → provider-scoped role override → `agentOverrides.<name>.model` → agent frontmatter `model` → `subagents.defaultModel` → the parent session model. A provider preference does not replace this order; it only resolves bare model ids when the active registry has more than one match. Fully qualified `provider/model` strings still win exactly.
+
+On the two Claude Code adapters a model is Claude Code's own alias or id rather than a DM child model, so a value set for one of them resolves nothing against the registry. `subagents.defaultModel` is ignored there, because it is a default for DM children. An explicit `agentOverrides.<name>.model` or agent frontmatter `model` is passed on as given, and Claude Code reports it when it does not recognize the value. See [agents](agents.md).
+
+Each launch resolves one model. Provider errors, including HTTP 429 responses, are returned from that model rather than selecting another one. Separately, a verified compaction abort after useful progress may continue the retained child session once on the same resolved model; this lifecycle recovery preserves work and is not model fallback.
 
 Use `model: "inherit"` in agent frontmatter or `agentOverrides.<name>.model` to select the current parent session model explicitly.
 
@@ -57,7 +61,7 @@ To keep one role definition but configure it differently for work and personal p
 }
 ```
 
-The provider key comes from the active parent session model (or an explicit host `preferredProvider`) before fallback selection. Provider-scoped fields layer over the ordinary override in the same settings file; project settings still win over user settings. A fallback attempt does not switch the selected provider configuration.
+The provider key comes from the active parent session model (or an explicit host `preferredProvider`). Provider-scoped fields layer over the ordinary override in the same settings file; project settings still win over user settings.
 
 For one run, put the override in the command:
 
@@ -65,7 +69,7 @@ For one run, put the override in the command:
 /run reviewer[model=anthropic/claude-sonnet-4:high] "Review this diff"
 ```
 
-For a persistent role override with a backup model for provider failures:
+For a persistent role override:
 
 ```json
 {
@@ -73,21 +77,20 @@ For a persistent role override with a backup model for provider failures:
     "agentOverrides": {
       "reviewer": {
         "model": "anthropic/claude-sonnet-4",
-        "thinking": "high",
-        "fallbackModels": ["openai-codex/gpt-5.6-luna:low"]
+        "thinking": "high"
       }
     }
   }
 }
 ```
 
-`subagents.defaultModel` and `subagents.defaultProvider` apply to builtin, package, user, and project agents. `defaultModel` fills only agents that do not set `model` in frontmatter. `defaultProvider` is also applied to frontmatter and override models so bare ids resolve against the intended provider. Per-run model overrides and `agentOverrides.<name>.model` still win, and explicit agent frontmatter still wins over the global default. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable a builtin (see [agents.md](agents.md)). Matching user and project agents also receive override fields that their frontmatter leaves unset, so a shared project config agent can keep the persona while local settings choose the model or provider.
+`subagents.defaultModel` and `subagents.defaultProvider` apply to builtin, package, user, project, and runtime-registered agents. `defaultModel` fills only agents that do not set `model` in frontmatter or in their runtime definition. `defaultProvider` is also applied to frontmatter and override models so bare ids resolve against the intended provider. Per-run model overrides and `agentOverrides.<name>.model` win over frontmatter and the global default. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable an agent (see [agents.md](agents.md)); matching custom-agent frontmatter is replaced for any field set by the override. Runtime-registered agents take only `model`, `defaultProvider`, `fast`, and `thinking` from `agentOverrides.<name>`; their other definition fields stay owned by the registering extension.
 
 ## Fast mode
 
 Set `fast: true` on a run, in agent frontmatter, or in `subagents.agentOverrides.<name>.fast` to request the OpenAI priority service tier for supported native OpenAI-Codex children. This can use a higher quota tier or cost more. It is off by default.
 
-Fast mode fails before launch unless every resolved model candidate is on the allowlist. The current allowlist is `openai-codex/gpt-5.6-luna` and `openai-codex/gpt-5.6-sol`. External runners, Anthropic models, and other providers do not use fast mode.
+Fast mode fails before launch unless the resolved model is a native `openai-codex/*` model. External runners, Anthropic models, and other providers do not use fast mode.
 
 ## Recommended model tiering (optional)
 
@@ -100,23 +103,11 @@ A setup that works well in practice: route agents by task shape instead of runni
 
 The routing rule: use the capability tiers (1–3) when the task is well-scoped, and the intent tier (4) when scoping or judging is the task itself.
 
-Give tier-4 agents cross-provider `fallbackModels` so subscription usage limits degrade gracefully instead of failing the run. Fallback triggers on retryable provider/model failures such as rate-limit, overload, unavailable-model, and provider-reported timeout errors. The outer run-level `timeoutMs` / `maxRuntimeMs` deadline is terminal and does not start another fallback attempt:
-
-```yaml
----
-name: shaper
-description: Open-ended design/UX/product/planning agent for ambiguous tasks
-model: anthropic/claude-fable-5
-thinking: medium
-fallbackModels: openai-codex/gpt-5.5:high
----
-```
-
-One interaction worth knowing for tier 4: forked context over an Anthropic parent transcript with signed thinking blocks forces the child's thinking off, so intent-tier agents work best with fresh context.
+Each launch resolves one model and starts the child once. Provider, authentication, quota, rate-limit, stream, empty-response, context-overflow, and provisioning failures are returned from that attempt. To try another model, the parent or operator must issue a later explicit launch.
 
 ## Thinking level defaults
 
-Set `subagents.defaultThinking` to give builtin, package, user, and project agents without a `thinking` value a shared thinking level, independent of the parent session's default. Project settings win over user settings. Explicit frontmatter, `agentOverrides.<name>.thinking`, and per-run thinking overrides still win. `thinking: false` remains an explicit opt-out:
+Set `subagents.defaultThinking` to give builtin, package, user, and project agents without a `thinking` value a shared thinking level, independent of the parent session's default. Project settings win over user settings. Matching `agentOverrides.<name>.thinking` and per-run thinking overrides replace frontmatter; otherwise explicit frontmatter remains in effect. `thinking: false` remains an explicit opt-out:
 
 ```json
 {
@@ -129,11 +120,11 @@ Set `subagents.defaultThinking` to give builtin, package, user, and project agen
 }
 ```
 
-If your provider rejects model IDs with thinking suffixes, set `subagents.disableThinking: true` in user or project settings. That clears bundled builtin thinking defaults in one place. An explicit higher-precedence `agentOverrides.<name>.thinking` value can opt a role back in. Existing custom-agent frontmatter remains authoritative.
+If your provider rejects model IDs with thinking suffixes, set `subagents.disableThinking: true` in user or project settings. That clears bundled builtin thinking defaults in one place. An explicit higher-precedence `agentOverrides.<name>.thinking` value can opt a role back in or replace custom-agent frontmatter thinking.
 
 ### Thinking ceiling
 
-Set `subagents.maxThinking` to enforce a hard maximum for every native DM child. The supported levels, from least to most thinking, are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`:
+Set `subagents.maxThinking` to enforce a hard maximum for every child that can ask for a thinking level: native DM children and the two Claude Code adapters. The supported levels, from least to most thinking, are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`:
 
 ```json
 {
@@ -144,7 +135,7 @@ Set `subagents.maxThinking` to enforce a hard maximum for every native DM child.
 }
 ```
 
-Requests above the ceiling fail before child startup; the setting covers frontmatter, `agentOverrides`, per-run overrides, fallback models, parallel/chain children, nested launches, and resumed children. Project settings take precedence over user settings. External runners retain their existing behavior.
+Requests above the ceiling fail before child startup; the setting covers frontmatter, `agentOverrides`, per-run overrides, parallel/chain children, nested launches, and resumed children. Project settings take precedence over user settings. External runners keep their existing behavior, except the two Claude Code adapters, which translate the requested level into `--effort` and enforce the same ceiling. An enforced `subagents.modelScope` also covers them: the model id that will reach the CLI is checked, and a launch that pins no model fails closed.
 
 ## Extension defaults
 
@@ -154,7 +145,7 @@ Set `subagents.defaultExtensions` to give builtin, package, user, and project ag
 - Empty array: sets `extensions: []` for agents that do not explicitly define it, disabling ambient extension loading.
 - Non-empty array: supplies that allowlist to agents that do not explicitly define one.
 
-Project settings win over user settings. Use `agentOverrides.<name>.extensions` for per-agent settings; explicit custom-agent frontmatter remains authoritative.
+Project settings win over user settings. Use `agentOverrides.<name>.extensions` for per-agent settings; a matching override replaces custom-agent frontmatter for that field.
 
 ```json
 {
@@ -169,7 +160,9 @@ Project settings win over user settings. Use `agentOverrides.<name>.extensions` 
 }
 ```
 
-A non-array value, an array containing a non-string entry, or an empty/whitespace-only string raises a settings error naming `defaultExtensions` and the offending settings file, matching the validation pattern used by `defaultModel` and `defaultThinking`.
+Set `subagents.defaultSubagentOnlyExtensions` to give agents without a `subagentOnlyExtensions` field a shared child-only extension list while preserving ambient extension discovery. An empty array is an explicit empty default but, unlike `defaultExtensions: []`, does not disable ambient extensions. An agent's frontmatter list (including `[]`) suppresses the default; user and then project `agentOverrides.<name>.subagentOnlyExtensions` replace it or clear it with `false`. Lists are not combined.
+
+The two defaults resolve independently, with an explicitly present project value winning over the user value. If both are set, `defaultExtensions` still disables ambient discovery and the child-only paths are loaded alongside its allowlist. Both reject non-arrays, non-string or blank entries with an error naming the setting and source file. Extension paths execute trusted code, so use project defaults only for trusted repositories and extensions.
 
 ## Inspecting the live mapping
 
@@ -215,19 +208,19 @@ To keep subagents inside a budget or compliance profile, enforce a model scope. 
 }
 ```
 
-- `allow` is a list of glob patterns matched against the resolved `provider/id` (only `*` is special, case-insensitive). The literal `inherit` means the current parent session model.
+- `allow` is a list of glob patterns matched against the resolved `provider/id` (only `*` is special, case-insensitive). The literal `inherit` means the current parent session model. The literal `scoped` means every model in the parent session's scoped-model set (dm's `/scoped-models`); when that set is empty, it means the same as `inherit`. Because `scoped` is reserved, it cannot match a provider literally named `scoped`.
 - `agents.<name>` adds a second allow-list for that agent. The model must pass both the global list and the matching agent list, so an agent rule cannot weaken the global rule. Agent rules inherit `enforce` and `strict` when those fields are absent.
 - A top-level `enforce: true` with only agent allow-lists restricts only those named agents. Unknown names are allowed so settings can be shared across projects and machines.
 - Models you pass explicitly — the tool-call `model`, `--model`, or a clarify pick — error and abort the run.
-- By default, models from agent frontmatter, `subagents.defaultModel`, the inherited parent session model, or fallback chains only warn and remain available, so existing configurations keep working while you tighten the scope.
-- Set `strict: true` with `enforce: true` to reject every resolved out-of-scope model. This includes inherited models and fallback candidates. An invalid fallback fails the run instead of being removed from the candidate chain.
+- By default, models from agent frontmatter, `subagents.defaultModel`, or the inherited parent session model only warn and remain available, so existing configurations keep working while you tighten the scope.
+- Set `strict: true` with `enforce: true` to reject every resolved out-of-scope model, including inherited models.
 - `enforce: true` requires at least one non-empty global or agent `allow` list; otherwise the config is rejected at load time.
 
-Model scope is policy only. It rejects or warns; it does not select a cheaper model. Set `agentOverrides.worker.model` to choose a worker model and use `modelScope.agents.worker` to prevent a per-run override or fallback from escaping that restriction.
+Model scope is policy only. It rejects or warns; it does not select a cheaper model. Set `agentOverrides.worker.model` to choose a worker model and use `modelScope.agents.worker` to prevent a per-run override from escaping that restriction.
 
-`inherit` expands in the parent process at each launch. It is never sent to the child as a model id. A nested child therefore inherits its immediate parent's current model, not the original top-level model. If no parent model is available, an enforced `inherit` entry does not match and fails closed.
+`inherit` and `scoped` expand in the parent process at each launch. They are never sent to the child as model ids. A nested child therefore inherits its immediate parent's current model, not the original top-level model. `scoped` uses the scoped-model set at launch, so a mid-session `/scoped-models` change applies to the next child; background runs keep the set captured when the run started. DM reports an empty set when the session is unscoped, either because nothing is configured or because no configured pattern matches an available model, and then lets the parent use every model. In that case `scoped` behaves exactly as `inherit`, which is narrower. If no parent model is available, an enforced `inherit` or `scoped` entry does not match and fails closed.
 
-Project `modelScope` settings replace the complete user `modelScope`, as with the existing project-over-user settings precedence. Project settings are trusted and can therefore replace user restrictions.
+Project `modelScope` settings replace the complete user `modelScope`, as with the existing project-over-user settings precedence. This applies only when the session trusts the project: when project trust is declined, project subagent settings are ignored and the user `modelScope` applies.
 
 ## Profiles and provider model catalogs
 
@@ -256,3 +249,5 @@ The workflow:
 - `/subagents-refresh-provider-models` writes a serialized provider model catalog with observed registry data, simple role-oriented classification, and live probe results from tiny one-shot `dm -p --model ... --no-tools` checks. The cache refreshes when missing or stale; use `--force` to ignore freshness and probe again immediately.
 - `/subagents-generate-profiles` uses the provider catalog to produce quota and quality profiles.
 - `/subagents-check-profile` re-checks each assigned model in a saved profile against the current registry and a live probe, so you can detect model removals, auth problems, or stale assignments.
+
+Hand-authored profile entries can also set `machine` to a non-empty string or `false`. Loading and checking validate the whole saved profile, including machine syntax; malformed values are rejected before loading writes settings or checking probes models. Valid machine strings are trimmed and use the same limits as agent settings. `false` clears a machine pin, while an omitted field preserves an existing string pin when loading. Validation does not query the live machine catalog.

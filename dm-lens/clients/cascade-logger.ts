@@ -29,6 +29,7 @@ export interface CascadeLogEntry {
 		| "cascade_tier3_skip" // #458: in-lane wait skipped for a tier-3 neighbor touch
 		| "cascade_tier3_reconcile" // #458: quiet-window reconcile of outstanding tier-3 touches
 		| "cascade_carry_over_drop" // #1443: late/carried run dropped — superseded by a later write, or the one-turn carry bound lapsed
+		| "cascade_carry_rendered" // #3168 F6: a carried run/coverage advisory actually rendered with its carry label this turn
 		| "cascade_injected" // #1446 item 1: what cascade text actually reached blockerParts this turn
 		| "cascade_test_targets"; // #1446 item 2: which tests were suggested for cascade neighbors, including the zero-suggestion case
 	filePath: string;
@@ -88,13 +89,4 @@ export function logCascade(entry: CascadeLogEntry): void {
 		...entry,
 		filePath: normalizeLoggedPath(entry.filePath),
 	});
-}
-
-export function getCascadeLogPath(): string {
-	return CASCADE_LOG_FILE;
-}
-
-/** Resolve once all enqueued cascade writes are on disk (tests/shutdown). */
-export function flushCascadeLog(): Promise<void> {
-	return writer.flush();
 }

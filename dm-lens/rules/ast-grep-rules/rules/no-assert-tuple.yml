@@ -1,24 +1,34 @@
 id: no-assert-tuple
 language: Python
 message: "Assert should not be called on a tuple literal"
-severity: error
+severity: warning
 note: |
   Port of SonarCloud python:S5905.
 
   `assert (a, b)` is always truthy because the tuple `(a, b)` is a
-  non-empty object. This is almost always a bug — the developer
-  probably meant `assert a, b` (two separate arguments) or
-  `assert (a == b)`.
+  non-empty object. The developer probably meant `assert a, b` (an
+  assertion with a message) or `assert (a == b)`.
 
-  The rule matches `assert` followed by a tuple literal. In Python
-  AST, `assert (1, 2)` parses as `assert_statement` whose test
-  is a `tuple` node (not parenthesized — the parens are just
-  grouping).
+  Bind the assertion's condition separately from its optional message,
+  then require that condition to be a tuple or a parentheses-only chain
+  ending in a tuple. Comparisons, calls, comprehensions, containers, and
+  tuple-valued assertion messages remain valid. The rule remains a
+  warning pending the multi-corpus false-positive audit required for
+  error severity.
 metadata:
   sonar: S5905
 rule:
-  all:
-    - kind: assert_statement
-    - has:
-        kind: tuple
-        stopBy: end
+  pattern: assert $COND
+constraints:
+  COND:
+    any:
+      - kind: tuple
+      - all:
+          - kind: parenthesized_expression
+          - has:
+              kind: tuple
+              stopBy:
+                not:
+                  any:
+                    - kind: parenthesized_expression
+                    - kind: tuple

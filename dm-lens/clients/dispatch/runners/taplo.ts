@@ -1,6 +1,9 @@
 import * as path from "node:path";
-import { findLocalBinUpwards } from "../../package-manager.js";
+import { pathsEqual } from "../../path-utils.js";
+import { findLocalBinUpwards, localBinPath } from "../../package-manager.js";
+import { stripAnsi } from "../../sanitize.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -9,8 +12,10 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 import {
 	createAvailabilityChecker,
+	coveringLaneAvailable,
 	lspPrimaryCoversFile,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
@@ -24,6 +29,7 @@ const taplo = createAvailabilityChecker("taplo", ".exe");
 //
 // #1937 round 2: the parser fix alone turned the old silent-clean into a false
 // BLOCKING diagnostic. clap prints `error: unexpected argument '--output'
+// EXIT TABLE (taplo 0.9 measured fixture): 0 clean; 1 findings; other nonzero rejected/error.
 // found`, which starts with the same lowercase `error:` a real taplo
 // diagnostic does, so a mistyped flag would have reddened every valid TOML
 // file. Both readings are wrong; the exit code is what separates them.
@@ -36,7 +42,7 @@ const HEADER_PATTERN = /^\s*(error|warning):(.*)$/;
 const LOCATION_LEAD = "┌─";
 
 /** The `:line:column` tail of a codespan location line. */
-const LOCATION_PATTERN = /:(\d+):(\d+)$/;
+const LOCATION_PATTERN = /^\s*┌─\s+(.+?):(\d+):(\d+)$/;
 
 /**
  * Parse `taplo lint` output (#1937).
@@ -64,9 +70,14 @@ const LOCATION_PATTERN = /:(\d+):(\d+)$/;
  * (#1937 round 2). The exit-code table in the runner is the primary guard;
  * this is the structural one, and each covers a case the other does not.
  */
-export function parseTaploOutput(raw: string, filePath: string): Diagnostic[] {
+export function parseTaploOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
-	const lines = (raw ?? "").split(/\r?\n/);
+	const absTarget = path.resolve(cwd, filePath);
+	const lines = stripAnsi(raw ?? "").split(/\r?\n/);
 
 	for (let i = 0; i < lines.length; i++) {
 		// Lowercase `error:`/`warning:` starts a diagnostic. taplo's tracing
@@ -93,8 +104,10 @@ export function parseTaploOutput(raw: string, filePath: string): Diagnostic[] {
 			if (!lines[j].includes(LOCATION_LEAD)) continue;
 			const location = LOCATION_PATTERN.exec(lines[j].trimEnd());
 			if (!location) continue;
-			line = Number.parseInt(location[1], 10) || 1;
-			column = Number.parseInt(location[2], 10) || 1;
+			if (!pathsEqual(path.resolve(cwd, location[1]!.trim()), absTarget))
+				continue;
+			line = Number.parseInt(location[2]!, 10) || 1;
+			column = Number.parseInt(location[3]!, 10) || 1;
 			break;
 		}
 		if (line === null) continue;
@@ -124,18 +137,32 @@ const taploRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "taplo");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("taplo")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		// #233: the `toml` LSP server IS `taplo lsp` (same binary). When that LSP
-		// covers this file, the warm server already produces these diagnostics —
-		// skip the redundant CLI scan to avoid double-reporting. Stays active when
-		// the LSP is disabled/unavailable so TOML coverage never regresses.
-		if (lspPrimaryCoversFile(ctx, "toml") && (await ctx.hasTool("taplo"))) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+		// #233, generalized (#3968): the `toml` LSP server IS `taplo lsp` (same
+		// binary), so the LSP covers this RUNNER's capability — the covers fact
+		// table (clients/lsp/server.ts `toml` → `taplo`) carries the mapping and
+		// the availability gates are the LSP's own binary. The warm server
+		// already produces these diagnostics — skip the redundant CLI scan.
+		// Stays active when the LSP is disabled/unavailable so TOML coverage
+		// never regresses.
+		const cover = lspPrimaryCoversFile(ctx, "taplo");
+		if (cover && (await coveringLaneAvailable(ctx, cover))) {
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				// The closed skip taxonomy — the shellcheck lane named its skip
+				// since #3968; this lane's identical skip was bare, reading as
+				// an unexplained empty output on the delivery surfaces
+				// (defect shape 10). F2 adds the claim's provenance beside it.
+				skipReason: "covered-by-primary",
+				claimSource: cover.claimSource,
+			};
 		}
 
 		// Project binary first (#1731, discipline B): `taplo.isAvailableAsync`
@@ -147,7 +174,8 @@ const taploRunner: RunnerDefinition = {
 		// correct for dm-lens's OWN managed install (a GitHub-release binary,
 		// `clients/installer/index.ts` taplo entry), a different artifact with a
 		// different extension, so it stays as the checker's fallback only.
-		let cmd: string | null = findLocalBinUpwards("taplo", cwd) ?? null;
+		let cmd: string | null =
+			localBinPath(findLocalBinUpwards("taplo", cwd)) ?? null;
 		if (!cmd) {
 			if (await taplo.isAvailableAsync(cwd)) {
 				cmd = taplo.getCommand(cwd);
@@ -182,7 +210,7 @@ const taploRunner: RunnerDefinition = {
 		const run = parseToolRun(
 			"taplo",
 			{ result, output: raw, exitCodes: TAPLO_EXIT_CODES },
-			(out) => parseTaploOutput(out, ctx.filePath),
+			(out) => parseTaploOutput(out, ctx.filePath, cwd),
 			{ skipWhenParsedNothing: true },
 		);
 		if (run.skipped) return run.skipped;
@@ -192,7 +220,10 @@ const taploRunner: RunnerDefinition = {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
 
-		return { status: "failed", diagnostics, semantic: "blocking" };
+		return findingsResult(diagnostics, {
+			status: "failed",
+			semantic: "blocking",
+		});
 	},
 };
 

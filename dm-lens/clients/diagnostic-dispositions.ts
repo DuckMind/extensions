@@ -99,7 +99,7 @@ export interface DispositionCandidate {
 }
 
 export type Disposition = "false-positive" | "suppress" | "defer" | "flagged";
-export type PersistedDisposition = Exclude<Disposition, "defer">;
+type PersistedDisposition = Exclude<Disposition, "defer">;
 
 export interface DispositionEntry {
 	disposition: PersistedDisposition;
@@ -134,6 +134,24 @@ interface DispositionStateFile {
 // below goes through `deferredKey`, which folds the resolved cwd into the Set
 // key, so the two projects can no longer collide.
 const deferredThisSession = new Set<string>();
+let widgetDispositionReconciler:
+	| ((
+			cwd: string,
+			target: DispositionMarkTarget,
+			disposition: Disposition,
+	  ) => void)
+	| null = null;
+
+/** Register the widget's mirror of the durable disposition state. */
+export function registerWidgetDispositionReconciler(
+	reconciler: (
+		cwd: string,
+		target: DispositionMarkTarget,
+		disposition: Disposition,
+	) => void,
+): void {
+	widgetDispositionReconciler = reconciler;
+}
 
 function deferredKey(cwd: string, anchor: string): string {
 	return `${normalizeMapKey(cwd)}::${anchor}`;
@@ -156,7 +174,8 @@ export const normalizeMessage = sharedNormalizeMessage;
 // case, symlink/realpath, or slash difference between the two forms silently
 // orphans the agent's own false-positive/flagged mark (a #533 dropped-signal).
 // Canonicalize BOTH inputs through `normalizeMapKey` (the SAME normalizer the
-// read side already relies on — realpathSync.native on Windows) BEFORE computing
+// read side already relies on — realpathSync.native on Windows, and on POSIX
+// too since #3098) BEFORE computing
 // the relative path, so write and read produce identical anchors regardless of
 // the form the caller held. `normalizeMapKey` is idempotent, so the already-
 // canonicalized read side is unaffected; the realpath I/O is acceptable here
@@ -187,11 +206,44 @@ export interface DispositionAnchorArgs {
 	content?: string;
 }
 
+/**
+ * The SPAN component of a strict anchor: the `lineContentHash` of the
+ * diagnostic's OWN line in `content`. `undefined` when there is no line to
+ * hash — no content, no line, or a line outside the content's range.
+ *
+ * Exported for #3183. The widget store's retention lifetime asks the same
+ * question a strict anchor does — "is the marked line still in this file?" —
+ * so it reuses this derivation rather than re-spelling it; a second spelling is
+ * how the store's answer drifts from the filter's (the retention identity's own
+ * drift from `computeWeakAnchor`'s parts cost #3158 a round). Note what is NOT
+ * here: the cwd/path component `stableFindingId` adds. Both sides of a
+ * retention comparison are the same file, so the span alone discriminates
+ * exactly as well while needing no `cwd` — which is why the store can ask it at
+ * all (see `retentionIdentity` in `clients/widget-state.ts`).
+ */
+export function strictAnchorSpan(
+	content: string | undefined,
+	line: number | undefined,
+): string | undefined {
+	if (content === undefined || line === undefined) return undefined;
+	const lines = content.split(/\r?\n/);
+	if (line < 1 || line > lines.length) return undefined;
+	return lineContentHash(lines[line - 1] ?? "");
+}
+
+/**
+ * Every span {@link strictAnchorSpan} could produce for `content` — one hash
+ * per line (#3183). Membership answers "does the line a mark was made against
+ * still exist in this file", wherever it has since moved to.
+ */
+export function strictAnchorSpansIn(content: string): Set<string> {
+	const spans = new Set<string>();
+	for (const line of content.split(/\r?\n/)) spans.add(lineContentHash(line));
+	return spans;
+}
+
 /** Site-specific anchor — see module doc. Used only for false-positive. */
 export function computeStrictAnchor(args: DispositionAnchorArgs): string {
-	const lines = args.content?.split(/\r?\n/);
-	const lineText =
-		args.line !== undefined && lines ? (lines[args.line - 1] ?? "") : "";
 	return stableFindingId("dd:", {
 		cwd: args.cwd,
 		filePath: args.filePath,
@@ -199,13 +251,17 @@ export function computeStrictAnchor(args: DispositionAnchorArgs): string {
 			args.tool ?? "",
 			args.rule ?? "",
 			normalizeMessage(args.message),
-			lineContentHash(lineText),
+			// An absent/out-of-range line hashes the empty string, exactly as the
+			// pre-#3183 `lines[args.line - 1] ?? ""` fallback did: stable, but less
+			// resistant to a same-file/rule/message collision (see
+			// `DispositionAnchorArgs.content`).
+			strictAnchorSpan(args.content, args.line) ?? lineContentHash(""),
 		],
 	});
 }
 
 /** Intent-level anchor — see module doc. Used for defer/flagged/suppress. */
-export function computeWeakAnchor(args: DispositionAnchorArgs): string {
+function computeWeakAnchor(args: DispositionAnchorArgs): string {
 	return stableFindingId("ddw:", {
 		cwd: args.cwd,
 		filePath: args.filePath,
@@ -497,6 +553,7 @@ function emitMarkTelemetry(
 		publishDisposition({
 			cwd,
 			filePath: target.filePath,
+			message: target.message,
 			disposition,
 			tool: target.tool,
 			rule: target.rule,
@@ -537,6 +594,7 @@ export function markDisposition(
 	const existing = readState(cwd).dispositions?.[anchor];
 	if (disposition === "defer") {
 		deferredThisSession.add(deferredKey(cwd, anchor));
+		widgetDispositionReconciler?.(cwd, target, disposition);
 		emitMarkTelemetry(
 			cwd,
 			target,
@@ -567,6 +625,9 @@ export function markDisposition(
 		lineText,
 	};
 	commitDisposition(cwd, anchor, entry);
+	// The durable commit is the guard for this mirror: a failed commit must not
+	// make the in-memory widget claim that a mark exists.
+	widgetDispositionReconciler?.(cwd, target, disposition);
 	emitMarkTelemetry(
 		cwd,
 		target,

@@ -433,6 +433,10 @@ export interface ResolvedFoundNeighbor {
 	filePath: string;
 	serverId: string;
 	diagnostics: LSPDiagnostic[];
+	/** #3168 F3: the #1444 publish stamp, threaded so a run built from this
+	 * neighbor carries its own observation time — the carried-run age label
+	 * renders from it instead of claiming no stamp exists. */
+	publishedAt?: number;
 }
 
 export interface CascadeTierReconcileOptions {
@@ -472,8 +476,11 @@ export function registerCascadeTierReconcileTask(
 	if (_reconcileTaskRegistered) return;
 	_reconcileTaskRegistered = true;
 
-	registerQuietWindowTask("cascade_tier3_reconcile", async () => {
+	registerQuietWindowTask("cascade_tier3_reconcile", async (context) => {
 		if (!isTierAwareCascadeEnabled()) return;
+		// #3499: `context.sessionGeneration` was captured when this task started,
+		// with no await before the synchronous drain below, so it is the
+		// generation of the touches drained.
 		const outcomes = await reconcileOutstandingCascadeTouches(getLspService());
 
 		// #1023: re-inject each resolved-found neighbor error so it reaches the
@@ -483,11 +490,20 @@ export function registerCascadeTierReconcileTask(
 		for (const o of outcomes) {
 			try {
 				if (o.outcome === "resolved-found" && o.diagnostics?.length) {
-					options.onResolvedFound?.({
+					const neighbor: ResolvedFoundNeighbor = {
 						filePath: o.filePath,
 						serverId: o.serverId,
 						diagnostics: o.diagnostics,
-					});
+						...(o.publishedAt !== undefined
+							? { publishedAt: o.publishedAt }
+							: {}),
+					};
+					const deliver = () => options.onResolvedFound?.(neighbor);
+					// #3499: the re-injection appends to the runtime shared with a
+					// same-cwd replacement; drop it if the task's session is gone.
+					if (context)
+						context.sessionGeneration.guardedWrite(o.filePath, deliver);
+					else deliver();
 				} else if (o.outcome === "resolved-clean" && o.publishedAt != null) {
 					// #1444: the stale-footer half of the same honesty problem — the
 					// neighbour proved clean, but only after the in-lane wait was

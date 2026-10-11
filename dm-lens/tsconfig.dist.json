@@ -15,7 +15,9 @@
 		"commands/**/*.ts",
 		"tools/**/*.ts",
 		"mcp/**/*.ts",
-		"scripts/lib/process-scan.mjs"
+		"scripts/lib/process-scan.mjs",
+		"scripts/lib/skills-predicate.mjs",
+		"scripts/lib/web-tree-sitter-dir.mjs"
 	],
 	"exclude": ["node_modules", "tests", "**/*.test.ts"]
 }

@@ -4,14 +4,22 @@ import { getProjectDataDir } from "../file-utils.js";
 import { writeFileAtomic } from "../atomic-write.js";
 import { readJsonCache } from "../json-cache-read.js";
 import { freshnessFromMtime } from "../freshness.js";
+import { hashDiagnosticContent } from "../lsp/diagnostic-binding.js";
 import type {
 	ProjectDiagnosticsDeltaReport,
 	ProjectDiagnosticsSnapshot,
 } from "./types.js";
 
+// v3 (#2154, #3060 review F1): rows carry `fileFingerprints` — the size and
+// sha256 of the bytes the scan actually read. A v2 snapshot has no content
+// axis at all; its rows can only be judged by `mtime <= scannedAt`, the test
+// that let an edit landing mid-scan read as fresh forever. Every row here is
+// a POSITIVE claim, so v2 records are rejected by the version guard and the
+// project is re-scanned rather than served under the axis that failed — the
+// same clean break `WORKSPACE_DIAGNOSTICS_CACHE_VERSION` v3 (#2776) made.
 // v2: cheap-tier scan now also runs ast-grep-napi (#308); invalidate older
 // snapshots so a pre-ast-grep cache isn't served as complete via refreshRunners=cached.
-export const PROJECT_DIAGNOSTICS_CACHE_VERSION = 2;
+export const PROJECT_DIAGNOSTICS_CACHE_VERSION = 3;
 const SNAPSHOT_CACHE_FILE = "project-diagnostics.json";
 const DELTA_CACHE_FILE = "project-diagnostics-delta.json";
 
@@ -104,14 +112,37 @@ export function reconcileProjectDiagnosticsSnapshot(
 		const cached = staleByFile.get(filePath);
 		if (cached !== undefined) return cached;
 		let stale: boolean;
-		let mtimeMs: number | undefined;
+		let stat: fs.Stats | undefined;
 		try {
-			mtimeMs = fs.statSync(filePath).mtimeMs;
+			stat = fs.statSync(filePath);
 		} catch {
-			mtimeMs = undefined; // deleted / unreadable -> indeterminate -> drop
+			stat = undefined; // deleted / unreadable -> indeterminate -> drop
+		}
+		// #2154: when the scan recorded what this file's bytes WERE, that answers
+		// the question directly and the timestamp comparison below cannot — a
+		// file edited while the scan was still running carries an mtime at or
+		// before `scannedAt` while holding bytes no rule here ever saw. Size is
+		// the cheap reject; only a same-size file is read and hashed. An exact
+		// content match is stronger evidence than any mtime ordering, so it
+		// settles the verdict on its own: these are per-file syntax rules, so
+		// identical bytes mean identical findings no matter what the clock says.
+		const fingerprint = snapshot.fileFingerprints?.[filePath];
+		if (fingerprint && stat) {
+			stale = true;
+			if (stat.size === fingerprint.sizeBytes) {
+				try {
+					stale =
+						hashDiagnosticContent(fs.readFileSync(filePath, "utf-8")) !==
+						fingerprint.contentHash;
+				} catch {
+					stale = true; // unreadable now -> indeterminate -> drop
+				}
+			}
+			staleByFile.set(filePath, stale);
+			return stale;
 		}
 		const verdict = freshnessFromMtime({
-			mtimeMs,
+			mtimeMs: stat?.mtimeMs,
 			referenceMs: scannedAtMs,
 		});
 		// Pre-kernel policy: an unreadable/missing file is stale (dropped).

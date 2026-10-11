@@ -115,3 +115,38 @@ test("DuckDuckGo 503 falls through configured transient routing", async () => {
 	assert.equal(child.status, 0, child.stderr);
 	assert.equal(JSON.parse(child.stdout.trim()).provider, "tavily");
 });
+
+test("DuckDuckGo reports bot checks distinctly and returns no-results pages as empty", async () => {
+	const home = await createConfig({
+		searchRouting: { providers: ["duckduckgo", "tavily"], fallbackOn: ["quota"] },
+	});
+	const child = runChild(`
+		const pages = {
+			status202: [202, '<p>please wait</p>'],
+			anomaly200: [200, '<div class="anomaly-modal__box">bots use DuckDuckGo too</div>'],
+			challenge200: [200, '<form id="challenge-form"></form>'],
+			empty: [200, '<div class="no-results__message">No results found for <b>zzz</b>.</div>'],
+		};
+		globalThis.fetch = async (url) => {
+			if (String(url) === "https://api.tavily.com/search") return new Response(JSON.stringify({ answer: "fallback", results: [] }), { status: 200 });
+			const [status, body] = pages[new URL(url).searchParams.get("q")];
+			return new Response(body, { status });
+		};
+		const { searchWithDuckDuckGo } = await import(${JSON.stringify(duckDuckGoModuleUrl)});
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const errors = {};
+		for (const q of ["status202", "anomaly200", "challenge200"]) {
+			try { await searchWithDuckDuckGo(q); } catch (error) { errors[q] = String(error); }
+		}
+		const empty = await searchWithDuckDuckGo("empty");
+		const routed = await search("status202", { provider: "auto" });
+		console.log(JSON.stringify({ errors, empty, routed: routed.provider }));
+	`, { DM_CODING_AGENT_DIR: home, TAVILY_API_KEY: "tavily-test-key" });
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.match(output.errors.status202, /DuckDuckGo blocked the request with a bot check \(HTTP 202/);
+	assert.match(output.errors.anomaly200, /DuckDuckGo blocked the request with a bot check \(HTTP 200/);
+	assert.match(output.errors.challenge200, /DuckDuckGo blocked the request with a bot check \(HTTP 200/);
+	assert.deepEqual(output.empty, { answer: "", results: [] });
+	assert.equal(output.routed, "tavily");
+});

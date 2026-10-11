@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd, hasPhpstanConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -16,7 +17,7 @@ import type { ToolExitCodes } from "./utils/spawn-outcome.js";
 import { parseToolRun } from "./utils/tool-failure.js";
 import { finishParsedRun } from "./utils/tool-failure.js";
 
-// phpstan's documented exit codes: 0 = no errors, 1 = errors found, 2 = a
+// EXIT TABLE (PHPStan 1.12 docs https://phpstan.org/user-guide/command-line-usage): 0 = no errors, 1 = errors found, 2 = a
 // fatal/internal error that stopped the analysis. Only 1 is a run that carries
 // findings.
 const PHPSTAN_EXIT_CODES: ToolExitCodes = { ran: [1] };
@@ -132,7 +133,7 @@ const phpstanRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "phpstan");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("phpstan")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };

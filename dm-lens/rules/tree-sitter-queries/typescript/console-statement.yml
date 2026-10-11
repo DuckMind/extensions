@@ -29,8 +29,8 @@ post_filter: not_in_test_block  # skip test blocks — no-console-in-tests handl
 # trains users to ignore the rule (#965). Application/library code outside
 # these paths still gets flagged.
 ignore_paths:
-  - "scripts/**"
-  - "bin/**"
+  - "**/scripts/**"
+  - "**/bin/**"
   - "**/logger.ts"
   - "**/logger.js"
   - "**/logger.mjs"

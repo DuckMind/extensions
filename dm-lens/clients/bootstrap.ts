@@ -59,6 +59,7 @@ import type { TestRunnerClient } from "./test-runner-client.js";
 import type { DeadCodeClient } from "./dead-code-client.js";
 import type { TodoScanner } from "./todo-scanner.js";
 import type { TrivyClient } from "./trivy-client.js";
+import { agentBehaviorClient } from "./agent-behavior-client.js";
 
 export interface BootstrapClients {
 	ruffClient: RuffClient;
@@ -95,6 +96,11 @@ export interface BootstrapClients {
  * by the single-flight primitive's identity-guarded release).
  */
 let residentClients: BootstrapClients | null = null;
+
+/** Behaviour history remains available before analyzer bootstrap completes. */
+export function getAgentBehaviorClient(): AgentBehaviorClient {
+	return agentBehaviorClient;
+}
 
 /**
  * Set by {@link markAnalyzerBootstrapShutdown} when the PRIMARY session tears
@@ -160,7 +166,7 @@ const bootstrapFlight = createSingleFlight<BootstrapClients>();
  * budget — it is the liveness bound AGENTS.md's both-bounds rule requires, so
  * a wedged module evaluation cannot park a `tool_call` handler forever.
  */
-export const BOOTSTRAP_LOAD_TIMEOUT_MS = 10_000;
+const BOOTSTRAP_LOAD_TIMEOUT_MS = 10_000;
 
 /**
  * How many consecutive failed builds before the seam stops rebuilding.
@@ -176,7 +182,7 @@ export const BOOTSTRAP_LOAD_TIMEOUT_MS = 10_000;
  * the demand fails OPEN immediately, and `session_start` re-arms the latch so
  * a repaired environment is never locked out for the life of the process.
  */
-export const BOOTSTRAP_FAILURE_STRIKE_LIMIT = 3;
+const BOOTSTRAP_FAILURE_STRIKE_LIMIT = 3;
 
 /**
  * A stand-in for an analysis client whose module failed to load (an unresolved
@@ -358,7 +364,7 @@ async function buildBootstrapClients(): Promise<BootstrapClients> {
 		load(
 			"agent-behavior",
 			async () =>
-				new (await import("./agent-behavior-client.js")).AgentBehaviorClient(),
+				(await import("./agent-behavior-client.js")).agentBehaviorClient,
 		),
 		loadList("dead-code", async () =>
 			(await import("./dead-code-client.js")).getDeadCodeClients(),
@@ -398,7 +404,7 @@ async function buildBootstrapClients(): Promise<BootstrapClients> {
  * {@link requestBootstrapClients} never says which on its own, so the reason
  * travels in the bounded record and the ledger entry instead.
  */
-export const BOOTSTRAP_UNAVAILABLE_REASONS = [
+const BOOTSTRAP_UNAVAILABLE_REASONS = [
 	"shutdown",
 	"timeout",
 	"aborted",
@@ -407,11 +413,11 @@ export const BOOTSTRAP_UNAVAILABLE_REASONS = [
 ] as const;
 
 /** One of {@link BOOTSTRAP_UNAVAILABLE_REASONS}. */
-export type BootstrapUnavailableReason =
+type BootstrapUnavailableReason =
 	(typeof BOOTSTRAP_UNAVAILABLE_REASONS)[number];
 
 /** A demand that could not be served. Carries the discriminating reason. */
-export class BootstrapUnavailableError extends Error {
+class BootstrapUnavailableError extends Error {
 	readonly unavailableReason: BootstrapUnavailableReason;
 
 	constructor(unavailableReason: BootstrapUnavailableReason, message: string) {

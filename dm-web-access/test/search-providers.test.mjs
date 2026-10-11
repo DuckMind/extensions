@@ -93,19 +93,40 @@ test("Brave search applies domain filters in the query and returned results", as
 	assert.deepEqual(output.results.map((result) => result.url), ["https://github.com/nicobailon/dm-web-access"]);
 });
 
-test("Perplexity normalizes invalid result counts", async () => {
-	const home = await mkdtemp(join(tmpdir(), "dm-web-access-perplexity-count-"));
+test("Perplexity searches through the Search API and maps result snippets", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dm-web-access-perplexity-search-"));
 	const child = runChild(`
-		globalThis.fetch = async () => new Response(JSON.stringify({
-			choices: [{ message: { content: "answer" } }],
-			citations: ["https://example.com/a", "https://example.com/b", "https://example.com/c", "https://example.com/d", "https://example.com/e"],
-		}), { status: 200, headers: { "content-type": "application/json" } });
+		const requests = [];
+		globalThis.fetch = async (url, init) => {
+			requests.push({ url: String(url), authorization: init.headers.Authorization, body: JSON.parse(init.body) });
+			return new Response(JSON.stringify({
+				id: "search-id",
+				results: [
+					{ title: " First page ", url: "https://example.com/a", snippet: "Page text A", date: "2026-01-01" },
+					{ title: "", url: "https://example.com/b", snippet: "" },
+					{ title: "No URL", snippet: "skipped" },
+					{ title: "C", url: "https://example.com/c", snippet: "Page text C" },
+					{ title: "D", url: "https://example.com/d", snippet: "Page text D" },
+					{ title: "E", url: "https://example.com/e", snippet: "Page text E" },
+					{ title: "F", url: "https://example.com/f", snippet: "Page text F" },
+				],
+			}), { status: 200, headers: { "content-type": "application/json" } });
+		};
 
 		const { searchWithPerplexity } = await import(${JSON.stringify(perplexityModuleUrl)});
+		const filtered = await searchWithPerplexity("filtered", {
+			numResults: 2,
+			recencyFilter: "week",
+			domainFilter: ["example.com", "-reddit.com", "not a domain"],
+		});
 		const negative = await searchWithPerplexity("negative", { numResults: -1 });
 		const nan = await searchWithPerplexity("nan", { numResults: Number.NaN });
 		const decimal = await searchWithPerplexity("decimal", { numResults: 3.8 });
-		console.log(JSON.stringify({ counts: [negative.results.length, nan.results.length, decimal.results.length] }));
+		console.log(JSON.stringify({
+			requests,
+			filtered,
+			counts: [negative.results.length, nan.results.length, decimal.results.length],
+		}));
 	`, {
 		HOME: home,
 		USERPROFILE: home,
@@ -113,7 +134,55 @@ test("Perplexity normalizes invalid result counts", async () => {
 	});
 
 	assert.equal(child.status, 0, child.stderr);
-	assert.deepEqual(JSON.parse(child.stdout.trim()).counts, [1, 5, 3]);
+	const output = JSON.parse(child.stdout.trim());
+	assert.deepEqual(output.requests[0], {
+		url: "https://api.perplexity.ai/search",
+		authorization: "Bearer pplx-test-key",
+		body: {
+			query: "filtered",
+			max_results: 2,
+			search_type: "fast",
+			search_context_size: "medium",
+			search_recency_filter: "week",
+			search_domain_filter: ["example.com", "-reddit.com"],
+		},
+	});
+	assert.deepEqual(output.requests.slice(1).map((request) => request.body.max_results), [1, 5, 3]);
+	assert.deepEqual(output.filtered.results, [
+		{ title: "First page", url: "https://example.com/a", snippet: "Page text A" },
+		{ title: "Source 2", url: "https://example.com/b", snippet: "" },
+	]);
+	assert.match(output.filtered.answer, /Page text A\nSource: First page \(https:\/\/example\.com\/a\)/);
+	assert.deepEqual(output.counts, [1, 5, 3]);
+});
+
+test("Perplexity prose answers use Sonar chat completions", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dm-web-access-perplexity-answer-"));
+	const child = runChild(`
+		let request = null;
+		globalThis.fetch = async (url, init) => {
+			request = { url: String(url), body: JSON.parse(init.body) };
+			return new Response(JSON.stringify({
+				choices: [{ message: { content: "Video summary" } }],
+				citations: ["https://example.com/source"],
+			}), { status: 200, headers: { "content-type": "application/json" } });
+		};
+
+		const { askPerplexity } = await import(${JSON.stringify(perplexityModuleUrl)});
+		const answer = await askPerplexity("Summarize this video");
+		console.log(JSON.stringify({ request, answer }));
+	`, {
+		HOME: home,
+		USERPROFILE: home,
+		PERPLEXITY_API_KEY: "pplx-test-key",
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.equal(output.request.url, "https://api.perplexity.ai/chat/completions");
+	assert.equal(output.request.body.model, "sonar");
+	assert.deepEqual(output.request.body.messages, [{ role: "user", content: "Summarize this video" }]);
+	assert.equal(output.answer, "Video summary");
 });
 
 test("Tavily search uses bearer auth and maps filters/content", async () => {
@@ -203,9 +272,6 @@ test("Brave, keyed Exa, and Tavily honor base URL overrides without leaking cred
 			if (target.includes("/brave/res/v1/web/search?")) {
 				return new Response(JSON.stringify({ web: { results: [] } }), { status: 200 });
 			}
-			if (target.endsWith("/exa/answer")) {
-				return new Response(JSON.stringify({ answer: "answer", citations: [] }), { status: 200 });
-			}
 			if (target.endsWith("/exa/search")) {
 				return new Response(JSON.stringify({ results: [] }), { status: 200 });
 			}
@@ -219,8 +285,7 @@ test("Brave, keyed Exa, and Tavily honor base URL overrides without leaking cred
 		const { searchWithExa } = await import(${JSON.stringify(exaModuleUrl)});
 		const { searchWithTavily } = await import(${JSON.stringify(tavilyModuleUrl)});
 		await searchWithBrave("configured");
-		await searchWithExa("answer endpoint");
-		await searchWithExa("search endpoint", { numResults: 2 });
+		await searchWithExa("default search");
 		await searchWithTavily("configured");
 
 		process.env.BRAVE_BASE_URL = "https://env.example.com/brave/res/v1/";
@@ -256,30 +321,122 @@ test("Brave, keyed Exa, and Tavily honor base URL overrides without leaking cred
 	assert.deepEqual(output.calls.map((call) => call.target), [
 		"https://gateway.example.com/brave/res/v1/web/search?q=configured&count=5",
 		"https://redirect.example.com/brave/res/v1/web/search?q=configured&count=5",
-		"https://gateway.example.com/exa/answer",
-		"https://redirect.example.com/exa/answer",
 		"https://gateway.example.com/exa/search",
 		"https://redirect.example.com/exa/search",
 		"https://gateway.example.com/tavily/search",
 		"https://redirect.example.com/tavily/search",
 		"https://env.example.com/brave/res/v1/web/search?q=environment&count=5",
-		"https://env.example.com/exa/answer",
+		"https://env.example.com/exa/search",
 		"https://env.example.com/tavily/search",
 	]);
 	assert.deepEqual(output.calls.map((call) => call.credential), [
 		"brave-config-key", null,
 		"exa-config-key", null,
-		"exa-config-key", null,
 		"Bearer tavily-config-key", null,
 		"brave-config-key", "exa-config-key", "Bearer tavily-config-key",
 	]);
 	assert.ok(output.calls.every((call) => call.redirect === "manual"));
-	assert.deepEqual(output.calls.slice(6, 8).map(({ method, hasBody, contentType }) => ({ method, hasBody, contentType })), [
+	assert.deepEqual(output.calls.slice(4, 6).map(({ method, hasBody, contentType }) => ({ method, hasBody, contentType })), [
 		{ method: "POST", hasBody: true, contentType: "application/json" },
 		{ method: "GET", hasBody: false, contentType: null },
 	]);
 	assert.match(output.invalidError, /^BRAVE_BASE_URL must be an absolute HTTP\(S\) URL$/);
 	assert.match(output.plaintextError, /^BRAVE_BASE_URL must be an absolute HTTPS URL$/);
+});
+
+test("provider base URLs allow HTTP only on exact loopback hosts", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dm-web-access-loopback-base-url-"));
+	const child = runChild(`
+		const calls = [];
+		globalThis.fetch = async (url, init = {}) => {
+			const target = String(url);
+			const credential = new Headers(init.headers).get("x-subscription-token");
+			calls.push({ target, credential });
+			if (new URL(target).searchParams.get("q") === "redirect") {
+				return new Response(null, {
+					status: 307,
+					headers: { location: "https://remote.example.com/redirected" },
+				});
+			}
+			return new Response(JSON.stringify({ web: { results: [] } }), { status: 200 });
+		};
+
+		const { searchWithBrave } = await import(${JSON.stringify(braveModuleUrl)});
+		process.env.BRAVE_BASE_URL = "http://localhost:8080/api";
+		await searchWithBrave("redirect");
+
+		const accepted = [
+			"http://localhost:8080/api/",
+			"http://LOCALHOST:8080/api",
+			"http://localhost.:8080/api",
+			"http://127.0.0.1:8080/api",
+			"http://127.42.3.4:8080/api",
+			"http://[::1]:8080/api",
+			"http://[0:0:0:0:0:0:0:1]:8080/api",
+			"https://gateway.example.com/api",
+		];
+		for (const [index, baseUrl] of accepted.entries()) {
+			process.env.BRAVE_BASE_URL = baseUrl;
+			await searchWithBrave("accepted-" + index);
+		}
+
+		const rejected = [
+			"http://example.com/api",
+			"http://localhost.example/api",
+			"http://foo.localhost/api",
+			"http://10.0.0.1/api",
+			"http://169.254.169.254/api",
+			"http://0.0.0.0/api",
+			"http://[::]/api",
+			"http://[::ffff:127.0.0.1]/api",
+		];
+		const rejectedErrors = [];
+		for (const baseUrl of rejected) {
+			process.env.BRAVE_BASE_URL = baseUrl;
+			try {
+				await searchWithBrave("rejected");
+				rejectedErrors.push(null);
+			} catch (error) {
+				rejectedErrors.push(error.message);
+			}
+		}
+
+		const invalid = [
+			"http://user:secret@localhost:8080/api",
+			"http://localhost:8080/api?debug=true",
+			"http://localhost:8080/api#fragment",
+		];
+		const invalidErrors = [];
+		for (const baseUrl of invalid) {
+			process.env.BRAVE_BASE_URL = baseUrl;
+			try {
+				await searchWithBrave("invalid");
+				invalidErrors.push(null);
+			} catch (error) {
+				invalidErrors.push(error.message);
+			}
+		}
+		console.log(JSON.stringify({ calls, rejectedErrors, invalidErrors }));
+	`, {
+		HOME: home,
+		USERPROFILE: home,
+		BRAVE_API_KEY: "brave-loopback-key",
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.deepEqual(output.calls.slice(0, 2), [
+		{ target: "http://localhost:8080/api/web/search?q=redirect&count=5", credential: "brave-loopback-key" },
+		{ target: "https://remote.example.com/redirected", credential: null },
+	]);
+	assert.equal(output.calls.length, 10);
+	assert.ok(output.calls.slice(2).every((call) => call.credential === "brave-loopback-key"));
+	assert.deepEqual(output.rejectedErrors, Array(8).fill("BRAVE_BASE_URL must be an absolute HTTPS URL"));
+	assert.deepEqual(output.invalidErrors, [
+		"BRAVE_BASE_URL must not include credentials",
+		"BRAVE_BASE_URL must not include query parameters or fragments",
+		"BRAVE_BASE_URL must not include query parameters or fragments",
+	]);
 });
 
 test("SearXNG search is SSRF-guarded and preferred first when configured", async () => {
@@ -541,8 +698,7 @@ test("Exa direct API key ignores full legacy usage counter", async () => {
 			capturedHeaders = init.headers;
 			capturedBody = JSON.parse(init.body);
 			return new Response(JSON.stringify({
-				answer: "Paid Exa answer",
-				citations: [{ title: "Exa Docs", url: "https://exa.ai/docs" }],
+				results: [{ title: "Exa Docs", url: "https://exa.ai/docs", highlights: ["Paid Exa answer"] }],
 			}), { status: 200, headers: { "content-type": "application/json" } });
 		};
 
@@ -568,11 +724,11 @@ test("Exa direct API key ignores full legacy usage counter", async () => {
 	assert.equal(child.status, 0, child.stderr);
 	const output = JSON.parse(child.stdout.trim());
 	assert.equal(output.available, true);
-	assert.equal(output.capturedUrl, "https://api.exa.ai/answer");
-	assert.deepEqual(output.capturedBody, { query: "paid exa query" });
+	assert.equal(output.capturedUrl, "https://api.exa.ai/search");
+	assert.deepEqual(output.capturedBody, { query: "paid exa query", type: "auto", numResults: 5, contents: { highlights: true } });
 	assert.equal(output.apiKey, "exa-paid-key");
 	assert.equal(output.integration, "dm-web-access");
-	assert.equal(output.result.answer, "Paid Exa answer");
+	assert.equal(output.result.answer, "Paid Exa answer\nSource: Exa Docs (https://exa.ai/docs)");
 	assert.deepEqual(output.result.results, [{ title: "Exa Docs", url: "https://exa.ai/docs", snippet: "" }]);
 	assert.equal(output.usage.count, 1000);
 });
@@ -592,7 +748,7 @@ test("Exa command source is lazy, overrides stale env, and rotates per request",
 		const keys = [];
 		globalThis.fetch = async (_url, init) => {
 			keys.push(init.headers["x-api-key"]);
-			return new Response(JSON.stringify({ answer: "ok", citations: [] }), {
+			return new Response(JSON.stringify({ results: [] }), {
 				status: 200,
 				headers: { "content-type": "application/json" },
 			});
@@ -817,7 +973,7 @@ test("OpenAI search requires web_search and maps domain filters", async () => {
 		let capturedBody = null;
 		globalThis.fetch = async (url, init) => {
 			capturedUrl = String(url);
-			capturedHeaders = init.headers;
+			capturedHeaders = Object.fromEntries(new Headers(init.headers));
 			capturedBody = JSON.parse(init.body);
 			return new Response(JSON.stringify({
 				output: [
@@ -850,7 +1006,7 @@ test("OpenAI search requires web_search and maps domain filters", async () => {
 		});
 		console.log(JSON.stringify({
 			url: capturedUrl,
-			authorization: capturedHeaders.Authorization,
+			authorization: capturedHeaders.authorization,
 			body: capturedBody,
 			results: result.results,
 			answer: result.answer,
@@ -889,7 +1045,7 @@ test("OpenAI search uses configured Responses endpoint", async () => {
 		let capturedAuthorization = "";
 		globalThis.fetch = async (url, init) => {
 			capturedUrl = String(url);
-			capturedAuthorization = init.headers.Authorization;
+			capturedAuthorization = new Headers(init.headers).get("authorization");
 			return new Response(JSON.stringify({
 				output: [
 					{ type: "web_search_call", action: { sources: [] } },
@@ -948,7 +1104,11 @@ test("curator auto default follows the active model provider", async () => {
 
 	assert.equal(resolveCuratorDefaultProvider("auto", available, { model: { provider: "openai-codex" } }), "openai");
 	assert.equal(resolveCuratorDefaultProvider("auto", available, { model: { provider: "openai" } }), "exa");
+	const signIn = (isOAuth) => ({ model: { provider: "openai" }, modelRegistry: { isUsingOAuth: () => isOAuth } });
+	assert.equal(resolveCuratorDefaultProvider("auto", available, signIn(true)), "openai");
+	assert.equal(resolveCuratorDefaultProvider("auto", available, signIn(false)), "exa");
 	assert.equal(resolveCuratorDefaultProvider("auto", { ...available, exa: false }, { model: { provider: "openai" } }), "openai");
+	assert.equal(resolveCuratorDefaultProvider("auto", { ...available, openai: false, exa: false, bocha: true, ollama: true }), "bocha");
 });
 
 test("auto search prefers Codex-backed OpenAI search when the selected model is openai-codex", async () => {
@@ -991,6 +1151,147 @@ test("auto search prefers Codex-backed OpenAI search when the selected model is 
 	assert.equal(output.capturedUrl, "https://chatgpt.com/backend-api/codex/responses");
 });
 
+test("auto search keeps selected Codex-backed OpenAI for result counts and recency filters", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dm-web-access-auto-codex-options-"));
+	const child = runChild(`
+		globalThis.fetch = async (url) => {
+			const requestUrl = String(url);
+			if (requestUrl === "https://chatgpt.com/backend-api/codex/responses") {
+				return new Response(JSON.stringify({
+					output: [
+						{ type: "web_search_call", action: { sources: [] } },
+						{ type: "message", content: [{ type: "output_text", text: "codex option answer" }] },
+					],
+				}), { status: 200, headers: { "content-type": "application/json" } });
+			}
+			if (requestUrl.startsWith("https://mcp.exa.ai/mcp")) {
+				const event = { result: { content: [{ type: "text", text: "Title: Exa Fallback\\nURL: https://exa.example/fallback\\nText: fallback answer" }] } };
+				return new Response("data: " + JSON.stringify(event) + "\\n\\n", {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			throw new Error("Unexpected fetch " + requestUrl);
+		};
+
+		const ctx = {
+			model: { provider: "openai-codex", id: "gpt-5.6-terra" },
+			modelRegistry: {
+				getAll: () => [{ provider: "openai-codex", id: "gpt-5.6-terra" }],
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "codex-token", headers: {} }),
+			},
+		};
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const result = await search("current model search", {
+			provider: "auto",
+			extensionContext: ctx,
+			numResults: 20,
+			recencyFilter: "week",
+		});
+		console.log(JSON.stringify({ provider: result.provider, answer: result.answer }));
+	`, {
+		HOME: home,
+		USERPROFILE: home,
+		DM_CODING_AGENT_DIR: home,
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const result = JSON.parse(child.stdout.trim());
+	assert.equal(result.provider, "openai");
+	assert.equal(result.answer, "codex option answer");
+});
+
+test("auto search falls through to Exa when selected Codex-backed OpenAI fails", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dm-web-access-auto-codex-failure-"));
+	const child = runChild(`
+		const calls = [];
+		globalThis.fetch = async (url) => {
+			const requestUrl = String(url);
+			calls.push(requestUrl);
+			if (requestUrl === "https://chatgpt.com/backend-api/codex/responses") {
+				return new Response("Codex unavailable", { status: 503 });
+			}
+			if (requestUrl.startsWith("https://mcp.exa.ai/mcp")) {
+				const event = { result: { content: [{ type: "text", text: "Title: Exa Fallback\\nURL: https://exa.example/fallback\\nText: Exa after Codex failure" }] } };
+				return new Response("data: " + JSON.stringify(event) + "\\n\\n", {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			throw new Error("Unexpected fetch " + requestUrl);
+		};
+
+		const ctx = {
+			model: { provider: "openai-codex", id: "gpt-5.6-terra" },
+			modelRegistry: {
+				getAll: () => [{ provider: "openai-codex", id: "gpt-5.6-terra" }],
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "codex-token", headers: {} }),
+			},
+		};
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const result = await search("current model search", {
+			provider: "auto",
+			extensionContext: ctx,
+			numResults: 20,
+			recencyFilter: "week",
+		});
+		console.log(JSON.stringify({ provider: result.provider, answer: result.answer, calls }));
+	`, {
+		HOME: home,
+		USERPROFILE: home,
+		DM_CODING_AGENT_DIR: home,
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.equal(output.provider, "exa");
+	assert.match(output.answer, /Exa after Codex failure/);
+	assert.equal(output.calls[0], "https://chatgpt.com/backend-api/codex/responses");
+	assert.match(output.calls[1], /^https:\/\/mcp\.exa\.ai\/mcp/);
+});
+
+test("auto search prefers official OpenAI search when the selected openai model uses ChatGPT sign-in", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dm-web-access-auto-openai-oauth-selected-"));
+	const child = runChild(`
+		const requests = [];
+		globalThis.fetch = async (url, init) => {
+			requests.push({ url: String(url), headers: Object.fromEntries(new Headers(init.headers)) });
+			if (String(url) !== "https://api.openai.com/v1/responses") throw new Error("Expected official OpenAI search first, got " + url);
+			return new Response(JSON.stringify({
+				output: [
+					{ type: "web_search_call", action: { sources: [] } },
+					{ type: "message", content: [{ type: "output_text", text: "chatgpt sign-in answer" }] },
+				],
+			}), { status: 200, headers: { "content-type": "application/json" } });
+		};
+
+		const token = "header." + Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url") + ".signature";
+		const model = { provider: "openai", api: "openai-responses", id: "gpt-5.6-terra", baseUrl: "https://api.openai.com/v1" };
+		const ctx = {
+			model,
+			modelRegistry: {
+				getAll: () => [model],
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: token, headers: {} }),
+				isUsingOAuth: (candidate) => candidate.provider === "openai",
+			},
+		};
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const result = await search("current model search", { provider: "auto", extensionContext: ctx });
+		console.log(JSON.stringify({ provider: result.provider, answer: result.answer, requests }));
+	`, {
+		HOME: home,
+		USERPROFILE: home,
+		DM_CODING_AGENT_DIR: home,
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.equal(output.provider, "openai");
+	assert.equal(output.answer, "chatgpt sign-in answer");
+	assert.equal(output.requests.length, 1);
+	assert.equal(output.requests[0].headers["chatgpt-account-id"], undefined);
+});
+
 test("auto search uses Exa before OpenAI when the selected model is not openai-codex", async () => {
 	const home = await mkdtemp(join(tmpdir(), "dm-web-access-auto-non-codex-selected-"));
 	const child = runChild(`
@@ -1013,6 +1314,7 @@ test("auto search uses Exa before OpenAI when the selected model is not openai-c
 			modelRegistry: {
 				getAll: () => [{ provider: "openai-codex", id: "gpt-5.6-terra" }],
 				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "codex-token", headers: {} }),
+				isUsingOAuth: () => false,
 			},
 		};
 		const { search } = await import(${JSON.stringify(searchModuleUrl)});
@@ -1057,7 +1359,7 @@ test("OpenAI search falls back to API key when model registry cannot enumerate",
 	assert.equal(child.status, 0, child.stderr);
 	const output = JSON.parse(child.stdout.trim());
 	assert.equal(output.answer, "fallback answer");
-	assert.equal(output.model, "gpt-5.6-terra");
+	assert.equal(output.model, "gpt-6-luna");
 });
 
 test("OpenAI search uses configured model with selected registry auth", async () => {
@@ -1109,6 +1411,43 @@ test("OpenAI search uses configured model with selected registry auth", async ()
 	assert.equal(output.selectedModel, "gpt-5.10");
 });
 
+test("OpenAI search picks the newest Luna model from the registry", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dm-web-access-openai-luna-"));
+	const child = runChild(`
+		let capturedBody = null;
+		globalThis.fetch = async (url, init) => {
+			capturedBody = JSON.parse(init.body);
+			return new Response(JSON.stringify({
+				output: [
+					{ type: "web_search_call", action: { sources: [] } },
+					{ type: "message", content: [{ type: "output_text", text: "luna answer" }] },
+				],
+			}), { status: 200, headers: { "content-type": "application/json" } });
+		};
+
+		// The ChatGPT subscription model list as DM 1.0.4 registers it.
+		const models = ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"]
+			.map((id) => ({ provider: "openai-codex", id }));
+		const ctx = {
+			modelRegistry: {
+				getAll: () => models,
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "codex-key", headers: {} }),
+			},
+		};
+
+		const { searchWithOpenAI } = await import(${JSON.stringify(openaiModuleUrl)});
+		await searchWithOpenAI("luna docs", { numResults: 1 }, ctx);
+		console.log(JSON.stringify({ requestModel: capturedBody.model }));
+	`, {
+		HOME: home,
+		USERPROFILE: home,
+		DM_CODING_AGENT_DIR: home,
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	assert.equal(JSON.parse(child.stdout.trim()).requestModel, "gpt-6-luna");
+});
+
 test("OpenAI search honors configured provider priority", async () => {
 	const home = await mkdtemp(join(tmpdir(), "dm-web-access-openai-providers-"));
 	await writeFile(join(home, "web-search.json"), JSON.stringify({
@@ -1117,7 +1456,7 @@ test("OpenAI search honors configured provider priority", async () => {
 	const child = runChild(`
 		let capturedAuthorization = "";
 		globalThis.fetch = async (url, init) => {
-			capturedAuthorization = init.headers.Authorization;
+			capturedAuthorization = new Headers(init.headers).get("authorization");
 			return new Response(JSON.stringify({
 				output: [
 					{ type: "web_search_call", action: { sources: [] } },

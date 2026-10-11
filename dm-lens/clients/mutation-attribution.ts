@@ -45,9 +45,10 @@ import { recordDegradationOnce } from "./degradation-ledger.js";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
+import { DM_LENS_TOOL_NAMES } from "./tool-config.js";
 
 /** Persisted-file schema version. A file of any other version is ignored. */
-export const MUTATION_ATTRIBUTION_FILE_VERSION = 1;
+const MUTATION_ATTRIBUTION_FILE_VERSION = 1;
 
 /** File under `getProjectDataDir(cwd)` holding the learned attributions. */
 export const MUTATION_ATTRIBUTION_FILE = "observed-mutating-tools.json";
@@ -59,7 +60,7 @@ export const MUTATION_ATTRIBUTION_FILE = "observed-mutating-tools.json";
  * co-occurrence — an unrelated tool call that happened to overlap a background
  * write — cannot durably mislabel a tool for every future session.
  */
-export const PERSIST_AFTER_OBSERVATIONS = 2;
+const PERSIST_AFTER_OBSERVATIONS = 2;
 
 /**
  * Consecutive clean observations after which an UNATTRIBUTED tool stops being
@@ -95,7 +96,7 @@ export const CLEAN_OBSERVATION_ARM_LIMIT = 2;
 export const DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS = 3;
 
 /** Bound on distinct tool names remembered, in-memory and on disk. */
-export const MUTATION_ATTRIBUTION_MAX_TOOLS = 64;
+const MUTATION_ATTRIBUTION_MAX_TOOLS = 64;
 
 /** How the attribution for a tool was reached. */
 export type LearnedMutationSource = "session" | "persisted";
@@ -133,6 +134,15 @@ interface AttributionState {
 }
 
 const ATTRIBUTION_FAMILY = "mutation-attribution";
+
+/**
+ * dm-lens owns these tool names, so their mixed read/write operations must
+ * never be promoted by the open-ended third-party learning mechanism (#4139).
+ */
+function isDmLensToolName(toolName: string): boolean {
+	return DM_LENS_TOOL_NAMES.includes(toolName);
+}
+
 /**
  * Bumped to 2 (#2449 review round 5, F3): `session` changed shape from a
  * plain `Map` to a `BoundedFifoMap` without a version bump at the time, so a
@@ -250,6 +260,7 @@ export function primePersistedMutationAttribution(
 export function lookupLearnedMutatingTool(
 	toolName: string,
 ): LearnedMutationSource | undefined {
+	if (isDmLensToolName(toolName)) return undefined;
 	const current = state();
 	if ((current.session.get(toolName)?.mutating ?? 0) > 0) return "session";
 	return current.fromDisk?.has(toolName) === true ? "persisted" : undefined;
@@ -294,6 +305,7 @@ export function isProvisionalLearnedAttribution(toolName: string): boolean {
  *    re-proving that on every call is the hot-path cost this latch removes).
  */
 export function shouldArmObservationForTool(toolName: string): boolean {
+	if (isDmLensToolName(toolName)) return false;
 	const observation = state().session.get(toolName);
 	if ((observation?.mutating ?? 0) > 0)
 		return isProvisionalLearnedAttribution(toolName);

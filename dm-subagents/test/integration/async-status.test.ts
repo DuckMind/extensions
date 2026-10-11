@@ -73,7 +73,7 @@ describe("async status helpers", () => {
 				outputFile,
 				steps: [
 					{ agent: "scout", status: "complete", durationMs: 10, description: "Inspect auth only" },
-					{ agent: "worker", status: "running", durationMs: 20, description: "Patch billing only", contextLimit: 128_000, toolBudgetBlocked: true, watchdog: { phase: "stale", seq: 2, lastUpdate: 200, followUpPending: false } },
+					{ agent: "worker", status: "running", durationMs: 20, description: "Patch billing only", contextLimit: 128_000, toolBudgetBlocked: true, watchdog: { phase: "stale", seq: 2, lastUpdate: 200 } },
 				],
 			});
 			const descriptor = createRunFanoutBudget("run-a", 64);
@@ -241,7 +241,8 @@ describe("async status helpers", () => {
 					nodes: [{ id: "bad", kind: "host-step", label: "bad", status: "running" }],
 				},
 			});
-			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false }), /host step.*expected an object/);
+			fs.rmSync(path.join(root, ACTIVE_RUN_INDEX_DIR, "workflow-host-invalid"));
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /host step.*expected an object/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -285,7 +286,8 @@ describe("async status helpers", () => {
 				startedAt: 100,
 				steps: [{ agent: "worker", workflowKey: "writer", lane: { version: 1, key: "other" }, status: "running" }],
 			});
-			assert.throws(() => listAsyncRuns(root, { states: ["running"] }), /does not match workflow key/);
+			fs.rmSync(path.join(root, ACTIVE_RUN_INDEX_DIR, "run-lane-invalid"));
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], repairScan: true }), /does not match workflow key/);
 			assert.equal(fs.existsSync(path.join(runDir, "status.json")), true);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -328,7 +330,7 @@ describe("async status helpers", () => {
 		}
 	});
 
-	it("preserves agent contract projections on step summaries", () => {
+	it("reads legacy mutation-effect fields as inert persisted JSON", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-contract-"));
 		try {
 			createAsyncDir(root, "run-contract", {
@@ -355,6 +357,7 @@ describe("async status helpers", () => {
 			assert.equal(step?.acceptance?.status, "rejected");
 			assert.equal(step?.review?.status, "not-requested");
 			assert.equal(step?.effects?.fileMutation?.status, "missing");
+			assert.equal(step?.execution?.success, true);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -431,11 +434,10 @@ describe("async status helpers", () => {
 			});
 
 			const text = formatAsyncRunList(listAsyncRuns(root, { states: ["running"] }));
-			assert.match(text, /1\. reviewer \| running \| gpt-5\.5 · thinking high/);
-			assert.match(text, /2\. scout \| running \| claude-haiku-4-5 · thinking low/);
-			assert.match(text, /3\. local \| running \| qwen2\.5-coder:7b(?! · thinking)/);
-			assert.match(text, /4\. fallback \| running \| claude-sonnet-4-5 · thinking low/);
-			assert.doesNotMatch(text, /openai-codex\/gpt-5\.5/);
+			assert.match(text, /1\. reviewer \| running \| openai-codex\/gpt-5\.5 · thinking high/);
+			assert.match(text, /2\. scout \| running \| anthropic\/claude-haiku-4-5 · thinking low/);
+			assert.match(text, /3\. local \| running \| ollama\/qwen2\.5-coder:7b(?! · thinking)/);
+			assert.match(text, /4\. fallback \| running \| anthropic\/claude-sonnet-4-5 · thinking low/);
 			assert.doesNotMatch(text, /gpt-5\.5:high/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -621,9 +623,10 @@ describe("async status helpers", () => {
 				startedAt: 100,
 				steps: [{ agent: "worker", status: "running" }],
 			});
+			fs.rmSync(path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-session"));
 
 			assert.throws(
-				() => listAsyncRuns(root),
+				() => listAsyncRuns(root, { repairScan: true }),
 				/sessionId must be a string/,
 			);
 		} finally {
@@ -865,6 +868,322 @@ describe("async status helpers", () => {
 
 			assert.deepEqual(runs.map((run) => run.id), ["active"]);
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates corrupt active status while restoring valid runs and releases an aged marker", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-corrupt-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const corruptDir = path.join(root, "bad-run");
+			const corruptStatusPath = path.join(corruptDir, "status.json");
+			fs.mkdirSync(corruptDir, { recursive: true });
+			fs.writeFileSync(corruptStatusPath, Buffer.from([0, 0, 0]));
+			fs.writeFileSync(path.join(corruptDir, "runner.stderr.log"), "runner stopped unexpectedly\n", "utf-8");
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-run");
+			fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+			fs.writeFileSync(markerPath, "", "utf-8");
+			fs.utimesSync(markerPath, new Date(1_000), new Date(1_000));
+
+			const runs = listAsyncRuns(root, {
+				states: ["running"],
+				reconcile: false,
+				now: () => 1_000 + DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS + 1,
+			});
+
+			assert.deepEqual(runs.map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(corruptDir), true);
+			assert.deepEqual(fs.readFileSync(corruptStatusPath), Buffer.from([0, 0, 0]));
+			assert.equal(fs.readFileSync(path.join(corruptDir, "runner.stderr.log"), "utf-8"), "runner stopped unexpectedly\n");
+			assert.equal(fs.existsSync(markerPath), false);
+			assert.ok(diagnostics.some((message) => message.includes("bad-run") && message.includes(corruptStatusPath) && message.includes("Failed to parse async status file")));
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active status validation failures while preserving ordinary validation errors", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-validation", {
+				runId: "bad-validation",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", workflowKey: "writer", lane: { version: 1, key: "other" }, status: "running" }],
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-validation");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-validation") && message.includes("Failed to validate async status file")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /Failed to validate async status file/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active reconciliation validation failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-reconcile-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-reconcile", {
+				runId: "bad-reconcile",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", model: 123, status: "running" }],
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-reconcile");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"] }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-reconcile") && message.includes("steps[0].model must be a string")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], repairScan: true }), /steps\[0\]\.model must be a string/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active status summary projection failures while preserving ordinary projection errors", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-summary-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-summary", {
+				runId: "bad-summary",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowChildren: {
+					version: 1,
+					parentToolCallId: "call_123",
+					workflowRunId: "other-run",
+					inventoryComplete: true,
+					workflowState: "running",
+					children: [],
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-summary");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-summary") && message.includes("workflowChildren.workflowRunId does not match")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /workflowChildren\.workflowRunId does not match/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active workflowChildren identifier projection failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-child-id-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-child-id", {
+				runId: "bad-child-id",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowChildren: {
+					version: 1,
+					parentToolCallId: "   ",
+					workflowRunId: "bad-child-id",
+					inventoryComplete: true,
+					workflowState: "running",
+					children: [],
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-child-id");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-child-id") && message.includes("workflowChildren.parentToolCallId must be a non-empty identifier")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /workflowChildren\.parentToolCallId must be a non-empty identifier/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active output file projection failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-output-file-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-output-file", {
+				runId: "bad-output-file",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				outputFile: { path: "output.txt" },
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-output-file");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-output-file") && message.includes("outputFile must be a string")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /outputFile must be a string/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active workflowGraph host-step projection failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-host-step-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-host-step", {
+				runId: "bad-host-step",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowGraph: {
+					runId: "bad-host-step",
+					mode: "workflow",
+					phases: [],
+					nodes: [{ id: "gate", kind: "host-step", label: "gate", status: "running" }],
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-host-step");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-host-step") && message.includes("hostStep': expected an object")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /hostStep': expected an object/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active workflowGraph container validation failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-async-status-workflow-graph-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-workflow-graph", {
+				runId: "bad-workflow-graph",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowGraph: {
+					runId: "bad-workflow-graph",
+					mode: "workflow",
+					phases: [],
+					nodes: null,
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-workflow-graph");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"] }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-workflow-graph") && message.includes("workflowGraph': nodes must be an array")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], repairScan: true }), /workflowGraph': nodes must be an array/);
+		} finally {
+			console.error = originalError;
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});

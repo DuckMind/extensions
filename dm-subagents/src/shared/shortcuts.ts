@@ -1,7 +1,3 @@
-import { Key, type KeyId } from "@duckmind/dm-tui";
-
-export const FLEET_OPEN_SHORTCUT: KeyId = Key.ctrlAlt("f");
-
 export function formatShortcutLabel(shortcut: string): string {
 	return shortcut
 		.split("+")

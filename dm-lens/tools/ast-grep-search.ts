@@ -21,7 +21,7 @@ import type { SearchReadLocation } from "../clients/search-read-registration.js"
 import { isAtOrAboveHomeDir } from "../clients/path-utils.js";
 import { compactRenderResult } from "./render-compact.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
-import { LANGUAGES } from "./shared.js";
+import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
 
 /**
  * Build the agent-facing error text, appending a remediation hint derived from
@@ -168,14 +168,16 @@ function toMatchLocations(
 }
 
 function suggestedDump(lang: string): {
-	tool: "ast_grep_dump";
+	tool: "ast_grep_search";
+	mode: "dump";
 	lang: string;
 	note: string;
 } {
 	return {
-		tool: "ast_grep_dump",
+		tool: "ast_grep_search",
+		mode: "dump",
 		lang,
-		note: "Run ast_grep_dump on a small representative source snippet (not a whole file) to inspect AST node kinds before retrying ast_grep_search.",
+		note: "Run ast_grep_search with dump=true on a small representative source snippet (not a whole file) to inspect AST node kinds before retrying the search.",
 	};
 }
 
@@ -275,7 +277,34 @@ function getPatternHint(
 		}
 	}
 
-	return "Hint: No matches. Retry once with a smaller valid AST pattern scoped to the same paths (for example a call like `foo($$$ARGS)`, an import statement, or `function $NAME($$$ARGS) { $$$BODY }`). If you're actually looking for a name/usage rather than a structural pattern, prefer symbol_search (ranked identifier search) or module_report (file outline) over another AST retry; lsp_navigation findReferences finds exact call sites once you have a definition. If that also fails, use grep for text search, or ast_grep_dump on a small representative snippet to inspect node kinds.";
+	return "Hint: No matches. Retry once with a smaller valid AST pattern scoped to the same paths (for example a call like `foo($$$ARGS)`, an import statement, or `function $NAME($$$ARGS) { $$$BODY }`). If you're actually looking for a name/usage rather than a structural pattern, prefer symbol_search (ranked identifier search) or module_report (file outline) over another AST retry; lsp_navigation findReferences finds exact call sites once you have a definition. If that also fails, use grep for text search, or ast_grep_search with dump=true on a small representative snippet to inspect node kinds.";
+}
+
+/** One-session response for callers holding a pre-fold tool name. */
+export function astGrepDumpCompatibilityResult(
+	params: Record<string, unknown>,
+	surface: "pi" | "mcp",
+) {
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: `The ast_grep_dump tool was retired. Call ${surface === "mcp" ? "dmlens_" : ""}ast_grep_search with dump=true and put the snippet in pattern instead.`,
+			},
+		],
+		isError: true,
+		details: {
+			compatibility: "ast_grep_dump -> ast_grep_search",
+			call: {
+				tool: surface === "mcp" ? "dmlens_ast_grep_search" : "ast_grep_search",
+				arguments: {
+					dump: true,
+					pattern: params.source,
+					lang: params.lang,
+				},
+			},
+		},
+	};
 }
 
 export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
@@ -283,22 +312,8 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 		name: "ast_grep_search" as const,
 		label: "AST Search",
 		description:
-			"Search code using AST-aware pattern matching. IMPORTANT: Use specific AST patterns, NOT text search.\n\n" +
-			"✅ GOOD patterns (complete AST shapes; $$$ accepts zero or more nodes):\n" +
-			"  - function $NAME($$$ARGS) { $$$BODY } (function declaration)\n" +
-			"  - fetchMetrics($$$ARGS)             (call with any arguments)\n" +
-			'  - import { $$$NAMES } from "module-name" (exact string-literal import)\n' +
-			"  - console.log($MSG)                 (method call)\n\n" +
-			"❌ BAD patterns (multiple nodes / raw text):\n" +
-			'  - it"test name"                     (missing parens - use it($TEST))\n' +
-			"  - console.log without args           (incomplete code)\n" +
-			"  - arbitrary text without code structure\n\n" +
-			'Metavariables match AST nodes, not text inside quoted string literals: `from "$PATH"` matches the literal text $PATH. Use an exact quoted string for a known import, or grep for wildcard text. ' +
-			"Use 'paths' to scope to specific files/folders. " +
-			"Use 'nodeKind' to find every node of a known AST kind, or 'ast_grep_dump' first when the kind is unknown. " +
-			"Avoid 'selector' unless you know the exact AST node kind; it narrows matching and does not extract fields. " +
-			'If this tool is inactive, call dm_lens_activate_tools with tools=["ast_grep_search"]; activation takes effect next turn. If zero matches, retry once with a simpler AST pattern, then use ast_grep_dump on a small representative snippet before falling back to grep.',
-		promptSnippet: "AST-aware structural code search",
+			"Search source by AST structure rather than text. Example: find calls with `console.log($MSG)`.",
+		promptSnippet: "Search source by AST structure",
 		renderResult: compactRenderResult<{
 			matchCount?: number;
 			totalMatches?: number;
@@ -306,6 +321,8 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			valid?: boolean;
 			validateOnly?: boolean;
 			mode?: string;
+			dump?: boolean;
+			includeAnonymous?: boolean;
 			applied?: boolean;
 		}>(({ details, isError, text }) => {
 			if (details?.validateOnly) {
@@ -325,12 +342,8 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			return `ast_grep_search — ${count}${ofTotal} match${count === 1 && !ofTotal ? "" : "es"}${applied}`;
 		}),
 		parameters: Type.Object({
-			pattern: Type.Optional(
-				Type.String({
-					description:
-						"AST pattern (use function/class/call context, not text). Required unless `rule` or `nodeKind` is provided. Do not put metavariables inside quoted string literals; they match literally.",
-				}),
-			),
+			dump: Type.Optional(Type.Boolean()),
+			pattern: Type.Optional(Type.String({ description: "AST pattern." })),
 			lang: Type.String({
 				enum: [...LANGUAGES] as string[],
 				description: "Target language",
@@ -338,90 +351,78 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			paths: Type.Optional(
 				Type.Array(Type.String(), {
 					maxItems: MAX_PATHS,
-					description: `Specific files/folders to search (max ${MAX_PATHS} entries)`,
+					description: "Files or directories to search.",
 				}),
 			),
 			selector: Type.Optional(
 				Type.String({
-					description:
-						"Advanced: restrict search to a specific AST node kind (for example 'call_expression' or 'function_declaration'). This narrows matching; it does not extract fields from matches.",
+					description: "AST node kind filter.",
 				}),
 			),
 			context: Type.Optional(
 				Type.Number({
-					description: "Show N lines before/after each match for context",
+					description: "Context lines around matches.",
 				}),
 			),
 			nodeKind: Type.Optional(
 				Type.String({
-					description:
-						"Expert grammar-specific escape hatch: find every node of this exact AST kind (for example `call_expression`) without writing a pattern. Node kinds are not universal across languages; use ast_grep_dump to discover them. Mutually exclusive with `pattern` and `rule`; can be combined with structural constraints.",
+					description: "AST node kind without a pattern.",
 				}),
 			),
 			insideKind: Type.Optional(
 				Type.String({
-					description:
-						'Restrict matches to nodes inside an ancestor of this AST node kind. Example: `insideKind: "function_declaration"` finds the pattern only when it appears inside a function body. Searches all ancestors (stopBy: end), not just the immediate parent. Synthesizes a YAML rule — takes precedence over `selector` and `strictness`.',
+					description: "Ancestor AST node kind filter.",
 				}),
 			),
 			hasKind: Type.Optional(
 				Type.String({
-					description:
-						'Restrict matches to nodes whose immediate child has this AST node kind (ast-grep default stopBy: neighbor). Example: `hasKind: "await_expression"`.',
+					description: "Immediate-child AST node kind filter.",
 				}),
 			),
 			hasDescendantKind: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes containing this AST node kind anywhere in their descendants. Explicit recursive form (`stopBy: end`); use this instead of `hasKind` when nesting is not immediate.",
+					description: "Recursive descendant AST node kind filter.",
 				}),
 			),
 			follows: Type.Optional(
 				Type.String({
-					description:
-						'Restrict matches to nodes that immediately follow a sibling matching this pattern. Example: `follows: "return $X"` finds the pattern only when preceded by a return statement.',
+					description: "Preceding sibling pattern filter.",
 				}),
 			),
 			precedes: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes that immediately precede a sibling matching this pattern.",
+					description: "Following sibling pattern filter.",
 				}),
 			),
 			rule: Type.Optional(
 				Type.String({
-					description:
-						"Raw ast-grep YAML rule. When provided, routes through `sg scan --config` instead of `sg run -p`, unlocking the full rule DSL. Takes precedence over `pattern` and structural-intent params. The YAML must include `id` and `language` fields.",
+					description: "Raw ast-grep YAML rule.",
 				}),
 			),
 			skip: Type.Optional(
 				Type.Number({
-					description:
-						"Match offset for pagination. Skip the first N matches and return the next page. Use when results are truncated — increment by the page size to retrieve subsequent pages.",
+					description: "Matches to skip for pagination.",
 				}),
 			),
 			maxMatches: Type.Optional(
 				Type.Number({
-					description: `Cap on matches returned per call (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). Lower it to keep a broad search compact; raise it to page less. Also sets the pagination step for skip.`,
+					description: "Maximum matches to return.",
 				}),
 			),
 			groupByFile: Type.Optional(
 				Type.Boolean({
-					description:
-						"Render results grouped by file (one line per file with L<line>:<col> locations) instead of each match's body. Compact distribution view for high-volume searches; match read-slices remain in details.matchLocations.",
+					description: "Group matches by file.",
 				}),
 			),
 			strictness: Type.Optional(
 				Type.String({
 					enum: ["smart", "relaxed", "ast", "cst", "signature", "template"],
-					description:
-						"Pattern matching strictness. 'smart' (default) ignores comments and whitespace. 'relaxed' also ignores unnamed nodes like punctuation — useful when optional trailing commas cause misses. 'ast' ignores all whitespace. 'signature' matches only structural shape, ignoring bodies.",
+					description: "Pattern matching strictness.",
 				}),
 			),
 			validateOnly: Type.Optional(
 				Type.Boolean({
-					description:
-						"Validate/compile the pattern or rule without scanning project files. Helps distinguish a bad pattern/rule from a real no-match result.",
+					description: "Validate without scanning.",
 				}),
 			),
 		}),
@@ -453,7 +454,9 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				follows,
 				precedes,
 				validateOnly,
+				dump,
 			} = params as {
+				dump?: boolean;
 				pattern?: string;
 				lang?: string;
 				paths?: string[];
@@ -480,6 +483,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			const lang = rawLang.replace(/^"|"$/g, "");
 			const searchPathsCount = paths?.length ?? 1;
 			const executionOptions = { signal: abortSignal, deadlineAt };
+			const dumpMode = dump === true;
 
 			function logOutcome(
 				outcome: AstGrepToolOutcome,
@@ -566,7 +570,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					};
 				}
 
-				if (!hasPattern && !hasRawRule && !hasNodeKind) {
+				if (!dumpMode && !hasPattern && !hasRawRule && !hasNodeKind) {
 					logOutcome("error", {
 						errorRaw: "pattern is required unless rule or nodeKind is provided",
 					});
@@ -622,6 +626,41 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					};
 				}
 				if (abortSignal?.aborted) return abortError();
+
+				if (dumpMode) {
+					if (!pattern.trim()) {
+						const errorRaw = "source is required when dump is true";
+						logOutcome("error", { errorRaw });
+						return {
+							content: [{ type: "text" as const, text: `Error: ${errorRaw}` }],
+							isError: true,
+							details: { mode: "dump", lang },
+						};
+					}
+					const result = await astGrepClient.dumpAst(pattern, lang);
+					if (result.error) {
+						logOutcome("error", { errorRaw: result.error });
+						return {
+							content: [
+								{ type: "text" as const, text: `Error: ${result.error}` },
+							],
+							isError: true,
+							details: { mode: "dump", lang },
+						};
+					}
+					const output = result.output ?? "";
+					logOutcome("success", { matchCount: lineCount(output) });
+					return {
+						content: [{ type: "text" as const, text: output }],
+						details: {
+							mode: "dump",
+							lang,
+							matchCount: lineCount(output),
+							totalMatches: lineCount(output),
+							truncated: false,
+						},
+					};
+				}
 
 				if (
 					!hasRawRule &&
@@ -684,7 +723,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 						details: {},
 					};
 				}
-				const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
+				const searchPaths = resolveAstGrepPaths(paths, ctx.cwd);
 				const PAGE_SIZE = Math.max(
 					1,
 					Math.min(

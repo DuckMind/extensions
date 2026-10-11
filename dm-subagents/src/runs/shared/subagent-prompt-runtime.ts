@@ -1,42 +1,34 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@duckmind/dm-coding-agent";
+import type { BeforeAgentStartEvent, BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@duckmind/dm-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
-import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
-import { decodePermissionRules, permissionDecision, PERMISSION_AUDIT_PATH_ENV, PERMISSION_POLICY_ENV } from "./permissions.ts";
-import { consumeSteerRequestsFromDir, MAX_STEER_QUEUE_SIZE, steerAckPathFromDir, writeSteerAckAt, writeSteerCapabilityAt, writeSteerRequestToDir, type SteerDeliveryStatus, type SteerRequest } from "../background/control-channel.ts";
-import { SUBAGENT_CHILD_AGENT_ENV, SUBAGENT_CHILD_INDEX_ENV, SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_FORK_CACHE_KEY_ENV, SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV, SUBAGENT_STEER_ACK_DIR_ENV, SUBAGENT_STEER_CAPABILITY_ENV, SUBAGENT_STEER_INBOX_ENV } from "./dm-args.ts";
-import { RUNTIME_EXTENSION_ACK_EVENT, RUNTIME_EXTENSION_ACK_PATH_ENV, isRuntimeAcknowledgedExtensionId, writeRuntimeAcknowledgedExtensions } from "./runtime-acknowledged-extensions.ts";
-import { createStructuredOutputToolParameters, STRUCTURED_OUTPUT_ACCEPTANCE_CAPTURE_ENV, STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
-import {
-	CHILD_TOOL_DIAGNOSTIC_PATH_ENV,
-	formatChildToolDiagnostic,
-	MCP_DIRECT_CHILD_TOOLS_ENV,
-	REQUIRED_CHILD_TOOLS_ENV,
-	writeChildToolDiagnostic,
-	type ChildToolDiagnostic,
-} from "./tool-availability.ts";
-import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV, decodeToolBudgetEnv, shouldBlockToolForBudget, toolBudgetBlockedMessage, toolBudgetSoftNudge } from "./tool-budget.ts";
-import type { JsonSchemaObject, ResolvedToolBudget, SubagentState } from "../../shared/types.ts";
+import { permissionDecision } from "./permissions.ts";
+import type { SteerRequest } from "../background/control-channel.ts";
+import { RUNTIME_EXTENSION_ACK_EVENT, isRuntimeAcknowledgedExtensionId } from "./runtime-acknowledged-extensions.ts";
+import { createStructuredOutputToolParameters, MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, validateStructuredOutputValue } from "./structured-output.ts";
+import { validateAcceptanceReport } from "./acceptance.ts";
+import { formatChildToolDiagnostic } from "./tool-availability.ts";
+import { shouldBlockToolForBudget, toolBudgetBlockedMessage, toolBudgetSoftNudge } from "./tool-budget.ts";
+import type { ResolvedToolBudget, SubagentState } from "../../shared/types.ts";
+import { INTERCOM_SESSION_IDENTITY_EVENT } from "../../shared/types.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
-import { getAgentDir, resolveWatchPath } from "../../shared/utils.ts";
+import { getAgentDir } from "../../shared/utils.ts";
 import { registerChildWatchdog } from "../../watchdog/register-child.ts";
-import { CHILD_WATCHDOG_CONFIG_ENV, decodeChildWatchdogConfig } from "../../watchdog/child-status.ts";
+import type { ChildWatchdogConfig } from "../../watchdog/child-status.ts";
 import { requestWatchdogPermission, type WatchdogPermissionRequest, type WatchdogPermissionResult } from "../../watchdog/permission-arbiter.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
-import { resolveWaitToolConfig } from "../background/wait-config.ts";
+import { captureWatchdogDiffBaseline, createWatchdogDiffTool, WATCHDOG_DIFF_TOOL_NAME } from "../../watchdog/diff-tool.ts";
+import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
-
-const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV = "DM_SUBAGENT_INHERIT_PROJECT_CONTEXT";
-const SUBAGENT_INHERIT_SKILLS_ENV = "DM_SUBAGENT_INHERIT_SKILLS";
-export const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "DM_SUBAGENT_INTERCOM_SESSION_NAME";
-/** Human-readable child display name (agent + task excerpt) set by the parent
- *  at launch; applied via dm.setSessionName when no intercom target exists. */
-export const SUBAGENT_SESSION_NAME_ENV = "DM_SUBAGENT_SESSION_NAME";
-const STEERING_LEGACY_SETTLE_FALLBACK_MS = 1000;
-const STEERING_SAFETY_POLL_INTERVAL_MS = 5000;
+import { MODEL_ONLY_TOOL } from "../../shared/extension-context.ts";
+import {
+	childSupervisorMetadata,
+	evaluateChildToolDiagnostic,
+	type ChildPermissions,
+	type ChildRuntimeConfig,
+} from "./child-runtime-config.ts";
 
 const STRUCTURED_OUTPUT_INSTRUCTIONS = [
 	"This subagent step has a strict structured output contract.",
@@ -76,45 +68,8 @@ const PROJECT_CONTEXT_LEGACY_HEADER = "\n\n# Project Context\n\nProject-specific
 const SKILLS_HEADER = "\n\nThe following skills provide specialized instructions for specific tasks.";
 const DATE_HEADER = "\nCurrent date:";
 
-function readBooleanEnv(name: string): boolean | undefined {
-	const value = process.env[name];
-	if (value === undefined) return undefined;
-	return value !== "0";
-}
-
-function readRequiredChildTools(): string[] | undefined {
-	const encoded = process.env[REQUIRED_CHILD_TOOLS_ENV]?.trim();
-	if (!encoded) return undefined;
-	const required = JSON.parse(encoded) as unknown;
-	if (!Array.isArray(required) || required.some((name) => typeof name !== "string" || !name)) {
-		throw new Error(`Invalid ${REQUIRED_CHILD_TOOLS_ENV} payload.`);
-	}
-	return required;
-}
-
-function readMcpDirectChildTools(): string[] | undefined {
-	const encoded = process.env[MCP_DIRECT_CHILD_TOOLS_ENV]?.trim();
-	if (!encoded) return undefined;
-	try {
-		const tools = JSON.parse(encoded) as unknown;
-		if (!Array.isArray(tools) || tools.some((name) => typeof name !== "string" || !name)) return undefined;
-		return tools;
-	} catch {
-		return undefined;
-	}
-}
-
-function refreshChildToolDiagnostic(dm: ExtensionAPI): ChildToolDiagnostic | undefined {
-	const filePath = process.env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV]?.trim();
-	const required = readRequiredChildTools();
-	if (!filePath || !required) return undefined;
-	const available = dm.getAllTools().map((tool) => tool.name);
-	return writeChildToolDiagnostic(filePath, required, available, process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim(), readMcpDirectChildTools());
-}
-
-function registerRuntimeExtensionAcknowledgements(dm: ExtensionAPI): void {
-	const outputPath = process.env[RUNTIME_EXTENSION_ACK_PATH_ENV]?.trim();
-	if (!outputPath) return;
+function registerRuntimeExtensionAcknowledgements(dm: ExtensionAPI, sink: ((ids: string[]) => void) | undefined): void {
+	if (!sink) return;
 	const ids: string[] = [];
 	let finalized = false;
 	const acknowledge = (payload: unknown): undefined => {
@@ -126,7 +81,7 @@ function registerRuntimeExtensionAcknowledgements(dm: ExtensionAPI): void {
 	const finalize = (): undefined => {
 		if (finalized) return undefined;
 		finalized = true;
-		writeRuntimeAcknowledgedExtensions(outputPath, ids);
+		sink(ids);
 		return undefined;
 	};
 	try {
@@ -223,9 +178,10 @@ export function stripGlobalContext(prompt: string): string {
 	});
 	const legacyStartIndex = rewrittenXml.indexOf(PROJECT_CONTEXT_LEGACY_HEADER);
 	if (legacyStartIndex === -1) return rewrittenXml;
-	const legacyEndIndex = findSectionEnd(rewrittenXml, legacyStartIndex + PROJECT_CONTEXT_LEGACY_HEADER.length, [SKILLS_HEADER, DATE_HEADER]);
+	const legacyEndIndex = findSectionEnd(rewrittenXml, legacyStartIndex + PROJECT_CONTEXT_LEGACY_HEADER.length, [SKILLS_HEADER, DATE_HEADER, "\n\n# Environment Context\n\n"]);
 	const legacyContext = rewrittenXml.slice(legacyStartIndex, legacyEndIndex);
-	return `${rewrittenXml.slice(0, legacyStartIndex)}${stripGlobalInstructionsFromLegacyContext(legacyContext)}${rewrittenXml.slice(legacyEndIndex)}`;
+	const filtered = stripGlobalInstructionsFromLegacyContext(legacyContext);
+	return `${rewrittenXml.slice(0, legacyStartIndex)}${/^## /m.test(filtered) ? filtered : ""}${rewrittenXml.slice(legacyEndIndex)}`;
 }
 
 export function stripInheritedSkills(prompt: string): string {
@@ -238,21 +194,23 @@ export function stripInheritedSkills(prompt: string): string {
 export function stripSubagentOrchestrationSkill(prompt: string): string {
 	return prompt
 		.replace(/\n{0,2}<skill\s+name=["']dm-subagents["'][^>]*>[\s\S]*?<\/skill>\n{0,2}/g, "\n\n")
-		.replace(/[ \t]*<skill>\s*[\s\S]*?<\/skill>\s*/g, (block) => SUBAGENT_ORCHESTRATION_SKILL_NAME_PATTERN.test(block) ? "" : block);
+		.replace(/^[ \t]*<skill>[\s\S]*?<\/skill>[ \t]*(?:\r?\n)?/gm, (block) => SUBAGENT_ORCHESTRATION_SKILL_NAME_PATTERN.test(block) ? "" : block)
+		.replace(/^(Loaded skills: )(.*)$/gm, (_line, prefix: string, names: string) =>
+			`${prefix}${names.split(", ").filter((name) => name !== "dm-subagents").join(", ")}`);
 }
 
 function stripChildBoundaryInstructions(prompt: string): string {
 	let rewritten = prompt;
-	for (const boundary of [CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS, CHILD_FANOUT_BOUNDARY_INSTRUCTIONS]) {
-		rewritten = rewritten.split(boundary).join("");
+	for (const instructions of [CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS, CHILD_FANOUT_BOUNDARY_INSTRUCTIONS, STRUCTURED_OUTPUT_INSTRUCTIONS]) {
+		rewritten = rewritten.split(`\n\n${instructions}`).join("").split(instructions).join("");
 	}
 	return rewritten.replace(/^(?:[ \t]*\r?\n)+/, "");
 }
 
-export function rewriteSubagentPrompt(
-	prompt: string,
-	options: { inheritProjectContext: boolean; inheritGlobalContext: boolean; inheritSkills: boolean; fanoutChild?: boolean },
-): string {
+type InheritedPromptOptions = { inheritProjectContext: boolean; inheritGlobalContext: boolean; inheritSkills: boolean };
+type ChildBoundaryOptions = { fanoutChild?: boolean; structuredOutput?: boolean };
+
+function stripInheritedPromptText(prompt: string, options: InheritedPromptOptions): string {
 	let rewritten = prompt;
 	if (!options.inheritProjectContext) {
 		rewritten = stripProjectContext(rewritten);
@@ -263,11 +221,41 @@ export function rewriteSubagentPrompt(
 	if (!options.inheritSkills) {
 		rewritten = stripInheritedSkills(rewritten);
 	}
-	rewritten = stripSubagentOrchestrationSkill(rewritten);
-	rewritten = stripChildBoundaryInstructions(rewritten);
+	return stripChildBoundaryInstructions(stripSubagentOrchestrationSkill(rewritten));
+}
+
+function appendChildBoundary(prompt: string, options: ChildBoundaryOptions): string {
 	const boundary = options.fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
-	const structured = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
-	return `${boundary}${structured}\n\n${rewritten}`;
+	const structured = options.structuredOutput ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
+	// DM's base prompt stays first so providers that recognize it by its opening still do.
+	return `${stripChildBoundaryInstructions(prompt)}\n\n${boundary}${structured}`;
+}
+
+export function rewriteSubagentPrompt(prompt: string, options: InheritedPromptOptions & ChildBoundaryOptions): string {
+	return appendChildBoundary(stripInheritedPromptText(prompt, options), options);
+}
+
+/** In place, so later handlers and the final render never see the removed context. */
+function filterChildPromptOptions(options: BeforeAgentStartEvent["systemPromptOptions"], inherited: InheritedPromptOptions): void {
+	if (!inherited.inheritProjectContext) options.contextFiles = [];
+	else if (!inherited.inheritGlobalContext) options.contextFiles = (options.contextFiles ?? []).filter((file) => !isGlobalContextFile(file.path));
+	options.skills = inherited.inheritSkills ? (options.skills ?? []).filter((skill) => skill.name !== "dm-subagents") : [];
+	// Role prompts can embed context, skill catalogs, or an earlier child's boundary as text.
+	if (options.customPrompt) options.customPrompt = stripInheritedPromptText(options.customPrompt, inherited);
+	if (options.appendSystemPrompt) options.appendSystemPrompt = stripInheritedPromptText(options.appendSystemPrompt, inherited);
+}
+
+function rewritesChildPrompt(config: ChildRuntimeConfig): boolean {
+	return config.inheritProjectContext !== undefined || config.inheritGlobalContext !== undefined || config.inheritSkills !== undefined || Boolean(config.fanoutChild);
+}
+
+/** Installed after every other extension: a returned prompt freezes out sections added after it. */
+export function registerSubagentPromptBoundary(dm: ExtensionAPI, config: ChildRuntimeConfig): void {
+	if (!rewritesChildPrompt(config)) return;
+	dm.on("before_agent_start", (event) => {
+		const finalized = appendChildBoundary(event.systemPrompt, { fanoutChild: config.fanoutChild, structuredOutput: Boolean(config.structuredOutput) });
+		return finalized === event.systemPrompt ? undefined : { systemPrompt: finalized };
+	});
 }
 
 function isParentOnlySubagentMessage(message: unknown): boolean {
@@ -302,27 +290,32 @@ const PROMPT_CACHE_KEY_APIS = new Set([
 	"openai-responses",
 ]);
 
-export function rewriteForkCacheProviderRequest(event: BeforeProviderRequestEvent, ctx?: Pick<ExtensionContext, "model">): unknown {
-	const forkCacheKey = process.env[SUBAGENT_FORK_CACHE_KEY_ENV]?.trim();
-	if (!forkCacheKey || !PROMPT_CACHE_KEY_APIS.has(ctx?.model?.api ?? "")) return undefined;
+export function rewriteForkCacheProviderRequest(event: BeforeProviderRequestEvent, ctx: Pick<ExtensionContext, "model"> | undefined, forkCacheKey: string | undefined): unknown {
+	const key = forkCacheKey?.trim();
+	if (!key || !PROMPT_CACHE_KEY_APIS.has(ctx?.model?.api ?? "")) return undefined;
 	if (!event || typeof event !== "object") return undefined;
 	const payload = event.payload;
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
 	if (typeof (payload as { prompt_cache_key?: unknown }).prompt_cache_key !== "string") return undefined;
-	return { ...payload, prompt_cache_key: forkCacheKey };
+	return { ...payload, prompt_cache_key: key };
 }
 
-function portableToolId(id: string): string {
+function portableToolId(id: string, preserveBoundedCompositeToolIds = false): string {
 	if (PORTABLE_TOOL_ID_PATTERN.test(id) && id.length <= MAX_PORTABLE_TOOL_ID_LENGTH) return id;
+	// Codex splits call_id|item_id on replay; each wire ID must remain portable and bounded.
+	if (preserveBoundedCompositeToolIds) {
+		const parts = id.split("|");
+		if (parts.length === 2 && parts.every((part) => PORTABLE_TOOL_ID_PATTERN.test(part) && part.length <= MAX_PORTABLE_TOOL_ID_LENGTH)) return id;
+	}
 	const encoded = `tool_${Buffer.from(id).toString("base64url") || "empty"}`;
 	if (encoded.length <= MAX_PORTABLE_TOOL_ID_LENGTH) return encoded;
 	return `tool_${createHash("sha256").update(id).digest("base64url")}`;
 }
 
-function sanitizeToolHistoryMessage(message: unknown): unknown {
+function sanitizeToolHistoryMessage(message: unknown, preserveBoundedCompositeToolIds = false): unknown {
 	const m = message as { role?: string; content?: unknown; toolCallId?: unknown };
 	if (m?.role === "toolResult" && typeof m.toolCallId === "string") {
-		const toolCallId = portableToolId(m.toolCallId);
+		const toolCallId = portableToolId(m.toolCallId, preserveBoundedCompositeToolIds);
 		return toolCallId === m.toolCallId ? message : { ...m, toolCallId };
 	}
 	if (m?.role !== "assistant" || !Array.isArray(m.content)) return message;
@@ -330,7 +323,7 @@ function sanitizeToolHistoryMessage(message: unknown): unknown {
 	const content = m.content.map((block) => {
 		const b = block as { type?: string; id?: unknown };
 		if (b?.type !== "toolCall" || typeof b.id !== "string") return block;
-		const id = portableToolId(b.id);
+		const id = portableToolId(b.id, preserveBoundedCompositeToolIds);
 		if (id === b.id) return block;
 		changed = true;
 		return { ...b, id };
@@ -347,8 +340,8 @@ function stripAssistantSubagentToolCallBlocks(message: unknown): unknown | undef
 	return { ...m, content: filteredContent };
 }
 
-export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean } = {}): unknown[] {
-	const preserveCurrentFanoutToolHistory = process.env[SUBAGENT_FANOUT_CHILD_ENV] === "1";
+export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean; preserveBoundedCompositeToolIds?: boolean; preserveFanoutToolHistory?: boolean } = {}): unknown[] {
+	const preserveCurrentFanoutToolHistory = options.preserveFanoutToolHistory === true;
 	const sanitizeToolIds = options.sanitizeToolIds ?? true;
 	let changed = false;
 	const filtered: unknown[] = [];
@@ -362,7 +355,7 @@ export function stripParentOnlySubagentMessages(messages: unknown[], options: { 
 			changed = true;
 			continue;
 		}
-		const sanitized = sanitizeToolIds ? sanitizeToolHistoryMessage(stripped) : stripped;
+		const sanitized = sanitizeToolIds ? sanitizeToolHistoryMessage(stripped, options.preserveBoundedCompositeToolIds === true) : stripped;
 		if (stripped !== message || sanitized !== stripped) changed = true;
 		filtered.push(sanitized);
 	}
@@ -381,23 +374,20 @@ export function formatSteerMessage(request: SteerRequest): string {
 
 export function registerPermissionGate(
 	dm: ExtensionAPI,
+	permissions: ChildPermissions | undefined,
+	childWatchdog: ChildWatchdogConfig | undefined,
 	requestPermission: (request: WatchdogPermissionRequest) => Promise<WatchdogPermissionResult> = requestWatchdogPermission,
 ): void {
-	const rules = decodePermissionRules(process.env[PERMISSION_POLICY_ENV]);
-	if (!rules) return;
+	const rules = permissions?.rules;
+	if (!rules || Object.keys(rules).length === 0) return;
+	const rawWatchdogConfig = childWatchdog ? JSON.stringify(childWatchdog) : undefined;
+	const timeoutMs = childWatchdog?.agentEndTimeoutMs ?? 30_000;
 	const onRuntimeEvent = dm.on as unknown as (event: string, handler: (event: { toolName?: string; input?: unknown }, ctx: ExtensionContext) => unknown) => void;
 	onRuntimeEvent("tool_call", async (event, ctx) => {
 		const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
 		const decision = permissionDecision(rules, toolName);
 		if (decision === "allow") return undefined;
 		if (decision === "deny") return { block: true, reason: `Blocked by dm-subagents permission rule: '${toolName}' is denied.` };
-		const rawWatchdogConfig = process.env[CHILD_WATCHDOG_CONFIG_ENV];
-		let timeoutMs = 30_000;
-		try {
-			timeoutMs = decodeChildWatchdogConfig(rawWatchdogConfig)?.agentEndTimeoutMs ?? timeoutMs;
-		} catch {
-			// The arbiter reports invalid configuration with the concrete decode error.
-		}
 		if (ctx.signal?.aborted) return { block: true, reason: "Blocked by dm-subagents permission rule: Watchdog permission decision was cancelled." };
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let abort: (() => void) | undefined;
@@ -409,7 +399,7 @@ export function registerPermissionGate(
 					toolName,
 					args: event.input ?? {},
 					rawWatchdogConfig,
-					auditPath: process.env[PERMISSION_AUDIT_PATH_ENV],
+					auditPath: permissions.auditPath,
 					...(ctx.signal ? { signal: ctx.signal } : {}),
 				}),
 				new Promise<WatchdogPermissionResult>((resolve) => {
@@ -453,249 +443,72 @@ function registerToolBudget(dm: ExtensionAPI, budget: ResolvedToolBudget | undef
 	});
 }
 
-export function registerSteeringInbox(
-	dm: ExtensionAPI,
-	deps: {
-		watch?: typeof fs.watch;
-		nativeRealpath?: (filePath: string) => string;
-		legacySettleFallbackMs?: number;
-		safetyPollIntervalMs?: number;
-		platform?: NodeJS.Platform;
-		timers?: Pick<typeof globalThis, "setInterval" | "clearInterval">;
-	} = {},
-): void {
-	const steerInbox = process.env[SUBAGENT_STEER_INBOX_ENV]?.trim();
-	if (!steerInbox) return;
-	const capabilityPath = process.env[SUBAGENT_STEER_CAPABILITY_ENV]?.trim();
-	const ackDir = process.env[SUBAGENT_STEER_ACK_DIR_ENV]?.trim();
-	const sendUserMessage = (dm as { sendUserMessage?: (content: string, options?: { deliverAs: "steer" | "followUp" }) => unknown }).sendUserMessage;
-	const childIndex = Number(process.env[SUBAGENT_CHILD_INDEX_ENV]);
-	const pending = new Map<string, Array<{ request: SteerRequest; deliveryStatus: SteerDeliveryStatus }>>();
-	const queued: Array<{ request: SteerRequest; ready: boolean }> = [];
-	let disposed = false;
-	let agentRunning = false;
-	let inTurn = false;
-	let awaitingSettlement = false;
-	let flushing = false;
-	let started = false;
-	let canSteer = typeof sendUserMessage === "function";
-	let watcher: fs.FSWatcher | undefined;
-	let interval: NodeJS.Timeout | undefined;
-	let safetyInterval: NodeJS.Timeout | undefined;
-	let settleFallback: NodeJS.Timeout | undefined;
-	const legacySettleFallbackMs = deps.legacySettleFallbackMs ?? STEERING_LEGACY_SETTLE_FALLBACK_MS;
-	const acknowledge = (request: SteerRequest, state: "delivered" | "queued" | "failed", message: string, deliveryStatus?: SteerDeliveryStatus): void => {
-		if (!ackDir || !Number.isInteger(childIndex) || childIndex < 0) return;
-		writeSteerAckAt(steerAckPathFromDir(ackDir, request.id), {
-			requestId: request.id,
-			index: childIndex,
-			ts: Date.now(),
-			state,
-			...(deliveryStatus ? { deliveryStatus } : {}),
-			message,
-		});
-	};
-	const publishCapability = (): void => {
-		if (!capabilityPath || !Number.isInteger(childIndex) || childIndex < 0) return;
-		writeSteerCapabilityAt(capabilityPath, { index: childIndex, pid: process.pid, readyAt: Date.now(), supported: canSteer });
-	};
-	const flush = (): void => {
-		if (disposed || flushing) return;
-		flushing = true;
-		try {
-			const requests = consumeSteerRequestsFromDir(steerInbox);
-			for (let index = 0; index < requests.length; index++) {
-				const request = requests[index]!;
-				if (!canSteer || typeof sendUserMessage !== "function") {
-					acknowledge(request, "failed", "Child DM session does not support sendUserMessage steering.");
-					continue;
-				}
-				const requestedMode = request.mode ?? "steer";
-				const autoCanUseIdle = requestedMode === "auto" && !agentRunning && !awaitingSettlement;
-				const delivery = requestedMode === "follow_up" || (requestedMode === "auto" && (inTurn || awaitingSettlement)) ? "followUp" as const : "steer" as const;
-				const pendingFollowUps = [...pending.values()].reduce((count, entries) => count + entries.filter((entry) => entry.deliveryStatus === "queued").length, 0);
-				if (delivery === "followUp" && queued.length + pendingFollowUps >= MAX_STEER_QUEUE_SIZE) {
-					acknowledge(request, "failed", `Follow-up queue is full (${MAX_STEER_QUEUE_SIZE} messages).`);
-					continue;
-				}
-				const formatted = formatSteerMessage(request);
-				const entries = pending.get(formatted) ?? [];
-				entries.push({ request, deliveryStatus: delivery === "followUp" ? "queued" : "delivered" });
-				pending.set(formatted, entries);
-				try {
-					sendUserMessage(formatted, autoCanUseIdle ? undefined : { deliverAs: delivery });
-				} catch (error) {
-					entries.pop();
-					if (entries.length === 0) pending.delete(formatted);
-					acknowledge(request, "failed", error instanceof Error ? error.message : String(error));
-					for (const retry of requests.slice(index + 1)) writeSteerRequestToDir(steerInbox, retry);
-					break;
+function registerStructuredOutputTool(dm: ExtensionAPI, structured: NonNullable<ChildRuntimeConfig["structuredOutput"]>): void {
+	const terminalState = structured.terminalState ??= { captured: false };
+	const required = structured.acceptanceReport === "required";
+	const parameters = createStructuredOutputToolParameters(structured.schema, { acceptanceReport: structured.acceptanceReport });
+	const registerTool = dm.registerTool as unknown as (tool: {
+		name: string;
+		label: string;
+		description: string;
+		parameters: unknown;
+		execute: (_id: string, params: { value: unknown; acceptanceReport?: unknown }) => Promise<unknown>;
+	}) => void;
+	registerTool({
+		name: "structured_output",
+		...MODEL_ONLY_TOOL,
+		label: "Structured Output",
+		description: "Submit the required final structured output for this subagent step. This terminates the step.",
+		parameters,
+		async execute(_id: string, params: { value: unknown; acceptanceReport?: unknown }) {
+			const validation = await validateStructuredOutputValue(structured.schema, params.value);
+			if (validation.status === "invalid") {
+				throw new Error(`Structured output validation failed: ${validation.message}`);
+			}
+			if (required && params.acceptanceReport === undefined) {
+				throw new Error(MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR);
+			}
+			if (required && params.acceptanceReport !== undefined) {
+				const acceptanceValidation = validateAcceptanceReport(params.acceptanceReport, "acceptanceReport");
+				if (!acceptanceValidation.report) {
+					throw new Error(`Invalid structured output acceptance report: ${acceptanceValidation.errors.join("; ")}`);
 				}
 			}
-		} finally {
-			flushing = false;
-		}
-	};
-	const onInput = (event: unknown): undefined => {
-		if (disposed || !event || typeof event !== "object") return undefined;
-		const input = event as { source?: unknown; streamingBehavior?: unknown; text?: unknown; content?: unknown };
-		if (input.source !== "extension") return undefined;
-		const text = typeof input.text === "string" ? input.text : typeof input.content === "string" ? input.content : undefined;
-		if (!text) return undefined;
-		const entries = pending.get(text);
-		const entry = entries?.shift();
-		if (!entry) return undefined;
-		if (entries?.length === 0) pending.delete(text);
-		if (entry.deliveryStatus === "queued") {
-			queued.push({ request: entry.request, ready: !inTurn });
-			acknowledge(entry.request, "queued", "DM queued the correlated follow-up input.", "queued");
-		} else {
-			acknowledge(entry.request, "delivered", "DM accepted the correlated steering input.", "delivered");
-		}
-		return undefined;
-	};
-	const start = (): void => {
-		if (started || disposed) return;
-		try {
-			fs.mkdirSync(steerInbox, { recursive: true });
-			publishCapability();
-		} catch {
-			return;
-		}
-		started = true;
-		const startPolling = (): void => {
-			if (interval || disposed) return;
-			interval = (deps.timers?.setInterval ?? setInterval)(flush, 250) as NodeJS.Timeout;
-			interval.unref?.();
-		};
-		const startSafetyPolling = (): void => {
-			if (safetyInterval || disposed) return;
-			safetyInterval = (deps.timers?.setInterval ?? setInterval)(flush, deps.safetyPollIntervalMs ?? STEERING_SAFETY_POLL_INTERVAL_MS) as NodeJS.Timeout;
-			safetyInterval.unref?.();
-		};
-		if (!shouldUseNativeFsWatch("child-steering-inbox", deps.platform)) {
-			startPolling();
-		} else {
-			try {
-				watcher = (deps.watch ?? fs.watch)(resolveWatchPath(steerInbox, deps.nativeRealpath), () => flush());
-				watcher.on("error", startPolling);
-				startSafetyPolling();
-			} catch {
-				watcher = undefined;
-				startPolling();
-			}
-		}
-	};
-	const activate = (): undefined => {
-		start();
-		flush();
-		return undefined;
-	};
-	const clearSettleFallback = (): void => {
-		if (!settleFallback) return;
-		clearTimeout(settleFallback);
-		settleFallback = undefined;
-	};
-	const markSettled = (): undefined => {
-		clearSettleFallback();
-		agentRunning = false;
-		inTurn = false;
-		awaitingSettlement = false;
-		return activate();
-	};
-	const armLegacySettleFallback = (): void => {
-		clearSettleFallback();
-		settleFallback = setTimeout(() => {
-			settleFallback = undefined;
-			if (disposed || !awaitingSettlement) return;
-			agentRunning = false;
-			inTurn = false;
-			awaitingSettlement = false;
-			activate();
-		}, legacySettleFallbackMs);
-		settleFallback.unref?.();
-	};
-
-	const onRuntimeEvent = dm.on as unknown as (event: string, handler: (event: unknown, ctx?: unknown) => unknown) => void;
-	// Register input before the watcher so an accepted extension input cannot race request dispatch.
-	onRuntimeEvent("input", onInput);
-	onRuntimeEvent("session_start", () => start());
-	onRuntimeEvent("agent_start", () => {
-		clearSettleFallback();
-		agentRunning = true;
-		awaitingSettlement = false;
-		return activate();
-	});
-	onRuntimeEvent("agent_end", (event) => {
-		inTurn = false;
-		if ((event as { willRetry?: unknown } | undefined)?.willRetry === true) {
-			clearSettleFallback();
-			agentRunning = true;
-			awaitingSettlement = true;
-			return activate();
-		}
-		agentRunning = true;
-		awaitingSettlement = true;
-		armLegacySettleFallback();
-		return activate();
-	});
-	onRuntimeEvent("agent_settled", markSettled);
-	onRuntimeEvent("session_compact", () => {
-		const unresolved = [...pending.values()].flat();
-		pending.clear();
-		for (const entry of unresolved) {
-			try {
-				writeSteerRequestToDir(steerInbox, { ...entry.request, mode: "follow_up" });
-			} catch (error) {
-				acknowledge(entry.request, "failed", `Could not retry steering after compaction: ${error instanceof Error ? error.message : String(error)}`);
-			}
-		}
-		return activate();
-	});
-	onRuntimeEvent("turn_start", () => {
-		clearSettleFallback();
-		agentRunning = true;
-		awaitingSettlement = false;
-		inTurn = true;
-		const next = queued.findIndex((entry) => entry.ready);
-		if (next >= 0) {
-			const [entry] = queued.splice(next, 1);
-			if (entry) acknowledge(entry.request, "delivered", "DM delivered the queued follow-up at a turn boundary.", "delivered");
-		}
-		return activate();
-	});
-	onRuntimeEvent("turn_end", () => {
-		inTurn = false;
-		for (const entry of queued) entry.ready = true;
-		return activate();
-	});
-	for (const eventName of ["message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_end"] as const) {
-		onRuntimeEvent(eventName, activate);
-	}
-	onRuntimeEvent("session_shutdown", () => {
-		for (const entry of queued) acknowledge(entry.request, "failed", "Run ended before queued follow-up delivery.", "queued");
-		for (const entries of pending.values()) {
-			for (const entry of entries) acknowledge(entry.request, "failed", "Run ended before DM confirmed steering input delivery.");
-		}
-		disposed = true;
-		clearSettleFallback();
-		try { watcher?.close(); } catch {}
-		if (interval) (deps.timers?.clearInterval ?? clearInterval)(interval);
-		if (safetyInterval) (deps.timers?.clearInterval ?? clearInterval)(safetyInterval);
+			structured.capture(params.value, structured.acceptanceReport ? params.acceptanceReport : undefined);
+			terminalState.captured = true;
+			return {
+				content: [{ type: "text", text: "Structured output captured." }],
+				details: {},
+				terminate: true,
+			};
+		},
 	});
 }
 
-export default function registerSubagentPromptRuntime(dm: ExtensionAPI): void {
-	registerRuntimeExtensionAcknowledgements(dm);
-	registerSteeringInbox(dm);
-	registerPermissionGate(dm);
-	registerToolBudget(dm, decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV], { allowZero: process.env[TOOL_BUDGET_ZERO_AUTH_ENV] === "1" }));
-	registerChildWatchdog(dm);
-	const waitToolConfig = resolveWaitToolConfig();
-	const waitState = {
+/** Register every child-side hook the prompt runtime owns for one child session. */
+export default function registerSubagentPromptRuntime(dm: ExtensionAPI, config?: ChildRuntimeConfig, drainObservation?: import("./readonly-drain-observation.ts").ReadonlyDrainObservation): void {
+	// A path-based load has no ChildRuntimeConfig. This can happen if an
+	// ambient-extension discovery path finds the runtime module in addition to
+	// the configured inline factory. It must be inert rather than crashing the
+	// child before startup; the inline factory remains the real registration path.
+	if (!config) return;
+	registerRuntimeExtensionAcknowledgements(dm, config.runtimeAcknowledgements);
+	registerPermissionGate(dm, config.permissions, config.childWatchdog);
+	registerToolBudget(dm, config.toolBudget);
+	if (config.structuredOutput && !config.structuredOutput.terminalState) config.structuredOutput.terminalState = { captured: false };
+	registerChildWatchdog(dm, config.childWatchdog, config.watchdogStatus, config.structuredOutput?.terminalState);
+	const requestedWatchdogDiff = config.requiredTools?.includes(WATCHDOG_DIFF_TOOL_NAME);
+	const reviewerLaunchBaseline = requestedWatchdogDiff && config.cwd
+		? captureWatchdogDiffBaseline(config.cwd)
+		: undefined;
+	if (requestedWatchdogDiff && typeof dm.registerTool === "function") {
+		dm.registerTool(createWatchdogDiffTool(reviewerLaunchBaseline, { workingTreeAtLaunch: true }));
+	}
+	const waitState = config.runtimeState ?? {
 		baseCwd: "",
 		currentSessionId: null,
 		asyncJobs: new Map(),
+		foregroundRuns: new Map(),
 		foregroundControls: new Map(),
 		lastForegroundControlId: null,
 		cleanupTimers: new Map(),
@@ -706,12 +519,14 @@ export default function registerSubagentPromptRuntime(dm: ExtensionAPI): void {
 		watcherRestartTimer: null,
 		resultFileCoalescer: { schedule: () => false, clear: () => {} },
 	} as unknown as SubagentState;
-	if (typeof dm.registerTool === "function") registerWaitTool(dm, waitState, waitToolConfig.enabled, undefined, waitToolConfig.defaultTimeoutMs);
+	const nestedRootRunId = inheritedNestedRouteOf(config)?.rootRunId;
+	if (typeof dm.registerTool === "function") registerWaitTool(dm, waitState, config.waitTool.enabled, undefined, config.waitTool.defaultTimeoutMs, { nestedRootRunId });
+	const supervisorMetadata = childSupervisorMetadata(config);
 	let nativeSupervisorClientRegistered = false;
 	const registerNativeSupervisorClientOnce = (): void => {
 		if (nativeSupervisorClientRegistered) return;
 		nativeSupervisorClientRegistered = true;
-		registerNativeSupervisorClient(dm);
+		registerNativeSupervisorClient(dm, supervisorMetadata);
 	};
 	const onRuntimeEvent = dm.on as unknown as (event: string, handler: (event: unknown, ctx?: ExtensionContext) => unknown) => void;
 	onRuntimeEvent("session_start", (_event: unknown, ctx?: ExtensionContext) => {
@@ -720,88 +535,74 @@ export default function registerSubagentPromptRuntime(dm: ExtensionAPI): void {
 		registerNativeSupervisorClientOnce();
 	});
 	onRuntimeEvent("agent_start", () => {
-		const diagnostic = refreshChildToolDiagnostic(dm);
+		if (!config.requiredTools) return;
+		const diagnostic = evaluateChildToolDiagnostic(config, dm.getAllTools().map((tool) => tool.name));
+		config.toolDiagnostic?.(diagnostic);
 		if (diagnostic) throw new Error(formatChildToolDiagnostic(diagnostic));
 	});
 	onRuntimeEvent("agent_end", async (_event: unknown, ctx: unknown) => {
-		if ((ctx as { hasUI?: boolean } | undefined)?.hasUI === true) return;
-		await drainOutstandingWork({ state: waitState, events: dm.events });
+		if ((ctx as { hasUI?: boolean } | undefined)?.hasUI === true) drainObservation?.deny();
+		if (drainObservation) {
+			try {
+				if ((ctx as ExtensionContext)?.sessionManager?.getSessionFile() !== waitState.currentSessionId) drainObservation.deny();
+			} catch { drainObservation.deny(); }
+		}
+		config.holdFinalDrain?.(true);
+		try {
+			await drainOutstandingWork({ state: waitState, events: dm.events, nestedRootRunId, hasPendingSupervisorRequest: config.hasPendingSupervisorRequest }, drainObservation);
+		} finally {
+			config.holdFinalDrain?.(false);
+		}
 	});
-	const structuredOutputPath = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV];
-	const structuredAcceptanceReportPath = process.env[STRUCTURED_OUTPUT_ACCEPTANCE_CAPTURE_ENV];
-	const structuredSchemaPath = process.env[STRUCTURED_OUTPUT_SCHEMA_ENV];
-	if (structuredOutputPath && structuredSchemaPath) {
-		const schema = JSON.parse(fs.readFileSync(structuredSchemaPath, "utf-8")) as JsonSchemaObject;
-		const parameters = createStructuredOutputToolParameters(schema, { acceptanceReport: Boolean(structuredAcceptanceReportPath) });
-		const registerTool = dm.registerTool as unknown as (tool: {
-			name: string;
-			label: string;
-			description: string;
-			parameters: unknown;
-			execute: (_id: string, params: { value: unknown; acceptanceReport?: unknown }) => Promise<unknown>;
-		}) => void;
-		registerTool({
-			name: "structured_output",
-			label: "Structured Output",
-			description: "Submit the required final structured output for this subagent step. This terminates the step.",
-			parameters,
-			async execute(_id: string, params: { value: unknown; acceptanceReport?: unknown }) {
-				const validation = await validateStructuredOutputValue(schema, params.value);
-				if (validation.status === "invalid") {
-					throw new Error(`Structured output validation failed: ${validation.message}`);
-				}
-				fs.mkdirSync(path.dirname(structuredOutputPath), { recursive: true });
-				fs.writeFileSync(structuredOutputPath, JSON.stringify(params.value), { mode: 0o600 });
-				if (structuredAcceptanceReportPath && params.acceptanceReport !== undefined) {
-					fs.writeFileSync(structuredAcceptanceReportPath, JSON.stringify(params.acceptanceReport), { mode: 0o600 });
-				}
-				return {
-					content: [{ type: "text", text: "Structured output captured." }],
-					details: { path: structuredOutputPath },
-					terminate: true,
-				};
-			},
-		});
-	}
+	if (config.structuredOutput) registerStructuredOutputTool(dm, config.structuredOutput);
 
-	onRuntimeEvent("before_provider_request", (event: unknown, ctx?: ExtensionContext) => rewriteForkCacheProviderRequest(event as BeforeProviderRequestEvent, ctx));
+	onRuntimeEvent("before_provider_request", (event: unknown, ctx?: ExtensionContext) => rewriteForkCacheProviderRequest(event as BeforeProviderRequestEvent, ctx, config.forkCacheKey));
 
 	onRuntimeEvent("context", (event: unknown, ctx?: ExtensionContext) => {
 		if (!event || typeof event !== "object" || !("messages" in event) || !Array.isArray(event.messages)) return undefined;
 		const messages = stripParentOnlySubagentMessages(event.messages, {
 			sanitizeToolIds: !COMPOSITE_TOOL_ID_APIS.has(ctx?.model?.api ?? ""),
+			preserveBoundedCompositeToolIds: ctx?.model?.api === "openai-codex-responses",
+			preserveFanoutToolHistory: config.fanoutChild,
 		});
 		if (messages === event.messages) return undefined;
 		return { messages };
 	});
 
+	// dm-intercom asks at session start for this session's intercom ID. Claiming
+	// the route there frees the session name for the readable label. An older
+	// dm-intercom never asks and routes by name, so the route stays the name.
+	const routingName = config.intercomSessionName;
+	let intercomIdClaimed = false;
+	if (routingName) {
+		dm.events.on(INTERCOM_SESSION_IDENTITY_EVENT, (request: unknown) => {
+			if (!request || typeof request !== "object" || !("version" in request) || request.version !== 1 || !("claim" in request) || typeof request.claim !== "function") return;
+			request.claim(routingName);
+			intercomIdClaimed = true;
+		});
+	}
+
 	onRuntimeEvent("before_agent_start", async (event: unknown) => {
 		if (!event || typeof event !== "object" || !("systemPrompt" in event) || typeof event.systemPrompt !== "string") return undefined;
 		registerNativeSupervisorClientOnce();
-		// The intercom target is a routing address and always wins; the display
-		// name (agent + task excerpt, computed by the parent at launch) only
-		// applies when the bridge is not addressing this child.
-		const intercomSessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
-		const displaySessionName = process.env[SUBAGENT_SESSION_NAME_ENV]?.trim();
-		const childSessionName = intercomSessionName || displaySessionName;
+		const childSessionName = intercomIdClaimed ? config.sessionName || routingName : routingName || config.sessionName;
 		if (childSessionName && typeof dm.setSessionName === "function") {
 			dm.setSessionName(childSessionName);
 		}
 
-		const inheritProjectContext = readBooleanEnv(SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV);
-		const inheritGlobalContext = readBooleanEnv(SUBAGENT_INHERIT_GLOBAL_CONTEXT_ENV);
-		const inheritSkills = readBooleanEnv(SUBAGENT_INHERIT_SKILLS_ENV);
-		const fanoutChild = readBooleanEnv(SUBAGENT_FANOUT_CHILD_ENV);
-		let rewritten = event.systemPrompt;
-		if (inheritProjectContext !== undefined || inheritGlobalContext !== undefined || inheritSkills !== undefined || fanoutChild !== undefined) {
-			rewritten = rewriteSubagentPrompt(event.systemPrompt, {
-				inheritProjectContext: inheritProjectContext ?? true,
-				inheritGlobalContext: inheritGlobalContext ?? true,
-				inheritSkills: inheritSkills ?? true,
-				fanoutChild: fanoutChild === true,
-			});
-		}
-		if (rewritten === event.systemPrompt) return;
-		return { systemPrompt: rewritten };
+		// DM has already rendered the base prompt before this event; returning
+		// the filtered text propagates it to later handlers and the provider.
+		if (!rewritesChildPrompt(config)) return;
+		filterChildPromptOptions((event as BeforeAgentStartEvent).systemPromptOptions, {
+			inheritProjectContext: config.inheritProjectContext ?? true,
+			inheritGlobalContext: config.inheritGlobalContext ?? true,
+			inheritSkills: config.inheritSkills ?? true,
+		});
+		const filtered = stripInheritedPromptText(event.systemPrompt, {
+			inheritProjectContext: config.inheritProjectContext ?? true,
+			inheritGlobalContext: config.inheritGlobalContext ?? true,
+			inheritSkills: config.inheritSkills ?? true,
+		});
+		return filtered === event.systemPrompt ? undefined : { systemPrompt: filtered };
 	});
 }

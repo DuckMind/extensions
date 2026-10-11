@@ -19,6 +19,8 @@
  * Or: npm install -g typos-cli (if wrapped)
  */
 
+import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -27,13 +29,17 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import { findingsResult } from "../types.js";
+import {
+	createAvailabilityChecker,
+	resolveRunnerCwd,
+} from "./utils/runner-helpers.js";
 import type { ToolExitCodes } from "./utils/spawn-outcome.js";
 import { parseToolRun } from "./utils/tool-failure.js";
 
 const typos = createAvailabilityChecker("typos", ".exe");
 
-// typos-cli exit codes: 0 = no typos, 2 = typos found, 1 = an error that
+// EXIT TABLE (typos-cli 1.29 docs https://github.com/crate-ci/typos): 0 = no typos, 2 = typos found, 1 = an error that
 // stopped the scan. Anything nonzero outside {2} is a rejected invocation.
 const TYPOS_EXIT_CODES: ToolExitCodes = { ran: [2] };
 
@@ -49,8 +55,13 @@ const TYPOS_EXIT_CODES: ToolExitCodes = { ran: [2] };
  *   "corrections": ["receive"]
  * }
  */
-function parseTyposOutput(raw: string, filePath: string): Diagnostic[] {
+function parseTyposOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 
 	if (!raw.trim()) {
 		return diagnostics;
@@ -72,6 +83,10 @@ function parseTyposOutput(raw: string, filePath: string): Diagnostic[] {
 			};
 
 			if (!parsed.typo || !parsed.line_num) continue;
+			// #3295: every typos JSONL record names its own `path`; a `typos.toml`
+			// `files.extend-exclude` or a directory argv makes that a second file.
+			if (parsed.path && !pathsEqual(path.resolve(cwd, parsed.path), absTarget))
+				continue;
 
 			const corrections = parsed.corrections?.join(", ") || "no suggestions";
 			const message = `Typo: "${parsed.typo}" → ${corrections}`;
@@ -106,8 +121,9 @@ const spellcheckRunner: RunnerDefinition = {
 	skipTestFiles: false, // Check docs in test files too
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
+		const cwd = resolveRunnerCwd(ctx, "spellcheck/typos");
 		// Skip if typos-cli is not installed
-		if (!(await typos.isAvailableAsync(ctx.cwd || process.cwd()))) {
+		if (!(await typos.isAvailableAsync(cwd))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -116,13 +132,10 @@ const spellcheckRunner: RunnerDefinition = {
 		// --exclude <pattern>: Could be used to exclude code blocks if needed
 		const args = ["--format", "json", ctx.filePath];
 
-		const result = await safeSpawnAsync(
-			typos.getCommand(ctx.cwd || process.cwd())!,
-			args,
-			{
-				timeout: 15000,
-			},
-		);
+		const result = await safeSpawnAsync(typos.getCommand(cwd)!, args, {
+			cwd,
+			timeout: 15000,
+		});
 
 		// #1816: typos-cli exits 0 clean, 2 with typos found, and 1 on an ERROR
 		// (unreadable config, bad argument). The `status === 2 || stdout` test
@@ -136,7 +149,7 @@ const spellcheckRunner: RunnerDefinition = {
 		const run = parseToolRun(
 			"spellcheck",
 			{ result, exitCodes: TYPOS_EXIT_CODES },
-			(out) => parseTyposOutput(out, ctx.filePath),
+			(out) => parseTyposOutput(out, ctx.filePath, cwd),
 			{ parseOutput: `${result.stdout ?? ""}${result.stderr ?? ""}` },
 		);
 		if (run.skipped) return run.skipped;
@@ -147,11 +160,10 @@ const spellcheckRunner: RunnerDefinition = {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
 
-		return {
+		return findingsResult(diagnostics, {
 			status: "failed",
-			diagnostics,
 			semantic: "warning",
-		};
+		});
 	},
 };
 

@@ -3,9 +3,11 @@
  */
 
 import * as fs from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Minimatch, type MinimatchOptions } from "./deps/minimatch.js";
+import { detectFileRole } from "./file-role.js";
 import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
 import {
 	isInSpawnTimeoutCooldown,
@@ -34,6 +36,11 @@ import {
 	loadDmLensProjectConfig,
 } from "./project-lens-config.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import {
+	isPiOwnedTempPath,
+	isEphemeralCheckoutRoot,
+} from "./ephemeral-root.js";
+import { getProcessSingleton } from "./process-singletons.js";
 
 /**
  * Return the directory where dm-lens stores project-specific data
@@ -45,7 +52,15 @@ import { safeSpawnAsync } from "./safe-spawn.js";
  * Override: set PILENS_DATA_DIR=/some/path — each project gets its own
  * subdirectory named after a sanitized form of its absolute path, e.g.
  *   PILENS_DATA_DIR=~/.dm-lens/projects
- *   → ~/.dm-lens/projects/home-user-myapp/
+ *   → ~/.dm-lens/projects/home-user-myapp-<8-hex-hash>/
+ *
+ * Temporary checkouts (#1129 decision B, `isEphemeralCheckoutRoot`: a real
+ * git checkout below the host tmpdir, or a directory inside one) keep the
+ * same slug under `<base>/.ephemeral/<pid>-<8 hex>/`, a base this process
+ * alone owns: normal within the process, never read by another one. The
+ * exit hook removes it and the session-start sweep reaps a dead process's.
+ * A leading dot keeps the name out of the slug namespace. Either answer is
+ * settled once per process per (base, cwd).
  *
  * This keeps project folders clean and avoids creating .dm-lens folders
  * inside user projects.
@@ -53,18 +68,285 @@ import { safeSpawnAsync } from "./safe-spawn.js";
 export function getProjectDataDir(cwd: string): string {
 	const legacyProjectDir = path.join(cwd, ".dm-lens");
 	const configuredBase = process.env.PILENS_DATA_DIR?.trim();
+	const resolvedBase = projectDataBase();
+	const memoKey = `${resolvedBase}\0${path.resolve(cwd)}`;
+	const cached = settledDataDirs.get(memoKey);
+	if (cached !== undefined) return cached;
 	if (!configuredBase && fs.existsSync(legacyProjectDir)) {
 		return legacyProjectDir;
 	}
-	const base = configuredBase || path.join(getGlobalDmLensDir(), "projects");
-	const normalized = normalizeFilePath(path.resolve(cwd));
-	const slug = normalized
+	const canonical = canonicalProjectRoot(cwd);
+	const readable = projectDataDirReadableSlug(canonical.root);
+	const hash = projectDataDirRootHash(canonical.root);
+	const slug = `${readable || "default"}-${hash}`;
+	const base = isEphemeralCheckoutRoot(cwd)
+		? ephemeralDataBase(resolvedBase)
+		: resolvedBase;
+	const dir = path.join(base, slug);
+	if (base !== resolvedBase && pendingDataDirMigrations.length < 32) {
+		pendingDataDirMigrations.push({ to: dir, outcome: "ephemeral" });
+	}
+	const settled = settleProjectDataDir(
+		base,
+		readable || "default",
+		dir,
+		memoKey,
+		canonical.fallback,
+	);
+	return settled;
+}
+
+function projectDataBase(): string {
+	const configuredBase = process.env.PILENS_DATA_DIR?.trim();
+	return configuredBase || path.join(getGlobalDmLensDir(), "projects");
+}
+
+const EPHEMERAL_DATA_DIR_NAME = ".ephemeral";
+const EPHEMERAL_TOKEN_PATTERN = /^(\d+)-[0-9a-f]{8}$/;
+
+/**
+ * The one token per process (a process singleton, so every module copy hands
+ * out the same dir). The random half keeps a reused pid from inheriting a
+ * dead process's leftovers before the sweep reaps them.
+ */
+function ephemeralDataToken(): { token: string; exitHook: boolean } {
+	return getProcessSingleton("project-data-ephemeral-token", 1, () => ({
+		token: `${process.pid}-${randomBytes(4).toString("hex")}`,
+		exitHook: false,
+	}));
+}
+
+function ephemeralDataBase(resolvedBase: string): string {
+	const state = ephemeralDataToken();
+	if (!state.exitHook) {
+		state.exitHook = true;
+		process.once("exit", removeEphemeralDataDirs);
+	}
+	return path.join(resolvedBase, EPHEMERAL_DATA_DIR_NAME, state.token);
+}
+
+/**
+ * The exit hook: remove this process's ephemeral base. Best-effort and total.
+ * An exit-time writer registered later can still recreate an entry; the
+ * session-start sweep removes it once this pid is dead.
+ */
+export function removeEphemeralDataDirs(): void {
+	const dir = path.join(
+		projectDataBase(),
+		EPHEMERAL_DATA_DIR_NAME,
+		ephemeralDataToken().token,
+	);
+	try {
+		fs.rmSync(dir, { recursive: true, force: true });
+	} catch {
+		// Left for the next session-start sweep.
+	}
+}
+
+/**
+ * Reap the ephemeral bases of dead processes under the configured data base.
+ * Reads at most `maxEntries` entries; touches only directories named
+ * `<pid>-<8 hex>` whose pid `isPidAlive` reports dead. A reused live pid keeps
+ * its dead predecessor's dir until that pid dies too: the safe direction.
+ * Returns the number of directories removed.
+ */
+export async function sweepDeadEphemeralDataDirs(options: {
+	isPidAlive: (pid: number) => boolean;
+	maxEntries?: number;
+}): Promise<number> {
+	const parent = path.join(projectDataBase(), EPHEMERAL_DATA_DIR_NAME);
+	let handle: fs.Dir;
+	try {
+		handle = await fs.promises.opendir(parent);
+	} catch {
+		return 0;
+	}
+	let removed = 0;
+	try {
+		for (let i = 0; i < (options.maxEntries ?? 512); i++) {
+			const entry = await handle.read();
+			if (entry === null) break;
+			const pid = entry.isDirectory()
+				? EPHEMERAL_TOKEN_PATTERN.exec(entry.name)?.[1]
+				: undefined;
+			if (pid === undefined || options.isPidAlive(Number(pid))) continue;
+			try {
+				await fs.promises.rm(path.join(parent, entry.name), {
+					recursive: true,
+					force: true,
+				});
+				removed++;
+			} catch {
+				// Left for the next sweep.
+			}
+		}
+	} catch {
+		// Best-effort directory scan.
+	} finally {
+		await handle.close().catch(() => {});
+	}
+	return removed;
+}
+
+/**
+ * The human-readable half of the project data-dir slug: the absolute root
+ * with separators folded to dashes and anything else stripped.
+ *
+ * #2874: this form ALONE is not an identity — `src/dm-lens` and
+ * `src/pi/lens` fold to the same string. It is only ever combined with
+ * {@link projectDataDirRootHash}. Never use it as a directory name alone.
+ */
+function projectDataDirReadableSlug(canonicalRoot: string): string {
+	const normalized = normalizeFilePath(canonicalRoot);
+	return normalized
 		.replace(/^[a-z]:/i, "") // strip Windows drive letter
 		.replace(/\/+/g, "-") // separators → dashes
 		.replace(/[^A-Za-z0-9-]/g, "") // strip anything else
 		.replace(/^-+/, "") // trim leading dashes
 		.replace(/-+$/, ""); // trim trailing dashes
-	return path.join(base.trim(), slug || "default");
+}
+
+/**
+ * The canonical root is the resolved absolute path for both slug halves.
+ * `realpathSync` is probed only to expose a fallback boundary failure; using
+ * its result would let one root spelling change identity when the boundary
+ * recovers. The hash is the first 8 hex chars of SHA-256 over that root. A
+ * collision needs the same readable slug and the same 32-bit prefix, so the
+ * practical collision population is readable-slug twin pairs. Pinned on
+ * purpose because changing it renames every directory.
+ */
+function canonicalProjectRoot(cwd: string): {
+	root: string;
+	fallback: boolean;
+} {
+	const resolved = path.resolve(cwd);
+	try {
+		// Probe the root, but keep the resolved spelling as the identity in both
+		// success and fallback cases. Resolving only on success would let a
+		// transient boundary failure choose a second data directory.
+		fs.realpathSync(resolved);
+	} catch {
+		// Best-effort: the root may not exist yet.
+		return { root: resolved, fallback: true };
+	}
+	return { root: resolved, fallback: false };
+}
+
+function projectDataDirRootHash(canonicalRoot: string): string {
+	return createHash("sha256").update(canonicalRoot).digest("hex").slice(0, 8);
+}
+
+export interface ProjectDataDirMigration {
+	/** The hashed-slug directory derived for the root. */
+	to: string;
+	/**
+	 * The bounded outcome that the session-start drain renders. `ephemeral`
+	 * (#1129) is not a migration: the root got a process-owned dir instead.
+	 */
+	outcome:
+		| "renamed"
+		| "coexisting"
+		| "rename-failed"
+		| "identity-fallback"
+		| "ephemeral";
+}
+
+const pendingDataDirMigrations: ProjectDataDirMigration[] = [];
+const settledDataDirs = new Map<string, string>();
+
+export function resetProjectDataDirSessionState(): void {
+	pendingDataDirMigrations.splice(0);
+}
+
+/**
+ * One-time upgrade from a pre-#2874 slug directory to its hashed name.
+ * When the old directory exists and the new one does not, the state moves
+ * with one atomic `renameSync` (same parent, so same filesystem). When both
+ * exist the new one wins and nothing moves. Either case queues one
+ * {@link ProjectDataDirMigration} for the session-start drain, which emits
+ * the `data_dir_migrated` record. Best-effort throughout: on any failure the
+ * caller gets the pre-existing directory and behavior is unchanged.
+ *
+ * No ledger import here on purpose: `probe-home-state.ts` documents that a
+ * direct edge between this module and `degradation-ledger.ts` in either
+ * direction adds `no-client-cycles` violations, so the record is emitted by
+ * the drain site in `runtime-session.ts` instead.
+ */
+function settleProjectDataDir(
+	base: string,
+	oldSlug: string,
+	dir: string,
+	memoKey: string,
+	identityFallback: boolean,
+): string {
+	const oldDir = path.join(base, oldSlug);
+	const newExists = fs.existsSync(dir);
+	const oldExists = fs.existsSync(oldDir);
+	if (!oldExists) {
+		if (identityFallback && pendingDataDirMigrations.length < 32) {
+			pendingDataDirMigrations.push({
+				to: dir,
+				outcome: "identity-fallback",
+			});
+		}
+		// Steady state: nothing to migrate from.
+		settledDataDirs.set(memoKey, dir);
+		return dir;
+	}
+	if (!newExists) {
+		try {
+			fs.renameSync(oldDir, dir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				if (fs.existsSync(dir)) {
+					settledDataDirs.set(memoKey, dir);
+					return dir;
+				}
+				if (fs.existsSync(oldDir)) return oldDir;
+				return dir;
+			}
+			// Best-effort: retain the old directory and publish one bounded
+			// failure notice for this process's memo key.
+			if (pendingDataDirMigrations.length < 32) {
+				pendingDataDirMigrations.push({
+					to: dir,
+					outcome: "rename-failed",
+				});
+			}
+			settledDataDirs.set(memoKey, oldDir);
+			return oldDir;
+		}
+	}
+	// Either the rename just moved the state, or both directories already
+	// existed and the new one wins. Queue one migration for the drain.
+	settledDataDirs.set(memoKey, dir);
+	if (pendingDataDirMigrations.length < 32) {
+		pendingDataDirMigrations.push({
+			to: dir,
+			outcome: newExists ? "coexisting" : "renamed",
+		});
+	}
+	return dir;
+}
+
+/**
+ * Drain the queued {@link ProjectDataDirMigration}s, clearing the queue.
+ * Called once per session start by `handleSessionStart`; each queued outcome is
+ * therefore recorded at most once per session. Test-only callers must not rely
+ * on queue depth across drains.
+ */
+export function drainProjectDataDirMigrations(): ProjectDataDirMigration[] {
+	return pendingDataDirMigrations.splice(0);
+}
+
+/**
+ * Test-only reset for the settled-directory memo. The memo is a pure
+ * performance cache (one `existsSync` pair saved per latched directory), so
+ * clearing it changes no observable behavior — it lets a test stage an
+ * old-slug directory AFTER learning the new name, then resolve again.
+ */
+export function _resetProjectDataDirMemoForTests(): void {
+	settledDataDirs.clear();
 }
 
 /**
@@ -92,12 +374,15 @@ export function getProjectDataDir(cwd: string): string {
  *     {@link homeRelativePath} so the default `~/.dm-lens/projects/...` store
  *     does not leak the account name into agent context (#2440 F5).
  *
- * Pure string work on top of `getProjectDataDir`'s own resolution: it never
- * stats the target, so it is safe to call for a file that has not been written
- * yet and cannot throw on a surface whose whole job is to render a hint.
+ * String work on top of `getProjectDataDir`'s own resolution. Since #4101,
+ * `toProjectRelativePath` retries canonically (a stat) only when the lexical
+ * test says the target is outside the root; that retry tolerates a missing
+ * path, so this stays safe for a file that has not been written yet and does
+ * not throw on a surface whose whole job is to render a hint.
  *
  * The relative-or-absolute decision reuses `toProjectRelativePath`
- * (`clients/path-utils.ts`) — the same shape-aware, non-stat'ing primitive
+ * (`clients/path-utils.ts`) — the same shape-aware primitive (lexical first,
+ * a canonical retry only on a lexical miss, #4101)
  * `toRunnerDisplayPath` (`clients/dispatch/runner-context.ts`) composes for
  * the analogous "relative path if under this root, else something else"
  * decision — rather than a second hand-rolled `path.relative` fold. It is NOT
@@ -174,6 +459,28 @@ export function getGlobalDmLensDir(): string {
 }
 
 /**
+ * True for pi/dm-lens-owned files that can arrive at the tool-result seam
+ * from outside the session root. These are housekeeping writes, not project
+ * edits for which the actionable outside-root notice is useful.
+ */
+export function isDmLensInternalPath(
+	filePath: string,
+	projectRoot: string,
+): boolean {
+	const absolute = path.resolve(filePath);
+	const home = path.resolve(os.homedir());
+	const candidates = [
+		getGlobalDmLensDir(),
+		getProjectDataDir(projectRoot),
+		path.join(home, ".pi"),
+		path.join(home, ".dm-lens"),
+	];
+	if (candidates.some((dir) => isUnderDir(absolute, dir))) return true;
+	if (isPiOwnedTempPath(absolute)) return true;
+	return false;
+}
+
+/**
  * Directories to exclude from all scans (build outputs, dependencies, caches).
  * Used consistently across all scanners to avoid noise from generated files.
  */
@@ -195,6 +502,14 @@ export const EXCLUDED_DIRS = [
 	".next",
 	".dm-lens",
 	".pi", // pi agent directory
+	// The SAME agent, rebranded: pi derives its config-dir name as
+	// `pkg.piConfig?.configDir || ".pi"` (pi-coding-agent 0.85.1,
+	// `dist/bundle/chunks/chunk-JVUZSMYM.js`), so a redistribution spells its
+	// `<configDir>/agent/sessions` history `.omp/agent/sessions` instead.
+	// #3112: a project-local one was walked entry-by-entry and spent the whole
+	// startup-scan entry budget, so a five-file project reported
+	// `too-many-entries` and never warmed its caches.
+	".omp",
 	".ruff_cache", // Python linter cache
 	".worktrees",
 	".claude",
@@ -239,9 +554,9 @@ export const EXCLUDED_DIRS = [
  * `buildProjectIgnoreMatcher`'s `patternsForDir` (#783) — both are tagged
  * `"dmlens"` and share the same tracked-file-rescue exemption.
  */
-export type GitignorePatternLayer = "global" | "gitignore" | "dmlens";
+type GitignorePatternLayer = "global" | "gitignore" | "dmlens";
 
-export interface GitignorePattern {
+interface GitignorePattern {
 	pattern: string;
 	negated: boolean;
 	directoryOnly: boolean;
@@ -397,7 +712,7 @@ function matchesGitignorePattern(
 	});
 }
 
-export function readGitignorePatterns(
+function readGitignorePatterns(
 	rootDir: string,
 	layer: GitignorePatternLayer = "gitignore",
 ): GitignorePattern[] {
@@ -985,7 +1300,11 @@ export function readGitignoreDirs(rootDir: string): string[] {
 }
 
 function globToRegExp(glob: string): RegExp {
+	// Directory names use the same `*`-only dialect as read-guard exemptions.
+	// Collapse adjacent stars before compiling to avoid nullable-group
+	// backtracking on a non-matching name (#2622).
 	const escaped = glob
+		.replace(/\*+/g, "*")
 		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
 		.replace(/\*/g, ".*")
 		.replace(/\?/g, ".");
@@ -1103,15 +1422,14 @@ export async function detectFileChangedAfterCommand(
  * Check if file path is a test/fixture/mock file.
  * Used by secrets scanner, rate command, and dispatch runners
  * to skip these files (false positives on fake credentials, etc).
+ *
+ * Delegate naming/directory classification to file-role (#2928). Fixtures,
+ * mocks and test helpers remain this skip gate's separate policy.
  */
 export function isTestFile(filePath: string): boolean {
+	if (detectFileRole(filePath) === "test") return true;
 	const normalized = filePath.replace(/\\/g, "/");
 	return (
-		normalized.includes(".test.") ||
-		normalized.includes(".spec.") ||
-		normalized.includes("/test/") ||
-		normalized.includes("/tests/") ||
-		normalized.includes("__tests__/") ||
 		normalized.includes("test-utils") ||
 		normalized.startsWith("test-") ||
 		normalized.includes(".fixture.") ||

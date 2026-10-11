@@ -6,6 +6,7 @@ import {
 	DOTNET_CSHARP_ROOT_MARKERS,
 	DOTNET_FSHARP_ROOT_MARKERS,
 	KIND_EXTENSIONS,
+	LEAN_ROOT_MARKERS,
 	TERRAGRUNT_FILENAMES,
 	type FileKind,
 } from "./file-kinds.js";
@@ -48,8 +49,15 @@ const PROJECT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	sql: [".sqlfluff", "pyproject.toml"],
 	php: ["composer.json", "composer.lock"],
 	prisma: ["schema.prisma", "prisma/schema.prisma"],
-	java: ["pom.xml", "build.gradle", ".classpath"],
+	// #2870: `build.gradle.kts` is the Kotlin-DSL spelling of `build.gradle`
+	// and marks a Java module just as well — its absence here (and in
+	// ROOT_MARKERS_BY_KIND below) is what left a `.java` file in a
+	// Kotlin-DSL Gradle module resolving to the workspace root, where a
+	// polyglot repo's go.mod then claimed it. `kotlin` already lists both
+	// spellings; java listed only the Groovy one.
+	java: ["pom.xml", "build.gradle", "build.gradle.kts", ".classpath"],
 	kotlin: ["build.gradle.kts", "build.gradle", "pom.xml"],
+	lean: LEAN_ROOT_MARKERS,
 	swift: ["Package.swift"],
 	dart: ["pubspec.yaml"],
 	elixir: ["mix.exs"],
@@ -65,6 +73,8 @@ const PROJECT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 
 const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	jsts: [
+		"biome.json",
+		"biome.jsonc",
 		"package.json",
 		"tsconfig.json",
 		"jsconfig.json",
@@ -95,8 +105,13 @@ const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	sql: [".sqlfluff", "pyproject.toml", "setup.cfg", "tox.ini"],
 	php: ["composer.json", "composer.lock"],
 	prisma: ["prisma/schema.prisma", "schema.prisma"],
-	java: ["pom.xml", "build.gradle", ".classpath"],
+	// #2870: see PROJECT_MARKERS_BY_KIND.java above — this is the table
+	// `resolveLanguageRootForFile` walks, so the missing Kotlin-DSL spelling
+	// is what anchored a nested Gradle module's `.java` file at the
+	// workspace root.
+	java: ["pom.xml", "build.gradle", "build.gradle.kts", ".classpath"],
 	kotlin: ["build.gradle.kts", "build.gradle", "pom.xml"],
+	lean: LEAN_ROOT_MARKERS,
 	swift: ["Package.swift"],
 	dart: ["pubspec.yaml"],
 	elixir: ["mix.exs"],
@@ -109,6 +124,31 @@ const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	csharp: DOTNET_CSHARP_ROOT_MARKERS,
 	fsharp: DOTNET_FSHARP_ROOT_MARKERS,
 };
+
+// Tool-owned configuration belongs beside the shared language vocabulary, but
+// not in ROOT_MARKERS_BY_KIND: these files are discovered by the tool, not by
+// the language root detector. Keeping them here lets runner cwd resolution
+// consume one canonical vocabulary without restoring a second seam-local map.
+const TOOL_MARKERS_BY_RUNNER: Readonly<Record<string, readonly string[]>> = {
+	ruff: ["ruff.toml", ".ruff.toml"],
+	oxlint: [".oxlintrc.json", "oxlint.config.js"],
+	"spellcheck/typos": ["_typos.toml", "typos.toml"],
+	yamllint: ["yamllint.yaml", "yamllint.yml"],
+	prettier: [".prettierignore"],
+};
+
+/** Return the one shared marker vocabulary used to anchor this file kind. */
+export function rootMarkersForFile(
+	filePath: string,
+	runner?: string,
+): readonly string[] {
+	const kind = detectFileKind(path.resolve(filePath));
+	const languageMarkers = kind ? (ROOT_MARKERS_BY_KIND[kind] ?? []) : [];
+	const toolMarkers = runner ? (TOOL_MARKERS_BY_RUNNER[runner] ?? []) : [];
+	return toolMarkers.length
+		? [...new Set([...languageMarkers, ...toolMarkers])]
+		: languageMarkers;
+}
 
 function hasProjectMarker(projectRoot: string, marker: string): boolean {
 	if (!marker.includes("*"))
@@ -198,27 +238,6 @@ function computeProjectLanguageProfile(
 	};
 }
 
-export function hasLanguage(
-	profile: ProjectLanguageProfile,
-	kind: FileKind,
-): boolean {
-	return !!profile.present[kind];
-}
-
-export function hasAnyLanguage(
-	profile: ProjectLanguageProfile,
-	kinds: readonly FileKind[],
-): boolean {
-	return kinds.some((kind) => hasLanguage(profile, kind));
-}
-
-export function isLanguageConfigured(
-	profile: ProjectLanguageProfile,
-	kind: FileKind,
-): boolean {
-	return !!profile.configured[kind];
-}
-
 export function getDefaultStartupTools(
 	profile: ProjectLanguageProfile,
 ): string[] {
@@ -250,7 +269,7 @@ export function resolveLanguageRootForFile(
 	const kind = detectFileKind(absoluteFilePath);
 	if (!kind) return path.resolve(workspaceRoot);
 
-	const markers = ROOT_MARKERS_BY_KIND[kind];
+	const markers = rootMarkersForFile(absoluteFilePath);
 	if (!markers || markers.length === 0) {
 		return path.resolve(workspaceRoot);
 	}
@@ -310,8 +329,8 @@ const WARMUP_CODE_EXTS: ReadonlySet<string> = new Set(
 // warmup walk is hard-capped. Without this, a walk rooted at a too-broad directory
 // (e.g. $HOME, if startup-scan's canWarmCaches guard is bypassed) traverses the
 // entire tree — #250's multi-hour home-dir scans. Generous enough to detect every
-// language present in any real project (mirrors startup-scan's 2000 limit).
-const MAX_WARMUP_SOURCE_FILES = 2000;
+// language present in any real project (mirrors startup-scan's 2500 limit).
+const MAX_WARMUP_SOURCE_FILES = 2500;
 
 // Total matched-file ceiling for the warmup walk, as a multiple of `maxFiles`
 // (#894 review): with per-category budgets the walk no longer stops at the

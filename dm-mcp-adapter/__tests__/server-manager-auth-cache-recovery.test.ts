@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@modelcontextprotocol/client", async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  Client: vi.fn().mockImplementation(() => ({
+  Client: vi.fn().mockImplementation(function () { return {
     setRequestHandler: vi.fn(), setNotificationHandler: vi.fn(),
     connect: vi.fn(async () => {
       const step = mocks.connectSteps.shift();
@@ -26,9 +26,9 @@ vi.mock("@modelcontextprotocol/client", async importOriginal => ({
     listResources: vi.fn(async () => { const error = mocks.listResourcesErrors.shift(); if (error) throw error; return { resources: [] }; }),
     listPrompts: vi.fn(async () => { const error = mocks.listPromptsErrors.shift(); if (error) throw error; return { prompts: [] }; }),
     getServerCapabilities: vi.fn(() => mocks.capabilities), getInstructions: vi.fn(() => undefined), close: vi.fn(async () => undefined),
-  })),
-  StreamableHTTPClientTransport: vi.fn().mockImplementation((url: URL, options: TransportOptions) => ({ url, options, close: vi.fn(async () => undefined) })),
-  SSEClientTransport: vi.fn().mockImplementation((url: URL, options: TransportOptions) => ({ url, options, close: vi.fn(async () => undefined) })),
+  }; }),
+  StreamableHTTPClientTransport: vi.fn().mockImplementation(function (url: URL, options: TransportOptions) { return { url, options, close: vi.fn(async () => undefined) }; }),
+  SSEClientTransport: vi.fn().mockImplementation(function (url: URL, options: TransportOptions) { return { url, options, close: vi.fn(async () => undefined) }; }),
 }));
 vi.mock("@modelcontextprotocol/client/stdio", () => ({ StdioClientTransport: vi.fn() }));
 vi.mock("../npx-resolver.ts", () => ({ resolveNpxBinary: vi.fn(async () => null) }));

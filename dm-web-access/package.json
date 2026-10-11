@@ -1,6 +1,6 @@
 {
   "name": "dm-web-access",
-  "version": "0.27.0",
+  "version": "0.38.0",
   "description": "Web search, URL fetching, PDF extraction, YouTube video understanding, and local video analysis for DM.",
   "type": "module",
   "license": "MIT",
@@ -16,6 +16,7 @@
     "youtube"
   ],
   "files": [
+    "dist",
     "*.ts",
     "CHANGELOG.md",
     "README.md",
@@ -24,6 +25,7 @@
     "dm-web-fetch-demo.mp4"
   ],
   "scripts": {
+    "build": "node scripts/build.js",
     "typecheck": "tsc --noEmit",
     "test": "node --test",
     "verify": "npm run typecheck && npm test"
@@ -35,27 +37,28 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nicobailon/pi-web-access.git"
+    "url": "git+https://github.com/DuckMind/extensions.git"
   },
   "bugs": {
-    "url": "https://github.com/nicobailon/pi-web-access/issues"
+    "url": "https://github.com/DuckMind/extensions/issues"
   },
-  "homepage": "https://github.com/nicobailon/pi-web-access#readme",
+  "homepage": "https://github.com/DuckMind/extensions/tree/main/dm-web-access#readme",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@mozilla/readability": "^0.6.0",
     "defuddle": "0.19.3",
     "linkedom": "^0.16.0",
     "p-limit": "^6.1.0",
     "promise.try": "^2.0.1",
     "turndown": "^7.2.0",
-    "typebox": "^1.1.38",
-    "unpdf": "^1.6.2",
-    "undici": "^8.9.0"
+    "undici": "8.11.2",
+    "unpdf": "^1.6.2"
   },
   "peerDependencies": {
     "@duckmind/dm-ai": "*",
     "@duckmind/dm-coding-agent": "*",
-    "@duckmind/dm-tui": "*"
+    "@duckmind/dm-tui": "*",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
     "@duckmind/dm-ai": {
@@ -66,10 +69,15 @@
     },
     "@duckmind/dm-tui": {
       "optional": true
+    },
+    "typebox": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@types/turndown": "^5.0.6",
+    "esbuild": "^0.28.1",
+    "typebox": "1.3.27",
     "typescript": "^7.0.2",
     "@duckmind/dm-ai": "file:../../dm-mono/packages/ai",
     "@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",

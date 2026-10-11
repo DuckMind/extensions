@@ -19,6 +19,30 @@ export interface SuppressibleDiagnostic {
 }
 
 const SUPPRESS_RE = /(?:\/\/|#)\s*dm-lens-ignore:\s*(.+)/;
+const TRAILING_REASON_RE = /(?:\s+--\s+|\s+—\s+|:\s+).+$/u;
+
+export function splitInlineSuppressionPayload(payload: string): {
+	ruleList: string;
+	trailingReason: string;
+} {
+	const reasonMatch = TRAILING_REASON_RE.exec(payload);
+	const trailingReason = reasonMatch?.[0];
+	if (reasonMatch === null || trailingReason === undefined) {
+		return { ruleList: payload, trailingReason: "" };
+	}
+	return {
+		ruleList: payload.slice(0, reasonMatch.index),
+		trailingReason,
+	};
+}
+
+export function parseInlineSuppressionRuleIds(payload: string): string[] {
+	const { ruleList } = splitInlineSuppressionPayload(payload);
+	return ruleList
+		.split(",")
+		.map((rule) => rule.trim())
+		.filter(Boolean);
+}
 
 /**
  * Normalize a rule id to the form a user writes in a `dm-lens-ignore` comment.
@@ -49,10 +73,9 @@ export function applyInlineSuppressions<T extends SuppressibleDiagnostic>(
 	for (let i = 0; i < lines.length; i++) {
 		const m = SUPPRESS_RE.exec(lines[i]);
 		if (!m) continue;
-		const rules = m[1]
-			.split(",")
-			.map((r) => r.trim())
-			.filter(Boolean);
+		const payload = m[1];
+		if (payload === undefined) continue;
+		const rules = parseInlineSuppressionRuleIds(payload);
 		const suppressedLine = i + 1; // same line (1-based)
 		const nextLine = i + 2; // next line (1-based)
 		for (const ruleId of rules) {

@@ -45,6 +45,7 @@ test("Parallel MCP searches anonymously, maps filters, and supports explicit rou
 	const output = JSON.parse(child.stdout.trim());
 	assert.equal(output.calls[0].url, "https://search.parallel.ai/mcp");
 	assert.equal(output.calls[0].headers.authorization, undefined);
+	assert.equal(output.calls[0].headers["user-agent"], "dm-web-access");
 	assert.equal(output.calls[0].body.params.name, "web_search");
 	assert.match(output.calls[0].body.params.arguments.search_queries[0], /site:example\.com/);
 	assert.match(output.calls[0].body.params.arguments.search_queries[0], /-site:private\.docs\.example\.com/);

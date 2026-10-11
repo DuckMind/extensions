@@ -1,8 +1,9 @@
-import { clampThinkingLevel, type ModelThinkingLevel, type ThinkingLevel } from "@duckmind/dm-ai";
-import { complete, completeSimple, type Api, type Message, type Model } from "@duckmind/dm-ai/compat";
+import type { ModelThinkingLevel, ThinkingLevel } from "@duckmind/dm-ai";
+import type { complete, Api, Message, Model } from "@duckmind/dm-ai/compat";
 import type { ExtensionContext } from "@duckmind/dm-coding-agent";
-import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns, splitThinkingSuffix, type SummaryThinkingLevel } from "./summary-model-scope.ts";
+import { findModelWithProviderRouting, getDmScopedModels, isModelInScope, splitThinkingSuffix, type SummaryThinkingLevel } from "./summary-model-scope.ts";
 import type { QueryResultData } from "./storage.ts";
+import { openCodeSessionHeaders } from "./opencode-session-headers.ts";
 
 type ProviderHeaders = Record<string, string | null>;
 type CompleteFunction = typeof complete;
@@ -29,12 +30,26 @@ export interface SummaryMeta {
 	edited?: boolean;
 }
 
-export type SummaryGenerationContext = Pick<ExtensionContext, "model" | "modelRegistry" | "cwd" | "isProjectTrusted">;
+export type SummaryGenerationContext = Pick<ExtensionContext, "model" | "modelRegistry" | "sessionManager"> & { scopedModels: ReadonlyArray<{ model: { provider: string; id: string } }> };
 
 function estimateTokens(text: string): number {
 	const trimmed = text.trim();
 	if (trimmed.length === 0) return 0;
 	return Math.max(1, Math.ceil(trimmed.length / 4));
+}
+
+const SNIPPET_BUDGETS = {
+	/** No answer text: the snippets are the only evidence. */
+	evidence: { perSource: 600, perQuery: 12_000 },
+	/** Answer present: snippets only corroborate it. */
+	corroboration: { perSource: 200, perQuery: 3_000 },
+} as const;
+
+function clampSnippet(snippet: string, budgetLeft: number, perSource: number): string {
+	const text = snippet.replace(/\s+/g, " ").trim();
+	const limit = Math.min(perSource, budgetLeft);
+	if (!text || limit <= 0) return "";
+	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
 function summarizeQueryResult(result: QueryResultData): string {
@@ -54,15 +69,24 @@ function summarizeQueryResult(result: QueryResultData): string {
 	}
 
 	lines.push("Sources:");
+	// Without snippets a provider that returns raw results gives the model
+	// nothing to summarise; with all of them the request overruns its deadline.
+	const budget = result.answer?.trim() ? SNIPPET_BUDGETS.corroboration : SNIPPET_BUDGETS.evidence;
+	let budgetLeft = budget.perQuery;
 	for (let i = 0; i < result.results.length; i++) {
 		const source = result.results[i];
 		lines.push(`${i + 1}. ${source.title} — ${source.url}`);
+		const snippet = clampSnippet(source.snippet ?? "", budgetLeft, budget.perSource);
+		if (snippet) {
+			budgetLeft -= snippet.length;
+			lines.push(`   ${snippet}`);
+		}
 	}
 
 	return lines.join("\n");
 }
 
-export function buildSummaryPrompt(results: QueryResultData[], feedback?: string): string {
+export function buildSummaryPrompt(results: QueryResultData[], feedback?: string, instructions?: string): string {
 	const sections = [
 		"You are writing the final web search summary for a coding assistant.",
 		"Write a concise, factual summary using only the provided search results.",
@@ -73,6 +97,11 @@ export function buildSummaryPrompt(results: QueryResultData[], feedback?: string
 		"- If evidence is weak or conflicting, say so explicitly.",
 		"- End with a short \"Sources\" section listing the most relevant URLs.",
 	];
+
+	const extraInstructions = typeof instructions === "string" ? instructions.trim() : "";
+	if (extraInstructions) {
+		sections.push(extraInstructions);
+	}
 
 	if (feedback) {
 		sections.push("- Incorporate the user feedback provided below into the summary.");
@@ -204,8 +233,9 @@ function parseModelSelector(value: string): { provider: string; id: string; thin
 	};
 }
 
-function resolveThinkingLevel(model: Model<Api>, requested?: SummaryThinkingLevel): ModelThinkingLevel | undefined {
+async function resolveThinkingLevel(model: Model<Api>, requested?: SummaryThinkingLevel): Promise<ModelThinkingLevel | undefined> {
 	if (!requested) return undefined;
+	const { clampThinkingLevel } = await import("@duckmind/dm-ai");
 	return clampThinkingLevel(model, requested as ModelThinkingLevel);
 }
 
@@ -213,7 +243,6 @@ async function resolveSummaryModelCandidates(
 	ctx: SummaryGenerationContext,
 	modelOverride?: string,
 ): Promise<{ candidates: Array<{ model: Model<Api>; apiKey?: string; headers?: ProviderHeaders; thinkingLevel?: SummaryThinkingLevel }>; errors: string[] }> {
-	const enabledModelPatterns = loadEnabledModelPatterns(ctx);
 	const specs: Array<{ provider: string; id: string; thinkingLevel?: SummaryThinkingLevel }> = [];
 	const normalizedOverride = typeof modelOverride === "string" ? modelOverride.trim() : "";
 	if (normalizedOverride.length > 0) specs.push(parseModelSelector(normalizedOverride));
@@ -232,7 +261,7 @@ async function resolveSummaryModelCandidates(
 			errors.push(`Summary model not found: ${value}`);
 			continue;
 		}
-		if (!modelMatchesEnabledPatterns(model, enabledModelPatterns)) {
+		if (!isModelInScope(model, getDmScopedModels(ctx))) {
 			errors.push(`Summary model is not enabled: ${value}`);
 			continue;
 		}
@@ -291,26 +320,26 @@ export async function generateSummaryDraft(
 	feedback?: string,
 	completeFn?: CompleteFunction,
 	deadlineMs = SUMMARY_GENERATION_DEADLINE_MS,
+	instructions?: string,
 ): Promise<{ summary: string; meta: SummaryMeta }> {
 	if (!ctx || !ctx.modelRegistry) {
 		throw new Error("Summary generation context unavailable");
 	}
+	if (signal?.aborted) throw new Error("Aborted");
 
 	const registry = ctx.modelRegistry as SummaryModelRegistry;
 	const customCompleteFn = completeFn !== undefined;
 	const usesRegistryComplete = !customCompleteFn && typeof registry.complete === "function";
-	completeFn ??= usesRegistryComplete ? registry.complete!.bind(registry) as CompleteFunction : complete;
+	let piAiCompat: typeof import("@duckmind/dm-ai/compat") | undefined;
 
 	const generationStartedAt = Date.now();
 	const deadlineController = new AbortController();
 	const deadlineMarker = Symbol("summary-generation-deadline");
 	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-	let resolveDeadline!: () => void;
 	const deadlinePromise = new Promise<typeof deadlineMarker>(resolve => {
-		resolveDeadline = () => resolve(deadlineMarker);
 		deadlineTimer = setTimeout(() => {
 			deadlineController.abort();
-			resolveDeadline();
+			resolve(deadlineMarker);
 		}, deadlineMs);
 	});
 
@@ -326,31 +355,40 @@ export async function generateSummaryDraft(
 		? AbortSignal.any([signal, deadlineController.signal])
 		: deadlineController.signal;
 
+	function checkSummaryDeadline(): void {
+		if (signal?.aborted) throw new Error("Aborted");
+		// Imports or synchronous providers can finish before an overdue timer runs.
+		if (deadlineController.signal.aborted || Date.now() - generationStartedAt >= deadlineMs) {
+			deadlineController.abort();
+			throw deadlineMarker;
+		}
+	}
+
 	async function raceSummaryOperation<T>(operation: Promise<T>): Promise<T> {
 		// A provider may ignore AbortSignal and never settle; observe it before racing so
 		// its eventual rejection cannot become an unhandled promise rejection.
 		void operation.then(() => undefined, () => undefined);
+		checkSummaryDeadline();
 		const contenders: Promise<unknown>[] = [operation, deadlinePromise];
 		if (callerAbortPromise) contenders.push(callerAbortPromise);
 		const result = await Promise.race(contenders);
-		if (result === deadlineMarker) {
-			if (signal?.aborted) throw new Error("Aborted");
-			throw deadlineMarker;
-		}
+		checkSummaryDeadline();
 		return result as T;
 	}
 
 	try {
 		if (signal?.aborted) throw new Error("Aborted");
-		const prompt = buildSummaryPrompt(results, feedback);
+		const prompt = buildSummaryPrompt(results, feedback, instructions);
 		let resolved: Awaited<ReturnType<typeof resolveSummaryModelCandidates>>;
 		try {
+			checkSummaryDeadline();
+			if (!customCompleteFn && !usesRegistryComplete) {
+				piAiCompat = await raceSummaryOperation(import("@duckmind/dm-ai/compat"));
+			}
+			completeFn ??= usesRegistryComplete ? registry.complete!.bind(registry) as CompleteFunction : piAiCompat!.complete;
 			resolved = await raceSummaryOperation(resolveSummaryModelCandidates(ctx, modelOverride));
 		} catch (err) {
-			if (signal?.aborted) throw new Error("Aborted");
-			if (err === deadlineMarker || deadlineController.signal.aborted) {
-				return buildFallbackSummary(results, "summary-generation-timeout", Date.now() - generationStartedAt);
-			}
+			checkSummaryDeadline();
 			const message = err instanceof Error ? err.message : String(err);
 			return buildFallbackSummary(results, `summary-model-settings-error: ${message}`, Date.now() - generationStartedAt);
 		}
@@ -359,23 +397,32 @@ export async function generateSummaryDraft(
 		for (const { model, apiKey, headers, thinkingLevel } of resolved.candidates) {
 			const startedAt = Date.now();
 			try {
+				// sessionId lets pi-ai's OpenCode providers add x-opencode-session. cacheRetention "none" keeps this
+				// one-off call out of the session's prompt cache and Codex continuation, as DM does for compaction.
+				const sessionId = ctx.sessionManager?.getSessionId?.();
 				const userMessage: Message = {
 					role: "user",
 					content: [{ type: "text", text: prompt }],
 					timestamp: Date.now(),
 				};
-				const requestedThinkingLevel = resolveThinkingLevel(model, thinkingLevel);
+				const requestedThinkingLevel = await raceSummaryOperation(resolveThinkingLevel(model, thinkingLevel));
 				const enabledThinkingLevel = requestedThinkingLevel && requestedThinkingLevel !== "off"
 					? requestedThinkingLevel as ThinkingLevel
 					: undefined;
+				const attributionHeaders = openCodeSessionHeaders(model, ctx.sessionManager);
+				const mergedHeaders = { ...headers, ...attributionHeaders };
 				const completionOptions = {
-					...(usesRegistryComplete ? {} : { apiKey, headers }),
+					...(usesRegistryComplete ? {} : { apiKey, headers: mergedHeaders }),
+					...(attributionHeaders ? { transformHeaders: (incoming: Record<string, string>) => ({ ...incoming, ...attributionHeaders }) } : {}),
+					sessionId,
+					cacheRetention: "none" as const,
 					signal: completionSignal,
 					...(requestedThinkingLevel ? { reasoning: requestedThinkingLevel } : {}),
 					...(enabledThinkingLevel ? { reasoningEffort: enabledThinkingLevel } : {}),
 				};
+				checkSummaryDeadline();
 				const completion = thinkingLevel !== undefined && !customCompleteFn && !usesRegistryComplete
-					? completeSimple(model, { messages: [userMessage] }, { apiKey, headers, signal: completionSignal, ...(enabledThinkingLevel ? { reasoning: enabledThinkingLevel } : {}) })
+					? piAiCompat!.completeSimple(model, { messages: [userMessage] }, { apiKey, headers: mergedHeaders, sessionId, cacheRetention: "none", signal: completionSignal, ...(enabledThinkingLevel ? { reasoning: enabledThinkingLevel } : {}) })
 					: completeFn(model, { messages: [userMessage] }, completionOptions);
 
 				const response = await raceSummaryOperation(Promise.resolve(completion));
@@ -408,10 +455,7 @@ export async function generateSummaryDraft(
 					},
 				};
 			} catch (err) {
-				if (signal?.aborted) throw new Error("Aborted");
-				if (err === deadlineMarker || deadlineController.signal.aborted) {
-					return buildFallbackSummary(results, "summary-generation-timeout", Date.now() - generationStartedAt);
-				}
+				checkSummaryDeadline();
 				if (isAbortError(err)) throw err;
 				lastError = err instanceof Error ? err.message : String(err);
 			}
@@ -422,6 +466,12 @@ export async function generateSummaryDraft(
 			lastError ? `summary-model-unavailable: ${lastError}` : "summary-model-unavailable",
 			Date.now() - generationStartedAt,
 		);
+	} catch (err) {
+		if (signal?.aborted) throw new Error("Aborted");
+		if (err === deadlineMarker) {
+			return buildFallbackSummary(results, "summary-generation-timeout", Date.now() - generationStartedAt);
+		}
+		throw err;
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
 		if (signal && callerAbortListener) signal.removeEventListener("abort", callerAbortListener);

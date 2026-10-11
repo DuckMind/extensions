@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@modelcontextprotocol/client", async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  Client: vi.fn().mockImplementation(() => {
+  Client: vi.fn().mockImplementation(function () {
     const client = {
       setRequestHandler: vi.fn(),
       setNotificationHandler: vi.fn(),
@@ -32,7 +32,7 @@ vi.mock("@modelcontextprotocol/client", async importOriginal => ({
     mocks.clients.push(client);
     return client;
   }),
-  StreamableHTTPClientTransport: vi.fn().mockImplementation((_url: URL, options: TransportOptions) => {
+  StreamableHTTPClientTransport: vi.fn().mockImplementation(function (_url: URL, options: TransportOptions) {
     const transport = { options, close: vi.fn(async () => undefined) };
     mocks.transports.push(transport);
     return transport;

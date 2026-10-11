@@ -9,7 +9,6 @@ import {
 	extractChildWrittenOutput,
 	finalizeSingleOutput,
 	formatSavedOutputReference,
-	injectOutputPathSystemPrompt,
 	injectSingleOutputInstruction,
 	normalizeSingleOutputOverride,
 	requestedOutputPathFromTask,
@@ -90,12 +89,14 @@ describe("injectSingleOutputInstruction", () => {
 		assert.match(output, /Ignore any other output filename or output path mentioned elsewhere/);
 	});
 
-	it("tells read-only agents to return the artifact for runtime persistence", () => {
-		const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md", { tools: ["read", "grep", "find", "ls"] });
-		assert.match(output, /Return the complete artifact in your final response\./);
-		assert.match(output, /runtime will persist it to exactly this path: \/tmp\/report\.md/);
-		assert.match(output, /Do not call contact_supervisor merely because no write-capable tool is available\./);
-		assert.doesNotMatch(output, /Write your findings to exactly this path/);
+	it("tells read-only agents, including the bundled reviewer profile, to return the artifact for runtime persistence", () => {
+		for (const tools of [["read", "grep", "find", "ls"], ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"]]) {
+			const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md", { tools });
+			assert.match(output, /Return the complete artifact in your final response\./);
+			assert.match(output, /runtime will persist it to exactly this path: \/tmp\/report\.md/);
+			assert.match(output, /Do not call contact_supervisor merely because no write-capable tool is available\./);
+			assert.doesNotMatch(output, /Write your findings to exactly this path/);
+		}
 	});
 });
 
@@ -103,27 +104,6 @@ describe("requestedOutputPathFromTask", () => {
 	it("extracts direct-write and runtime-persisted report paths", () => {
 		assert.equal(requestedOutputPathFromTask("Write your findings to exactly this path: /tmp/direct.md"), "/tmp/direct.md");
 		assert.equal(requestedOutputPathFromTask("The runtime will persist it to exactly this path: `/tmp/persisted.md`"), "/tmp/persisted.md");
-	});
-});
-
-describe("injectOutputPathSystemPrompt", () => {
-	it("adds the authoritative runtime output path to the system prompt", () => {
-		const output = injectOutputPathSystemPrompt("Output format (`old.md`):", "/tmp/new.md");
-		assert.match(output, /^Output format \(`old\.md`\):/);
-		assert.match(output, /Runtime output path override:/);
-		assert.match(output, /Write your findings to exactly this path: \/tmp\/new\.md/);
-		assert.match(output, /Ignore any other output filename or output path mentioned elsewhere/);
-	});
-
-	it("uses runtime-persistence instructions in read-only system prompts", () => {
-		const output = injectOutputPathSystemPrompt("Analyze only", "/tmp/new.md", { tools: ["read"] });
-		assert.match(output, /Return the complete artifact in your final response\./);
-		assert.match(output, /runtime will persist it to exactly this path: \/tmp\/new\.md/);
-		assert.doesNotMatch(output, /Write your findings to exactly this path/);
-	});
-
-	it("leaves prompts unchanged when no output path is active", () => {
-		assert.equal(injectOutputPathSystemPrompt("Base prompt", undefined), "Base prompt");
 	});
 });
 

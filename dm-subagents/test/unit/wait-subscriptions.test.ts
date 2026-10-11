@@ -107,7 +107,7 @@ describe("non-blocking wait subscriptions", () => {
 		}
 	});
 
-	it("rejects non-blocking subscriptions from headless tool calls", async () => {
+	it("registers bg_wait and rejects non-blocking subscriptions from headless tool calls", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-wait-subscribe-headless-"));
 		try {
 			const state = makeState();
@@ -122,12 +122,12 @@ describe("non-blocking wait subscriptions", () => {
 			const registered: Array<{ name: string; description: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean }> }> = [];
 			registerWaitTool({
 				events: new TestBus(),
+				on() {},
 				registerTool(value: unknown) { registered.push(value as typeof registered[number]); },
 			} as never, state, true, {
 				arm() { throw new Error("headless calls must not arm subscriptions"); },
 			});
-			assert.deepEqual(registered.map((entry) => entry.name), ["bg_wait", "subagent_wait"]);
-			assert.match(registered[1]?.description ?? "", /deprecated compatibility alias for `bg_wait`/i);
+			assert.deepEqual(registered.map((entry) => entry.name), ["bg_wait", "wait"]);
 			await assert.rejects(
 				registered[0]!.execute("wait", { id: "run-headless", nonBlocking: true }, undefined, undefined, { hasUI: false }),
 				/long-lived interactive subagent runtime/,
@@ -135,6 +135,50 @@ describe("non-blocking wait subscriptions", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("tells the root session that async runs wake it natively and a child to collect its descendants", () => {
+		const descriptions: string[] = [];
+		const dm = { events: new TestBus(), on() {}, registerTool(value: { description: string }) { descriptions.push(value.description); } } as never;
+		registerWaitTool(dm, makeState(), true);
+		registerWaitTool(dm, makeState(), true, undefined, undefined, { nestedRootRunId: "root" });
+		assert.match(descriptions[0]!, /async subagent runs already wake this session natively/);
+		assert.match(descriptions[1]!, /bg_wait/);
+	});
+
+	it("ends a blocking bg_wait when the user sends a message while the agent is busy", async () => {
+		const state = makeState();
+		state.foregroundRuns = new Map([["run-live", {
+			runId: "run-live",
+			mode: "single",
+			cwd: os.tmpdir(),
+			sessionId: "session-a",
+			updatedAt: Date.now(),
+			children: [{ agent: "worker", index: 0, status: "detached" }],
+		}]]);
+		type WaitResult = { isError?: boolean; details: { wait?: { reason: string; activeRunIds: string[] } } };
+		const registered: Array<{ execute: (...args: unknown[]) => Promise<WaitResult> }> = [];
+		const inputHandlers: Array<(event: { source: string; streamingBehavior?: string }) => void> = [];
+		const sendInput = (event: { source: string; streamingBehavior?: string }) => {
+			for (const handler of inputHandlers) handler(event);
+		};
+		registerWaitTool({
+			events: new TestBus(),
+			on(event: string, handler: typeof inputHandlers[number]) { if (event === "input") inputHandlers.push(handler); },
+			registerTool(value: unknown) { registered.push(value as typeof registered[number]); },
+		} as never, state, true);
+
+		const pending = registered[0]!.execute("wait", { id: "run-live", timeoutMs: 60_000 }, undefined, undefined, { hasUI: true });
+		sendInput({ source: "extension", streamingBehavior: "steer" });
+		sendInput({ source: "interactive" });
+		const early = await Promise.race([pending.then(() => "settled"), new Promise((resolve) => setTimeout(() => resolve("pending"), 300))]);
+		assert.equal(early, "pending");
+
+		sendInput({ source: "interactive", streamingBehavior: "steer" });
+		const result = await pending;
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details.wait?.reason, "user_input");
+		assert.deepEqual(result.details.wait?.activeRunIds, ["run-live"]);
 	});
 
 	it("restores durable registrations and wakes on exact completion", () => {
@@ -169,6 +213,8 @@ describe("non-blocking wait subscriptions", () => {
 
 			writeStatus(asyncRoot, "run-exact", "complete", { sessionId: "session-a" });
 			recordWaitCompletion(restoredState, "run-exact", {
+				runId: "run-exact",
+				sessionId: "session-a",
 				agent: "worker",
 				state: "complete",
 				success: true,
@@ -249,7 +295,7 @@ describe("non-blocking wait subscriptions", () => {
 
 			const message = sent[0] ?? "";
 			assert.match(message, /Resume-first/);
-			assert.match(message, /subagent\(\{ action: "resume", id: "run-revive", index: 1, message:/);
+			assert.match(message, /subagent\(\{ action: "resume", id: "run-revive", message: "[^"]*", options: \{ index: 1 \} \}\)/);
 			assert.match(message, /before reporting failure or launching a replacement/);
 			assert.match(message, /only if revive fails or the user explicitly asks/);
 		} finally {

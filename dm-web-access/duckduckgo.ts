@@ -1,6 +1,7 @@
-import { parseHTML } from "linkedom";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 
 const SEARCH_URL = "https://html.duckduckgo.com/html/";
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -8,26 +9,6 @@ const SEARCH_TIMEOUT_MS = 30_000;
 interface NormalizedDomainFilters {
 	allowed: string[];
 	blocked: string[];
-}
-
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
 }
 
 function normalizeDomainFilters(domainFilter: string[] | undefined): NormalizedDomainFilters {
@@ -77,7 +58,7 @@ export async function searchWithDuckDuckGo(query: string, options: SearchOptions
 			method: "GET",
 			headers: {
 				Accept: "text/html",
-				"User-Agent": "Mozilla/5.0 (compatible; dm-web-access/1.0; +https://github.com/nicobailon/dm-web-access)",
+				"User-Agent": "Mozilla/5.0 (compatible; dm-web-access/1.0; +https://github.com/DuckMind/extensions/tree/main/dm-web-access)",
 			},
 			signal: options.signal
 				? AbortSignal.any([AbortSignal.timeout(SEARCH_TIMEOUT_MS), options.signal])
@@ -88,7 +69,12 @@ export async function searchWithDuckDuckGo(query: string, options: SearchOptions
 			throw new Error(`DuckDuckGo search error ${response.status}: ${body.slice(0, 300)}`);
 		}
 
+		const { parseHTML } = await import("linkedom");
 		const { document } = parseHTML(await response.text());
+		// DuckDuckGo's bot check answers 202 with an anomaly/challenge page instead of results.
+		if (response.status === 202 || document.querySelector(".anomaly-modal__box, #challenge-form")) {
+			throw new Error(`DuckDuckGo blocked the request with a bot check (HTTP ${response.status}, rate limited); use another search provider`);
+		}
 		const filters = normalizeDomainFilters(options.domainFilter);
 		const results: SearchResult[] = [];
 		let parseableResults = 0;
@@ -103,10 +89,10 @@ export async function searchWithDuckDuckGo(query: string, options: SearchOptions
 			if (!matchesDomainFilters(resultUrl, filters)) continue;
 			const snippet = container.querySelector(".result__snippet")?.textContent?.trim() ?? "";
 			results.push({ title, url: resultUrl, snippet });
-			if (results.length >= normalizeCount(options.numResults)) break;
+			if (results.length >= normalizeSearchResultCount(options.numResults)) break;
 		}
-		if (parseableResults === 0) {
-			throw new Error("DuckDuckGo returned no parseable results (invalid response)");
+		if (parseableResults === 0 && !document.querySelector(".no-results__message")) {
+			throw new Error("DuckDuckGo returned no parseable results (invalid response; the page format may have changed)");
 		}
 
 		activityMonitor.logComplete(activityId, response.status);

@@ -10,10 +10,12 @@ import {
 	FLEET_STATUS_WIDGET_KEY,
 	SubagentFleetStatus,
 	collectFleetStatusEntries,
+	fleetAgentIdentityColor,
 	formatFleetElapsed,
 	formatFleetTokens,
 	resolveFleetViewPlacement,
 } from "../../src/tui/fleet-status.ts";
+import { setMainThinkingLevelSource } from "../../src/tui/running-tone.ts";
 
 function clearExternalRuns(): void {
 	delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_RUN_REGISTRY_KEY)];
@@ -42,9 +44,175 @@ const theme = {
 	fg: (_name: string, text: string) => text,
 	bg: (_name: string, text: string) => text,
 	bold: (text: string) => text,
+	getThinkingBorderColor: (_level: string) => (text: string) => text,
+};
+
+const toneTheme = {
+	fg: (name: string, text: string) => `⟦${name}⟧${text}⟦/⟧`,
+	bg: (_name: string, text: string) => text,
+	bold: (text: string) => text,
+	getThinkingBorderColor: (level: string) => (text: string) => `⟦thinking:${level}⟧${text}⟦/⟧`,
 };
 
 describe("below-editor subagent FleetView", () => {
+	for (const source of ["workflow", "nested-run", "nested-step"] as const) {
+		it(`advances only running ${source} detail elapsed and freezes terminal evidence`, () => {
+			const cases = [
+				{ status: "running", startedAt: 1_000, durationMs: 0, expected: ["9s", "19s"] },
+				{ status: "complete", startedAt: 1_000, endedAt: 4_000, expected: ["3s", "3s"] },
+				{ status: "failed", startedAt: 1_000, endedAt: 4_000, expected: ["3s", "3s"] },
+				{ status: "stopped", startedAt: 1_000, endedAt: 4_000, expected: ["3s", "3s"] },
+				{ status: "paused", startedAt: 1_000, expected: [undefined, undefined] },
+				{ status: "complete", startedAt: 1_000, expected: [undefined, undefined] },
+				{ status: "pending", startedAt: 1_000, expected: [undefined, undefined] },
+				{ status: "running", expected: [undefined, undefined] },
+				...(source === "workflow" ? [
+					{ status: "complete", durationMs: 2_000, startedAt: 1_000, endedAt: 4_000, expected: ["2s", "2s"] },
+					{ status: "complete", durationMs: 0, expected: ["0s", "0s"] },
+				] as const : []),
+			] as const;
+			const originalNow = Date.now;
+			try {
+				for (const { expected, ...facts } of cases) {
+					Date.now = () => 10_000;
+					const state = stateForTest();
+					const step = { index: 0, agent: "timed-leaf", ...facts };
+					state.asyncJobs.set("owner", {
+						asyncId: "owner", asyncDir: "/tmp/owner", status: "running", startedAt: 1_000,
+						mode: source === "workflow" ? "workflow" : "single",
+						steps: source === "workflow" ? [step] : [{ index: 0, agent: "owner", status: "running" }],
+						...(source !== "workflow" ? { nestedChildren: [{
+							id: "nested", parentRunId: "owner", parentStepIndex: 0, depth: 1, path: [{ runId: "owner", stepIndex: 0 }],
+							...(source === "nested-step" ? { state: "running" as const, mode: "parallel" as const, steps: [step] }
+								: { ...facts, state: facts.status === "pending" ? "queued" as const : facts.status, agent: "timed-leaf" }),
+						}] } : {}),
+					});
+					let widgetFactory: ((tui: unknown, theme: typeof theme) => { render(width: number): string[] }) | undefined;
+					const ctx = { hasUI: true, ui: {
+						setWidget(_key: string, content: typeof widgetFactory) { if (content) widgetFactory = content; },
+						onTerminalInput() { return () => {}; }, getEditorText() { return ""; },
+						requestRender() {}, notify() {}, theme,
+					} } as unknown as ExtensionContext;
+					const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+					try {
+						fleet.setContext(ctx);
+						const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, theme);
+						fleet.handleKey("\x1b[B");
+						for (const [index, now] of [10_000, 20_000].entries()) {
+							Date.now = () => now;
+							const line = component.render(240).find((line) => line.includes("timed-leaf") && /[├└]─/.test(line));
+							assert.ok(line, `${source} ${facts.status} must remain visible`);
+							assert.equal(line.match(/ · (\d+s)(?: ·|$)/)?.[1], expected[index], `${source} ${facts.status} at ${now}`);
+						}
+					} finally { fleet.dispose(); }
+				}
+			} finally { Date.now = originalNow; }
+		});
+	}
+	it("keeps workflow accounting on child rows without zero or overlapping wrapper totals", () => {
+		const state = stateForTest();
+		const usage = { input: 119_000, output: 200, total: 119_200, window: 118_900 };
+		const workflow = {
+			asyncId: "accounting", asyncDir: "/tmp/accounting", mode: "workflow" as const,
+			status: "running" as const, startedAt: Date.now(),
+			steps: [{ agent: "reviewer", workflowKey: "review", status: "running" as const, tokens: usage }],
+		};
+		state.asyncJobs.set(workflow.asyncId, workflow);
+		let widgetFactory: ((tui: unknown, theme: typeof theme) => { render(width: number): string[] }) | undefined;
+		const ctx = { hasUI: true, ui: {
+			setWidget(_key: string, content: typeof widgetFactory | undefined) { if (content) widgetFactory = content; },
+			onTerminalInput() { return () => {}; }, getEditorText() { return ""; }, theme,
+		} } as unknown as ExtensionContext;
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext(ctx);
+			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) }, theme);
+			for (const materialized of [false, true]) {
+				if (materialized) state.asyncJobs.set("child", {
+					asyncId: "child", asyncDir: "/tmp/child", mode: "single", status: "running",
+					parentWorkflowRunId: workflow.asyncId, workflowKey: "review",
+					steps: [{ agent: "reviewer", status: "running", tokens: usage }],
+				});
+				for (const totalTokens of [undefined, usage]) {
+					state.asyncJobs.set(workflow.asyncId, { ...workflow, totalTokens });
+					fleet.refresh();
+					const compact = component.render(240).join("\n");
+					assert.match(compact, /usage on child rows/);
+					assert.doesNotMatch(compact, /0 tokens|238\.4k|window|spent/);
+					fleet.handleKey("\x1b[B");
+					const expanded = component.render(400).join("\n");
+					const wrapper = expanded.split("\n").find((line) => line.includes("workflow · running"))!;
+					assert.match(wrapper, /usage on child rows/);
+					assert.doesNotMatch(wrapper, /tokens|window|spent/);
+					assert.equal(expanded.match(/118\.9k window · 119\.2k spent/g)?.length, 1);
+					fleet.handleKey("\x1b");
+				}
+			}
+		} finally { fleet.dispose(); }
+	});
+
+	it("preserves unrelated native usage beside workflow child usage in the compact roster", () => {
+		const state = stateForTest();
+		const childUsage = { input: 119_000, output: 200, total: 119_200, window: 118_900 };
+		state.asyncJobs.set("workflow", {
+			asyncId: "workflow", asyncDir: "/tmp/workflow", mode: "workflow", status: "running",
+			totalTokens: childUsage,
+			steps: [{ agent: "reviewer", workflowKey: "review", status: "running", tokens: childUsage }],
+		});
+		state.asyncJobs.set("child", {
+			asyncId: "child", asyncDir: "/tmp/child", mode: "single", status: "running",
+			parentWorkflowRunId: "workflow", workflowKey: "review", totalTokens: childUsage,
+		});
+		state.foregroundControls.set("standalone", {
+			runId: "standalone", mode: "single", currentAgent: "worker", startedAt: Date.now(), updatedAt: Date.now(),
+			tokens: 42_000, window: 30_000,
+		});
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext({ hasUI: true, ui: { setWidget() {}, theme } } as unknown as ExtensionContext);
+			const compact = fleet.render(240, theme as unknown as ExtensionContext["ui"]["theme"]).join("\n");
+			assert.match(compact, /standalone: ↓ 30\.0k window · 42\.0k spent · workflow usage on child rows/);
+			assert.doesNotMatch(compact, /119\.2k|161\.2k|280\.4k|Σ windows/);
+		} finally { fleet.dispose(); }
+	});
+
+	it("labels concurrent context windows as a sum in the visible compact roster", () => {
+		const state = stateForTest();
+		for (const id of ["one", "two"]) state.foregroundControls.set(id, {
+			runId: id, mode: "single", currentAgent: "worker", startedAt: Date.now(), updatedAt: Date.now(),
+			tokens: 120_000, window: 90_000,
+		});
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext({ hasUI: true, ui: { setWidget() {}, theme } } as unknown as ExtensionContext);
+			assert.match(fleet.render(240, theme as unknown as ExtensionContext["ui"]["theme"]).join("\n"), /180\.0k Σ windows · 240\.0k spent/);
+		} finally { fleet.dispose(); }
+	});
+
+	it("advances quiet workflow bottlenecks while terminal durations stay frozen", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("quiet", {
+			asyncId: "quiet", asyncDir: "/tmp/quiet", mode: "workflow", status: "running", startedAt: 1_000, updatedAt: 1_083,
+			steps: [
+				{ index: 0, workflowKey: "live", agent: "worker", status: "running", startedAt: 2_000, durationMs: 0 },
+				{ index: 1, workflowKey: "done", agent: "worker", status: "complete", startedAt: 1_000, durationMs: 2_000 },
+				{ index: 2, workflowKey: "queued", agent: "worker", status: "pending", startedAt: 1_000 },
+				{ index: 3, workflowKey: "unknown", agent: "worker", status: "running" },
+			],
+		});
+		const originalNow = Date.now;
+		try {
+			for (const now of [415_000, 425_000]) {
+				Date.now = () => now;
+				const entry = collectFleetStatusEntries(state)[0]!;
+				const items = entry.workflowChecklist!.phases.flatMap((phase) => phase.items);
+				assert.equal(items.find((item) => item.key === "live")?.durationMs, now - 2_000);
+				assert.equal(items.find((item) => item.key === "done")?.durationMs, 2_000);
+				assert.equal(items.find((item) => item.key === "queued")?.durationMs, undefined);
+				assert.equal(items.find((item) => item.key === "unknown")?.durationMs, undefined);
+			}
+		} finally { Date.now = originalNow; }
+	});
 	it("formats elapsed time and token counts like the Claude Code fleet", () => {
 		assert.equal(formatFleetElapsed(10_600), "11s");
 		assert.equal(formatFleetTokens(999), "↓ 999 tokens");
@@ -178,12 +346,22 @@ describe("below-editor subagent FleetView", () => {
 			assert.ok(compactLines[0]!.includes("↓/← to inspect"));
 			assert.ok(visibleWidth(compactLines[0]!) <= 80);
 
+			state.activeAsyncCapacity = { used: 0, limit: 0 };
+			const unlimitedIdleSummary = component.render(80)[0]!;
+			assert.match(unlimitedIdleSummary, /7 active agents/);
+			assert.doesNotMatch(unlimitedIdleSummary, /Async runs 0\/∞/);
+			state.activeAsyncCapacity = { used: 2, limit: 0 };
+			assert.match(component.render(80)[0]!, /Async runs 2\/∞/);
+			state.activeAsyncCapacity = { used: 0, limit: 4 };
+			assert.match(component.render(80)[0]!, /Async runs 0\/4/);
+			state.activeAsyncCapacity = { used: 2, limit: 4 };
+
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const expandedLines = component.render(80);
 			assert.ok(expandedLines.some((line) => line.includes("> main")));
 			assert.ok(expandedLines.some((line) => line.includes("  worker-0")), "unselected agents use blank focus space");
 			assert.ok(expandedLines.every((line) => !/[⏺◯]/u.test(line)), "selection avoids terminal-ambiguous circle glyphs");
-			assert.ok(expandedLines.some((line) => line.includes("worker-0 (fable-5 · thinking low)")));
+			assert.ok(expandedLines.some((line) => line.includes("worker-0 (anthropic/fable-5 · thinking low)")));
 			assert.ok(expandedLines.some((line) => line.includes("11s · ↓ 13.1k tokens")));
 			assert.ok(expandedLines.some((line) => line.includes("↓ 1 more")));
 			for (const line of expandedLines) assert.ok(visibleWidth(line) <= 80, `line exceeded width: ${line}`);
@@ -192,6 +370,57 @@ describe("below-editor subagent FleetView", () => {
 			assert.equal(component.render(80).length, 1);
 			assert.deepEqual(fleet.handleKey("\x1b[D"), { consume: true });
 			assert.ok(component.render(80).length > 1, "Left should also expand the roster");
+		} finally {
+			fleet.dispose();
+		}
+	});
+
+	it("keeps common FleetView agent identities on distinct theme colors", () => {
+		for (const [left, right] of [["scout", "worker"], ["tester", "explorer"], ["debug", "videoReview"]] as const) {
+			assert.notEqual(fleetAgentIdentityColor(left), fleetAgentIdentityColor(right));
+		}
+	});
+
+	it("keeps agent color stable when async display labels differ", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("labeled-agents", {
+			asyncId: "labeled-agents",
+			asyncDir: "/tmp/labeled-agents",
+			status: "running",
+			mode: "parallel",
+			startedAt: Date.now() - 1_000,
+			updatedAt: Date.now(),
+			steps: [
+				{ agent: "scout", label: "Find seams", status: "running", index: 0 },
+				{ agent: "scout", label: "Audit API", status: "running", index: 1 },
+			],
+		});
+		const colorTheme = {
+			fg: (name: string, text: string) => `⟦${name}⟧${text}⟦/⟧`,
+			bg: (_name: string, text: string) => text,
+			bold: (text: string) => text,
+		};
+		let widgetFactory: ((tui: unknown, theme: typeof colorTheme) => { render(width: number): string[] }) | undefined;
+		const ctx = {
+			hasUI: true,
+			ui: {
+				setWidget(_key: string, content: typeof widgetFactory | undefined) { if (content) widgetFactory = content; },
+				onTerminalInput() { return () => {}; },
+				getEditorText() { return ""; },
+				requestRender() {},
+				notify() {},
+				theme: colorTheme,
+			},
+		} as unknown as ExtensionContext;
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext(ctx);
+			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, colorTheme);
+			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
+			const lines = component.render(160);
+			const colorFor = (label: string) => lines.find((line) => line.includes(label))?.match(new RegExp(`⟦(\\w+)⟧${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`))?.[1];
+			assert.equal(colorFor("Find seams (scout)"), colorFor("Audit API (scout)"));
+			assert.equal(colorFor("Find seams (scout)"), fleetAgentIdentityColor("scout"));
 		} finally {
 			fleet.dispose();
 		}
@@ -1006,6 +1235,27 @@ describe("below-editor subagent FleetView", () => {
 		assert.deepEqual(workflow?.workflowRows?.map((row) => row.name), ["review (reviewer)"]);
 	});
 
+	it("keeps advisory preflight declarations out of Fleet runtime rows and counts", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("workflow-preflight", {
+			asyncId: "workflow-preflight",
+			asyncDir: "/tmp/workflow-preflight",
+			status: "running",
+			mode: "workflow",
+			startedAt: 10,
+			updatedAt: 20,
+			preflight: { version: 1, coverage: "partial", lanes: [{ key: "pr14", mode: "review" }] },
+			steps: [{ agent: "reviewer", workflowKey: "pr14-quality", status: "running" }],
+		});
+
+		const workflow = collectFleetStatusEntries(state).find((entry) => entry.key === "async:workflow-preflight");
+		assert.deepEqual(workflow?.workflowRows?.map((row) => [row.name, row.state]), [["pr14-quality (reviewer)", "running"]]);
+		assert.deepEqual(
+			workflow?.workflowChecklist && { total: workflow.workflowChecklist.total, running: workflow.workflowChecklist.running, queued: workflow.workflowChecklist.queued },
+			{ total: 1, running: 1, queued: 0 },
+		);
+	});
+
 	it("renders bounded workflow progress rows under the workflow parent", () => {
 		const state = stateForTest();
 		const workflowJob = {
@@ -1047,7 +1297,7 @@ describe("below-editor subagent FleetView", () => {
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(140).join("\n");
 			assert.match(lines, /workflow · running/);
-			assert.match(lines, /Plan: scan · Find seams \(scout\) \[fresh\] \(gpt-5\.6-luna · thinking max\) · complete/);
+			assert.match(lines, /Plan: scan · Find seams \(scout\) \[fresh\] \(openai-codex\/gpt-5\.6-luna · thinking max\) · complete/);
 			assert.match(lines, /Review: review \(reviewer\) \[fork\] · running · tool grep/);
 			assert.match(lines, /Verify: test \(tester\) · pending/);
 		} finally {
@@ -1259,7 +1509,7 @@ describe("below-editor subagent FleetView", () => {
 			const component = widgetFactory!(tui, theme);
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(180);
-			assert.ok(lines.some((line) => line.includes("reviewer (gpt-5 · thinking medium)")));
+			assert.ok(lines.some((line) => line.includes("reviewer (openai/gpt-5 · thinking medium)")));
 			assert.ok(lines.some((line) => line.includes("worker")));
 			assert.ok(lines.every((line) => !line.includes("Review only authentication") && !line.includes("Implement only billing") && !line.includes("Review the authentication changes")));
 			assert.ok(lines.some((line) => line.includes("↓ 4.2k tokens")));
@@ -1351,6 +1601,103 @@ describe("below-editor subagent FleetView", () => {
 			assert.equal(restoredComponent.render(100).length, 1, "Escape should return to the compact summary");
 		} finally {
 			fleet.dispose();
+		}
+	});
+
+	it("colors a running nested row by the thinking level of the child it stands for", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("owner", {
+			asyncId: "owner", asyncDir: "/tmp/owner", status: "running", startedAt: Date.now(), mode: "single",
+			steps: [{ index: 0, agent: "owner", status: "running" }],
+			nestedChildren: [
+				{ id: "leaf-run", parentRunId: "owner", parentStepIndex: 0, depth: 1, path: [{ runId: "owner", stepIndex: 0 }], state: "running", agent: "leaf-agent", thinking: "max" },
+				{ id: "fanout", parentRunId: "owner", parentStepIndex: 0, depth: 1, path: [{ runId: "owner", stepIndex: 0 }], state: "running", mode: "parallel", steps: [{ agent: "step-agent", status: "running", thinking: "medium" }] },
+			],
+		});
+		let widgetFactory: ((tui: unknown, theme: typeof toneTheme) => { render(width: number): string[] }) | undefined;
+		const ctx = { hasUI: true, ui: {
+			setWidget(_key: string, content: typeof widgetFactory) { if (content) widgetFactory = content; },
+			onTerminalInput() { return () => {}; }, getEditorText() { return ""; },
+			requestRender() {}, notify() {}, theme: toneTheme,
+		} } as unknown as ExtensionContext;
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext(ctx);
+			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, toneTheme);
+			fleet.handleKey("\x1b[B");
+			const lines = component.render(240);
+			const glyphTone = (label: string) => lines.find((line) => line.includes(label) && /[├└]─/.test(line))?.match(/⟦([^⟧]+)⟧●⟦\/⟧/)?.[1];
+			assert.equal(glyphTone("leaf-agent"), "thinking:max");
+			assert.equal(glyphTone("step-agent"), "thinking:medium");
+		} finally {
+			fleet.dispose();
+		}
+	});
+
+	it("colors a running workflow child row and its state word by the child's thinking level", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("wf", {
+			asyncId: "wf", asyncDir: "/tmp/wf", status: "running", startedAt: Date.now(), mode: "workflow",
+			steps: [
+				{ index: 0, agent: "wf-writer", status: "running", thinking: "xhigh" },
+				{ index: 1, agent: "wf-scout", status: "running" },
+			],
+		});
+		let widgetFactory: ((tui: unknown, theme: typeof toneTheme) => { render(width: number): string[] }) | undefined;
+		const ctx = { hasUI: true, ui: {
+			setWidget(_key: string, content: typeof widgetFactory) { if (content) widgetFactory = content; },
+			onTerminalInput() { return () => {}; }, getEditorText() { return ""; },
+			requestRender() {}, notify() {}, theme: toneTheme,
+		} } as unknown as ExtensionContext;
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext(ctx);
+			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, toneTheme);
+			fleet.handleKey("\x1b[B");
+			const lines = component.render(240);
+			const row = (label: string) => lines.find((line) => line.includes(label) && /[\u251c\u2514]\u2500/.test(line)) ?? "";
+			assert.match(row("wf-writer"), /\u27e6thinking:xhigh\u27e7\u25cf\u27e6\/\u27e7/);
+			assert.match(row("wf-writer"), /\u27e6thinking:xhigh\u27e7running\u27e6\/\u27e7/);
+			assert.match(row("wf-scout"), /\u27e6accent\u27e7\u25cf\u27e6\/\u27e7/);
+		} finally {
+			fleet.dispose();
+		}
+	});
+
+	it("colors a running workflow phase row by the main session's thinking level", () => {
+		setMainThinkingLevelSource(() => "high");
+		const state = stateForTest();
+		state.asyncJobs.set("wf-phase", {
+			asyncId: "wf-phase", asyncDir: "/tmp/wf-phase", status: "running", startedAt: Date.now(), mode: "workflow",
+			workflowGraph: {
+				runId: "wf-phase", mode: "workflow",
+				phases: [{ title: "build-phase", nodeIds: ["a", "b"] }],
+				nodes: [
+					{ id: "a", kind: "agent", agent: "phase-a", label: "a", status: "running", flatIndex: 0 },
+					{ id: "b", kind: "agent", agent: "phase-b", label: "b", status: "running", flatIndex: 1 },
+				],
+			},
+			steps: [
+				{ index: 0, agent: "phase-a", status: "running", workflowKey: "a" },
+				{ index: 1, agent: "phase-b", status: "running", workflowKey: "b" },
+			],
+		});
+		let widgetFactory: ((tui: unknown, theme: typeof toneTheme) => { render(width: number): string[] }) | undefined;
+		const ctx = { hasUI: true, ui: {
+			setWidget(_key: string, content: typeof widgetFactory) { if (content) widgetFactory = content; },
+			onTerminalInput() { return () => {}; }, getEditorText() { return ""; },
+			requestRender() {}, notify() {}, theme: toneTheme,
+		} } as unknown as ExtensionContext;
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		try {
+			fleet.setContext(ctx);
+			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, toneTheme);
+			fleet.handleKey("\x1b[B");
+			const phaseRow = component.render(240).find((line) => line.includes("build-phase")) ?? "";
+			assert.match(phaseRow, /\u27e6thinking:high\u27e7\u25cf\u27e6\/\u27e7/);
+		} finally {
+			fleet.dispose();
+			setMainThinkingLevelSource(() => undefined);
 		}
 	});
 });

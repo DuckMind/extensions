@@ -17,7 +17,12 @@ import {
 	resolveNodePackageManager,
 	runScriptArgs,
 } from "../package-manager.js";
+import { incrementDegradationCount } from "../degradation-ledger.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
+import {
+	createBoundedOutputSink,
+	DEFAULT_MAX_OUTPUT_BYTES,
+} from "../spawn-output-cap.js";
 import type { AnalyzeFileOptions, McpAnalyzeResult } from "./analyze.js";
 
 /**
@@ -44,6 +49,14 @@ export interface FreshAnalyzeOutcome {
  * Fork `node <workerPath>` to analyze a file in a fresh process. We spawn node
  * directly (no shell) so an interpreter path containing spaces is safe on
  * Windows — `safeSpawnAsync`'s shell mode does not escape the command itself.
+ *
+ * #3383: both pipes accumulate through {@link createBoundedOutputSink} rather
+ * than `+=`. The worker writes one JSON document to stdout, so an unbounded
+ * accumulation here could reach the same ending #3375 fixed at the shared spawn
+ * seam — V8 refusing the next concatenation with `RangeError: Invalid string
+ * length` inside a `data` handler, uncatchable by this promise. The only thing
+ * bounding it before was the `timeoutMs` kill, and a worker can emit hundreds
+ * of MiB long before 120 s elapse.
  */
 export function analyzeFileFresh(
 	workerPath: string,
@@ -71,8 +84,8 @@ export function analyzeFileFresh(
 			return;
 		}
 
-		let stdout = "";
-		let stderr = "";
+		const stdout = createBoundedOutputSink();
+		const stderr = createBoundedOutputSink();
 		let settled = false;
 		const finish = (outcome: FreshAnalyzeOutcome) => {
 			if (settled) return;
@@ -86,24 +99,56 @@ export function analyzeFileFresh(
 		}, timeoutMs);
 
 		child.stdout.setEncoding("utf8");
-		child.stdout.on("data", (chunk: string) => (stdout += chunk));
+		child.stdout.on("data", (chunk: string) => {
+			// Settled already means timed out or failed: keep accumulating and the
+			// retained output outlives the promise nobody is awaiting any more.
+			if (settled) return;
+			stdout.append(chunk);
+			// Truncated stdout is never parseable JSON, so the run is over. Report
+			// the cap as the ending instead of letting `JSON.parse` blame the
+			// worker's output shape, and terminate the producer.
+			if (!stdout.truncated) return;
+			incrementDegradationCount({
+				kind: "spawn-output-cap-truncated",
+				subject: "mcp-fresh-analyze",
+				reason: `worker stdout reached the ${DEFAULT_MAX_OUTPUT_BYTES}-byte default cap after ${stdout.observedBytes} bytes; worker terminated`,
+				metadata: {
+					capBytes: DEFAULT_MAX_OUTPUT_BYTES,
+					capSource: "default",
+					observedBytes: stdout.observedBytes,
+					killed: true,
+				},
+			});
+			try {
+				child.kill();
+			} catch {
+				// Best-effort: the worker may already be gone, and this runs inside a
+				// `data` handler where a throw would be uncatchable.
+			}
+			finish({
+				error: `worker output exceeded ${DEFAULT_MAX_OUTPUT_BYTES} bytes`,
+			});
+		});
 		child.stderr.setEncoding("utf8");
-		child.stderr.on("data", (chunk: string) => (stderr += chunk));
+		child.stderr.on("data", (chunk: string) => {
+			if (settled) return;
+			stderr.append(chunk);
+		});
 		child.on("error", (err) =>
 			finish({ error: `failed to fork worker: ${err.message}` }),
 		);
 		child.on("close", (code) => {
 			if (code !== 0) {
 				finish({
-					error: `worker exited ${code}: ${stderr.trim() || "(no stderr)"}`,
+					error: `worker exited ${code}: ${stderr.text.trim() || "(no stderr)"}`,
 				});
 				return;
 			}
 			try {
-				finish({ result: JSON.parse(stdout) as McpAnalyzeResult });
+				finish({ result: JSON.parse(stdout.text) as McpAnalyzeResult });
 			} catch {
 				finish({
-					error: `worker produced invalid JSON (${stderr.trim() || stdout.slice(0, 200)})`,
+					error: `worker produced invalid JSON (${stderr.text.trim() || stdout.text.slice(0, 200)})`,
 				});
 			}
 		});

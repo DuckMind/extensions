@@ -1,5 +1,7 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import {
 	getAutofixCapability,
 	getLinterPolicyForCwd,
@@ -15,8 +17,19 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 const ktlint = createAvailabilityChecker("ktlint", ".exe");
+
+// KtLint's exit contract, declared HERE rather than in the shared classifier:
+// an admission is a property of this tool, and #3291 round 2 shipped it through
+// a shared `parseToolRun` option that silently erased every OTHER runner's
+// table. KtLint 1.8.0's CLI page documents the JSON reporter and a nonzero exit
+// on violations, but does not enumerate numeric classes; 1, 2 and 3 are the
+// statuses this runner observes carrying a valid reporter payload, and a valid
+// payload is the evidence that analysis was reached. Any other nonzero status
+// stays a rejected invocation.
+const KTLINT_EXIT_CODES = { ran: [1, 2, 3] } as const;
 
 interface KtlintError {
 	line: number;
@@ -44,14 +57,23 @@ function normalizeKtlintResults(parsed: unknown): KtlintResult[] | null {
 	return null;
 }
 
-function parseKtlintOutput(raw: string, filePath: string): Diagnostic[] | null {
+function parseKtlintOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] | null {
 	try {
 		const parsed = normalizeKtlintResults(JSON.parse(raw));
 		if (!parsed) return null;
 
 		const autofix = getAutofixCapability("ktlint");
 		const diagnostics: Diagnostic[] = [];
+		const absTarget = path.resolve(cwd, filePath);
 		for (const result of parsed) {
+			// #3295: ktlint's JSON reporter is an array of FILES; `.editorconfig`
+			// globs put more than the argv in it.
+			if (result.file && !pathsEqual(path.resolve(cwd, result.file), absTarget))
+				continue;
 			for (const err of result.errors ?? []) {
 				diagnostics.push({
 					id: `ktlint-${err.ruleId}-${err.line}-${err.col}`,
@@ -75,13 +97,6 @@ function parseKtlintOutput(raw: string, filePath: string): Diagnostic[] | null {
 	}
 }
 
-function firstOutputLine(result: { stdout?: string; stderr?: string }): string {
-	return (result.stderr || result.stdout || "")
-		.trim()
-		.split(/\r?\n/, 1)[0]
-		.slice(0, 200);
-}
-
 const ktlintRunner: RunnerDefinition = {
 	id: "ktlint",
 	appliesTo: ["kotlin"],
@@ -89,7 +104,7 @@ const ktlintRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "ktlint");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("ktlint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -110,62 +125,26 @@ const ktlintRunner: RunnerDefinition = {
 			timeout: 30000,
 		});
 
-		// Ktlint exits non-zero when issues are found, so only treat a total lack
-		// of output as a hard skip. Any non-empty but unparseable output should
-		// surface as runner failure instead of a false clean result.
-		if (result.error && !result.stdout) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
-		const diagnostics = parseKtlintOutput(result.stdout || "", ctx.filePath);
-		if (diagnostics === null) {
-			const detail = firstOutputLine(result) || "Unknown ktlint output";
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: "ktlint-output-unparseable",
-						message: `Unable to parse ktlint output: ${detail}`,
-						filePath: ctx.filePath,
-						severity: "warning",
-						semantic: "warning",
-						tool: "ktlint",
-						fixable: false,
-						autoFixAvailable: false,
-					},
-				],
-				semantic: "warning",
-			};
-		}
-		if (diagnostics.length === 0) {
-			if (result.status && result.status !== 0) {
-				return {
-					status: "failed",
-					diagnostics: [
-						{
-							id: "ktlint-nonzero-no-diagnostics",
-							message:
-								firstOutputLine(result) ||
-								"ktlint exited non-zero without JSON diagnostics",
-							filePath: ctx.filePath,
-							severity: "warning",
-							semantic: "warning",
-							tool: "ktlint",
-							fixable: false,
-							autoFixAvailable: false,
-						},
-					],
-					semantic: "warning",
-				};
-			}
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		return {
-			status: result.status && result.status !== 0 ? "failed" : "succeeded",
-			diagnostics,
-			semantic: "warning",
-		};
+		// `output` is what the classifier judges AND what the parser reads: ktlint
+		// writes its reporter payload to stdout and its errors to stderr, so both
+		// are one wire here. The exit table rides in this same per-runner input,
+		// never in a shared option (#3291 r3).
+		const run = parseToolRun<Diagnostic>(
+			"ktlint",
+			{
+				result,
+				output: `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+				exitCodes: KTLINT_EXIT_CODES,
+			},
+			(output) => parseKtlintOutput(output, ctx.filePath, cwd) ?? [],
+		);
+		if (run.skipped) return run.skipped;
+		return finishParsedRun({
+			tool: "ktlint",
+			ctx,
+			result,
+			diagnostics: run.diagnostics,
+		});
 	},
 };
 

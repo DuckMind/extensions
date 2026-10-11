@@ -18,13 +18,28 @@ const config = resolveControlConfig(undefined, {
 });
 
 describe("subagent control attention state", () => {
-	it("marks a run as needing attention only after the idle threshold", () => {
-		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, now: 50 }), undefined);
-		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, now: 400 }), "needs_attention");
-		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, currentTool: "bash", now: 400 }), undefined);
-		assert.equal(deriveActivityState({ config, startedAt: 0, now: 400 }), "needs_attention");
+	it("notifies once for each distinct long-open tool call even when notice text matches", () => {
+		const seen = new Set<string>();
+		const event = buildControlEvent({ to: "needs_attention", runId: "run", agent: "worker", reason: "tool_open_threshold", currentTool: "bash", toolCallId: "first" });
+		assert.equal(claimControlNotification(resolveControlConfig(), event, seen), true);
+		assert.equal(claimControlNotification(resolveControlConfig(), { ...event, ts: event.ts + 1000 }, seen), false);
+		assert.equal(claimControlNotification(resolveControlConfig(), { ...event, toolCallId: "second" }, seen), true);
+		const notice = formatControlNoticeMessage({ ...event, index: 2 });
+		assert.match(notice, /"action":"command.cancel","id":"run","options":\{"index":2,"toolCallId":"first"\}/);
+		assert.match(notice, /"action":"command.yield"/);
 	});
 
+	it("marks a run as needing attention only after the idle threshold", () => {
+		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, now: 50 }), undefined);
+		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, turnCount: 1, now: 400 }), "needs_attention");
+		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, currentTool: "bash", now: 400 }), undefined);
+		assert.equal(deriveActivityState({ config, startedAt: 0, turnCount: 1, now: 400 }), "needs_attention");
+	});
+
+	it("does not mark a zero-turn run as needing attention", () => {
+		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, turnCount: 0, now: 400 }), undefined);
+		assert.equal(deriveActivityState({ config, startedAt: 0, lastActivityAt: 0, now: 400 }), undefined);
+	});
 
 	it("builds compact needs-attention control events", () => {
 		const event = buildControlEvent({
@@ -53,22 +68,10 @@ describe("subagent control attention state", () => {
 			to: "needs_attention",
 			runId: "run-1",
 			agent: "worker",
-			message: "worker completed without making edits for an implementation task",
+			message: "worker needs attention",
 		});
 
-		assert.equal(event.message, "worker completed without making edits for an implementation task");
-	});
-
-	it("builds terminal completion guard control events", () => {
-		const event = buildControlEvent({
-			to: "needs_attention",
-			runId: "run-1",
-			agent: "worker",
-			message: "worker completed without making edits for an implementation task",
-			reason: "completion_guard",
-		});
-
-		assert.equal(event.reason, "completion_guard");
+		assert.equal(event.message, "worker needs attention");
 	});
 
 	it("defaults notifications to active-long-running and needs attention", () => {
@@ -103,25 +106,34 @@ describe("subagent control attention state", () => {
 	it("scales the default idle threshold for higher thinking levels", () => {
 		const defaults = resolveControlConfig();
 
-		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, now: 60_001 }), "needs_attention");
-		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, thinking: "low", now: 60_001 }), "needs_attention");
-		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, thinking: "minimal", now: 60_001 }), "needs_attention");
-		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, thinking: "high", now: 60_001 }), undefined);
-		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, thinking: "high", now: 300_001 }), "needs_attention");
+		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, turnCount: 1, now: 60_001 }), "needs_attention");
+		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, turnCount: 1, thinking: "low", now: 60_001 }), "needs_attention");
+		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, turnCount: 1, thinking: "minimal", now: 60_001 }), "needs_attention");
+		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, turnCount: 1, thinking: "high", now: 60_001 }), undefined);
+		assert.equal(deriveActivityState({ config: defaults, startedAt: 0, turnCount: 1, thinking: "high", now: 300_001 }), "needs_attention");
 	});
 
 	it("keeps explicit idle threshold overrides higher priority than thinking scale", () => {
 		const explicit = resolveControlConfig(undefined, { needsAttentionAfterMs: 90_000 });
 
 		assert.equal(explicit.needsAttentionAfterMsIsExplicit, true);
-		assert.equal(deriveActivityState({ config: explicit, startedAt: 0, thinking: "high", now: 90_001 }), "needs_attention");
+		assert.equal(deriveActivityState({ config: explicit, startedAt: 0, turnCount: 1, thinking: "high", now: 90_001 }), "needs_attention");
+	});
+
+	it("preserves inherited default idle scaling when merging a resolved control config", () => {
+		const inherited = resolveControlConfig();
+		const merged = resolveControlConfig(inherited, { activeNoticeAfterMs: 123_000 });
+
+		assert.equal(merged.needsAttentionAfterMsIsExplicit, false);
+		assert.equal(merged.activeNoticeAfterMs, 123_000);
+		assert.equal(deriveActivityState({ config: merged, startedAt: 0, turnCount: 1, thinking: "high", now: 60_001 }), undefined);
 	});
 
 	it("treats recovered resolved configs without explicitness metadata as fixed thresholds", () => {
 		const recovered = { ...resolveControlConfig(undefined, { needsAttentionAfterMs: 90_000 }) };
 		delete recovered.needsAttentionAfterMsIsExplicit;
 
-		assert.equal(deriveActivityState({ config: recovered, startedAt: 0, thinking: "high", now: 90_001 }), "needs_attention");
+		assert.equal(deriveActivityState({ config: recovered, startedAt: 0, turnCount: 1, thinking: "high", now: 90_001 }), "needs_attention");
 	});
 
 	it("marks non-exempt open tools for attention at the active threshold", () => {
@@ -204,6 +216,7 @@ describe("subagent control attention state", () => {
 		assert.match(message, /Status: subagent\(\{ action: "status", id: "78f659a3" \}\)/);
 		assert.match(message, /Interrupt: subagent\(\{ action: "interrupt", id: "78f659a3" \}\)/);
 		assert.doesNotMatch(message, /Wait:/);
+		assert.match(formatControlNoticeMessage({ ...event, index: 2 }), /Top-level live async nudge: subagent\(\{ action: "steer", id: "78f659a3", message: "[^"]*", options: \{ index: 2 \} \}\)/);
 	});
 
 	it("formats open-tool attention notices with tool facts", () => {
@@ -222,7 +235,37 @@ describe("subagent control attention state", () => {
 
 		assert.match(message, /worker has had tool 'bash' open for 240s/);
 		assert.match(message, /Facts: tool bash 240s \| path scripts\/run-tests\.sh/);
-		assert.match(message, /message: "Check tool bash at path scripts\/run-tests\.sh\. Report the smallest next step or ask for a decision\."/);
+		assert.match(message, /Inspect the running command and recent output/);
+		assert.match(message, /A queued steer does not cancel an in-flight bash call/);
+		assert.match(message, /dev server or watch command/);
+		assert.match(message, /Elapsed time alone does not prove/);
+		assert.match(message, /yield a needed persistent command or cancel the exact incorrect command/);
+		assert.match(message, /Transcript: subagent\(\{ action: "status", id: "78f659a3", options: \{ view: "transcript" \} \}\)/);
+		assert.doesNotMatch(message, /live async nudge|live nested nudge|Interrupt:|Direct intercom target:/);
+		assert.match(formatControlIntercomMessage(event), /A queued steer does not cancel an in-flight bash call/);
+	});
+
+	it("scopes open-bash transcript inspection to the selected child without suggesting a run-wide interrupt", () => {
+		const event = buildControlEvent({
+			to: "needs_attention", runId: "parallel-run", agent: "worker", index: 2,
+			reason: "tool_open_threshold", currentTool: "bash",
+		});
+		const message = formatControlNoticeMessage(event);
+		assert.match(message, /Transcript: subagent\(\{ action: "status", id: "parallel-run", options: \{ view: "transcript", index: 2 \} \}\)/);
+		assert.match(message, /interrupt is run-scoped and may affect siblings/);
+		assert.doesNotMatch(message, /subagent\(\{ action: "interrupt"/);
+	});
+
+	it("preserves nudge guidance for other tools and bash notices unrelated to an open call", () => {
+		for (const input of [
+			{ reason: "tool_open_threshold" as const, currentTool: "read" },
+			{ reason: "tool_failures" as const, currentTool: "bash" },
+		]) {
+			const event = buildControlEvent({ to: "needs_attention", runId: "run-1", agent: "worker", ...input });
+			const message = formatControlNoticeMessage(event);
+			assert.match(message, /Top-level live async nudge:/);
+			assert.doesNotMatch(message, /A queued steer does not cancel/);
+		}
 	});
 
 	it("uses bounded task context in nudges and de-duplicates distinct contexts", () => {
@@ -278,26 +321,6 @@ describe("subagent control attention state", () => {
 		assert.doesNotMatch(message, /Subagent needs attention/);
 	});
 
-	it("formats terminal completion guard notices without live-run commands", () => {
-		const event = buildControlEvent({
-			to: "needs_attention",
-			runId: "78f659a3",
-			agent: "worker",
-			index: 0,
-			message: "worker completed without making edits for an implementation task",
-			reason: "completion_guard",
-		});
-
-		const message = formatControlNoticeMessage(event, "subagent-worker-78f659a3-1");
-
-		assert.match(message, /Subagent failed: worker/);
-		assert.match(message, /read the output artifact or session/);
-		assert.match(message, /Run intercom target \(may be inactive\): subagent-worker-78f659a3-1/);
-		assert.doesNotMatch(message, /Status:/);
-		assert.doesNotMatch(message, /Interrupt:/);
-		assert.doesNotMatch(message, /What are you blocked on/);
-	});
-
 	it("formats intercom notifications with the same control commands", () => {
 		const event = buildControlEvent({ to: "needs_attention", runId: "78f659a3", agent: "worker" });
 
@@ -321,8 +344,8 @@ describe("subagent control attention state", () => {
 			runId: "run-1",
 			agent: "worker",
 			index: 0,
-			message: "worker completed without making edits for an implementation task",
-			reason: "completion_guard",
+			message: "worker needs attention",
+			reason: "tool_failures",
 		});
 		assert.equal(claimControlNotification(resolveControlConfig(), terminalEvent, seen, "subagent-worker-run-1-1"), true);
 	});

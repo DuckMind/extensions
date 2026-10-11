@@ -1,8 +1,9 @@
-import { Agent, type StreamFn, type ThinkingLevel } from "@duckmind/dm-agent-core";
-import { convertToLlm, type ExtensionContext } from "@duckmind/dm-coding-agent";
+import type { Agent, StreamFn, ThinkingLevel } from "@duckmind/dm-agent-core";
+import type { ExtensionContext } from "@duckmind/dm-coding-agent";
+import type { ProviderHeaders } from "@duckmind/dm-ai";
 import { streamSimple } from "@duckmind/dm-ai/compat";
-import type { Model, ProviderHeaders } from "@duckmind/dm-ai";
 import { agentStreamOptions } from "../../shared/agent-stream-options.ts";
+import { opencodeSessionHeaders } from "../../shared/opencode-session-headers.ts";
 import type { ForegroundRunControl } from "../../shared/types.ts";
 export type PromptAuditView = "authored" | "runtime" | "effective";
 
@@ -21,7 +22,7 @@ export interface LivePromptAudit {
 
 const livePrompts = new WeakMap<ForegroundRunControl, Map<number, LivePromptAudit>>();
 
-type RegistryModel = Model<any>;
+type RegistryModel = NonNullable<ExtensionContext["model"]>;
 
 function fullModelId(model: Pick<RegistryModel, "provider" | "id">): string {
 	return `${model.provider}/${model.id}`;
@@ -64,18 +65,21 @@ export async function rewritePromptWithGuidance(input: {
 }): Promise<string> {
 	const model = input.ctx.model;
 	if (!model) throw new Error("Prompt redo needs the current session model to rewrite the authored task.");
+	const [{ Agent }, { convertToLlm }] = await Promise.all([
+		import("@duckmind/dm-agent-core"),
+		import("@duckmind/dm-coding-agent"),
+	]);
 	const auth = await resolveRewriteAuth(input.ctx, model);
-	const registeredProvider = (input.ctx.modelRegistry as {
-		getRegisteredProviderConfig?: (provider: string) => { api?: string; streamSimple?: StreamFn } | undefined;
-	}).getRegisteredProviderConfig?.(model.provider);
-	const baseStreamFn = input.streamFn ?? (registeredProvider?.streamSimple && registeredProvider.api === model.api
-		? registeredProvider.streamSimple
-		: streamSimple);
+	const registryStream = (input.ctx.modelRegistry as { streamSimple?: StreamFn }).streamSimple;
+	const baseStreamFn: StreamFn = input.streamFn ?? (registryStream
+		? (nextModel, context, streamOptions) => registryStream.call(input.ctx.modelRegistry, nextModel, context, streamOptions)
+		: (nextModel, context, streamOptions) => streamSimple(nextModel, context, streamOptions));
+	const sessionId = input.ctx.sessionManager.getSessionId();
 	const streamFn: StreamFn = (nextModel, context, streamOptions) => baseStreamFn(nextModel, context, {
 		...streamOptions,
 		...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
 		env: auth.env || streamOptions?.env ? { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } : undefined,
-		headers: { ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
+		headers: { ...opencodeSessionHeaders(nextModel, sessionId), ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
 	});
 	const ctxThinking = (input.ctx as { getThinkingLevel?: () => ThinkingLevel }).getThinkingLevel?.();
 	const agent = new Agent({

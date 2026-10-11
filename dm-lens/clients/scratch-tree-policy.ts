@@ -54,7 +54,25 @@
  *     fully in scope.
  */
 
+import { relative } from "node:path";
 import { EXCLUDED_DIRS, getExcludedDirGlobs } from "./file-utils.js";
+import {
+	canonicalDirectory,
+	listNestedLinkedWorktreeRoots,
+} from "./review-graph/git-identity.js";
+import { escapeRegExp } from "./string-utils.js";
+
+/**
+ * The linked worktrees nested under `cwd`, whatever they are called (#4132),
+ * as paths relative to `cwd`. The scanners above walk `cwd` themselves and see
+ * a worktree as project files; a name list cannot know where one was put. The
+ * discovery returns real paths, so the offset is taken from the real `cwd` and
+ * the caller joins it back onto its own spelling of `cwd`.
+ */
+export function nestedWorktreeOffsets(cwd: string): string[] {
+	const base = canonicalDirectory(cwd);
+	return listNestedLinkedWorktreeRoots(cwd).map((root) => relative(base, root));
+}
 
 /** Directory-name entries only — drops glob entries (e.g. `*.dSYM`) that a
  * bare directory-name/regex exclude can't express. */
@@ -72,10 +90,6 @@ function literalExcludedDirNames(): string[] {
  */
 export function getScratchTreeGlobPatterns(): string[] {
 	return getExcludedDirGlobs();
-}
-
-function escapeRegExp(literal: string): string {
-	return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** Bare directory names, for tools (opengrep/semgrep `--exclude`) that treat a
@@ -102,6 +116,12 @@ export function getScratchTreeFnmatchPatterns(): string[] {
 export const SECRETS_LANE_SCRATCH_DIR_NAMES: readonly string[] = [
 	// pi-ecosystem / coding-agent data + cache directories.
 	".pi",
+	// The same agent's rebranded config dir (#3112) — pi's config-dir name is
+	// `pkg.piConfig?.configDir || ".pi"`, so `.omp/agent/sessions` is the very
+	// history `.pi/agent/sessions` holds. Without it the secrets lane READS a
+	// project-local session history and can report a key a user pasted into a
+	// transcript as a blocking first-party leak.
+	".omp",
 	".dm-lens",
 	".claude",
 	".codex",

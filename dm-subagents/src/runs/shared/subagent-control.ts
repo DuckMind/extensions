@@ -45,11 +45,12 @@ export function resolveControlConfig(
 	const enabled = override?.enabled ?? globalConfig?.enabled ?? DEFAULT_CONTROL_CONFIG.enabled;
 	const overrideNeedsAttentionAfterMs = parsePositiveInt(override?.needsAttentionAfterMs);
 	const globalNeedsAttentionAfterMs = parsePositiveInt(globalConfig?.needsAttentionAfterMs);
+	const globalNeedsAttentionAfterMsIsExplicit = (globalConfig as Partial<ResolvedControlConfig> | undefined)?.needsAttentionAfterMsIsExplicit ?? globalNeedsAttentionAfterMs !== undefined;
 	const needsAttentionAfterMs = overrideNeedsAttentionAfterMs
 		?? globalNeedsAttentionAfterMs
 		?? DEFAULT_CONTROL_CONFIG.needsAttentionAfterMs;
 	const needsAttentionAfterMsIsExplicit = overrideNeedsAttentionAfterMs !== undefined
-		|| globalNeedsAttentionAfterMs !== undefined;
+		|| globalNeedsAttentionAfterMsIsExplicit;
 	const activeNoticeAfterMs = parsePositiveInt(override?.activeNoticeAfterMs)
 		?? parsePositiveInt(globalConfig?.activeNoticeAfterMs)
 		?? DEFAULT_CONTROL_CONFIG.activeNoticeAfterMs;
@@ -98,11 +99,12 @@ export function deriveActivityState(input: {
 	config: ResolvedControlConfig;
 	startedAt: number;
 	lastActivityAt?: number;
+	turnCount?: number;
 	currentTool?: string;
 	thinking?: string | false;
 	now?: number;
 }): ActivityState | undefined {
-	if (!input.config.enabled || input.currentTool) return undefined;
+	if (!input.config.enabled || input.currentTool || (input.turnCount ?? 0) === 0) return undefined;
 	const now = input.now ?? Date.now();
 	const lastActivity = input.lastActivityAt ?? input.startedAt;
 	const ageMs = Math.max(0, now - lastActivity);
@@ -136,6 +138,7 @@ export function buildControlEvent(input: {
 	tokens?: number;
 	toolCount?: number;
 	currentTool?: string;
+	toolCallId?: string;
 	currentToolDurationMs?: number;
 	currentPath?: string;
 	elapsedMs?: number;
@@ -168,6 +171,7 @@ export function buildControlEvent(input: {
 		...(input.tokens !== undefined ? { tokens: input.tokens } : {}),
 		...(input.toolCount !== undefined ? { toolCount: input.toolCount } : {}),
 		...(input.currentTool ? { currentTool: input.currentTool } : {}),
+		...(input.toolCallId ? { toolCallId: input.toolCallId } : {}),
 		...(input.currentToolDurationMs !== undefined ? { currentToolDurationMs: input.currentToolDurationMs } : {}),
 		...(input.currentPath ? { currentPath: input.currentPath } : {}),
 		...(elapsedMs !== undefined ? { elapsedMs } : {}),
@@ -186,7 +190,8 @@ export function shouldNotifyControlEvent(config: ResolvedControlConfig, event: C
 export function controlNotificationKey(event: ControlEvent, childIntercomTarget?: string): string {
 	const childKey = childIntercomTarget ?? (event.index !== undefined ? `${event.runId}:${event.index}` : event.runId);
 	const contextHash = createHash("sha256").update(formatControlNudge(event)).digest("hex").slice(0, 8);
-	return `${childKey}:${event.type}:${event.reason ?? "idle"}:${contextHash}`;
+	const callKey = event.reason === "tool_open_threshold" && event.toolCallId ? `:${event.toolCallId}` : "";
+	return `${childKey}:${event.type}:${event.reason ?? "idle"}${callKey}:${contextHash}`;
 }
 
 export function claimControlNotification(config: ResolvedControlConfig, event: ControlEvent, seenKeys: Set<string>, childIntercomTarget?: string): boolean {
@@ -221,67 +226,67 @@ export function formatControlNudge(event: ControlEvent): string {
 
 export function formatControlNoticeMessage(event: ControlEvent, childIntercomTarget?: string): string {
 	const runTarget = event.runId;
-	if (event.reason === "completion_guard") {
-		return [
-			`Subagent failed: ${event.agent}`,
-			`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
-			`Signal: ${event.message}`,
-			"Next: read the output artifact or session from the subagent result, then retry with a more explicit implementation prompt or handle the fix directly.",
-			childIntercomTarget ? `Run intercom target (may be inactive): ${childIntercomTarget}` : undefined,
-		].filter((line): line is string => Boolean(line)).join("\n");
-	}
-
 	const nudgeMessage = formatControlNudge(event);
-	const steerCommand = `subagent({ action: "steer", id: "${runTarget}", ${event.index !== undefined ? `index: ${event.index}, ` : ""}message: ${JSON.stringify(nudgeMessage)} })`;
+	const steerCommand = `subagent({ action: "steer", id: "${runTarget}", message: ${JSON.stringify(nudgeMessage)}${event.index !== undefined ? `, options: { index: ${event.index} }` : ""} })`;
 	const nestedResumeCommand = `subagent({ action: "resume", id: "${runTarget}", message: ${JSON.stringify(nudgeMessage)} })`;
+	const facts = formatLongRunningFacts(event);
+	const head = (title: string) => [
+		`${title}: ${event.agent}`,
+		`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
+		`Signal: ${event.message}`,
+		facts ? `Facts: ${facts}` : undefined,
+	];
+	const status = `Status: subagent({ action: "status", id: "${runTarget}" })`;
+	const lines = (items: Array<string | undefined>) => items.filter((line): line is string => Boolean(line)).join("\n");
 	if (event.type === "active_long_running") {
-		const facts = formatLongRunningFacts(event);
-		return [
-			`Subagent active but long-running: ${event.agent}`,
-			`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
-			`Signal: ${event.message}`,
-			facts ? `Facts: ${facts}` : undefined,
+		return lines([
+			...head("Subagent active but long-running"),
 			"Hint: Inspect status first. Use steer for a top-level live async child, routed resume for a live nested child, or resume to revive a paused/completed/failed child.",
 			`Top-level live async nudge: ${steerCommand}`,
 			`Routed live nested nudge: ${nestedResumeCommand}`,
 			childIntercomTarget ? `Direct intercom target: ${childIntercomTarget}` : undefined,
-			`Status: subagent({ action: "status", id: "${runTarget}" })`,
+			status,
 			`Interrupt: subagent({ action: "interrupt", id: "${runTarget}" })`,
-		].filter((line): line is string => Boolean(line)).join("\n");
+		]);
+	}
+
+	if (event.reason === "tool_open_threshold" && event.currentTool === "bash") {
+		const command = (label: string, action: string) => `${label}: subagent(${JSON.stringify({ action, id: runTarget, options: { ...(event.index !== undefined ? { index: event.index } : {}), toolCallId: event.toolCallId } })})`;
+		return lines([
+			...head("Subagent needs attention"),
+			"Hint: Inspect the running command and recent output before nudging. A queued steer does not cancel an in-flight bash call. A dev server or watch command may intentionally never return. Elapsed time alone does not prove the command is stuck.",
+			"Recovery: For a local DM child explicitly granted subagent_command, yield a needed persistent command or cancel the exact incorrect command, then steer the child. Query command.status to confirm the result. If command controls are unavailable, inspect partial changes and interruption scope before interrupt/resume; interrupt is run-scoped and may affect siblings.",
+			...(event.toolCallId ? [command("Command", "command.status"), command("Yield", "command.yield"), command("Cancel", "command.cancel")] : []),
+			status,
+			`Transcript: subagent({ action: "status", id: "${runTarget}", options: { view: "transcript"${event.index !== undefined ? `, index: ${event.index}` : ""} } })`,
+		]);
 	}
 
 	const supervisorHint = event.reason === "supervisor_request"
 		? "Supervisor request: reply to the pending request. If subagent_supervisor pending is empty, check intercom pending because an external intercom tool may own the request."
 		: undefined;
-	const facts = formatLongRunningFacts(event);
-	return [
-		`Subagent needs attention: ${event.agent}`,
-		`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
-		`Signal: ${event.message}`,
-		facts ? `Facts: ${facts}` : undefined,
+	return lines([
+		...head("Subagent needs attention"),
 		event.recentFailureSummary ? `Recent failures: ${event.recentFailureSummary}` : undefined,
 		supervisorHint,
 		"Hint: Inspect status first unless the run is clearly blocked. Use steer for a top-level live async child, routed resume for a live nested child, or resume to revive a paused/completed/failed child.",
 		`Top-level live async nudge: ${steerCommand}`,
 		`Routed live nested nudge: ${nestedResumeCommand}`,
 		childIntercomTarget ? `Direct intercom target: ${childIntercomTarget}` : undefined,
-		`Status: subagent({ action: "status", id: "${runTarget}" })`,
+		status,
 		`Interrupt: subagent({ action: "interrupt", id: "${runTarget}" })`,
-	].filter((line): line is string => Boolean(line)).join("\n");
+	]);
 }
 
+
 export function formatControlIntercomMessage(event: ControlEvent, childIntercomTarget?: string): string {
-	const statusLabel = event.reason === "completion_guard"
-		? "subagent failed"
-		: event.type === "active_long_running"
+	const statusLabel = event.type === "active_long_running"
 			? "subagent active but long-running"
 			: "subagent needs attention";
 	return [
 		statusLabel,
 		"",
-		event.reason === "completion_guard"
-			? `${event.agent} failed in run ${event.runId}.`
-			: event.type === "active_long_running"
+		event.type === "active_long_running"
 				? `${event.agent} is still active but long-running in run ${event.runId}.`
 				: `${event.agent} needs attention in run ${event.runId}.`,
 		"",

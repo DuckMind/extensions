@@ -8,12 +8,13 @@
  */
 
 import { logExtension } from "../../extension-log.js";
-import { getLSPService } from "../../lsp/index.js";
+import { getLSPService } from "../../lsp/capabilities.js";
 import {
 	augmentPythonEnvironment,
 	detectPythonEnvironment,
 } from "../../python-environment.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -45,7 +46,7 @@ const pyrightRunner: RunnerDefinition = {
 			await lspService.getClientForFile(ctx.filePath);
 		}
 
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "pyright");
 
 		// Get pyright command - try multiple strategies
 		let cmd: string | null = null;

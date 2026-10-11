@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import type {
 	AstGrepClient,
 	AstGrepOutlineFile,
@@ -6,7 +5,7 @@ import type {
 } from "../clients/ast-grep-client.js";
 import { Type } from "../clients/deps/typebox.js";
 import { compactRenderResult } from "./render-compact.js";
-import { LANGUAGES } from "./shared.js";
+import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
 
 // Cap the wire payload so an outline over a large directory can't flood context.
 const MAX_FILES = 50;
@@ -47,20 +46,8 @@ export function createAstGrepOutlineTool(astGrepClient: AstGrepClient) {
 		name: "ast_grep_outline" as const,
 		label: "AST-Grep Outline",
 		description:
-			"Syntax-only code structure (symbols, imports, exports, and members) via " +
-			"`ast-grep outline`. Fast, local, no index/LSP/cross-file semantics — useful " +
-			"for languages or structures where dm-lens's own extractor is weak, or for a " +
-			"raw second opinion.\n\n" +
-			"Prefer module_report for dm-lens-aware navigation (who-uses-this, " +
-			"complexity/fanout, recommendedReads, blast radius, callback handles). Use " +
-			"ast_grep_outline when you want the syntax tree's own view of a file or a " +
-			"whole directory.\n\n" +
-			"Returns JSON: per file, `items[]` with name/symbolType/signature/range, " +
-			"`isExported`/`isImport`, nested `members[]` (with `isPublic`), and ready " +
-			"`read` args on every entry. NOTE: structure only — an outline is NOT a read " +
-			"of a symbol's body (use read_symbol/read_enclosing for that).",
-		promptSnippet:
-			"Syntax-only code outline via ast-grep (no index/LSP); module_report is the richer default",
+			"Return syntax-only symbols, imports, exports, and members with ast-grep. An outline shows structure, not a symbol body, and does not satisfy read-before-edit; use read_symbol or read_enclosing for body coverage. Example: outline `src/` before choosing a symbol to read.",
+		promptSnippet: "Inspect syntax without index or LSP",
 		renderResult: compactRenderResult<{
 			files?: number;
 			items?: number;
@@ -149,9 +136,7 @@ export function createAstGrepOutlineTool(astGrepClient: AstGrepClient) {
 			if (rawPaths.length === 0) return errorResult("paths is required");
 			// Resolve relative paths against the workspace; pass absolute paths to the
 			// CLI (execFile-style args — no shell interpolation).
-			const absPaths = rawPaths.map((p) =>
-				path.isAbsolute(p) ? p : path.resolve(cwd, p),
-			);
+			const absPaths = resolveAstGrepPaths(rawPaths, cwd);
 
 			if (!(await astGrepClient.ensureAvailable())) {
 				return errorResult(

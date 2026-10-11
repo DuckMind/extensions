@@ -16,18 +16,21 @@ import {
 	type PositionEncoding,
 } from "./position-encoding.js";
 import { recordLspMutation, type LspMutationContext } from "../lsp-mutation.js";
+import { withHostFileMutationQueues } from "../file-mutation-queue.js";
+import { incrementDegradationCount } from "../degradation-ledger.js";
+import { logLatency } from "../latency-logger.js";
 import {
 	detectLineEnding,
 	normalizeToLF,
 	restoreLineEndings,
 } from "../host-edit-normalize.js";
 
-export interface LSPPosition {
+interface LSPPosition {
 	line: number;
 	character: number;
 }
 
-export interface LSPRange {
+interface LSPRange {
 	start: LSPPosition;
 	end: LSPPosition;
 }
@@ -68,9 +71,11 @@ interface DeleteFileOp {
 	options?: ResourceOptions;
 }
 
-export interface AppliedWorkspaceFileDetail {
+interface AppliedWorkspaceFileDetail {
 	filePath: string;
 	range?: { start: number; end: number };
+	ranges?: Array<{ start: number; end: number }>;
+	authorshipUnknown?: boolean;
 	importsChanged?: boolean;
 }
 
@@ -101,6 +106,37 @@ export interface ApplyWorkspaceEditOptions {
 	mutationContext?: LspMutationContext;
 	/** Rename flows use one outer bookkeeping record after their resource rename. */
 	observe?: boolean;
+	/**
+	 * #3541: the bytes a caller's edit positions were computed from, keyed by
+	 * the file's realpath (a caller and the edit's URI can spell one file
+	 * differently, and `normalizeMapKey` keeps a symlinked directory's
+	 * spelling). Checked against the disk inside pi's mutation queue; a
+	 * mismatch refuses the whole edit with {@link StaleWorkspaceEditContentError}.
+	 */
+	expectedContent?: ReadonlyMap<string, string>;
+}
+
+/**
+ * #3541: a file changed between the read an edit was computed from and the
+ * edit's turn in pi's mutation queue. Thrown by the preflight, before any write.
+ */
+export class StaleWorkspaceEditContentError extends Error {}
+
+/**
+ * #3541/#3601: refuse an edit whose content cannot be shown to be what it was
+ * computed from. One ledger count and one {@link StaleWorkspaceEditContentError}
+ * naming the file, for the preflight's own mismatch and for a caller that
+ * refuses a file it cannot bind (`lsp_navigation`'s rename).
+ */
+export function refuseStaleWorkspaceEdit(filePath: string, why: string): never {
+	incrementDegradationCount({
+		kind: "lsp-edit-stale-content",
+		subject: filePath,
+		reason: `${why}; the edit was not applied`,
+	});
+	throw new StaleWorkspaceEditContentError(
+		`stale text document content for ${filePath}: ${why}`,
+	);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -263,7 +299,7 @@ function formatRange(range: LSPRange): string {
 	return `${range.start.line + 1}:${range.start.character + 1}-${range.end.line + 1}:${range.end.character + 1}`;
 }
 
-export function rangesOverlap(a: LSPRange, b: LSPRange): boolean {
+function rangesOverlap(a: LSPRange, b: LSPRange): boolean {
 	return (
 		comparePosition(a.start, b.end) < 0 && comparePosition(b.start, a.end) < 0
 	);
@@ -533,7 +569,7 @@ export async function normalizeWorkspaceEditToUtf16(
 	};
 }
 
-export function flattenWorkspaceTextEdits(edit: {
+function flattenWorkspaceTextEdits(edit: {
 	changes?: Record<string, unknown[]>;
 	documentChanges?: unknown[];
 }): Map<string, LSPTextEdit[]> {
@@ -683,6 +719,33 @@ function parseResource(change: Record<string, unknown>): WorkspaceEditOp {
 			options: parseResourceOptions(change.options, kind),
 		};
 	throw new Error(`unsupported workspace resource operation: ${String(kind)}`);
+}
+
+/** #3541: the on-disk path of every file a planned edit writes. */
+function plannedDiskPaths(planned: WorkspaceEditOp[]): string[] {
+	return planned.flatMap((op) =>
+		op.kind === "rename"
+			? [uriToDiskPath(op.oldUri), uriToDiskPath(op.newUri)]
+			: [uriToDiskPath(op.uri)],
+	);
+}
+
+/** #3541: the on-disk path of every file `edit` writes (text, create, both rename ends, delete). */
+export function workspaceEditDiskPaths(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): string[] {
+	return plannedDiskPaths(planWorkspaceEdit(edit));
+}
+
+/** #3601: the on-disk path of every file `edit` writes TEXT to (the only files the content preflight compares). */
+export function workspaceEditTextPaths(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): string[] {
+	return planWorkspaceEdit(edit).flatMap((op) =>
+		op.kind === "text" ? [uriToDiskPath(op.uri)] : [],
+	);
 }
 
 function planWorkspaceEdit(
@@ -1052,6 +1115,7 @@ async function createWorkspaceUriConfiner(
 		} catch (err) {
 			throw new Error(
 				`invalid workspace edit URI ${uri}: ${err instanceof Error ? err.message : String(err)}`,
+				{ cause: err },
 			);
 		}
 		if (!path.isAbsolute(filePath))
@@ -1171,6 +1235,16 @@ async function preflightWorkspaceEdit(
 		if (!physicalPath)
 			throw new Error(`text edit target does not exist: ${filePath}`);
 		const content = await fs.readFile(physicalPath, "utf-8");
+		// `?.` skips the realpath when no caller passed expected content.
+		const expected = options.expectedContent?.get(
+			await fs.realpath(physicalPath),
+		);
+		if (expected !== undefined && expected !== content) {
+			refuseStaleWorkspaceEdit(
+				filePath,
+				"the file changed after the edit was computed from it",
+			);
+		}
 		state.content = content;
 		return content;
 	};
@@ -1395,109 +1469,152 @@ export async function applyWorkspaceEdit(
 		fileDetails,
 	});
 	try {
-		prepared = await preflightWorkspaceEdit(planned, cwd, options);
-		for (const op of planned) {
-			const size = operationSize(op);
-			if (op.kind === "text") operationCounts.textEdits += size;
-			else operationCounts[op.kind]++;
-			operationTotal += size;
-		}
-		for (const op of planned) {
-			if (prepared.ignored.has(op)) {
-				skipOperation(op);
-				continue;
+		// #3541: the read-modify-write of every path runs inside pi's mutation
+		// queue, so an agent edit of one of them cannot land between this
+		// edit's read and its write (and be erased by it).
+		const queuePaths = plannedDiskPaths(planned);
+		const queueStart = Date.now();
+		await withHostFileMutationQueues(queuePaths, async () => {
+			logLatency({
+				type: "phase",
+				filePath: cwd,
+				phase: "lsp_edit_queue_wait",
+				durationMs: Date.now() - queueStart,
+				metadata: { paths: queuePaths.length },
+			});
+			prepared = await preflightWorkspaceEdit(planned, cwd, options);
+			for (const op of planned) {
+				const size = operationSize(op);
+				if (op.kind === "text") operationCounts.textEdits += size;
+				else operationCounts[op.kind]++;
+				operationTotal += size;
 			}
-			if (op.kind === "text") {
-				// Report/key on the normalized path (forward-slash, realpath-canonical),
-				// but read/write the decoded on-disk path so the URI's casing is honored
-				// on win32 (see uriToDiskPath).
-				const filePath = uriToPath(op.uri);
-				const diskPath = uriToDiskPath(op.uri);
-				const edits = prepared.text.get(op) ?? [];
-				if (edits.length === 0) {
+			for (const op of planned) {
+				if (prepared.ignored.has(op)) {
 					skipOperation(op);
 					continue;
 				}
-				const content = await fs.readFile(diskPath, "utf-8");
-				const updated = applyTextEditsToString(content, edits, "utf-16");
-				await fs.writeFile(diskPath, updated, "utf-8");
-				const start = Math.min(
-					...edits.map((item) => item.range.start.line + 1),
-				);
-				const end = Math.max(...edits.map((item) => item.range.end.line + 1));
-				touchedFiles.add(filePath);
-				fileDetails.push({
-					filePath,
-					range: { start, end },
-					importsChanged:
-						importsSignature(content) !== importsSignature(updated),
-				});
-				markApplied(op);
-				descriptions.push(
-					`Applied ${edits.length} edit(s) to ${relativeToCwd(filePath, cwd)}`,
-				);
-			} else if (op.kind === "create") {
-				// Create on the decoded path so `NewFile.txt` is not lowercased on win32;
-				// report/key on the normalized path.
-				const filePath = uriToPath(op.uri);
-				const diskPath = uriToDiskPath(op.uri);
-				await fs.mkdir(path.dirname(diskPath), { recursive: true });
-				if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
-				else await fs.writeFile(diskPath, "", { flag: "wx" });
-				touchedFiles.add(filePath);
-				fileDetails.push({
-					filePath,
-					range: { start: 1, end: 1 },
-					importsChanged: false,
-				});
-				markApplied(op);
-				descriptions.push(`Created ${relativeToCwd(filePath, cwd)}`);
-			} else if (op.kind === "rename") {
-				// Rename on the decoded paths so the destination casing is honored (and a
-				// case-only rename actually changes the name); report on normalized paths.
-				const oldPath = uriToPath(op.oldUri);
-				const newPath = uriToPath(op.newUri);
-				const oldDisk = uriToDiskPath(op.oldUri);
-				const newDisk = uriToDiskPath(op.newUri);
-				await fs.mkdir(path.dirname(newDisk), { recursive: true });
-				if (op.options?.overwrite)
-					await fs.rm(newDisk, { recursive: true, force: true });
-				await fs.rename(oldDisk, newDisk);
-				touchedFiles.add(oldPath);
-				touchedFiles.add(newPath);
-				fileDetails.push(
-					{
-						filePath: oldPath,
+				if (op.kind === "text") {
+					// Report/key on the normalized path (forward-slash, realpath-canonical),
+					// but read/write the decoded on-disk path so the URI's casing is honored
+					// on win32 (see uriToDiskPath).
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					const edits = prepared.text.get(op) ?? [];
+					if (edits.length === 0) {
+						skipOperation(op);
+						continue;
+					}
+					const content = await fs.readFile(diskPath, "utf-8");
+					const updated = applyTextEditsToString(content, edits, "utf-16");
+					const changesLineCount = edits.some((edit) => {
+						const removedLines = edit.range.end.line - edit.range.start.line;
+						const insertedLines = (edit.newText.match(/\r\n|\r|\n/g) ?? [])
+							.length;
+						return removedLines !== insertedLines;
+					});
+					await fs.writeFile(diskPath, updated, "utf-8");
+					const start = Math.min(
+						...edits.map((item) => item.range.start.line + 1),
+					);
+					const end = Math.max(
+						...edits.map(
+							(item) =>
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						),
+					);
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
+						range: { start, end },
+						ranges: edits.map((item) => ({
+							start: item.range.start.line + 1,
+							end:
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						})),
+						authorshipUnknown: changesLineCount,
+						importsChanged:
+							importsSignature(content) !== importsSignature(updated),
+					});
+					markApplied(op);
+					descriptions.push(
+						`Applied ${edits.length} edit(s) to ${relativeToCwd(filePath, cwd)}`,
+					);
+				} else if (op.kind === "create") {
+					// Create on the decoded path so `NewFile.txt` is not lowercased on win32;
+					// report/key on the normalized path.
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					await fs.mkdir(path.dirname(diskPath), { recursive: true });
+					if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
+					else await fs.writeFile(diskPath, "", { flag: "wx" });
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
 						range: { start: 1, end: 1 },
-						importsChanged: true,
-					},
-					{
-						filePath: newPath,
+						authorshipUnknown: true,
+						importsChanged: false,
+					});
+					markApplied(op);
+					descriptions.push(`Created ${relativeToCwd(filePath, cwd)}`);
+				} else if (op.kind === "rename") {
+					// Rename on the decoded paths so the destination casing is honored (and a
+					// case-only rename actually changes the name); report on normalized paths.
+					const oldPath = uriToPath(op.oldUri);
+					const newPath = uriToPath(op.newUri);
+					const oldDisk = uriToDiskPath(op.oldUri);
+					const newDisk = uriToDiskPath(op.newUri);
+					await fs.mkdir(path.dirname(newDisk), { recursive: true });
+					if (op.options?.overwrite)
+						await fs.rm(newDisk, { recursive: true, force: true });
+					await fs.rename(oldDisk, newDisk);
+					touchedFiles.add(oldPath);
+					touchedFiles.add(newPath);
+					fileDetails.push(
+						{
+							filePath: oldPath,
+							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
+							importsChanged: true,
+						},
+						{
+							filePath: newPath,
+							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
+							importsChanged: true,
+						},
+					);
+					markApplied(op);
+					descriptions.push(
+						`Renamed ${relativeToCwd(oldPath, cwd)} → ${relativeToCwd(newPath, cwd)}`,
+					);
+				} else {
+					const filePath = uriToPath(op.uri);
+					const diskPath = uriToDiskPath(op.uri);
+					await fs.rm(diskPath, {
+						recursive: op.options?.recursive === true,
+						force: false,
+					});
+					touchedFiles.add(filePath);
+					fileDetails.push({
+						filePath,
 						range: { start: 1, end: 1 },
+						authorshipUnknown: true,
 						importsChanged: true,
-					},
-				);
-				markApplied(op);
-				descriptions.push(
-					`Renamed ${relativeToCwd(oldPath, cwd)} → ${relativeToCwd(newPath, cwd)}`,
-				);
-			} else {
-				const filePath = uriToPath(op.uri);
-				const diskPath = uriToDiskPath(op.uri);
-				await fs.rm(diskPath, {
-					recursive: op.options?.recursive === true,
-					force: false,
-				});
-				touchedFiles.add(filePath);
-				fileDetails.push({
-					filePath,
-					range: { start: 1, end: 1 },
-					importsChanged: true,
-				});
-				markApplied(op);
-				descriptions.push(`Deleted ${relativeToCwd(filePath, cwd)}`);
+					});
+					markApplied(op);
+					descriptions.push(`Deleted ${relativeToCwd(filePath, cwd)}`);
+				}
 			}
-		}
+		});
 	} catch (err) {
 		const partial = makeResult();
 		if (options.mutationContext && options.observe !== false) {

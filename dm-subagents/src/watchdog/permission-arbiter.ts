@@ -4,9 +4,10 @@ import { streamSimple } from "@duckmind/dm-ai/compat";
 import { Type, type Static } from "typebox";
 import { appendPermissionAudit, permissionArgsPreview } from "../runs/shared/permissions.ts";
 import { agentStreamOptions } from "../shared/agent-stream-options.ts";
+import { opencodeSessionHeaders } from "../shared/opencode-session-headers.ts";
 import { decodeChildWatchdogConfig } from "./child-status.ts";
 import { childResolvedConfig } from "./register-child.ts";
-import { resolveWatchdogReviewModel } from "./review.ts";
+import { formatWatchdogCwdSection, resolveWatchdogReviewModel } from "./review.ts";
 
 const PermissionDecisionParams = Type.Object({
 	decision: Type.String({ enum: ["approve", "deny"] }),
@@ -94,29 +95,32 @@ export function createWatchdogPermissionArbiter(options: WatchdogPermissionArbit
 				const config = childResolvedConfig(childConfig);
 				const selection = await resolveWatchdogReviewModel(request.ctx, config);
 				const auth = selection.auth;
-				const registeredProvider = (request.ctx.modelRegistry as {
-					getRegisteredProviderConfig?: (provider: string) => { api?: string; streamSimple?: StreamFn } | undefined;
-				}).getRegisteredProviderConfig?.(selection.model.provider);
-				const baseStreamFn = options.streamFn ?? (registeredProvider?.streamSimple && registeredProvider.api === selection.model.api
-					? registeredProvider.streamSimple
-					: streamSimple);
+				const sessionId = request.ctx.sessionManager.getSessionId();
+				const registryStream = (request.ctx.modelRegistry as { streamSimple?: StreamFn }).streamSimple;
+				const baseStreamFn: StreamFn = options.streamFn ?? (registryStream
+					? (model, context, streamOptions) => registryStream.call(request.ctx.modelRegistry, model, context, streamOptions)
+					: (model, context, streamOptions) => streamSimple(model, context, streamOptions));
 				const streamFn: StreamFn = (model, context, streamOptions) => baseStreamFn(model, context, {
 					...streamOptions,
 					...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
 					env: auth.env || streamOptions?.env ? { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } : undefined,
-					headers: { ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
+					headers: { ...opencodeSessionHeaders(model, sessionId), ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
 				});
+				const systemPrompt = [
+					"You are the dm-subagents watchdog permission arbiter.",
+					"Decide only whether this exact non-bash child tool call should proceed.",
+					"Call watchdog_permission_decision exactly once with approve or deny and a concise reason.",
+					"Deny when uncertain. Do not produce freeform advice or ask the parent orchestrator.",
+					"",
+					formatWatchdogCwdSection(request.ctx.cwd),
+				].join("\n");
+				const tools = [tool];
 				agent = new Agent({
 					initialState: {
-						systemPrompt: [
-							"You are the dm-subagents watchdog permission arbiter.",
-							"Decide only whether this exact non-bash child tool call should proceed.",
-							"Call watchdog_permission_decision exactly once with approve or deny and a concise reason.",
-							"Deny when uncertain. Do not produce freeform advice or ask the parent orchestrator.",
-						].join("\n"),
+						systemPrompt,
 						model: selection.model,
 						thinkingLevel: selection.thinkingLevel,
-						tools: [tool],
+						tools,
 					},
 					convertToLlm,
 					...agentStreamOptions(streamFn),

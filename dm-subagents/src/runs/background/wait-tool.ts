@@ -4,6 +4,7 @@ import type { Details, SubagentState } from "../../shared/types.ts";
 import { resolveWaitToolConfig, waitForSubagents } from "./subagent-wait.ts";
 import type { WaitSubscriptionManager } from "./wait-subscriptions.ts";
 import { finalizeToolResult } from "../../extension/tool-result.ts";
+import { registerPinnedTool } from "../../extension/declaration-pinning.ts";
 
 export function registerWaitTool(
 	dm: ExtensionAPI,
@@ -11,27 +12,40 @@ export function registerWaitTool(
 	enabled = resolveWaitToolConfig().enabled,
 	subscriptions?: Pick<WaitSubscriptionManager, "arm">,
 	defaultTimeoutMs?: number,
+	child?: { nestedRootRunId?: string },
+	hasPendingSupervisorRequest?: () => boolean,
 ): void {
-	const description = `Wait for background, provider, or detached work that has no native completion notification, then return.
-
-Ordinary async subagent runs already notify this session natively when they complete or need attention. In an interactive chat, return control instead of calling this merely to wait. Use this tool for provider jobs, remembered detached foreground runs, or other background work without a native notification path. Headless runs auto-drain current-session subagent work at agent_end; use this tool only when the current turn must receive non-notifying background work results.
-
-• { } — return when the first initially active async run or registered provider item finishes, or when a subagent needs attention.
-• { all: true } — wait for every async run and provider item that was active when the call began.
-• { id: "..." } — wait for one async or remembered detached foreground subagent run (id or prefix).
-• { id: "...", nonBlocking: true } — resolve the prefix once, persist an exact-run wake subscription, and return immediately. Use this for detached work without native completion delivery; the originating interactive session wakes on completion, failure, attention, reconciliation failure, or timeout.
-• { stopOnAttention: false } — for blocking waits only, keep waiting through idle or long-thinking attention; supervisor/contact requests still stop the wait.
-• { timeoutMs: 600000 } — stop waiting after N ms; active work keeps running. Omitted values use waitTool.defaultTimeoutMs, then 30 minutes. Window expiry returns a non-error window_elapsed result with active work identities.
-
-Non-blocking subscriptions are visible in subagent status and differ from disabling waitTool: waitTool.enabled=false returns immediately without registering any future wake. Provider jobs are session-scoped and identified exactly, so replacing one job with another cannot hide a completion. Provider extensions must be explicitly loaded in this process. In a child agent, keep \`bg_wait\` (or the deprecated \`subagent_wait\` compatibility alias) in the child tool allowlist and load each provider through the agent's extensions or subagentOnlyExtensions; this tool never loads providers or grants tools itself.${enabled ? "" : "\n\nConfigured behavior: bg_wait and its subagent_wait compatibility alias are disabled by config.waitTool or DM_SUBAGENT_WAIT_TOOL_ENABLED and return immediately without blocking."}`;
-	const execute: ToolDefinition<typeof SubagentWaitParams, Details>["execute"] = async (_id, params, signal, onUpdate, ctx) => finalizeToolResult(await waitForSubagents(params, signal, {
-		state,
-		events: dm.events,
-		enabled,
-		...(defaultTimeoutMs !== undefined ? { defaultTimeoutMs } : {}),
-		onUpdate,
-		...(subscriptions && ctx?.hasUI ? { subscribe: (input) => subscriptions.arm(input) } : {}),
-	}));
+	const description = `Wait for background work, then return. ${child ? "This child runtime has no native completion notifier: use blocking bg_wait to collect your owned descendants this turn and read their result references; agent_end draining does not synthesize results." : "Ordinary async subagent runs already wake this session natively; use bg_wait only for provider, detached, or other background work without native notification, when a same-turn result is needed."}
+{} — first active run or provider item to finish or need attention.
+{all:true} — all work active at call time.
+{id} — one run; a finished async run returns its result references.
+{id,nonBlocking:true} — subscribe to that run's wake and return now.
+Timeout or a user message ends the wait without error; work keeps running.${enabled ? "" : "\nDisabled by config.waitTool or DM_SUBAGENT_WAIT_TOOL_ENABLED: returns immediately."}`;
+	// Messages typed while the agent is busy (steer or follow-up) end open waits so they reach the model.
+	const userInputWaits = new Set<AbortController>();
+	dm.on("input", (event) => {
+		if (event.source === "extension" || !event.streamingBehavior) return;
+		for (const controller of userInputWaits) controller.abort();
+	});
+	const execute: ToolDefinition<typeof SubagentWaitParams, Details>["execute"] = async (_id, params, signal, onUpdate, ctx) => {
+		const userInput = new AbortController();
+		userInputWaits.add(userInput);
+		try {
+			return finalizeToolResult(await waitForSubagents(params, signal, {
+				state,
+				nestedRootRunId: child?.nestedRootRunId,
+				events: dm.events,
+				enabled,
+				hasPendingSupervisorRequest,
+				userInputSignal: userInput.signal,
+				...(defaultTimeoutMs !== undefined ? { defaultTimeoutMs } : {}),
+				onUpdate,
+				...(subscriptions && ctx?.hasUI ? { subscribe: (input) => subscriptions.arm(input) } : {}),
+			}));
+		} finally {
+			userInputWaits.delete(userInput);
+		}
+	};
 	const primaryTool: ToolDefinition<typeof SubagentWaitParams, Details> = {
 		name: "bg_wait",
 		label: "Background Wait",
@@ -39,17 +53,11 @@ Non-blocking subscriptions are visible in subagent status and differ from disabl
 		parameters: SubagentWaitParams,
 		execute,
 	};
-	dm.registerTool(primaryTool);
-	dm.registerTool({
+	registerPinnedTool(dm, primaryTool);
+	registerPinnedTool(dm, {
 		...primaryTool,
 		name: "wait",
 		label: "Wait",
 		description: "Compatibility alias for `bg_wait`.",
-	});
-	dm.registerTool({
-		...primaryTool,
-		name: "subagent_wait",
-		label: "Subagent Wait (deprecated)",
-		description: "Deprecated compatibility alias for `bg_wait`. Use `bg_wait` for background, provider, or detached work without a native completion notification. It has the same parameters and behavior.",
 	});
 }

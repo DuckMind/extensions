@@ -19,13 +19,30 @@ const hostPeerPackages = {
   "@duckmind/dm-ai": { peer: "*", dev: "file:../../dm-mono/packages/ai" },
   "@duckmind/dm-coding-agent": { peer: "*", dev: "file:../../dm-mono/packages/coding-agent" },
   "@duckmind/dm-tui": { peer: "*", dev: "file:../../dm-mono/packages/tui" },
-  "typebox": { peer: "*", dev: "1.3.3" },
+  "typebox": { peer: "*", dev: "1.3.27" },
 };
 
 describe("package.json files", () => {
   it("keeps the bundled MCP scripting skill available for manual use only", () => {
     const skill = readFileSync(join(repoRoot, "skills", "mcp-scripting", "SKILL.md"), "utf-8");
     expect(skill).toMatch(/^disable-model-invocation:\s*true\s*$/m);
+  });
+
+  it("ships every doc section the published README links to", () => {
+    const readme = readFileSync(join(repoRoot, "README.md"), "utf-8");
+    const links = [...readme.matchAll(/\]\(([^)]*docs\/[^)]*)\)/g)].map(([, url]) => {
+      const parsed = url!.match(/^(docs\/[\w-]+\.md)(?:#([\w-]+))?$/);
+      expect(parsed, url).not.toBeNull();
+      return parsed!;
+    });
+
+    expect(links.length).toBeGreaterThan(0);
+    expect(packageJson.files).toContain("docs");
+    for (const [, path, anchor] of links) {
+      const headings = readFileSync(join(repoRoot, path!), "utf-8").match(/^#+ .+$/gm)!
+        .map((heading) => heading.replace(/^#+ /, "").toLowerCase().replace(/[^\w\- ]/g, "").replaceAll(" ", "-"));
+      if (anchor) expect(headings, `${path}#${anchor}`).toContain(anchor);
+    }
   });
 
   it("exports source entry points and plain Node host helpers", () => {
@@ -58,7 +75,9 @@ describe("package.json files", () => {
     const publishedFiles = new Set(packageJson.files ?? []);
 
     expect(packageJson.scripts?.prepare).toBeUndefined();
-    expect(packageJson.scripts?.prepack).toBe("npm run build:public && npm run cleanup:package");
+    expect(packageJson.scripts?.prepack).toContain("examples/interactive-visualizer run build");
+    expect(packageJson.files).toContain("examples/interactive-visualizer/dist/app.html");
+    expect(packageJson.files).toContain("examples/interactive-visualizer/dist/server.js");
     expect(publishedFiles.has("dist")).toBe(true);
     for (const entry of Object.values(packageJson.exports ?? {})) {
       if (!entry || typeof entry !== "object") continue;
@@ -96,22 +115,68 @@ describe("package.json files", () => {
 });
 
 describe("package.json dependency policy", () => {
-  it("treats DM host packages as optional peers with exact dev pins", () => {
+  it("uses only registry semver dependency specs and no native refresh-lock addon", () => {
+    const dependencyGroups = [
+      packageJson.dependencies ?? {},
+      packageJson.devDependencies ?? {},
+      packageJson.peerDependencies ?? {},
+    ];
+    const registrySemver = /^(?:[~^]?\d+\.\d+\.\d+|\*)(?:\s*\|\|\s*(?:[~^]?\d+\.\d+\.\d+|\*))*$/;
+
+    for (const dependencies of dependencyGroups) {
+      for (const [name, spec] of Object.entries(dependencies)) {
+        if (dependencies === packageJson.devDependencies && name in hostPeerPackages && name !== "typebox") {
+          expect(spec).toBe(`file:../../dm-mono/packages/${name.slice("@duckmind/dm-".length)}`);
+          continue;
+        }
+        if (name === "recheck") {
+          expect(spec).toBe("4.6.0-beta.3");
+          continue;
+        }
+        expect(spec).toMatch(registrySemver);
+        expect(spec).not.toMatch(/^(?:https?:|git(?:\+[^:]+)?:|file:)/);
+      }
+    }
+    expect(packageJson.dependencies?.["fs-native-extensions"]).toBeUndefined();
+  });
+
+  it("declares DM host packages as peers with exact dev pins", () => {
     const entries = Object.entries(hostPeerPackages);
 
     for (const [name, versions] of entries) {
       expect(packageJson.peerDependencies?.[name]).toBe(versions.peer);
-      expect(packageJson.peerDependenciesMeta?.[name]?.optional).toBe(true);
+      expect(packageJson.peerDependenciesMeta?.[name]?.optional ?? false).toBe(versions.optional ?? false);
       expect(packageJson.dependencies?.[name]).toBeUndefined();
       expect(packageJson.devDependencies?.[name]).toBe(versions.dev);
     }
   });
 
-  it("uses the stable modular SDK v2 client/core packages without the legacy monolithic SDK", () => {
-    expect(packageJson.dependencies?.["@modelcontextprotocol/ext-apps"]).toBeDefined();
+  // Hosts that import the package outside DM's extension loader resolve peers with Node, so a peer
+  // imported at runtime cannot be optional. Type-only peers stay optional to skip their install.
+  it("marks a DM host peer optional only when shipped source imports it for types alone", () => {
+    const shippedSources = (packageJson.files ?? [])
+      .filter((file) => /\.(?:ts|js|mjs|cjs)$/.test(file))
+      .map((file) => readFileSync(join(repoRoot, file), "utf-8"));
+
+    for (const [name, versions] of Object.entries(hostPeerPackages)) {
+      const specifier = `["']${name}(?:/[^"']*)?["']`;
+      const runtimeImport = new RegExp([
+        `^[ \\t]*(?:import|export)[ \\t]+(?!type\\b)[^;\\n]*?from[ \\t]+${specifier}`,
+        `^\\s*import\\s+${specifier}`,
+        `\\b(?:import|require)\\(\\s*${specifier}\\s*\\)`,
+      ].join("|"), "m");
+      expect(shippedSources.some((source) => runtimeImport.test(source)), name).toBe(!versions.optional);
+    }
+  });
+
+  it("tests extension APIs against the local authoritative DM host", () => {
+    expect(packageJson.devDependencies?.["@duckmind/dm-coding-agent"]).toBe("file:../../dm-mono/packages/coding-agent");
+  });
+
+  it("declares modular SDK v2 packages without directly depending on the legacy monolith", () => {
     expect(packageJson.dependencies?.["@modelcontextprotocol/sdk"]).toBeUndefined();
-    expect(packageJson.dependencies?.["@modelcontextprotocol/client"]).toBe("2.0.0");
-    expect(packageJson.dependencies?.["@modelcontextprotocol/core"]).toBe("2.0.0");
+    expect(packageJson.dependencies?.["@modelcontextprotocol/client"]).toBe("2.3.1");
+    expect(packageJson.dependencies?.["@modelcontextprotocol/core"]).toBe("2.3.1");
     expect(packageJson.devDependencies?.["@modelcontextprotocol/server"]).toBeUndefined();
   });
 });

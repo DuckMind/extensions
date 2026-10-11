@@ -6,6 +6,7 @@ import type { AsyncJobState, NestedRunSummary } from "../../src/shared/types.ts"
 const theme = {
 	fg(_name: string, text: string): string { return text; },
 	bold(text: string): string { return text; },
+	getThinkingBorderColor(_level: string): (text: string) => string { return (text) => text; },
 };
 
 function withMockedDateNow<T>(now: number, fn: () => T): T {
@@ -151,12 +152,14 @@ describe("nested widget rendering", () => {
 		assert.match(expanded, /\[\d{2}:\d{2}:\d{2}\] . completed-step: Finalize report · completed/);
 	});
 
-	it("keeps event-time timestamps stable while running glyphs use wall time", () => {
+	it("keeps event-time timestamps stable while nested running glyphs use the supplied frame", () => {
 		const state = job(nested("nested-reviewer", "root-run", "running", { currentTool: "read", currentToolStartedAt: 0 }));
-		const first = withMockedDateNow(0, () => buildWidgetLines([state], theme as any, 120, true));
-		const second = withMockedDateNow(1_125, () => buildWidgetLines([state], theme as any, 120, true));
-		assert.notDeepEqual(second, first);
-		assert.deepEqual(withoutRunningGlyphs(second), withoutRunningGlyphs(first));
+		const first = withMockedDateNow(0, () => buildWidgetLines([state], theme as any, 120, true, 0));
+		const unrelatedRender = withMockedDateNow(125, () => buildWidgetLines([state], theme as any, 120, true, 0));
+		const nextFrame = withMockedDateNow(1_000, () => buildWidgetLines([state], theme as any, 120, true, 1));
+		assert.deepEqual(unrelatedRender, first);
+		assert.notDeepEqual(nextFrame, first);
+		assert.deepEqual(withoutRunningGlyphs(nextFrame), withoutRunningGlyphs(first));
 	});
 
 	it("rerenders when only nested state changes", () => {
@@ -165,5 +168,21 @@ describe("nested widget rendering", () => {
 		const renamed = job(nested("nested-reviewer", "root-run", "running", { sessionName: "nested-reviewer: Review nested run" }));
 		assert.notEqual(widgetRenderKey(first), widgetRenderKey(second));
 		assert.notEqual(widgetRenderKey(first), widgetRenderKey(renamed));
+	});
+
+	it("colors running nested rows by the thinking level of the child each stands for", () => {
+		const toneTheme = {
+			fg: (name: string, text: string) => `⟦${name}⟧${text}⟦/⟧`,
+			bold: (text: string) => text,
+			getThinkingBorderColor: (level: string) => (text: string) => `⟦thinking:${level}⟧${text}⟦/⟧`,
+		};
+		const child = nested("leaf-run", "root-run", "running", {
+			thinking: "xhigh",
+			steps: [{ agent: "step-agent", status: "running", thinking: "minimal" }],
+		});
+		const lines = buildWidgetLines([job(child)], toneTheme as any, 160, true);
+		const glyphTone = (label: string) => lines.find((line) => line.includes(label))?.match(/⟦([^⟧]+)⟧[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●]⟦\/⟧/)?.[1];
+		assert.equal(glyphTone("leaf-run"), "thinking:xhigh");
+		assert.equal(glyphTone("step-agent"), "thinking:minimal");
 	});
 });

@@ -10,7 +10,7 @@ Bundled DM extension for delegating tasks to specialized agents.
 
 ## Current upstream shape
 
-Technical provenance: this package is synced from `nicobailon/dm-subagents` release `v0.33.1`. DM ships the adapted source as `dm-subagents`.
+Technical provenance: this package is synced from `nicobailon/pi-subagents` release `v0.77.0`. DM ships the adapted source as `dm-subagents`.
 The nicobailon source-layout release includes `subagent`, `wait`, slash commands, prompts, skills, and bundled agent definitions; legacy local-only overlays are not silently claimed here.
 
 ## Default paths
@@ -22,7 +22,7 @@ The nicobailon source-layout release includes `subagent`, `wait`, slash commands
 ## Environment
 
 - Preferred recursion env: `DM_SUBAGENT_MAX_DEPTH`
-- Compatibility fallback still accepted: `DM_SUBAGENT_MAX_DEPTH`
+- Compatibility fallback still accepted: `PI_SUBAGENT_MAX_DEPTH`
 
 ## Bundled with dm
 

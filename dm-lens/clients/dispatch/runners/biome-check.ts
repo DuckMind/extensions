@@ -8,6 +8,7 @@
 
 import * as path from "node:path";
 import { incrementDegradationCount } from "../../degradation-ledger.js";
+import { pathsEqual } from "../../path-utils.js";
 import { mapWithConcurrency } from "../../dependency-checker.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import {
@@ -23,7 +24,10 @@ import type {
 	RunnerResult,
 } from "../types.js";
 
-import { resolveToolCommandWithInstallFallback } from "./utils/runner-helpers.js";
+import {
+	resolveRunnerCwd,
+	resolveToolCommandWithInstallFallback,
+} from "./utils/runner-helpers.js";
 import { finishParsedRun } from "./utils/tool-failure.js";
 
 interface BiomeDiagnostic {
@@ -92,40 +96,55 @@ export function biomeRuleNameFromCategory(
 export function parseBiomeJson(
 	raw: string,
 	filePath: string,
+	cwd: string,
 	fixKindByRule?: ReadonlyMap<string, BiomeFixKind>,
 ): { diagnostics: Diagnostic[]; parseError?: string } {
 	try {
 		const result = JSON.parse(raw);
 		const diagnostics: BiomeDiagnostic[] = result.diagnostics || [];
 		const autofix = getAutofixCapability("biome");
+		const absTarget = path.resolve(cwd, filePath);
 
 		return {
-			diagnostics: diagnostics.map((d) => {
-				const ruleName = biomeRuleNameFromCategory(d.category);
-				const fixKind = ruleName ? fixKindByRule?.get(ruleName) : undefined;
-				const isFixable = fixKind === "safe" || fixKind === "unsafe";
+			diagnostics: diagnostics.flatMap((d) => {
+				// #3295: `location.path` is biome's own name for the file each
+				// diagnostic is about; `biome.json` `files.includes` can widen the
+				// run past the argv.
+				if (
+					d.location?.path &&
+					!pathsEqual(path.resolve(cwd, d.location.path), absTarget)
+				)
+					return [];
+				{
+					const ruleName = biomeRuleNameFromCategory(d.category);
+					const fixKind = ruleName ? fixKindByRule?.get(ruleName) : undefined;
+					const isFixable = fixKind === "safe" || fixKind === "unsafe";
 
-				return {
-					id: `biome:${d.category}:${d.location.start.line}`,
-					message: d.message,
-					filePath,
-					line: d.location.start.line,
-					column: d.location.start.column,
-					severity: normalizeBiomeSeverity(d.severity),
-					semantic: d.severity === "error" ? "blocking" : ("warning" as const),
-					tool: "biome",
-					rule: d.category,
-					fixable: isFixable,
-					// Mirrors `biomeClient.fixFileAsync`'s own `lint --write` call
-					// (no `--unsafe`, clients/biome-client.ts): the pipeline only
-					// ever applies SAFE fixes, so only "safe" earns autoFixAvailable.
-					autoFixAvailable:
-						fixKind === "safe" && (autofix?.safePipelineAutofix ?? false),
-					fixKind:
-						isFixable && autofix?.fixKind !== "none"
-							? autofix?.fixKind
-							: undefined,
-				};
+					return [
+						{
+							id: `biome:${d.category}:${d.location.start.line}`,
+							message: d.message,
+							filePath,
+							line: d.location.start.line,
+							column: d.location.start.column,
+							severity: normalizeBiomeSeverity(d.severity),
+							semantic:
+								d.severity === "error" ? "blocking" : ("warning" as const),
+							tool: "biome",
+							rule: d.category,
+							fixable: isFixable,
+							// Mirrors `biomeClient.fixFileAsync`'s own `lint --write` call
+							// (no `--unsafe`, clients/biome-client.ts): the pipeline only
+							// ever applies SAFE fixes, so only "safe" earns autoFixAvailable.
+							autoFixAvailable:
+								fixKind === "safe" && (autofix?.safePipelineAutofix ?? false),
+							fixKind:
+								isFixable && autofix?.fixKind !== "none"
+									? autofix?.fixKind
+									: undefined,
+						},
+					];
+				}
 			}),
 		};
 	} catch (err) {
@@ -257,13 +276,18 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 	priority: PRIORITY.FORMAT_AND_LINT_PRIMARY,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || path.dirname(ctx.filePath);
+		const cwd = resolveRunnerCwd(ctx, "biome");
 		const policy = getJstsLintPolicyForCwd(cwd);
 
 		// Defer to ESLint/oxlint if the project has explicitly configured one —
 		// biome runs as the default linter only when no alternative is present.
 		if (!policy.hasBiomeConfig && policy.hasExplicitNonBiomeLinter) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				skipReason: "configured-non-biome-linter",
+			};
 		}
 
 		const cmd = await resolveToolCommandWithInstallFallback(cwd, "biome");
@@ -316,21 +340,27 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 
 		const parsed =
 			checkResult.status === 0 || checkResult.status === 1
-				? parseBiomeJson(checkResult.stdout || "", ctx.filePath, fixKindByRule)
+				? parseBiomeJson(
+						checkResult.stdout || "",
+						ctx.filePath,
+						cwd,
+						fixKindByRule,
+					)
 				: { diagnostics: [] as Diagnostic[] };
 
 		if (parsed.parseError) {
 			const raw = checkResult.stdout || checkResult.stderr || "";
 			const preview = raw.replace(/\s+/g, " ").slice(0, 160);
+			const message =
+				"Biome JSON parse failed: " +
+				parsed.parseError +
+				(preview ? " (output preview: " + preview + ")" : "");
 			return {
 				status: "failed",
 				diagnostics: [
 					{
 						id: "biome:parse-error:1",
-						message:
-							"Biome JSON parse failed: " +
-							parsed.parseError +
-							(preview ? " (output preview: " + preview + ")" : ""),
+						message,
 						filePath: ctx.filePath,
 						line: 1,
 						column: 1,
@@ -340,6 +370,8 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 					},
 				],
 				semantic: "warning",
+				failureKind: "parser_error",
+				failureMessage: message.slice(0, 200),
 			};
 		}
 

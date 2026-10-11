@@ -8,7 +8,7 @@ import { EXTENSION_TO_GRAMMAR, KIND_TO_GRAMMAR } from "./language-registry.js";
 import * as path from "node:path";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
 import type { Symbol, SymbolKind, SymbolRef } from "./symbol-types.js";
-import type { TreeSitterClient } from "./tree-sitter-client.js";
+import { type TreeSitterClient, wasmQueryInput } from "./tree-sitter-client.js";
 
 // Tree-sitter query patterns for symbol extraction
 const SYMBOL_QUERIES: Record<string, { defs: string; refs: string }> = {
@@ -812,10 +812,14 @@ export class TreeSitterSymbolExtractor {
 
 	// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter Query/Language types
 	private compileQuery(Query: any, language: any, src: string, label: string) {
+		// #3678 F-C: key a compile trap to the query source, so one
+		// always-trapping query is charged to itself instead of spending the
+		// process budget at every extractor init and aborting on the fourth.
+		const input = wasmQueryInput(`${this.languageId}:${label}:${src}`);
 		try {
 			return new Query(language, src);
 		} catch (err) {
-			if (this.client.reportWasmAbort(err)) throw err;
+			if (this.client.reportWasmAbort(err, input)) throw err;
 			logTreeSitterDiagnostic({
 				subsystem: "symbol-extractor",
 				languageId: this.languageId,

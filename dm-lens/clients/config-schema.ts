@@ -50,6 +50,7 @@ import {
 	type ConfigSchemaNode,
 	DENY_KEY,
 	type DenyPolicy,
+	MERGE_STRATEGY_KEY,
 } from "./config-core/schema.js";
 import {
 	flagConfigSectionKeys,
@@ -58,10 +59,10 @@ import {
 	PROJECT_FOREIGN_CONFIG_NAMESPACES,
 	PROJECT_NON_FLAG_CONFIG_SECTIONS,
 } from "./lens-flag-registry.js";
+import { LENS_TOOL_NAMES } from "./tool-config.js";
 
 /** The JSON Schema dialect the published artifact declares. */
-export const CONFIG_SCHEMA_DIALECT =
-	"https://json-schema.org/draft/2020-12/schema";
+const CONFIG_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema";
 
 /**
  * A node the schema says nothing else about. `config-core` treats a node with
@@ -132,12 +133,111 @@ const LSP_KEY_DENY: Readonly<Record<string, DenyPolicy>> = {
 	disabledServers: "array-union",
 };
 
-export { LSP_KEY_DENY };
-
 /** The `x-deny` annotation for a key, or nothing when it carries no denial. */
 function denyAnnotation(key: string): { [DENY_KEY]?: DenyPolicy } {
 	const policy = LSP_KEY_DENY[key];
 	return policy === undefined ? {} : { [DENY_KEY]: policy };
+}
+
+/**
+ * The `lsp.servers.<id>` entry shape this schema publishes.
+ *
+ * #2416 reserved the namespace; #3968 adds its first typed FIELD — `covers`,
+ * the runner-ownership claim (`clients/lsp/config.ts`'s
+ * `CustomServerConfig.covers`). The entry stays OPEN on every other field
+ * (`additionalProperties: true` — the loader owns those shapes' diagnostics
+ * today), so declaring `covers` narrows nothing a user already relies on.
+ * The type is the fail-closed half of the claim's validation: a non-array
+ * value or a non-string member is dropped by `config-core`'s `validate()`
+ * with a `PILENS_CFG_0005` record AT THE LEAF'S POINTER (file and tier
+ * attributed by the resolution), before any loader projects it. The ID
+ * semantics (a recognized dispatch runner id) are the loader's check — the
+ * schema cannot import the dispatch registry without closing a
+ * `no-client-cycles` cycle, so this node deliberately declares type, not
+ * enum.
+ *
+ * `x-merge-strategy: "replace"` is the core's default, spelled to state the
+ * intent: the nearest tier that sets `covers` supplies the WHOLE claim (the
+ * field belongs to the server entry's definition — no union of two tiers'
+ * claims), matching `x-merge-strategy`'s documented vocabulary rather than
+ * introducing a strategy kind.
+ */
+function lspServerEntryNode(): ConfigSchemaNode {
+	return {
+		type: "object",
+		additionalProperties: true,
+		[STABILITY_TIER_KEY]: "experimental",
+		properties: {
+			covers: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[MERGE_STRATEGY_KEY]: "replace",
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			name: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+			enabled: { type: "boolean", [STABILITY_TIER_KEY]: "experimental" },
+			role: {
+				type: "string",
+				enum: ["language", "auxiliary"],
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			// `command` accepts string here solely for the compatibility window;
+			// ResolvedLspConfig makes argv the only canonical output.
+			command: { [STABILITY_TIER_KEY]: "experimental" },
+			args: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			extensions: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			rootMarkers: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			env: {
+				type: "object",
+				additionalProperties: {
+					type: "string",
+					[STABILITY_TIER_KEY]: "experimental",
+				},
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			initializationOptions: {
+				type: "object",
+				additionalProperties: true,
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+		},
+	};
+}
+
+function lspServerOverrideNode(): ConfigSchemaNode {
+	return {
+		type: "object",
+		additionalProperties: true,
+		[STABILITY_TIER_KEY]: "experimental",
+		properties: {
+			command: { [STABILITY_TIER_KEY]: "experimental" },
+			env: {
+				type: "object",
+				additionalProperties: {
+					type: "string",
+					[STABILITY_TIER_KEY]: "experimental",
+				},
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			initializationOptions: {
+				type: "object",
+				additionalProperties: true,
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+		},
+	};
 }
 
 function lspNamespace(): ConfigSchemaNode {
@@ -156,7 +256,15 @@ function lspNamespace(): ConfigSchemaNode {
 		properties[key] = {
 			...(declared ? { type: declared } : {}),
 			[STABILITY_TIER_KEY]: "experimental",
-			...(declared === "object" ? { additionalProperties: true } : {}),
+			...(declared === "object"
+				? key === "servers"
+					? // #3968: server entries are TYPED — each carries the covers
+						// claim node — while staying open on every other field.
+						{ additionalProperties: lspServerEntryNode() }
+					: key === "serverOverrides"
+						? { additionalProperties: lspServerOverrideNode() }
+						: { additionalProperties: true }
+				: {}),
 			...denyAnnotation(key),
 		};
 	}
@@ -165,6 +273,33 @@ function lspNamespace(): ConfigSchemaNode {
 		additionalProperties: true,
 		[STABILITY_TIER_KEY]: "stable",
 		properties,
+	};
+}
+
+/** The shared public rule policy shape (#4226). */
+function rulePolicyEntryNode(): ConfigSchemaNode {
+	return {
+		type: "object",
+		additionalProperties: true,
+		properties: {
+			threshold: { type: "number", [STABILITY_TIER_KEY]: "experimental" },
+			// These two legacy fields remain opaque so the project compatibility
+			// parser can preserve its established field-specific diagnostics.
+			disable: opaque("experimental"),
+			select: opaque("experimental"),
+			ignorePaths: {
+				type: "array",
+				items: {
+					type: "string",
+					minLength: 1,
+					[STABILITY_TIER_KEY]: "experimental",
+				},
+				[MERGE_STRATEGY_KEY]: "append",
+				[DENY_KEY]: "array-union",
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+		},
+		[STABILITY_TIER_KEY]: "experimental",
 	};
 }
 
@@ -182,6 +317,31 @@ function buildConfigSchema(): ConfigSchemaNode {
 	]) {
 		properties[key] = opaque("stable");
 	}
+	properties.tools = {
+		type: "object",
+		additionalProperties: true,
+		properties: Object.fromEntries(
+			LENS_TOOL_NAMES.map((name) => [
+				name,
+				{
+					type: "object",
+					additionalProperties: true,
+					properties: {
+						enabled: { type: "boolean", [STABILITY_TIER_KEY]: "experimental" },
+					},
+					[STABILITY_TIER_KEY]: "experimental",
+				},
+			]),
+		),
+		[STABILITY_TIER_KEY]: "stable",
+	};
+	// Rule ids are an open keyed map, but their policy fields are shared config
+	// leaves so global and project policy merge field-wise with provenance.
+	properties.rules = {
+		type: "object",
+		additionalProperties: rulePolicyEntryNode(),
+		[STABILITY_TIER_KEY]: "experimental",
+	};
 
 	// Namespaces owned by another tool that ride in the same file (`trivy`,
 	// `helm`). Reserved so they survive validation, `experimental` because their
@@ -189,6 +349,45 @@ function buildConfigSchema(): ConfigSchemaNode {
 	for (const key of PROJECT_FOREIGN_CONFIG_NAMESPACES) {
 		properties[key] ??= opaque("experimental");
 	}
+
+	for (const key of [
+		"knip",
+		"jscpd",
+		"madge",
+		"gitleaks",
+		"govulncheck",
+		"deadCode",
+		"complexity",
+	]) {
+		properties[key] = {
+			type: "object",
+			additionalProperties: true,
+			properties: {
+				enabled: { type: "boolean", [STABILITY_TIER_KEY]: "experimental" },
+			},
+			[STABILITY_TIER_KEY]: "stable",
+		};
+	}
+	properties.startup = {
+		type: "object",
+		additionalProperties: true,
+		properties: {
+			mode: {
+				type: "string",
+				enum: ["quick", "full", "minimal"],
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			scans: {
+				type: "object",
+				additionalProperties: true,
+				properties: {
+					enabled: { type: "boolean", [STABILITY_TIER_KEY]: "experimental" },
+				},
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+		},
+		[STABILITY_TIER_KEY]: "stable",
+	};
 
 	// The four legacy ROOT LSP keys. Still accepted for their deprecation window
 	// (#2418 registry), and `experimental` because they are scheduled for

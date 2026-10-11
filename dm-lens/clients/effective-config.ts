@@ -55,6 +55,7 @@ import { getGlobalDmLensDir } from "./file-utils.js";
 import { type LanguageEntry, resolveLanguage } from "./language-registry.js";
 import { getDmLensGlobalConfigPath } from "./lens-config.js";
 import {
+	customServerSpecsOf,
 	explainServersForFile,
 	lspConfigOf,
 	registerLSPConfig,
@@ -68,7 +69,9 @@ import {
 // apart on a Windows-shaped path (AGENTS.md defect shape 2).
 import { isSameOrWithin } from "./lsp/server.js";
 import { homeRelativePath } from "./path-utils.js";
+import { resolveToolCwd } from "./tool-cwd.js";
 import { compareOrdinal } from "./string-utils.js";
+import { LENS_TOOL_NAMES, resolveLensToolEnabled } from "./tool-config.js";
 
 export interface EffectiveConfigOptions {
 	/** Workspace the resolution is performed for. Defaults to `process.cwd()`. */
@@ -83,6 +86,7 @@ export interface EffectiveConfigOptions {
 	readonly redact?: true;
 	/** `$HOME` used for home-relative rewriting. Test seam only. */
 	readonly homeDir?: string;
+	readonly noTools?: string | readonly string[];
 }
 
 /**
@@ -98,16 +102,30 @@ export interface EffectiveConfigOptions {
  * list is taken at `cwd` itself, exactly as if no `file` had been asked
  * about at all.
  */
-export type EffectiveConfigDocument = ConfigDocumentSummary;
+type EffectiveConfigDocument = ConfigDocumentSummary;
 
 /** A custom server's definition, reduced to what cannot carry a secret. */
-export interface RedactedServerSpec {
+interface RedactedServerSpec {
 	/** `argv[0]` only. */
 	readonly command?: string;
 	/** How many argv entries the definition carries, including `argv[0]`. */
 	readonly argvCount: number;
 	/** Env NAMES, sorted. Values never appear on this surface. */
 	readonly envNames: readonly string[];
+	/**
+	 * The runner-ownership claim, as the resolved config carries it (#3968).
+	 * Runner ids are not secret and do not name paths or env values: a covers
+	 * value renders so `effective_config` answers "why did this runner defer"
+	 * from the same view that renders the server. `command`/`args`/`env` keep
+	 * their existing redaction untouched. Absent when the entry carries none;
+	 * the runtime loader (`lspConfigOf`) has already dropped unknown runner-id
+	 * members from the SESSION's copy, and the core's validation drops
+	 * non-array values at the leaf, so this projects the resolved value's
+	 * claim — a value the runtime will not act on would render only when the
+	 * resolution this view was built from predates the drop (never: one
+	 * resolution, two consumers).
+	 */
+	readonly covers?: readonly string[];
 }
 
 /** One server's answer for a file, with the reason and the tier that decided. */
@@ -124,15 +142,16 @@ export interface EffectiveServerDecision {
 }
 
 /** Why a runner did or did not make a file's dispatch plan. */
-export type ToolSelectionReason =
+type ToolSelectionReason =
 	| "selected"
 	| "not-registered-for-kind"
 	| "no-dispatch-plan";
 
-export interface EffectiveToolDecision {
+interface EffectiveToolDecision {
 	readonly id: string;
 	readonly selected: boolean;
 	readonly reason: ToolSelectionReason;
+	readonly resolvedCwd: string;
 }
 
 /** The per-file half: language, servers, tools. */
@@ -173,6 +192,7 @@ export interface EffectiveConfigView {
 	readonly provenanceCounts: Readonly<Record<SourceTier, number>>;
 	/** The stable `PILENS_CFG_*` codes this resolution produced, with counts. */
 	readonly recordCounts: Readonly<Record<string, number>>;
+	readonly tools: readonly { name: string; enabled: boolean }[];
 	/**
 	 * Absent when no `file` was asked about. `{ error }` when one was named but
 	 * lies outside `cwd` — never a view resolved against a tree unrelated to the
@@ -211,10 +231,23 @@ function redactServerSpec(entry: unknown): RedactedServerSpec | undefined {
 		typeof record.env === "object" && record.env !== null
 			? Object.keys(record.env as Record<string, unknown>).sort(compareOrdinal)
 			: [];
+	// The resolved value is validate()'s output, so a covers key present here
+	// is an array; a defensive member check keeps a hand-built resolution (a
+	// caller that skipped validate(), contract-citing merge.ts) from rendering
+	// a non-string member as a runner id.
+	const rawCovers = record.covers;
+	let covers: string[] | undefined;
+	if (Array.isArray(rawCovers)) {
+		covers = [];
+		for (const member of rawCovers as unknown[]) {
+			if (typeof member === "string") covers.push(member);
+		}
+	}
 	return {
 		...(command === undefined ? {} : { command }),
 		argvCount: (command === undefined ? 0 : 1) + args.length,
 		envNames: env,
+		...(covers === undefined || covers.length === 0 ? {} : { covers }),
 	};
 }
 
@@ -297,13 +330,16 @@ function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
  * tree nothing initialized, which would report every server as selected — and
  * round 2 got it by calling `initLSPConfig(cwd, { report: false })`. That
  * inverted this surface's own guarantee: `initLSPConfig` is the session-root
- * registry's single writer and the `workspaceConfigs` LRU's only producer, so
+ * registry's single writer and the per-root config store's only producer, so
  * a question about a foreign directory enrolled it as a served LSP root
  * (widening the #2052 access gate) and, after ~40 such questions, evicted a
- * live root's config from the 32-entry LRU — silently lifting the operator's
- * `disabledServers` denial, which is precisely what this surface promises
- * cannot happen. `sessionRoots` is capped at 128, so `shouldInitializeSessionRoot`
- * never repaired it either.
+ * live root's config from what was then a separate 32-entry LRU — silently
+ * lifting the operator's `disabledServers` denial, which is precisely what
+ * this surface promises cannot happen, and `shouldInitializeSessionRoot` never
+ * repaired it because the 128-entry registry still reported the root served.
+ * #2518 collapsed those two containers into one entry per root, so the second
+ * half of that failure is gone; the first half — a read-only query enrolling a
+ * foreign root at all — is still this surface's own to avoid
  *
  * So the query DERIVES the config instead: `lspConfigOf` (the projection
  * `loadLSPConfig` returns, minus the notices — rule 2) through the same
@@ -367,7 +403,9 @@ export async function effectiveConfig(
 		resolveDmLensConfig({
 			cwd: dir,
 			globalDir: getGlobalDmLensDir(),
-			globalConfigPath: getDmLensGlobalConfigPath(homeDir),
+			// Production resolution for the global tier — see loadLSPConfig's
+			// comment (global-config-location PR, refs #2457).
+			globalConfigPath: getDmLensGlobalConfigPath(),
 			homeDir,
 		});
 
@@ -440,6 +478,15 @@ export async function effectiveConfig(
 		provenance: provenanceView(resolved, homeDir).entries,
 		provenanceCounts: summary.countsByTier,
 		recordCounts: countBy(resolution.records, (record) => record.code),
+		tools: LENS_TOOL_NAMES.map((name) => ({
+			name,
+			enabled: resolveLensToolEnabled(
+				name,
+				resolved.value,
+				undefined,
+				options.noTools,
+			),
+		})),
 		...(fileOutsideCwd
 			? {
 					file: {
@@ -455,14 +502,17 @@ export async function effectiveConfig(
 							absolute,
 							resolved,
 							homeDir,
+							cwd,
 							// The gates read the LSP slice of that SAME resolution, through
 							// the same `registerLSPConfig` conversion `initLSPConfig` uses —
-							// no session-root registration, no `workspaceConfigs` LRU write
+							// no session-root registration, no per-root config-store write
 							// (P11/P12). Computed here rather than hoisted into a
 							// `{ absolute, lspConfig }` struct (#2520): `absolute` is already
 							// this branch's narrowed local, so the struct's own field was
 							// carrying the same fact twice.
-							registerLSPConfig(lspConfigOf(resolution.value)),
+							registerLSPConfig(
+								lspConfigOf(resolution.value, undefined, resolution.provenance),
+							),
 						),
 					}),
 	};
@@ -489,17 +539,17 @@ async function fileView(
 	absolute: string,
 	resolved: Resolved<Record<string, unknown>>,
 	homeDir: string,
+	workspaceCwd: string,
 	lspConfig: RegisteredLSPConfig,
 ): Promise<EffectiveFileView> {
 	const language: LanguageEntry | undefined = resolveLanguage(absolute);
 	const kind = detectFileKind(absolute);
 	const section = lspSectionOf(resolved.value);
-	const customServers =
-		typeof section.servers === "object" &&
-		section.servers !== null &&
-		!Array.isArray(section.servers)
-			? (section.servers as Record<string, unknown>)
-			: {};
+	// The redacted spec reads the SAME validated projection the gates register
+	// (`customServerSpecsOf`), not the raw section: the covers values rendered
+	// here are the claim the runtime holds, and a member the loader dropped
+	// cannot render as if it would defer anything (#3968).
+	const customServers = customServerSpecsOf(resolved.value);
 
 	// The provenance that answers "why can I not turn THIS one back on".
 	//
@@ -579,6 +629,13 @@ async function fileView(
 		id,
 		selected: available.has(id),
 		reason: toolReason(available.has(id), kind),
+		resolvedCwd: homeRelativePath(
+			resolveToolCwd("runner", id, absolute, {
+				cwd: workspaceCwd,
+				suppressTelemetry: true,
+			}).cwd,
+			homeDir,
+		),
 	}));
 
 	return {

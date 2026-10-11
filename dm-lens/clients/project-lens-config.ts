@@ -70,6 +70,8 @@ import {
 	assignFlagConfigSection,
 	flagConfigSectionKeys,
 	GLOBAL_NON_FLAG_CONFIG_SECTIONS,
+	GLOBAL_ONLY_NON_FLAG_KEYS,
+	hasFlagConfigPath,
 	LENS_FLAGS,
 	type LensFlagSpec,
 	PROJECT_FOREIGN_CONFIG_NAMESPACES,
@@ -82,6 +84,7 @@ import {
 	type ConfigLocation,
 	configSearchDirs,
 	getDmLensGlobalConfigPath,
+	isResolvedGlobalConfigPath,
 	PROJECT_CONFIG_BASENAMES,
 	PROJECT_CONFIG_LOCATIONS,
 } from "./config-locations.js";
@@ -105,7 +108,11 @@ import {
 	isAtOrAboveHomeDir,
 	walkUpDirs,
 } from "./path-utils.js";
-import { findDmLensConfigMarkerInDir } from "./workspace-topology.js";
+import {
+	dirMtimesStillFresh,
+	findDmLensConfigMarkerInDir,
+} from "./workspace-topology.js";
+import { readToolConfig } from "./tool-config.js";
 
 /**
  * Project config basenames, in DESCENDING precedence (first match wins), for
@@ -118,7 +125,7 @@ import { findDmLensConfigMarkerInDir } from "./workspace-topology.js";
  */
 export { PROJECT_CONFIG_BASENAMES } from "./config-locations.js";
 
-export interface DmLensProjectRuleConfig {
+interface DmLensProjectRuleConfig {
 	/** Optional override for the rule's primary numeric threshold. */
 	threshold?: number;
 	/**
@@ -143,14 +150,16 @@ export interface DmLensProjectRuleConfig {
 	 * explicit exclusion trumps explicit inclusion).
 	 */
 	select?: string[];
+	/** Project rule paths excluded from the rule's scan and output. */
+	ignorePaths?: string[];
 }
 
-export interface DmLensProjectMutationConfig {
+interface DmLensProjectMutationConfig {
 	/** Whether this mutation path is enabled for the project. */
 	enabled?: boolean;
 }
 
-export interface DmLensProjectReviewGraphConfig {
+interface DmLensProjectReviewGraphConfig {
 	/**
 	 * Explicit review-graph file budget, clamped to `[100, 20_000]`.
 	 * `undefined` means "derive from `maxProjectFiles` via the taper".
@@ -163,6 +172,11 @@ const REVIEW_GRAPH_MAX_FILES_MIN = 100;
 const REVIEW_GRAPH_MAX_FILES_MAX = 20_000;
 
 export interface DmLensProjectConfig {
+	tools?: Record<string, { enabled?: boolean }>;
+	startup?: {
+		mode?: "quick" | "full" | "minimal";
+		scans?: { enabled?: boolean };
+	};
 	/** gitignore-style glob patterns added to every diagnostic scan. */
 	ignore: string[];
 	/** Per-rule threshold overrides; missing keys mean "use hardcoded default". */
@@ -350,8 +364,17 @@ export function loadDmLensProjectConfig(
 	// a dm-lens-owned file were then produced by nobody at all. The dm-lens
 	// loader now enumerates those documents itself, for records only: nothing
 	// here is merged, and which file supplies a VALUE is unchanged.
-	reportDmLensConfigRecords(entry.legacyRecords);
 	const configInfo = preloadedInfo ?? freshInfoFor(entry);
+	// The selected legacy document is resolved below and its bounded migration
+	// records are cached with that projection. Reporting the discovery copy as
+	// well would produce two suppression records with different totals, because
+	// the discovery walk and the single-document resolution see different
+	// record populations. Keep discovery-only documents here; the selected file
+	// is reported by `loadCachedConfigFile`.
+	const selectedLegacyPath = configInfo?.path;
+	reportDmLensConfigRecords(
+		entry.legacyRecords.filter((record) => record.file !== selectedLegacyPath),
+	);
 	if (!configInfo) return EMPTY_PROJECT_CONFIG;
 	return loadCachedConfigFile(configInfo);
 }
@@ -491,11 +514,7 @@ function safeDirMtimeMs(dir: string): number {
 }
 
 function discoveryCacheStillFresh(entry: DiscoveryCacheEntry): boolean {
-	if (
-		!entry.dirMtimes.every(
-			(cached) => safeDirMtimeMs(cached.dir) === cached.mtimeMs,
-		)
-	) {
+	if (!dirMtimesStillFresh(entry.dirMtimes)) {
 		return false;
 	}
 	// #2483 round 2. When no config was found anywhere, `bearingDirMtimes`'s
@@ -557,6 +576,11 @@ function discoverDmLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 		if (!info) {
 			for (const name of PROJECT_CONFIG_BASENAMES) {
 				const candidate = path.join(dir, name);
+				// The global tier reads its file by absolute path; a candidate that
+				// IS that file is refused here rather than adopted as a project
+				// config, which would double-read and double-validate it
+				// (global-config-location PR, refs #2457).
+				if (isResolvedGlobalConfigPath(candidate)) continue;
 				const stat = safeFileStat(candidate);
 				if (stat?.isFile()) {
 					info = {
@@ -571,6 +595,7 @@ function discoverDmLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 		}
 		for (const location of LEGACY_PROJECT_LOCATIONS) {
 			const file = path.join(dir, location.relativePath);
+			if (isResolvedGlobalConfigPath(file)) continue;
 			const stat = safeFileStat(file);
 			if (!stat?.isFile()) continue;
 			legacySources.push({
@@ -723,6 +748,28 @@ function parseRulePolicyList(
 	return { list, invalid: false };
 }
 
+function parseRulePathList(
+	note: NoteIgnored,
+	ruleId: string,
+	value: unknown,
+): string[] | undefined {
+	if (!Array.isArray(value)) {
+		note(`rules.${ruleId}.ignorePaths must be an array of strings`);
+		return undefined;
+	}
+	const paths = value
+		.filter(
+			(entry): entry is string =>
+				typeof entry === "string" && entry.trim().length > 0,
+		)
+		.map((entry) => entry.trim());
+	if (value.length > 0 && paths.length === 0) {
+		note(`rules.${ruleId}.ignorePaths must contain a non-empty string`);
+		return undefined;
+	}
+	return paths;
+}
+
 /** A parsed config plus the two classes of record it produced. */
 interface ParsedConfigFile {
 	config: DmLensProjectConfig;
@@ -798,7 +845,15 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 	// after the first silently lost the `config-deprecated` ledger row despite
 	// the file still being the exact deprecated one on disk.
 	const raw: unknown = resolved.value;
-	const obj = resolved.value;
+	// The legacy project projection owns the field-specific `rules.*` parser
+	// contract. Keep the shared validation for every other section, but let this
+	// parser see malformed rule entries so it can retain its established notices
+	// instead of replacing them with a generic config-core record.
+	const rawProject = outcome.value as Record<string, unknown>;
+	const obj: Record<string, unknown> = {
+		...resolved.value,
+		...(rawProject.rules !== undefined ? { rules: rawProject.rules } : {}),
+	};
 
 	const ignore = Array.isArray(obj.ignore)
 		? obj.ignore.filter((p): p is string => typeof p === "string")
@@ -807,6 +862,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 	for (const spec of PROJECT_SCOPED_LENS_FLAGS) {
 		assignFlagConfigSection(obj, mutations, spec.configKey, note);
 	}
+	const toolConfig = readToolConfig(obj, note);
 
 	const rules: Record<string, DmLensProjectRuleConfig> = {};
 	if (obj.rules && typeof obj.rules === "object" && !Array.isArray(obj.rules)) {
@@ -844,14 +900,28 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 				if (!parsed.invalid && parsed.list.length > 0)
 					entry.select = parsed.list;
 			}
+			if ("ignorePaths" in r) {
+				const paths = parseRulePathList(note, ruleId, r.ignorePaths);
+				if (paths && paths.length > 0) entry.ignorePaths = paths;
+			}
 			// Honor both threshold-only and policy-only entries; only drop if
 			// the entry had no recognized fields at all (e.g. { unrelated: true }).
 			// A recognized-but-malformed field already warned above, so only warn
 			// here when nothing recognized was spelled at all — #444 proposed
 			// `only` rather than `select`, and that typo must not fail silent.
-			if (entry.threshold !== undefined || entry.disable || entry.select) {
+			if (
+				entry.threshold !== undefined ||
+				entry.disable ||
+				entry.select ||
+				entry.ignorePaths
+			) {
 				rules[ruleId] = entry;
-			} else if (!("threshold" in r) && !("disable" in r) && !("select" in r)) {
+			} else if (
+				!("threshold" in r) &&
+				!("disable" in r) &&
+				!("select" in r) &&
+				!("ignorePaths" in r)
+			) {
 				note(
 					`rules.${ruleId} has no recognized setting (threshold, disable, select); ignored`,
 				);
@@ -897,6 +967,48 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		}
 	}
 
+	let startup: DmLensProjectConfig["startup"];
+	if (obj.startup !== undefined) {
+		if (
+			!obj.startup ||
+			typeof obj.startup !== "object" ||
+			Array.isArray(obj.startup)
+		) {
+			note("startup must be an object");
+		} else {
+			const section = obj.startup as Record<string, unknown>;
+			if (
+				section.mode === "quick" ||
+				section.mode === "full" ||
+				section.mode === "minimal"
+			) {
+				startup = { mode: section.mode };
+			} else if ("mode" in section) {
+				note('startup.mode must be "quick", "full", or "minimal"');
+			}
+			if (section.scans !== undefined) {
+				if (
+					!section.scans ||
+					typeof section.scans !== "object" ||
+					Array.isArray(section.scans)
+				) {
+					note("startup.scans must be an object");
+				} else if (
+					typeof (section.scans as Record<string, unknown>).enabled ===
+					"boolean"
+				) {
+					startup ??= {};
+					startup.scans = {
+						enabled: (section.scans as Record<string, unknown>)
+							.enabled as boolean,
+					};
+				} else if ("enabled" in (section.scans as Record<string, unknown>)) {
+					note("startup.scans.enabled must be a boolean");
+				}
+			}
+		}
+	}
+
 	// #533 hygiene: mirror the global loader's unknown-key warn so a typo in a
 	// shared `.dm-lens.json` (e.g. `maxProjectFile`, `lps`) produces a signal
 	// instead of silently doing nothing. The recognized set is single-sourced
@@ -927,6 +1039,15 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 	const globalScopeOnlyFlagKeys = LENS_FLAGS.map(
 		(spec) => spec.configKey,
 	).filter((configKey) => !projectScoped.has(configKey));
+	// Non-flag global-only keys sitting inside an otherwise project-recognized
+	// section (#3131) — `actionableWarnings.autoFix.maxFixes` is not a
+	// `LENS_FLAGS` entry (no CLI flag, not boolean), so it is invisible to the
+	// derivation above. `GLOBAL_ONLY_NON_FLAG_KEYS` is the single place that
+	// population is enumerated instead of a second hand-typed list here.
+	const globalScopeOnlyDottedKeys: readonly string[] = [
+		...globalScopeOnlyFlagKeys,
+		...GLOBAL_ONLY_NON_FLAG_KEYS,
+	];
 	// The literal path is derived, not hand-typed (#2426 review round 3, S1):
 	// under `DM_LENS_CONFIG_PATH` the canonical global config is NOT
 	// `~/.dm-lens/config.json`, and a hardcoded string in this notice would name
@@ -936,10 +1057,21 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		os.homedir(),
 	);
 	const warnUnhonoredKey = (label: string, globalOnly: boolean): void => {
+		if (!globalOnly) {
+			note(
+				`unknown key "${label}" is not a recognized dm-lens setting (check for a typo); ignored`,
+			);
+			return;
+		}
+		// Only a `LENS_FLAGS` entry has a CLI flag (#3150): the label is either the
+		// flag's own dotted key or a section that holds one.
+		const hasCliFlag = LENS_FLAGS.some(
+			({ configKey }) =>
+				configKey === label || configKey.startsWith(`${label}.`),
+		);
+		const cliClause = hasCliFlag ? " or pass the matching CLI flag" : "";
 		note(
-			globalOnly
-				? `"${label}" is a global-only dm-lens setting and is not honored in a project .dm-lens.json (set it in ${globalConfigLabel} or pass the matching CLI flag); ignored`
-				: `unknown key "${label}" is not a recognized dm-lens setting (check for a typo); ignored`,
+			`"${label}" is a global-only dm-lens setting and is not honored in a project .dm-lens.json (set it in ${globalConfigLabel}${cliClause}); ignored`,
 		);
 	};
 	for (const key of Object.keys(obj)) {
@@ -964,7 +1096,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			const dotted = `${namespace}.${key}`;
 			warnUnhonoredKey(
 				dotted,
-				globalScopeOnlyFlagKeys.some(
+				globalScopeOnlyDottedKeys.some(
 					(configKey) =>
 						configKey === dotted || configKey.startsWith(`${dotted}.`),
 				),
@@ -972,8 +1104,42 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		}
 	}
 
+	// MIXED-SCOPE SECTIONS (#3112, #3131). A section can be project-scoped as a
+	// whole and still hold a global-only setting: `tools` carries the
+	// project-owned per-tool `enabled` leaves AND the global `tools.lazy`
+	// (`--no-lazy-tools`), the same split `lsp` has (#2426 review round 2, F3);
+	// `actionableWarnings` carries the project-owned `autoFix.enabled` AND the
+	// global-only `autoFix.maxFixes`, which is not even a flag (#3131). The
+	// top-level scan above sees only the SECTION name, so a global-only setting
+	// written inside a recognized project section was dropped with no signal at
+	// all — the thing `docs/configuration.md` promises never happens.
+	//
+	// WHICH sub-keys those are is DERIVED from the registry — `LENS_FLAGS` for
+	// flag keys, `GLOBAL_ONLY_NON_FLAG_KEYS` for the rest — never listed here,
+	// so there is no second scope table to drift from the first. A key whose
+	// SECTION is not recognized at project scope is skipped: the top-level
+	// scan already reported that whole section, and a second notice naming the
+	// same setting twice under two spellings is the duplicate-notice noise #2426
+	// review round 6 removed. Everything else under a recognized section is left
+	// to that section's own parser — `readToolConfig` reports an unknown tool
+	// name under its own code (`PILENS_CFG_0009`).
+	//
+	// An enumerated-honored-keys namespace (`lsp`) needs no skip here: the loop
+	// above reports the very same dotted key with the very same reason, and
+	// `warnIgnoredConfigOnce`'s latch collapses the two into one notice. A skip
+	// for it was written and then deleted — mutating it out changed no output.
+	for (const configKey of globalScopeOnlyDottedKeys) {
+		const dotIndex = configKey.indexOf(".");
+		if (dotIndex < 0) continue;
+		if (!knownProjectKeys.has(configKey.slice(0, dotIndex))) continue;
+		if (!hasFlagConfigPath(obj, configKey)) continue;
+		warnUnhonoredKey(configKey, true);
+	}
+
 	return {
 		config: {
+			...(toolConfig === undefined ? {} : { tools: toolConfig }),
+			...(startup === undefined ? {} : { startup }),
 			ignore,
 			rules,
 			...(mutations as Pick<
@@ -985,7 +1151,9 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			raw,
 			configPath,
 		},
-		records: resolved.records,
+		records: resolved.records.filter(
+			(record) => !record.key.startsWith("/rules/"),
+		),
 		ignored: ignoredRecords(),
 	};
 }

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ExtensionAPI } from "@duckmind/dm-coding-agent";
 import { RUNTIME_AGENT_REGISTER_EVENT, registerAgent, registerAgentViaEvents, type RuntimeAgentRegistrationRequest } from "../../src/api/agents.ts";
 import { registerRuntimeAgentEventListener } from "../../src/agents/runtime-agent-events.ts";
-import { handleList } from "../../src/agents/agent-management.ts";
+import { handleList, handleManagementAction } from "../../src/agents/agent-management.ts";
 import { discoverAgents, discoverAgentsAll } from "../../src/agents/agents.ts";
 import { clearRuntimeAgentsForPi, mergeRuntimeAgents } from "../../src/agents/runtime-agent-registry.ts";
 
@@ -42,6 +42,11 @@ function makeEventBus(): ExtensionAPI["events"] {
 
 function makePiWithEvents(events: ExtensionAPI["events"]): ExtensionAPI {
 	return { on() {}, registerTool() {}, events } as unknown as ExtensionAPI;
+}
+
+function writeJson(filePath: string, value: unknown): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
 }
 
 function writeProjectAgent(name: string, aliases: string[] = []): void {
@@ -120,6 +125,23 @@ describe("runtime agent registration", () => {
 		assert.equal(agent?.inheritProjectContext, true);
 		assert.equal(agent?.inheritGlobalContext, true);
 
+		registration.dispose();
+	});
+
+	it("preserves excludeTools on runtime agents", () => {
+		const registration = registerAgent({
+			dm,
+			name: "runtime-exclude-helper",
+			definition: {
+				description: "Runtime exclude helper",
+				systemPrompt: "Help at runtime.",
+				tools: ["read", "write"],
+				excludeTools: ["write", "unknown_tool"],
+			},
+		});
+
+		const agent = mergeRuntimeAgents(dm, discoverAgents(tempProject, "both")).agents.find((candidate) => candidate.name === "runtime-exclude-helper");
+		assert.deepEqual(agent?.excludeTools, ["write", "unknown_tool"]);
 		registration.dispose();
 	});
 
@@ -210,6 +232,194 @@ describe("runtime agent registration", () => {
 		const listed = handleList({}, { cwd: tempProject, modelRegistry: { getAvailable: () => [] }, runtimeAgentOwner: dm });
 		const text = listed.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("\n");
 		assert.match(text, /- runtime-helper \(runtime, aliases: helper\): Runtime helper/);
+	});
+
+	it("reports runtime agent model mappings by name and alias", () => {
+		const registration = registerAgent({
+			dm,
+			name: "runtime-model-helper",
+			definition: {
+				description: "Runtime model helper",
+				systemPrompt: "Help with model routing.",
+				aliases: ["model-helper"],
+				model: "openai/gpt-5-mini",
+				thinking: "high",
+			},
+		});
+		try {
+			const ctx = {
+				cwd: tempProject,
+				modelRegistry: {
+					getAvailable: () => [
+						{ provider: "openai", id: "gpt-5-mini" },
+						{ provider: "anthropic", id: "claude-sonnet-4" },
+					],
+				},
+				model: { provider: "openai", id: "gpt-5-mini" },
+				runtimeAgentOwner: dm,
+			};
+			const all = handleManagementAction("models", {}, ctx);
+			const allText = all.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("\n");
+			assert.equal(all.isError, false);
+			assert.match(allText, /runtime-model-helper\n  model:\n    openai\/gpt-5-mini\n  source: runtime agent config\n  thinking: high/);
+
+			const filtered = handleManagementAction("models", { agent: "model-helper" }, ctx);
+			const filteredText = filtered.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("\n");
+			assert.equal(filtered.isError, false);
+			assert.match(filteredText, /Agent: model-helper/);
+			assert.match(filteredText, /Effective model:\n  openai\/gpt-5-mini/);
+			assert.match(filteredText, /Source: runtime agent config/);
+		} finally {
+			registration.dispose();
+		}
+	});
+
+	it("applies subagent default model and thinking to runtime agents that declare none", () => {
+		writeJson(path.join(tempHome, ".dm", "agent", "settings.json"), {
+			subagents: { defaultModel: "openai/gpt-5-mini", defaultThinking: "low" },
+		});
+		const unpinned = registerAgent({
+			dm,
+			name: "runtime-default-helper",
+			definition: { description: "Runtime default helper", systemPrompt: "Help.", tools: ["read"] },
+		});
+		const pinned = registerAgent({
+			dm,
+			name: "runtime-pinned-helper",
+			definition: { description: "Runtime pinned helper", systemPrompt: "Help.", model: "anthropic/claude-sonnet-4" },
+		});
+		try {
+			const settings = { cwd: tempProject, scope: "both" as const };
+			const merged = mergeRuntimeAgents(dm, discoverAgents(tempProject, "both"), undefined, settings).agents;
+			const defaulted = merged.find((candidate) => candidate.name === "runtime-default-helper");
+			assert.equal(defaulted?.model, "openai/gpt-5-mini");
+			assert.equal(defaulted?.thinking, "low");
+			assert.equal(defaulted?.modelSource?.type, "subagents.defaultModel");
+			assert.equal(defaulted?.modelSource?.scope, "user");
+			assert.deepEqual(defaulted?.tools, ["read"]);
+			assert.equal(defaulted?.systemPrompt, "Help.");
+
+			const kept = merged.find((candidate) => candidate.name === "runtime-pinned-helper");
+			assert.equal(kept?.model, "anthropic/claude-sonnet-4");
+			assert.equal(kept?.modelSource, undefined);
+			assert.equal(kept?.thinking, "low");
+
+			const bare = mergeRuntimeAgents(dm, discoverAgents(tempProject, "both")).agents
+				.find((candidate) => candidate.name === "runtime-default-helper");
+			assert.equal(bare?.model, undefined, "without a settings context the registered definition is returned as-is");
+		} finally {
+			unpinned.dispose();
+			pinned.dispose();
+		}
+	});
+
+	it("applies only model-tier agentOverrides fields to runtime agents, project over user", () => {
+		writeJson(path.join(tempHome, ".dm", "agent", "settings.json"), {
+			subagents: {
+				defaultModel: "openai/gpt-5-mini",
+				agentOverrides: {
+					"runtime-override-helper": {
+						model: "anthropic/claude-sonnet-4",
+						thinking: "high",
+						tools: ["bash"],
+						systemPrompt: "Replaced by settings.",
+						disabled: true,
+					},
+					"runtime-cleared-helper": { thinking: "high" },
+				},
+			},
+		});
+		writeJson(path.join(tempProject, ".dm", "settings.json"), {
+			subagents: {
+				agentOverrides: {
+					"runtime-override-helper": { thinking: "medium" },
+					"runtime-cleared-helper": { model: false },
+				},
+			},
+		});
+		const overridden = registerAgent({
+			dm,
+			name: "runtime-override-helper",
+			definition: { description: "Runtime override helper", systemPrompt: "Help.", tools: ["read"] },
+		});
+		const cleared = registerAgent({
+			dm,
+			name: "runtime-cleared-helper",
+			definition: { description: "Runtime cleared helper", systemPrompt: "Help.", model: "openai/gpt-5-mini" },
+		});
+		try {
+			const merged = mergeRuntimeAgents(dm, discoverAgents(tempProject, "both"), undefined, { cwd: tempProject, scope: "both" }).agents;
+			const agent = merged.find((candidate) => candidate.name === "runtime-override-helper");
+			assert.equal(agent?.model, "anthropic/claude-sonnet-4", "user override model wins over defaultModel");
+			assert.equal(agent?.thinking, "medium", "project override thinking wins over user override thinking");
+			assert.deepEqual(agent?.tools, ["read"], "tools stay extension-owned");
+			assert.equal(agent?.systemPrompt, "Help.", "systemPrompt stays extension-owned");
+			assert.notEqual(agent?.disabled, true, "disabled is not honored for runtime agents");
+
+			const back = merged.find((candidate) => candidate.name === "runtime-cleared-helper");
+			assert.equal(back?.model, undefined, "model: false clears the definition model so the agent inherits the session model");
+			assert.equal(back?.thinking, "high");
+		} finally {
+			overridden.dispose();
+			cleared.dispose();
+		}
+	});
+
+	it("reports the subagent default model source for runtime agents", () => {
+		writeJson(path.join(tempHome, ".dm", "agent", "settings.json"), {
+			subagents: { defaultModel: "openai/gpt-5-mini" },
+		});
+		const registration = registerAgent({
+			dm,
+			name: "runtime-default-source-helper",
+			definition: { description: "Runtime default source helper", systemPrompt: "Help." },
+		});
+		try {
+			const ctx = {
+				cwd: tempProject,
+				modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt-5-mini" }] },
+				model: { provider: "anthropic", id: "claude-sonnet-4" },
+				runtimeAgentOwner: dm,
+			};
+			const filtered = handleManagementAction("models", { agent: "runtime-default-source-helper" }, ctx);
+			const text = filtered.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("\n");
+			assert.equal(filtered.isError, false);
+			assert.match(text, /Effective model:\n  openai\/gpt-5-mini/);
+			assert.match(text, /Source: user defaultModel/);
+		} finally {
+			registration.dispose();
+		}
+	});
+
+	it("reports provider-scoped model settings for runtime agents", () => {
+		writeJson(path.join(tempHome, ".dm", "agent", "settings.json"), {
+			subagents: {
+				agentOverridesByProvider: {
+					anthropic: {
+						"runtime-provider-helper": { model: "anthropic/claude-sonnet-4", thinking: "high" },
+					},
+				},
+			},
+		});
+		const registration = registerAgent({
+			dm,
+			name: "runtime-provider-helper",
+			definition: { description: "Runtime provider helper", systemPrompt: "Help." },
+		});
+		try {
+			const managed = handleManagementAction("models", { agent: "runtime-provider-helper" }, {
+				cwd: tempProject,
+				modelRegistry: { getAvailable: () => [{ provider: "anthropic", id: "claude-sonnet-4" }] },
+				model: { provider: "anthropic", id: "claude-sonnet-4" },
+				runtimeAgentOwner: dm,
+			});
+			const text = managed.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("\n");
+			assert.equal(managed.isError, false);
+			assert.match(text, /Effective model:\n  anthropic\/claude-sonnet-4/);
+			assert.match(text, /Thinking: high/);
+		} finally {
+			registration.dispose();
+		}
 	});
 
 	it("fails closed for builtin and duplicate runtime identities", () => {

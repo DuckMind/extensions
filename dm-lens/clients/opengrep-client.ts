@@ -44,18 +44,22 @@
  *
  * Scope note (#1562 class fix): the CLI scan is handed `--exclude` per shared
  * scratch/cache tree (`scratch-tree-policy.ts`) so a directory that isn't
- * gitignored (opengrep's own default exclusion) still doesn't reach the
- * agent as a finding — same `EXCLUDED_DIRS`-derived list gitleaks/trivy use.
+ * gitignored still doesn't reach the agent as a finding. Linked worktrees are
+ * deliberately not added to that argv list: opengrep's git-mode walk already
+ * skips nested checkouts, avoiding one expensive wcmatch pattern per checkout.
  *
  * Refs: #584, #111 (opengrep adoption), #387 (workspace-sweep serialization), #1562
  */
 
+import type { AnalysedRootSignal } from "./analysed-root.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { resolveOpengrepConfig } from "./opengrep-config.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { getScratchTreeDirNames } from "./scratch-tree-policy.js";
+import { realpathOrResolve } from "./path-utils.js";
+import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 
@@ -85,11 +89,19 @@ export interface OpengrepFinding {
 	cwe?: string[];
 }
 
-export interface OpengrepResult {
+export interface OpengrepResult extends AnalysedRootSignal {
 	success: boolean;
 	findings: OpengrepFinding[];
 	scannedAt: string;
 	summary?: string;
+	reason?:
+		| "not-installed"
+		| "spawn-failed"
+		| "no-report"
+		| "refused"
+		| "crashed"
+		| "partial-no-paths";
+	partial?: true;
 }
 
 const EMPTY_RESULT: Omit<OpengrepResult, "scannedAt"> = {
@@ -133,13 +145,14 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 	 * opengrep process (mirrors `GitleaksClient`/`JscpdClient`).
 	 */
 	async scan(cwd: string): Promise<OpengrepResult> {
-		const targetDir = path.resolve(cwd);
+		const targetDir = realpathOrResolve(cwd);
 		const scannedAt = new Date().toISOString();
 
 		if (!(await this.ensureAvailable())) {
 			return {
 				...EMPTY_RESULT,
 				scannedAt,
+				reason: "not-installed",
 				summary: "opengrep not installed",
 			};
 		}
@@ -151,7 +164,9 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 		const scannedAt = new Date().toISOString();
 		const bin = this.binaryPath ?? "opengrep";
 		const resolved = OpengrepClient.resolveConfig(cwd);
-		const outDir = mkdtempSync(path.join(os.tmpdir(), "dm-lens-opengrep-"));
+		const outDir = mkdtempSync(
+			path.join(scannerReportParentDir(), "dm-lens-opengrep-"),
+		);
 		const reportPath = path.join(outDir, "opengrep-report.json");
 		try {
 			const result = await safeSpawnAsync(
@@ -175,7 +190,13 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 					// pattern matches that directory name anywhere in the tree,
 					// independent of gitignore. Same `EXCLUDED_DIRS`-derived list
 					// gitleaks/trivy use, so the three scanners can't drift apart.
-					...getScratchTreeDirNames().flatMap((name) => ["--exclude", name]),
+					// Opengrep's git-mode walk already omits nested linked checkouts.
+					// Do not turn each registration into a wcmatch pattern: hundreds of
+					// patterns make the matcher quadratic and can hit its pattern limit.
+					...getScratchTreeDirNames().flatMap((pattern) => [
+						"--exclude",
+						pattern,
+					]),
 					cwd,
 				],
 				{ cwd, timeout: SCAN_TIMEOUT_MS },
@@ -183,35 +204,86 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 
 			if (result.error) {
 				this.log(`Scan error: ${result.error.message}`);
+				const reason = `${result.failure ?? "spawn-failed"}: ${result.error.message}`;
+				this.recordRefusal(cwd, reason, result.status);
 				return {
 					...EMPTY_RESULT,
 					scannedAt,
-					summary: result.error.message.slice(0, 200),
+					reason: "spawn-failed",
+					summary: reason.slice(0, 200),
 				};
 			}
 
 			if (!fs.existsSync(reportPath)) {
+				const reason =
+					(result.stderr ?? "").trim().split("\n")[0] || "no report produced";
+				this.recordRefusal(cwd, reason, result.status);
 				return {
 					...EMPTY_RESULT,
 					scannedAt,
-					summary:
-						(result.stderr ?? "").trim().split("\n")[0] || "no report produced",
+					reason: "no-report",
+					summary: reason,
 				};
 			}
 
-			const findings = parseOpengrepReport(
-				fs.readFileSync(reportPath, "utf-8"),
-			);
+			const raw = fs.readFileSync(reportPath, "utf-8");
+			const report = readOpengrepReport(raw);
+			if (report.verdict === "refused" || result.status !== 0) {
+				const reason =
+					report.verdict === "refused"
+						? report.reason
+						: `opengrep exited with status ${result.status}`;
+				this.recordRefusal(cwd, reason, result.status);
+				return {
+					...EMPTY_RESULT,
+					scannedAt,
+					reason: "refused",
+					summary: reason.slice(0, 200),
+				};
+			}
+			if (report.partial) {
+				recordDegradationOnce({
+					kind: "opengrep-partial-scan",
+					subject: cwd,
+					reason: report.partial.reason,
+					metadata: { status: result.status },
+				});
+			}
+			// #2154: the one opengrep site that parsed a scan of this root.
 			return {
 				success: true,
-				findings,
+				// A warning-level partial report with no scanned paths proves that
+				// the producer went cold. A complete empty report still proves a
+				// genuine scan, so it is still "analysed" for the render layer's
+				// analysed-and-found-nothing state (#2970) — but it carries no
+				// FILE-level authority, which `analyzedFiles: []` below is what
+				// says.
+				analyzed: !report.partial || report.scanned.length > 0,
+				// #2962: the set is ALWAYS carried, empty included. "This producer
+				// declared its coverage and it was zero files" and "this producer
+				// declares no coverage at all" are different facts; dropping the
+				// empty array collapses them into the second, and the second is
+				// what hands a zero-file scan whole-root retirement authority
+				// downstream (`runnerRetirementDecision`, tools/lens-diagnostics.ts).
+				analyzedFiles: report.scanned.map((file) =>
+					realpathOrResolve(path.resolve(cwd, file)),
+				),
+				...(report.partial ? { partial: true } : {}),
+				...(report.partial ? { summary: report.partial.reason } : {}),
+				...(report.partial && report.scanned.length === 0
+					? { reason: "partial-no-paths" as const }
+					: {}),
+				findings: report.findings,
 				scannedAt,
 			};
 		} catch (err) {
+			const reason = err instanceof Error ? err.message : String(err);
+			this.recordRefusal(cwd, reason, undefined);
 			return {
 				...EMPTY_RESULT,
 				scannedAt,
-				summary: err instanceof Error ? err.message.slice(0, 200) : String(err),
+				reason: "crashed",
+				summary: reason.slice(0, 200),
 			};
 		} finally {
 			try {
@@ -221,6 +293,74 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 			}
 		}
 	}
+
+	private recordRefusal(
+		cwd: string,
+		reason: string,
+		status: number | null | undefined,
+	): void {
+		recordDegradationOnce({
+			kind: "opengrep-scan-refused",
+			subject: cwd,
+			reason,
+			metadata: { status },
+		});
+	}
+}
+
+type ParsedOpengrepReport = {
+	errors?: unknown;
+	results?: unknown;
+	paths?: { scanned?: unknown };
+};
+
+function readOpengrepReport(raw: string):
+	| { verdict: "refused"; reason: string }
+	| {
+			verdict: "usable";
+			partial?: { reason: string };
+			findings: OpengrepFinding[];
+			scanned: string[];
+	  } {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return { verdict: "refused", reason: "unparseable opengrep report" };
+	}
+	if (!parsed || typeof parsed !== "object")
+		return { verdict: "refused", reason: "unparseable opengrep report" };
+	const report = parsed as ParsedOpengrepReport;
+	if (!Array.isArray(report.results) && !Array.isArray(report.errors))
+		return { verdict: "refused", reason: "unparseable opengrep report" };
+	const errors = (Array.isArray(report.errors) ? report.errors : []).map(
+		(error): { level?: string; message: string } => {
+			if (typeof error === "string") return { message: error };
+			if (!error || typeof error !== "object")
+				return { message: "unrecognised opengrep error entry" };
+			const entry = error as { level?: unknown; message?: unknown };
+			const level = typeof entry.level === "string" ? entry.level : undefined;
+			const message =
+				typeof entry.message === "string" ? entry.message : undefined;
+			return {
+				...(level ? { level } : {}),
+				message: message ?? level ?? "unrecognised opengrep error entry",
+			};
+		},
+	);
+	const refusal = errors.find((error) => error.level !== "warn");
+	if (refusal) return { verdict: "refused", reason: refusal.message };
+	const scanned = Array.isArray(report.paths?.scanned)
+		? report.paths.scanned.filter(
+				(file): file is string => typeof file === "string",
+			)
+		: [];
+	return {
+		verdict: "usable",
+		...(errors[0] ? { partial: { reason: errors[0].message } } : {}),
+		findings: parseOpengrepReport(parsed),
+		scanned,
+	};
 }
 
 // --- Parser ---
@@ -236,13 +376,17 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
  * CLI surface has drifted in places, e.g. `--files-with-matches` requires
  * `--experimental` where semgrep's doesn't).
  */
-export function parseOpengrepReport(raw: string): OpengrepFinding[] {
-	if (!raw.trim()) return [];
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch {
-		return [];
+export function parseOpengrepReport(
+	rawOrParsed: string | ParsedOpengrepReport,
+): OpengrepFinding[] {
+	if (typeof rawOrParsed === "string" && !rawOrParsed.trim()) return [];
+	let parsed: unknown = rawOrParsed;
+	if (typeof rawOrParsed === "string") {
+		try {
+			parsed = JSON.parse(rawOrParsed);
+		} catch {
+			return [];
+		}
 	}
 	if (!parsed || typeof parsed !== "object") return [];
 	const results = (parsed as Record<string, unknown>).results;

@@ -4,10 +4,306 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- PDFs can be converted by a document parser you run yourself. Set `pdf.provider: "endpoint"` and `pdf.endpointUrl`, and `fetch_content` sends the PDF to that service and uses the Markdown it returns, with no API key or per-page cost. In `auto`, a configured endpoint is tried before Datalab, Gemini and the built-in parser, and a failed request falls back to them. The URL passes the same SSRF checks as other fetches, so a LAN host needs its range in `ssrf.allowRanges`. Thanks to [@goodman-b](https://github.com/goodman-b) for [PR #553](https://github.com/nicobailon/pi-web-access/pull/553).
+
+### Changed
+
+- Search summaries now show the summary model each source's snippet, not just its title and URL, so providers that return ranked results without an answer get a summary of what the pages say. Snippets are capped per source and per query (600 and 12,000 characters, or 200 and 3,000 when the provider already gave an answer) to keep summaries within their deadline. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for [PR #547](https://github.com/nicobailon/pi-web-access/pull/547).
+
 ### Fixed
 
-- Cleaned stale GitHub clone runtime directories after a crashed process when the owner can be proven dead, while preserving runtimes with unknown or live owners. Thanks to [@yazanabuashour](https://github.com/yazanabuashour) for issue #331.
-- Kept an existing legacy `~/.dm/web-search.json` in use when `XDG_CONFIG_HOME` is set but its XDG config file is absent. Thanks to [@hu3rror](https://github.com/hu3rror) for issue #333.
+- Single-URL fetches and completed search summaries now include model-visible storage IDs and retrieval calls, so stored content remains reachable without access to host metadata. Guidance uses the configured retrieval tool name, respects disabled retrieval, and leaves raw bodies and approved summary text unchanged. Thanks to [@mothieras](https://github.com/mothieras) for [issue #548](https://github.com/nicobailon/pi-web-access/issues/548) and [PR #551](https://github.com/nicobailon/pi-web-access/pull/551).
+- Truncated `fetch_content` answers now clarify that stored content is the original source, not the remaining answer, and offer source retrieval from offset zero instead of an answer offset. Thanks to [@mothieras](https://github.com/mothieras) for [issue #550](https://github.com/nicobailon/pi-web-access/issues/550) and [PR #552](https://github.com/nicobailon/pi-web-access/pull/552).
+- When a model sends `queries`, `provider` or `domainFilter` as a string that starts with `[` but isn't valid JSON, `web_search` now returns a tool error saying the field must be an array of strings, instead of running the whole string as one literal search. Thanks to [@tschnorpfeil](https://github.com/tschnorpfeil) for [issue #542](https://github.com/nicobailon/pi-web-access/issues/542) and [@MatrixNeoKozak](https://github.com/MatrixNeoKozak) for [PR #543](https://github.com/nicobailon/pi-web-access/pull/543).
+- In `auto` search, a provider that answers successfully but with no results and no answer no longer ends the search. The next available provider is tried, and the first empty response is returned only when every provider came back empty. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for [PR #546](https://github.com/nicobailon/pi-web-access/pull/546).
+- Brave search results no longer show raw markup such as `<strong>` and `&mdash;` in titles and snippets. Numeric entities outside the Unicode range stay as written instead of failing the search. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for [PR #545](https://github.com/nicobailon/pi-web-access/pull/545).
+- A Perplexity request that stalls now gives up after 30 seconds instead of holding the search for the whole turn. The timeout is reported as a provider error, so `auto` search and configured routing move on to the next provider instead of treating it as a cancelled search. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for [PR #544](https://github.com/nicobailon/pi-web-access/pull/544).
+- DuckDuckGo search now tells a bot check apart from an empty search. When DuckDuckGo answers with its bot check (HTTP 202 or a challenge page), the error says DuckDuckGo blocked the request and to use another provider, and configured `searchRouting` treats it like a rate limit (`quota`). A search that found nothing now returns no results instead of failing. Only a page with neither results nor a "no results" message still fails with "no parseable results", which now says the page format may have changed. Thanks to [@tschnorpfeil](https://github.com/tschnorpfeil) for [issue #541](https://github.com/nicobailon/pi-web-access/issues/541).
+- `fetch_content` with `mode: "raw"` on a PDF now says raw mode doesn't decode PDFs and suggests the default Markdown mode or `mode: "answer"` with a prompt, instead of only reporting an unsupported content type. Thanks to [@goodman-b](https://github.com/goodman-b) for [PR #555](https://github.com/nicobailon/pi-web-access/pull/555), split out of [PR #553](https://github.com/nicobailon/pi-web-access/pull/553).
+- `fetch_content` on a GitHub pull request or issue no longer repeats long bodies and comments: the start shows inline once and the rest is stored at the end of the document. Comments, review comments, files, commits, checks and reviews left out of the inline view are now stored too, so the retrieval hint that points at them finds them. Items GitHub was never asked for point at the `gh` command instead. Hints use the retrieval tool's configured name, or only `gh` when retrieval is turned off. Thanks to [@mothieras](https://github.com/mothieras) for [issue #549](https://github.com/nicobailon/pi-web-access/issues/549).
+- `fetch_content` answer mode with several URLs now shows each URL's answer, instead of only a list of URLs with character counts. The answers share the same output limit as a single-URL answer and say when one is cut short. The retrieval hint now says the stored content is the original pages, not the answers. See [issue #556](https://github.com/nicobailon/pi-web-access/issues/556).
+
+## [0.38.0] - 2026-10-09
+
+### Highlights
+
+- Search with Ceramic, a new paid keyword search provider you can select.
+- OpenAI search now defaults to the newest Luna model, which costs about 20 times less per token than Terra.
+- Answer mode and query rewriting work with models whose provider signs in without an API key, such as pi-multiprovider models.
+- Requests through a proxy keep their method, headers, body and `Content-Length`, and HEAD requests stay HEAD requests.
+
+### Added
+
+- New Ceramic search provider for [Ceramic](https://www.ceramic.ai)'s keyword web search API, used only when you select it. Set `ceramicApiKey` or `CERAMIC_API_KEY` to your Ceramic key. Ceramic is a paid API with free starter credits, so it is never picked by `auto` or `all`. Allowed domains are added to the query as `site:` filters, and excluded domains are removed from the results. Ceramic has no date filter, so `recencyFilter` is ignored. Thanks to [@sweepies](https://github.com/sweepies) for [issue #523](https://github.com/nicobailon/pi-web-access/issues/523).
+
+### Changed
+
+- The `web_search` tool description is now four sentences on how to use the tool, instead of a paragraph listing every provider, the `all` policy and each workflow mode. The model still sees the providers and the `all` policy in the `provider` parameter and the modes in the `workflow` parameter. Thanks to [@mcwalrus](https://github.com/mcwalrus) for [issue #528](https://github.com/nicobailon/pi-web-access/issues/528).
+- OpenAI `web_search` now runs on the newest Luna model by default, such as `gpt-6-luna` on a ChatGPT subscription, instead of `gpt-5.6-terra`. Terra costs about 20 times as much per token as `gpt-6-luna` and is a generation older, so searches were using a large share of subscription usage. With only an API key, the default is `gpt-6-luna`. Set `openaiSearchModel` to pick a different model. Thanks to [@sslotin](https://github.com/sslotin) for [issue #520](https://github.com/nicobailon/pi-web-access/issues/520).
+- Search summaries and `fetch_content` answer mode now give DM the session ID and let its `opencode` and `opencode-go` providers add OpenCode's `x-opencode-session` header, instead of building OpenCode's headers themselves. They no longer send `x-opencode-client`, and custom providers pointed at `opencode.ai` no longer get the session header from dm-web-access. See [issue #537](https://github.com/nicobailon/pi-web-access/issues/537).
+
+### Fixed
+
+- With a proxy set, `fetch(new Request(...))` now sends the Request's own method, headers, body, redirect setting and abort signal. It used to arrive as a bare GET without them. HEAD requests through the proxy are now real HEAD requests with an empty response body instead of GETs. Thanks to [@xiaozhu1337](https://github.com/xiaozhu1337) for [issue #535](https://github.com/nicobailon/pi-web-access/issues/535) and [PR #536](https://github.com/nicobailon/pi-web-access/pull/536).
+- With a proxy set, HEAD responses keep the server's `Content-Length`, and a POST or PUT with no body sends `Content-Length: 0` as native fetch does, instead of omitting it (which some servers answer with 411). See [issue #539](https://github.com/nicobailon/pi-web-access/issues/539).
+- Keyless Parallel MCP searches no longer fail with Parallel's "free-tier rate limit" error. Requests went out with Node's default `undici` User-Agent, which Parallel rate-limits as one shared bucket, so they now send `User-Agent: dm-web-access`. Thanks to [@kestermcullough](https://github.com/kestermcullough) for [PR #531](https://github.com/nicobailon/pi-web-access/pull/531).
+- `fetch_content` answer mode and search query rewriting now work with models whose provider signs in without giving DM an API key, such as models added by [pi-multiprovider](https://github.com/monotykamary/pi-multiprovider). Answer mode used to fail with "No API key available for answer model" even though DM could call the model. Thanks to [@eikopf](https://github.com/eikopf) for [issue #530](https://github.com/nicobailon/pi-web-access/issues/530).
+- A host that serves several conversations at once from one process, with one extension instance per session (an app or chat server built on the DM SDK), no longer loses results across conversations. Each instance now keeps its own session's results, background fetches and active flag: one conversation starting or ending used to clear every stored result, so a `get_search_content` in another conversation answered "No stored results for responseId …", and its background `includeContent` fetches were aborted. Sessions forked from one history hold the results they share until the last of them ends, and deleting a shared result from `/search` removes it only from that session. DM itself, which runs one instance and switches its session, behaves as before. GitHub clones are removed when the last live session ends, and while sessions keep overlapping, a session's end removes the clones no fetch has returned since the oldest live session started. A session that restores results from history marks the clones they point at as used, so a session forked from another keeps its clone paths after the original ends. Thanks to [@kid7st](https://github.com/kid7st) for [PR #521](https://github.com/nicobailon/pi-web-access/pull/521).
+- `@modelcontextprotocol/sdk` is updated from 1.27.1 to 1.32.1, which fixes [GHSA-6qxp-vccf-f47h](https://github.com/advisories/GHSA-6qxp-vccf-f47h), so `npm audit` no longer reports it. That advisory covers the SDK's OAuth client, which dm-web-access doesn't use: its HTTP providers send API keys in headers and its MCP server runs over stdio. Thanks to [@M1racleShih](https://github.com/M1racleShih) for [PR #522](https://github.com/nicobailon/pi-web-access/pull/522) and [@SidShaytay](https://github.com/SidShaytay) for [issue #519](https://github.com/nicobailon/pi-web-access/issues/519).
+
+## [0.37.0] - 2026-10-05
+
+### Highlights
+
+- Search through degoog, a self-hosted or public metasearch engine, with no API key needed.
+- Perplexity search results now include real page snippets and cost less per search.
+- DM `codemode` scripts can work with search results and fetched pages as data instead of reading formatted text.
+- Failed tool calls are now marked as errors, so DM and MCP clients can tell a failure from a success.
+
+### Added
+
+- New degoog search provider for a self-hosted or public [degoog](https://degoog.org) metasearch instance, used only when you select it. It works without an API key and uses `https://degoog.org` by default. Set `degoogBaseUrl` or `DEGOOG_URL` to use your own instance, `degoogApiKey` or `DEGOOG_API_KEY` if your instance requires a key, and `degoogEngines` to limit which engines it queries. It supports domain and recency filters, routing, and the curator. Thanks to [@zhouzhuojie](https://github.com/zhouzhuojie) for [PR #515](https://github.com/nicobailon/pi-web-access/pull/515).
+- In DM `codemode` scripts, `web_search` and `fetch_content` return data instead of the text the model sees: each query's results and errors, and each URL's full content and error, even when the call fails. Searches from a script don't open the curator unless the script asks for it, and `includeContent` waits for the pages instead of fetching them in the background. What the model sees and the MCP output are unchanged. See "In codemode scripts" in the README. [Issue #516](https://github.com/nicobailon/pi-web-access/issues/516).
+
+### Changed
+
+- Perplexity `web_search` results now come from Perplexity's Search API, so each result has a real page snippet instead of an empty one, and searches cost less ($1 per 1,000 searches, with no token billing). Results no longer include an answer written by Sonar. YouTube summaries still use Sonar. Thanks to [@DWalland](https://github.com/DWalland) for [issue #512](https://github.com/nicobailon/pi-web-access/issues/512).
+- Failed tool calls are now marked as errors (`isError: true`) in DM and over MCP. This covers invalid arguments and calls where nothing succeeded, such as a `web_search` or `source_check` where every search failed. DM versions before 1.0 ignore the marker. `fetch_content` called without a URL now names the parameters to use, as `web_search` already did. Other messages are unchanged. Thanks to [@j-koester](https://github.com/j-koester) for [PR #514](https://github.com/nicobailon/pi-web-access/pull/514).
+
+## [0.36.0] - 2026-10-04
+
+### Highlights
+
+- Use dm-web-access's search and fetch tools from Claude Code, Codex, Cursor, and other MCP clients with `npx -y dm-web-access`.
+- Docs sites that publish markdown versions of their pages now come back as clean markdown.
+- Brave prepaid keys keep working after the first search, and OpenAI search shows the real error, such as a usage limit.
+- Keep Firecrawl PDF costs down by reading only the first few pages of each PDF.
+- New Keenable search provider that works without an API key.
+
+### Added
+
+- The search and fetch tools (`web_search`, `fetch_content`, `get_search_content`, and `source_check`) run as a local MCP server for Claude Code, Codex, Cursor, and other MCP clients. Start it with `npx -y dm-web-access`. It reads the same `web-search.json` and provider keys as the DM extension and does not need DM installed. DM-only features such as the curator, summaries, and Kimi search are not available there. See "Use from other agents (MCP)" in the README. Thanks to [@Avg8888](https://github.com/Avg8888) for [issue #496](https://github.com/nicobailon/pi-web-access/issues/496).
+- `fetch_content` asks servers for markdown first, so sites that publish markdown versions of pages (Cloudflare, Mintlify, and other docs hosts) return clean markdown directly. `mode: "raw"` still asks for the server's normal representation. Thanks to [@erwinkramer](https://github.com/erwinkramer) for [issue #495](https://github.com/nicobailon/pi-web-access/issues/495).
+- `web_search` can restrict Exa results to a category such as `news` or `research paper` with the new `category` parameter. Other providers ignore it. Without an Exa API key, if Exa's filtered search is unavailable, the category is added to the query text instead. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [PR #493](https://github.com/nicobailon/pi-web-access/pull/493).
+- New Keenable search provider, used only when you select it. It works without an API key through Keenable's public endpoint; set `keenableApiKey` or `KEENABLE_API_KEY` for higher limits. It supports domain and recency filters, routing, and the curator. Thanks to [@ilya-bogin-keenable](https://github.com/ilya-bogin-keenable) for [PR #506](https://github.com/nicobailon/pi-web-access/pull/506).
+- Set `firecrawlPdfMaxPages` to have Firecrawl read only the first N pages of each PDF, which caps per-page PDF billing on fetches and `includeContent` searches. Cut-off PDFs end with a note giving both page counts. Leaving it unset keeps the current behavior. Thanks to [@Dangooy](https://github.com/Dangooy) for [issue #507](https://github.com/nicobailon/pi-web-access/issues/507).
+
+### Fixed
+
+- Brave search with a prepaid (pay-as-you-go) key no longer fails every call after the first with "quota exhausted; estimated reset in ~702h". Prepaid plans report a monthly rate limit of 0, which was read as an exhausted quota. Thanks to [@kk-code-lab](https://github.com/kk-code-lab) for [issue #501](https://github.com/nicobailon/pi-web-access/issues/501).
+- OpenAI web search shows the server's real error when a response fails partway, such as a ChatGPT subscription usage limit, instead of "no parseable response output". Falling back to the next provider still works. Thanks to [@ShinoharaHaruna](https://github.com/ShinoharaHaruna) for [PR #505](https://github.com/nicobailon/pi-web-access/pull/505).
+- `web_search` with `includeContent` keeps page content the search provider already returned and only fetches the pages it didn't cover. Before, it fetched every page again, and a failed fetch replaced usable content.
+- `web_search` accepts `provider`, `queries`, and `domainFilter` lists that the model sent as a JSON string, such as `provider: "[\"parallel-mcp\"]"`. Before, these calls were rejected before the search ran. Thanks to [@advaitpaliwal](https://github.com/advaitpaliwal) for [PR #491](https://github.com/nicobailon/pi-web-access/pull/491).
+- `fetch_content` reports a tool error when its only URL failed or every URL in a batch failed. Before, DM recorded these as successful calls even though the text said `Error: ...`. Batches where some URLs succeed are unchanged. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for [PR #504](https://github.com/nicobailon/pi-web-access/pull/504).
+- `get_search_content` reads a fetched page without `url` or `urlIndex` when the fetch holds only one page. Before, calls like `{ responseId, findText }` failed with "No URL specified" and the model had to retry with `urlIndex: 0`. Thanks to [@j-koester](https://github.com/j-koester) for [PR #494](https://github.com/nicobailon/pi-web-access/pull/494).
+- When the model reads a long `source_check` result with `get_search_content`, each page now says how to get the next one, as search and fetch pages already did.
+- Local video analysis through the Gemini Web cookie fallback no longer comes back as "garbled characters", because uploads now send the file's type and name. Thanks to [@leonzyb](https://github.com/leonzyb) for [issue #508](https://github.com/nicobailon/pi-web-access/issues/508).
+
+## [0.35.0] - 2026-09-30
+
+### Highlights
+
+- Tell the summarizer what matters to you, such as keeping prices, limits, and versions exactly as written.
+- Brave search holds up on low-rate plans instead of failing when several searches run at once.
+- OpenAI web search works when you signed in to DM with your ChatGPT account.
+
+### Added
+
+- Add your own instructions to search summaries with `summaryInstructions` in `web-search.json`, for example "keep prices, limits, and versions verbatim." They apply to summaries from the curator and the `auto-summary` workflow, and the built-in safety rules still apply. Thanks to [@rcharrisg](https://github.com/rcharrisg) for [PR #489](https://github.com/nicobailon/pi-web-access/pull/489).
+
+### Fixed
+
+- Brave searches now wait their turn according to the rate limits Brave reports, so running several searches at once no longer overruns low-rate plans. If Brave says to slow down and the wait is short, the search retries once. If the wait is long, it fails right away and later searches respect the same wait. The 30-second search timeout includes this waiting. Thanks to [@saschaSpoonbill](https://github.com/saschaSpoonbill) for [PR #487](https://github.com/nicobailon/pi-web-access/pull/487).
+- OpenAI web search now works when you signed in to DM with "Sign in with ChatGPT" on the `openai` provider. Searches go to OpenAI's official API, and `auto` search tries OpenAI first for this login, as it already did for `openai-codex`. With an `openai` API key, `auto` still tries Exa first. Thanks to [@kasumikira](https://github.com/kasumikira) for [issue #488](https://github.com/nicobailon/pi-web-access/issues/488).
+
+## [0.34.0] - 2026-09-30
+
+### Highlights
+
+- Turning on web tools no longer costs a prompt-cache miss on models like DeepSeek. New sessions now pick the activation style that suits the model.
+- Search with Z.ai's GLM Coding Plan and use your plan quota instead of paying per call.
+- `fetch_content` now gets past Cloudflare "Just a moment..." pages by handing off to your other fetch providers.
+- Fetching works on networks where only your configured proxy can resolve hostnames.
+- `undici` is updated to pick up fixes for known security advisories.
+
+### Added
+
+- Search with Z.ai's GLM Coding Plan web search when you select `provider: "zai"`. Set `ZAI_API_KEY` or `zaiApiKey` to your plan key, and set `zaiEndpoint: "china"` if your key comes from bigmodel.cn. Searches use your plan quota instead of per-call billing. Thanks to [@nailuoGG](https://github.com/nailuoGG) for [issue #475](https://github.com/nicobailon/pi-web-access/issues/475) and for live-testing the China endpoint in [issue #479](https://github.com/nicobailon/pi-web-access/issues/479).
+
+### Changed
+
+- `toolActivation` now defaults to `"auto"`. On models that can take tools added mid-conversation, new sessions start with `web_enable` as before. On other models, such as DeepSeek, every enabled web tool is available from the first request, so turning them on no longer makes DM resend the whole conversation and miss the prompt cache. Set `"dynamic"` to always start with `web_enable`, or `"eager"` to never use it. Resumed sessions keep the tools they already had. The README's Tool activation section explains the trade-off. Thanks to [@tinoy1336](https://github.com/tinoy1336) for [issue #484](https://github.com/nicobailon/pi-web-access/issues/484) and [@jordi9](https://github.com/jordi9) for [issue #481](https://github.com/nicobailon/pi-web-access/issues/481).
+- Keyed Exa searches with default options or `numResults: 5` now call Exa's `/search` endpoint instead of `/answer`, like every other keyed Exa search. Their answer text now comes from the search results instead of Exa's generated answer. If you route Exa through a custom `exaBaseUrl` gateway, it must support `/search`. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [issue #470](https://github.com/nicobailon/pi-web-access/issues/470).
+- When `fetch_content` can't get a page, its list of fallback options now explains how to turn on the keyless Jina Reader fallback. It names only the setting you still need and keeps your current or default provider order. The hint doesn't appear if Jina already ran for that fetch, and it warns that Jina's servers fetch the target URLs. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [PR #471](https://github.com/nicobailon/pi-web-access/pull/471).
+
+### Fixed
+
+- `fetch_content` now treats a Cloudflare "Just a moment..." challenge page returned with HTTP 200 as a failed fetch, so your configured fallback providers can retrieve the real page. Detection needs Cloudflare's `cf-mitigated: challenge` header or its challenge-page scripts, so a page that only says "Just a moment..." is unaffected. Raw mode still returns the response unchanged, and authenticated fetches report the challenge without falling back to other providers. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [issue #472](https://github.com/nicobailon/pi-web-access/issues/472).
+- With `ssrf.trustEnvProxy: true`, the `proxy` configured in `web-search.json` now resolves hostnames for web tools instead of your local DNS, so `fetch_content` works where only the proxy can resolve names. A per-call `proxy` with a different value is still checked against local DNS. When local resolution fails for a request going through the configured proxy, the error now names this setting. Thanks to [@ChenAuCarre](https://github.com/ChenAuCarre) for [issue #476](https://github.com/nicobailon/pi-web-access/issues/476).
+- Exa results without a title are now labeled with their site's hostname, such as `cdn.jsdelivr.net`, instead of `Source N`. Results whose URL has no hostname, such as `mailto:` or `file:` links, still use `Source N`. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [PR #469](https://github.com/nicobailon/pi-web-access/pull/469).
+- `undici` is updated to 8.11.2. Earlier 8.x releases, including the 8.10.0 this package previously installed, have known security advisories such as decompression denial of service and a TLS certificate validation bypass. Thanks to [@setanta00](https://github.com/setanta00) for [issue #483](https://github.com/nicobailon/pi-web-access/issues/483).
+
+## [0.33.0] - 2026-09-27
+
+### Highlights
+
+- Keep every web tool available from the first message with `"toolActivation": "eager"`, for models that rarely call `web_enable` on their own.
+- Search with You.com when you select it explicitly.
+- Give each DM process its own fetched-page cache so parallel sessions stop evicting each other's pages.
+- Model allowlists in `enabledModels` or `--models` now work with every pattern DM accepts.
+- Resumed older sessions keep the tools they had instead of gaining `web_enable`.
+
+### Added
+
+- Set `"toolActivation": "eager"` in `web-search.json` to skip `web_enable` and keep every enabled web tool available from the first message. With the default `"dynamic"` setting, `web_enable` now tells the model to call it first whenever current, external, or linked information could help. Thanks to [@ackalker](https://github.com/ackalker) for [issue #458](https://github.com/nicobailon/pi-web-access/issues/458).
+- Set `PI_WEB_ACCESS_CACHE_ROOT` to a directory to give a DM process its own fetched-page cache. The cache goes in a `web-search-cache` folder inside that directory, and `web-search.json` stays where it is. Parallel sessions then stop evicting each other's cached pages. Thanks to [@goodman-b](https://github.com/goodman-b) for [issue #457](https://github.com/nicobailon/pi-web-access/issues/457).
+- You.com is available as an optional search provider. Set `youApiKey` or `YDC_API_KEY`, then select `provider: "you"`, add it to a provider list, or list it in `searchRouting`. It also appears in the Curator. `auto` and `provider: "all"` never pick it. Thanks to [@mouse-value-add](https://github.com/mouse-value-add) for [PR #461](https://github.com/nicobailon/pi-web-access/pull/461).
+
+### Fixed
+
+- Resuming a session that never had `web_enable`, for example one started before dm-web-access was installed or upgraded, no longer adds it partway through the conversation. The session keeps the tools it already had. Thanks to [@nilsoskar](https://github.com/nilsoskar) for [issue #462](https://github.com/nicobailon/pi-web-access/issues/462).
+- Answer mode, query rewrite, and summaries now follow the model list DM builds from `enabledModels` or `--models`, so every pattern DM accepts works here too, including patterns such as `@(!(openai-codex))/*` and partial names such as `sonnet`. Before, an allowlist made of those patterns blocked every model. Thanks to [@IdrisGit](https://github.com/IdrisGit) for [issue #463](https://github.com/nicobailon/pi-web-access/issues/463) and [PR #464](https://github.com/nicobailon/pi-web-access/pull/464).
+- `web_enable` now depends on the version of DM you are running, not an older DM package that may be installed next to the extension, so those setups no longer lose it. It needs DM 0.86.0 or newer. On older DM, every enabled web tool stays available from the start. Thanks to [@PhrZer](https://github.com/PhrZer) for [PR #456](https://github.com/nicobailon/pi-web-access/pull/456) and [@nguyenchiencong](https://github.com/nguyenchiencong) for [issue #444](https://github.com/nicobailon/pi-web-access/issues/444).
+
+## [0.32.0] - 2026-09-26
+
+### Highlights
+
+- Spread Tavily searches across up to 20 API keys, with automatic failover when one runs out of quota.
+- Use Gemini Web browser cookies on KDE Linux, where Chrome keeps its password in KWallet.
+- Search with OpenAI through OpenCode and `opencode-go` without session errors or the wrong model.
+- See full search queries and URLs in tool-call labels.
+- Globally installed DM no longer shows false version or duplicate TypeBox warnings.
+
+### Added
+
+- Tavily can use a pool of up to 20 API keys. Set `TAVILY_API_KEY_1` through `TAVILY_API_KEY_20`, and when a key hits a quota or auth error the search moves on to the next one. `TAVILY_API_KEY_INDEX` picks the key to try first, and `TAVILY_API_KEY` / `tavilyApiKey` is tried last. Thanks to [@apoapostolov](https://github.com/apoapostolov) for [PR #430](https://github.com/nicobailon/pi-web-access/pull/430).
+
+### Fixed
+
+- On KDE Linux, Chrome and Chromium cookies for Gemini Web now decrypt with the password stored in KWallet when Secret Service doesn't have it. Thanks to [@dianzuan](https://github.com/dianzuan) for [issue #436](https://github.com/nicobailon/pi-web-access/issues/436).
+- OpenAI search requests to `opencode.ai` now include OpenCode's session headers, fixing `400 MissingSessionID` errors. Other destinations never receive these headers. Thanks to [@juliocc](https://github.com/juliocc) for [PR #445](https://github.com/nicobailon/pi-web-access/pull/445).
+- When `openaiSearchModel` isn't set, OpenAI search through gateways such as `opencode-go` now picks the newest GPT model instead of a non-OpenAI model.
+- Globally installed DM no longer shows a false "requires DM 0.86.1 or newer" warning, and dynamic tool activation now works there. Thanks to [@samsimsom](https://github.com/samsimsom) for [issue #428](https://github.com/nicobailon/pi-web-access/issues/428).
+- TypeBox now comes from DM instead of being installed separately, which avoids duplicate copies and DM startup warnings. Thanks to [@ksreenivasan](https://github.com/ksreenivasan) for [issue #442](https://github.com/nicobailon/pi-web-access/issues/442) and [PR #443](https://github.com/nicobailon/pi-web-access/pull/443).
+- Tool-call labels show full search queries and fetch URLs when the terminal is wide enough, instead of cutting them off at 60 characters. Thanks to [@TheBestPessimist](https://github.com/TheBestPessimist) for [issue #440](https://github.com/nicobailon/pi-web-access/issues/440).
+
+## [0.31.0] - 2026-09-22
+
+### Highlights
+
+- Start fresh sessions with a smaller web-tool list, then enable the tools when you need them.
+- Keep long search responses manageable without losing access to the full results.
+- Search with Baizhi MCP when you explicitly configure it.
+- Connect Brave, Exa, and Tavily to local HTTP services on loopback addresses.
+
+### Added
+
+- Fresh sessions now show `web_enable` instead of the full web-tool list when supported. Call it to make your configured web tools available. Thanks to [@Knimoms](https://github.com/Knimoms) for [PR #424](https://github.com/nicobailon/pi-web-access/pull/424).
+- Added Baizhi MCP as an optional search provider, with search routing and Curator support. It is used only when explicitly selected. Thanks to [@ct-jaryn](https://github.com/ct-jaryn) for [PR #422](https://github.com/nicobailon/pi-web-access/pull/422).
+
+### Changed
+
+- Long `web_search` responses now show a shorter result and the providers used. Full results remain available through `get_search_content`. Thanks to [@theSprog](https://github.com/theSprog) for [issue #423](https://github.com/nicobailon/pi-web-access/issues/423).
+
+### Fixed
+
+- Allow explicitly configured Brave, Exa, and Tavily API base URLs to use HTTP on true loopback hosts while continuing to require HTTPS remotely. Thanks to [@aaschmid](https://github.com/aaschmid) for [issue #421](https://github.com/nicobailon/pi-web-access/issues/421).
+
+## [0.30.0] - 2026-09-19
+
+### Highlights
+
+- Start installed copies of DM Web Access much faster with a precompiled bundle.
+- Use standalone OpenAI search or reuse an existing DM provider URL without duplicating gateway configuration.
+- Control which search providers and fetch modes are available.
+- Search Google through the new explicit Serply provider.
+- Get more reliable proxy handling, OpenCode requests, PDF answers, source checks, and stored-content retrieval.
+
+### Added
+
+- Added opt-in `openaiUseProviderBaseUrl` to reuse a selected DM provider's URL and credentials for OpenAI search. An explicit `openaiResponsesUrl` still takes precedence.
+- Added opt-in `openaiUseAlphaSearch` for standalone OpenAI search, with source limits, recency filtering, allowed-domain filtering, and normal provider fallback. Existing Responses search remains the default. Thanks to [@ZacharyQin](https://github.com/ZacharyQin) for [PR #420](https://github.com/nicobailon/pi-web-access/pull/420).
+- Added `fetch.defaultMode` and `fetch.allowedModes` for choosing the default `fetch_content` mode and disabling unwanted modes. Thanks to [@Slooz](https://github.com/Slooz) for #395.
+- Added `webSearch.allowedProviders` to restrict providers consistently across search, source checks, routing, aggregation, schemas, and Curator. Thanks to [@Slooz](https://github.com/Slooz) for #396.
+- Added an explicit-only Serply Google Search provider with domain filtering, recency filtering, routing, and Curator support. Configure it with `serplyApiKey` or `SERPLY_API_KEY`. Thanks to Serply vendor [@googio](https://github.com/googio) for PR #386.
+
+### Changed
+
+- Published packages now load a precompiled bundle for faster startup, while source checkouts continue loading TypeScript directly. Thanks to [@Yisus423](https://github.com/Yisus423) for [issue #418](https://github.com/nicobailon/pi-web-access/issues/418) and [PR #419](https://github.com/nicobailon/pi-web-access/pull/419).
+- Fresh installs now use the silent `none` web search workflow by default. Explicit and configured Curator or summary workflows are unchanged. Thanks to [@ducaoya](https://github.com/ducaoya) for issue #416.
+
+### Fixed
+
+- Preserve legacy `~/.dm/web-search.json` configuration when `~/.dm/agent/web-search.json` is absent in default environments without `XDG_CONFIG_HOME`. Thanks to [@fancyboi999](https://github.com/fancyboi999) for issue #411.
+- List Crawl4AI in the README provider summary and the package description, which both still omitted it after the provider shipped in 0.29.0. Thanks to [@bergheim](https://github.com/bergheim) for [PR #382](https://github.com/nicobailon/pi-web-access/pull/382).
+- Removed the unconditional global `fetch` replacement during extension initialization; proxy transport is now installed lazily when a proxied web-tool operation runs. Thanks to [@AdrianJ20](https://github.com/AdrianJ20) for [issue #388](https://github.com/nicobailon/pi-web-access/issues/388).
+- Send OpenCode session attribution headers when generating summaries, preventing configured `opencode` and `opencode-go` summary models from silently falling through to another candidate. Thanks to [@damozhang](https://github.com/damozhang) for issue #385.
+- Send the `x-opencode-session` / `x-opencode-client` attribution headers when `fetch_content` answer mode uses an `opencode` or `opencode-go` model. The answer path dispatches through the model registry, which bypasses the attribution headers DM merges in the main agent loop, so those requests were rejected with `400 MissingSessionID`. Thanks to [@MrSerious0](https://github.com/MrSerious0) for PR #381.
+- Pass extracted PDF Markdown to `fetch_content` answer mode instead of the saved-file notice, while preserving readable-mode file output and stored-content retrieval. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for PR #390.
+- Prevent malformed `fetch_content` auth, mode, or proxy parameters from breaking tool-call rendering while preserving strict execution validation. Thanks to [@tekumara](https://github.com/tekumara) for issue #387.
+- Clarified that a negative `fetch_content` answer-mode result means the answer was not found in the extracted content, rather than asserting that it is absent from the whole page. Thanks to [@Slooz](https://github.com/Slooz) for issue #394.
+- Stop inferring claim support or contradiction from unrelated lexical markers in `source_check`; retrieved passages now require manual semantic review. Thanks to [@wayenchan](https://github.com/wayenchan) for issue #383.
+- Return bounded `get_search_content` excerpts instead of dropping oversized merged match ranges, using compact query IDs to reserve representative ranges when discovered spans fit the output budget. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for PR #391.
+
+## [0.29.0] - 2026-09-10
+
+### Highlights
+
+- Search Google through SerpApi with domain and recency filters.
+- Use a self-hosted Crawl4AI instance as an extraction fallback.
+- Connect through SOCKS proxies and resolve credentials with 1Password service accounts.
+- Start DM faster through on-demand loading of extraction and AI features.
+- Get more reliable provider fallback, credential routing, caching, and config discovery.
+
+### Added
+
+- Added a Curator action that approves the current summary and uses auto-summary for later default-workflow searches in the same prompt run. The choice is not saved between prompts. Thanks to [@thomak-dev](https://github.com/thomak-dev) for issue #376.
+- Added a self-hosted Crawl4AI extraction fallback for `fetch_content`, configured with `crawl4aiBaseUrl` / `CRAWL4AI_BASE_URL` and `crawl4aiApiToken` / `CRAWL4AI_API_TOKEN`. It runs after Firecrawl and before hosted providers, and can be selected with `crawl4ai` in `fetchRouting.providers`. Thanks to [@bergheim](https://github.com/bergheim) for [PR #375](https://github.com/nicobailon/pi-web-access/pull/375).
+- Added an explicit SerpApi Google Search provider with `serpapiApiKey` / `SERPAPI_KEY`, domain and recency filters, search routing, and Curator support. Thanks to [@tanysheng](https://github.com/tanysheng) for PR #363.
+- Added SOCKS4, SOCKS4A, SOCKS5, and SOCKS5H proxy support in config and per-call overrides. Thanks to [@phillipzink](https://github.com/phillipzink) for PR #365.
+- Added 1Password service-account support for credential resolver commands through `OP_SERVICE_ACCOUNT_TOKEN`. Thanks to PR author [@Avg8888](https://github.com/Avg8888) and commit author [@xapids](https://github.com/xapids) for [PR #364](https://github.com/nicobailon/pi-web-access/pull/364).
+
+### Changed
+
+- Load extraction and AI features only when first used, reducing extension startup time. Thanks to [@ducaoya](https://github.com/ducaoya) for PR #366.
+
+### Fixed
+
+- Treat Tavily monthly plan exhaustion as a quota error so search routing can fall back to another provider. Thanks to [@simbel](https://github.com/simbel) for issue #378.
+- Refuse to send DM-resolved OpenAI credentials to the official Responses endpoint when they belong to a provider with a custom `baseUrl`. Configure `openaiResponsesUrl` explicitly to search through a gateway. Thanks to [@projectkite](https://github.com/projectkite) for issue #367.
+- Remove expired fetched content from memory when pruning the cache, while preserving the retrieval window and session history. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for issue #362.
+- Use DM's agent directory (`~/.dm/agent/web-search.json`) for the default web-search config instead of falling back to the legacy `~/.dm/web-search.json`. Existing `DM_CODING_AGENT_DIR` and XDG behavior is unchanged. Thanks to [@lJoublanc](https://github.com/lJoublanc) for issue #360.
+
+## [0.28.0] - 2026-09-04
+
+### Highlights
+
+- Search X posts through xAI or choose Mistral for web searches.
+- Batch searches run in parallel for faster multi-query research.
+- Follow-up retrieval can access stored search results, and Perplexity keeps all cited sources.
+- Web-tool proxy settings no longer affect unrelated DM requests.
+
+### Added
+
+- Documented the Linux `xdg-utils` dependency for automatic curator browser launch and the manual URL fallback. Thanks to [@wickedTangent](https://github.com/wickedTangent) for issue #336 and PR #337.
+- Added opt-in X post search through xAI alongside web search, configured with `xaiSearchTools`. Thanks to [@Jerry2003sky](https://github.com/Jerry2003sky) for issue #342.
+- Added Mistral web search with `provider: "mistral"`, using `mistralApiKey` / `MISTRAL_API_KEY` credentials. Premium web search is available as a separate opt-in. Thanks to [@jaudiger](https://github.com/jaudiger) for issue #346.
+
+### Changed
+
+- Run batch searches in parallel with a concurrency limit, keeping results in query order and preserving provider fallback. Thanks to [@Noir-Lime](https://github.com/Noir-Lime) for PR #345.
+
+### Fixed
+
+- Included `responseId` in search output so the model can retrieve stored results with `get_search_content`. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for PR #354.
+- Fixed flaky tests on slower Node startups. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for PR #353.
+- Kept all sources cited in Perplexity answers, even beyond `numResults`. Answers without citations still respect the result limit. Thanks to [@schlessera](https://github.com/schlessera) for issue #340 and PR #341.
+- Limited configured proxies to web-tool requests so unrelated DM requests are unaffected. Thanks to [@alexei-ciobanu](https://github.com/alexei-ciobanu) for PR #339 and [@mystery4f](https://github.com/mystery4f) for PR #343.
+- Cleaned up abandoned GitHub clone directories after crashes, only when their owning process is confirmed dead. Thanks to [@yazanabuashour](https://github.com/yazanabuashour) for issue #331.
+- Kept using an existing `~/.dm/web-search.json` when `XDG_CONFIG_HOME` is set but no config file exists there. Thanks to [@hu3rror](https://github.com/hu3rror) for issue #333.
 
 ## [0.27.0] - 2026-08-28
 

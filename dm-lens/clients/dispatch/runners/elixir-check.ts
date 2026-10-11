@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProjectDataDir } from "../../file-utils.js";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -10,6 +12,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 // Per-cwd cached `--version` probes (#120). Before this, each dispatch
 // invocation fired a fresh `safeSpawnAsync` per command — once per Elixir
@@ -48,15 +51,16 @@ function parseElixirOutput(
 
 	// elixirc reports paths RELATIVE to its cwd (e.g. `bad.ex`, not the absolute
 	// path we passed), so resolve the reported path against the runner cwd — not
-	// process.cwd(). Elixir 1.16+ also normalizes to a lowercase drive letter and
-	// forward slashes (`c:/...`), which never string-equals `C:\...` on Windows,
-	// so compare case-insensitively there.
-	const matchesTarget = (sourcePath: string): boolean => {
-		const resolved = path.resolve(cwd, sourcePath.trim());
-		return process.platform === "win32"
-			? resolved.toLowerCase() === resolvedTarget.toLowerCase()
-			: resolved === resolvedTarget;
-	};
+	// process.cwd(). Two resolved spellings of ONE file still differ in ways
+	// only the filesystem can settle — Elixir 1.16+ normalizes to a lowercase
+	// drive letter and forward slashes (`c:/...`), which never string-equals
+	// `C:\...` on Windows — so ask `pathsEqual`, the repo's on-disk identity
+	// seam, instead of hand-rolling a win32 case fold here. It folds case
+	// exactly where the filesystem does and nowhere else, which a
+	// `process.platform` test cannot express; `terragrunt.ts:90` asks the same
+	// question the same way (#1193).
+	const matchesTarget = (sourcePath: string): boolean =>
+		pathsEqual(path.resolve(cwd, sourcePath.trim()), resolvedTarget);
 
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index];
@@ -151,13 +155,6 @@ function parseElixirOutput(
 	return diagnostics;
 }
 
-function firstOutputLine(result: { stdout?: string; stderr?: string }): string {
-	return `${result.stderr || ""}\n${result.stdout || ""}`
-		.trim()
-		.split(/\r?\n/, 1)[0]
-		.slice(0, 200);
-}
-
 const elixirCheckRunner: RunnerDefinition = {
 	id: "elixir-check",
 	appliesTo: ["elixir"],
@@ -165,7 +162,7 @@ const elixirCheckRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "elixir-check");
 		const absPath = path.resolve(cwd, ctx.filePath);
 
 		let command: string | undefined;
@@ -188,52 +185,42 @@ const elixirCheckRunner: RunnerDefinition = {
 			cwd,
 			timeout: 30000,
 		});
-		if (result.error && !result.stdout && !result.stderr) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
 		const raw = `${result.stderr || ""}\n${result.stdout || ""}`;
 		const hasProjectContext = command === "mix";
-		const diagnostics = parseElixirOutput(raw, ctx.filePath, cwd).map((d) =>
-			hasProjectContext
-				? d
-				: {
-						...d,
-						// A direct elixirc invocation cannot resolve Mix dependencies.
-						// Standalone findings inform the agent, but cannot block it.
-						semantic: "warning" as const,
-					},
+		const parsed = parseToolRun(
+			"elixir-check",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (Elixir 1.16 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(out) =>
+				parseElixirOutput(out, ctx.filePath, cwd).map((d) =>
+					hasProjectContext
+						? d
+						: {
+								...d,
+								// A direct elixirc invocation cannot resolve Mix dependencies.
+								// Standalone findings inform the agent, but cannot block it.
+								semantic: "warning" as const,
+							},
+				),
 		);
-		if (diagnostics.length === 0) {
-			if (result.status && result.status !== 0) {
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "elixir-check",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+			classify: (diagnostics) => {
+				const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
 				return {
-					status: "failed",
-					diagnostics: [
-						{
-							id: "elixir-check-nonzero-no-diagnostics",
-							message:
-								firstOutputLine(result) ||
-								`${command} exited non-zero without structured diagnostics`,
-							filePath: ctx.filePath,
-							severity: "error",
-							semantic: hasProjectContext ? "blocking" : "warning",
-							tool: "elixir-check",
-							rule: command,
-							fixable: false,
-						},
-					],
-					semantic: hasProjectContext ? "blocking" : "warning",
+					status: hasBlocking ? "failed" : "succeeded",
+					semantic: hasBlocking ? "blocking" : "warning",
 				};
-			}
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
-		return {
-			status: hasBlocking ? "failed" : "succeeded",
-			diagnostics,
-			semantic: hasBlocking ? "blocking" : "warning",
-		};
+			},
+		});
 	},
 };
 

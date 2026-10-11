@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,11 +25,15 @@ function runRegistrationWithConfig(configText) {
 			const { default: initializeExtension } = await import(${JSON.stringify(indexUrl)});
 			const tools = [];
 			const commands = [];
+			let active = [];
 			initializeExtension({
-				registerTool(tool) { tools.push({ name: tool.name, description: tool.description, promptSnippet: tool.promptSnippet, parameters: tool.parameters }); },
+				registerTool(tool) { tools.push({ name: tool.name, description: tool.description, promptSnippet: tool.promptSnippet, parameters: tool.parameters }); active.push(tool.name); },
 				registerCommand(name) { commands.push(name); },
 				registerShortcut() {},
-				on() {},
+				on() { return () => {}; },
+				getAllTools() { return tools; },
+				getActiveTools() { return active; },
+				setActiveTools(names) { active = [...names]; },
 			});
 			console.log(JSON.stringify({ tools, commands }));
 		`,
@@ -65,7 +70,21 @@ test("malformed config falls back during extension registration", () => {
 	const child = runRegistrationWithConfig("{");
 	assert.equal(child.status, 0, child.stderr);
 	const registered = JSON.parse(child.stdout);
-	assert.deepEqual(registered.tools.map(tool => tool.name), ["web_search", "source_check", "fetch_content", "get_search_content"]);
+	assert.deepEqual(registered.tools.map(tool => tool.name), ["web_search", "source_check", "fetch_content", "get_search_content", "web_enable"]);
+});
+
+test("default public execution tool definitions retain their compatibility hashes", () => {
+	const expected = {
+		web_search: "eb831762c218c50c43cedf765a984f6b1c46efb47ac9b7289dfbac4854112de4",
+		source_check: "48e69c75320f7a844a83bfe032c98b93ef11115e908831e6349915e708b16889",
+		fetch_content: "e305aec8120db1a999a32efd1e088ab0de8fdbb043cfe945c6fe1db629424b57",
+		get_search_content: "e1c7597fc085a811c0c6fcde365a96571c275c70b93a48206a38be06a7a45a5f",
+	};
+	const tools = registered({}).tools.filter(tool => tool.name !== "web_enable");
+	assert.deepEqual(Object.fromEntries(tools.map(({ name, description, parameters }) => [
+		name,
+		createHash("sha256").update(JSON.stringify({ name, description, parameters })).digest("hex"),
+	])), expected);
 });
 
 test("search tools constrain numResults to integer values from 1 through 20", () => {
@@ -84,14 +103,14 @@ test("search tools constrain numResults to integer values from 1 through 20", ()
 });
 
 test("tool registration gates support legacy and per-tool config", () => {
-	assert.deepEqual(registeredToolNames({ webSearch: { enabled: false } }), ["fetch_content", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({ webSearch: { enabled: false } }), ["fetch_content", "get_search_content", "web_enable"]);
 	assert.deepEqual(registeredToolNames({
 		webSearch: { enabled: false },
 		tools: { webSearch: { enabled: true }, sourceCheck: { enabled: true }, fetchContent: { enabled: false } },
-	}), ["web_search", "source_check", "get_search_content"]);
+	}), ["web_search", "source_check", "get_search_content", "web_enable"]);
 	assert.deepEqual(registeredToolNames({
 		tools: { sourceCheck: { enabled: false }, getSearchContent: { enabled: false } },
-	}), ["web_search", "fetch_content"]);
+	}), ["web_search", "fetch_content", "web_enable"]);
 });
 
 test("command registration gates default to enabled", () => {
@@ -112,6 +131,8 @@ test("registered tools do not advertise disabled get_search_content", () => {
 	assert.ok(fetchTool);
 	assert.doesNotMatch(fetchTool.description, /get_search_content/);
 	assert.match(fetchTool.description, /retrieval tool is not registered/);
+	assert.doesNotMatch(registeredTool({ tools: { getSearchContent: { enabled: false } } }, "web_search").description, /get_search_content/);
+	assert.match(registeredTool({ toolNames: { getSearchContent: "open_content" } }, "web_search").description, /retrieval with open_content /);
 });
 
 test("web activity shortcut renders through the supported string-array API", async () => {
@@ -142,7 +163,7 @@ test("web activity shortcut renders through the supported string-array API", asy
 });
 
 test("tool names can be configured without changing defaults", () => {
-	assert.deepEqual(registeredToolNames({}), ["web_search", "source_check", "fetch_content", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({}), ["web_search", "source_check", "fetch_content", "get_search_content", "web_enable"]);
 	assert.deepEqual(registeredToolNames({
 		toolNames: {
 			webSearch: "research_web",
@@ -150,12 +171,14 @@ test("tool names can be configured without changing defaults", () => {
 			fetchContent: "grab_content",
 			getSearchContent: "open_content",
 		},
-	}), ["research_web", "verify_sources", "grab_content", "open_content"]);
+	}), ["research_web", "verify_sources", "grab_content", "open_content", "web_enable"]);
 });
 
-test("tool name config rejects invalid and duplicate registered names", () => {
+test("tool config rejects invalid, duplicate, or reserved names and unknown toolActivation", () => {
 	assert.match(registrationError({ toolNames: { webSearch: "1bad" } }), /toolNames\.webSearch/);
 	assert.match(registrationError({ toolNames: { webSearch: "same_name", fetchContent: "same_name" } }), /duplicates/);
+	assert.match(registrationError({ toolActivation: "lazy" }), /toolActivation.*"auto", "dynamic", or "eager"/);
+	assert.match(registrationError({ toolNames: { webSearch: "web_enable" } }), /web_enable.*reserved/i);
 });
 
 test("webSearch.enabled false registers only fetch tools and ignores disabled-name duplicates", () => {
@@ -167,7 +190,7 @@ test("webSearch.enabled false registers only fetch tools and ignores disabled-na
 			fetchContent: "grab_content",
 			getSearchContent: "open_content",
 		},
-	}), ["grab_content", "open_content"]);
+	}), ["grab_content", "open_content", "web_enable"]);
 	assert.match(registrationError({
 		webSearch: { enabled: false },
 		toolNames: { fetchContent: "same_name", getSearchContent: "same_name" },

@@ -25,6 +25,10 @@ import { findLocalOpengrepConfig } from "../opengrep-config.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { findLocalZizmorConfig } from "../zizmor-config.js";
 import { classifyDefect } from "./diagnostic-taxonomy.js";
+import {
+	isRuleIgnoredForPath,
+	loadRuleIgnorePatterns,
+} from "./rule-ignores.js";
 import type { DefectClass, Diagnostic, OutputSemantic } from "./types.js";
 
 export interface AuxiliaryLspProfile {
@@ -317,17 +321,51 @@ export function isAuxiliaryDiagnosticSuppressed(
  * files that are suppressed per-edit reappeared wholesale in every
  * `mode=full` sweep. Omitting `opts` (or `opts.fileRole`) keeps every existing
  * 2-arg call site's behavior byte-for-byte unchanged.
+ *
+ * #3041: `opts.filePath` + `opts.scanRoot` additionally apply each rule's own
+ * `ignores` path carve-out (#965) — the THIRD member of the same defect class
+ * as #586 and #692 above. `ast-grep scan` applies `ignores` during its own
+ * project walk, but `ast-grep lsp` publishes per-document diagnostics WITHOUT
+ * applying them (measured against ast-grep 0.45.3), so a rule the NAPI runner
+ * correctly skips on `scripts/**` came back over LSP on every `source=lsp`
+ * query and every `mode=full` sweep. Both routes reach this function, so the
+ * carve-out belongs here rather than in either route's own output merge.
  */
 export function applyAuxiliarySuppressions(
 	diagnostics: readonly LSPDiagnostic[],
 	content: string,
-	opts?: { fileRole?: FileRole },
+	opts?: { fileRole?: FileRole; filePath?: string; scanRoot?: string },
 ): LSPDiagnostic[] {
+	// One catalog read per call, not per diagnostic. Both rule loaders behind it
+	// are cached (~0.09 ms per call on dm-lens's own catalog), so a per-file call
+	// from a sweep costs the same order as the NAPI runner's own per-file load.
+	const { filePath, scanRoot } = opts ?? {};
+	const ruleIgnores =
+		filePath && scanRoot ? loadRuleIgnorePatterns(scanRoot) : undefined;
 	return diagnostics.filter((d) => {
 		if (isAuxiliaryDiagnosticSuppressed(d, content)) return false;
 		if (opts?.fileRole === "test") {
 			const profile = findAuxiliaryProfileForSource(d.source);
 			if (profile?.skipTestFiles) return false;
+		}
+		// Keyed by the diagnostic's own rule id — ast-grep's LSP reports the bare
+		// catalog id as `code`. Gated on the producing tool as well: the map is
+		// built from the AST-GREP catalog, so without the gate any auxiliary whose
+		// own rule id happened to collide with a catalog id (several are generic —
+		// `no-raw-types`, `no-string-concat-in-loop`) would be silently dropped on
+		// a path an unrelated rule carved out. Losing a finding silently is the
+		// harm this whole change exists to stop, so the collision is gated, not
+		// accepted (#3041 r2 F4).
+		if (
+			ruleIgnores !== undefined &&
+			findAuxiliaryProfileForSource(d.source)?.tool === "ast-grep" &&
+			isRuleIgnoredForPath(
+				filePath as string,
+				scanRoot as string,
+				ruleIgnores.get(String(d.code)),
+			)
+		) {
+			return false;
 		}
 		return true;
 	});

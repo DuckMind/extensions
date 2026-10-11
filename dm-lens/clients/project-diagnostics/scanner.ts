@@ -41,10 +41,12 @@ import {
 	PROJECT_DIAGNOSTICS_CACHE_VERSION,
 	saveProjectDiagnosticsSnapshot,
 } from "./cache.js";
+import { hashDiagnosticContent } from "../lsp/diagnostic-binding.js";
 import type {
 	ProjectDiagnostic,
 	ProjectDiagnosticsScanOptions,
 	ProjectDiagnosticsSnapshot,
+	ProjectScanFileFingerprint,
 } from "./types.js";
 // Side-effect import: registers fact providers and fact rules.
 import "../dispatch/integration.js";
@@ -132,6 +134,14 @@ interface FileMajorScan {
 	astGrep: ProjectDiagnostic[];
 	filesScanned: number;
 	wasmAborted: boolean;
+	/**
+	 * #2154: the bytes each file was READ with, for every file this pass
+	 * produced at least one diagnostic from. Captured inside the loop, from the
+	 * same `content` string the rules ran over — never re-read afterwards, or
+	 * an edit landing between the scan and the re-read would be fingerprinted
+	 * as if the rules had seen it, which is the very defect this closes.
+	 */
+	fingerprints: Record<string, ProjectScanFileFingerprint>;
 }
 
 /**
@@ -166,6 +176,7 @@ async function scanFileMajorRules(
 	const treeSitter: ProjectDiagnostic[] = [];
 	const factRules: ProjectDiagnostic[] = [];
 	const astGrep: ProjectDiagnostic[] = [];
+	const fingerprints: Record<string, ProjectScanFileFingerprint> = {};
 	const sgModule = await loadSg();
 	let phaseOneFilesScanned = 0;
 	let astGrepFilesScanned = 0;
@@ -313,12 +324,35 @@ async function scanFileMajorRules(
 			if (!langId && !factEligible && !astGrepLang) continue;
 			if (langId || factEligible) phaseOneFilesScanned++;
 
+			// #2154 (#3060 round 2 F1): read the BYTES once, then decode. The
+			// fingerprint below must record the file's ON-DISK length, because
+			// that is what the reader compares against `statSync().size`. A
+			// length taken from the decoded STRING disagrees for every file
+			// holding a byte that is not valid UTF-8 — one such byte decodes to
+			// a 3-byte U+FFFD — so the size check could never match and every
+			// row from that file was retired on every cached read, for a file
+			// nobody touched. That is the DROP direction this store's own
+			// reconcile doc calls the worse one. `buf.length` equals
+			// `stat.size` for every file; both sides then hash the same lossy
+			// decode, so an unchanged file still matches exactly.
 			let content: string | null;
+			let contentBytes: number | undefined;
 			try {
-				content = fs.readFileSync(filePath, "utf-8");
+				const buf = fs.readFileSync(filePath);
+				contentBytes = buf.length;
+				content = buf.toString("utf-8");
 			} catch {
 				content = null;
+				contentBytes = undefined;
 			}
+
+			// #2154: how many rows existed BEFORE this file was scanned, so the
+			// fingerprint below is written only for files that actually produced
+			// one — the snapshot keeps no row for any other file, and an entry
+			// for a file with no row is dead weight in a record that is read on
+			// every `refreshRunners=cached` call.
+			const rowsBeforeFile =
+				treeSitter.length + factRules.length + astGrep.length;
 
 			try {
 				await scanTreeSitterFile(filePath, langId, content);
@@ -376,6 +410,20 @@ async function scanFileMajorRules(
 						...graphIr,
 					});
 				}
+				// #2154: bind this file's rows to the bytes they were computed
+				// from. Only reachable with `content` in hand, which is the point
+				// — the fingerprint must describe what the rules READ, never what
+				// disk holds by the time the scan ends.
+				if (
+					content !== null &&
+					contentBytes !== undefined &&
+					treeSitter.length + factRules.length + astGrep.length > rowsBeforeFile
+				) {
+					fingerprints[filePath] = {
+						sizeBytes: contentBytes,
+						contentHash: hashDiagnosticContent(content),
+					};
+				}
 				filesScanned++;
 			} finally {
 				// This store belongs to the scan, and every consumer of this file's
@@ -395,7 +443,14 @@ async function scanFileMajorRules(
 
 	if (!client) {
 		await scan();
-		return { treeSitter, factRules, astGrep, filesScanned, wasmAborted };
+		return {
+			treeSitter,
+			factRules,
+			astGrep,
+			filesScanned,
+			wasmAborted,
+			fingerprints,
+		};
 	}
 
 	const startedAt = Date.now();
@@ -432,7 +487,14 @@ async function scanFileMajorRules(
 	// `astGrepFilesScanned` still feed the `project_diagnostics_scan` record
 	// above (`astGrep` sub-field), so this cost stays observable without a
 	// second, always-zero record to carry it.
-	return { treeSitter, factRules, astGrep, filesScanned, wasmAborted };
+	return {
+		treeSitter,
+		factRules,
+		astGrep,
+		filesScanned,
+		wasmAborted,
+		fingerprints,
+	};
 }
 
 export async function scanProjectDiagnostics(
@@ -485,6 +547,7 @@ export async function scanProjectDiagnostics(
 	// scan stops promptly when the agent/user aborts (#341).
 	const runners: string[] = [];
 	const diagnostics: ProjectDiagnostic[] = [];
+	let fileFingerprints: Record<string, ProjectScanFileFingerprint> = {};
 	let wasmAborted = false;
 	let filesScanned = files.length;
 	if (!signal?.aborted) {
@@ -498,6 +561,15 @@ export async function scanProjectDiagnostics(
 			diagnostics.push(...scanned.astGrep);
 			runners.push("ast-grep-napi");
 		}
+		// #2154: keep a fingerprint only for a file that still has a row after
+		// the ast-grep discard above, so the record cannot claim to describe a
+		// file whose only rows were dropped.
+		const rowFiles = new Set(diagnostics.map((d) => d.filePath));
+		fileFingerprints = Object.fromEntries(
+			Object.entries(scanned.fingerprints).filter(([file]) =>
+				rowFiles.has(file),
+			),
+		);
 	}
 	const snapshot: ProjectDiagnosticsSnapshot = {
 		version: PROJECT_DIAGNOSTICS_CACHE_VERSION,
@@ -507,6 +579,7 @@ export async function scanProjectDiagnostics(
 		diagnostics,
 		filesScanned,
 		runners,
+		fileFingerprints,
 	};
 	// #760: only present when true — keeps existing snapshots/serializations
 	// byte-identical for the untruncated (normal) case.

@@ -1,5 +1,4 @@
-import { complete } from "@duckmind/dm-ai/compat";
-import type { Api, AssistantMessage, Message, Model, ProviderHeaders, TextContent } from "@duckmind/dm-ai";
+import { completeSimple, type Api, type AssistantMessage, type Message, type Model, type TextContent } from "@duckmind/dm-ai/compat";
 import { truncateAtWord } from "./utils.ts";
 import { throwIfAborted } from "./abort.ts";
 import type { ExtensionUIContext, ModelRegistry } from "@duckmind/dm-coding-agent";
@@ -57,7 +56,7 @@ export async function handleSamplingRequest(
   }
 
   const messages = params.messages.map(convertSamplingMessage);
-  const { model, apiKey, headers } = await resolveSamplingModel(options, params.modelPreferences);
+  const model = resolveSamplingModel(options, params.modelPreferences);
   throwIfAborted(signal);
   await confirmSampling(
     options,
@@ -66,19 +65,23 @@ export async function handleSamplingRequest(
   );
   throwIfAborted(signal);
 
-  const result = await complete(
+  const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) throw new Error(auth.error);
+  throwIfAborted(signal);
+  const result = await completeSimple(
     model,
     {
       ...(params.systemPrompt !== undefined ? { systemPrompt: params.systemPrompt } : {}),
       messages,
     },
     {
-      ...(apiKey !== undefined ? { apiKey } : {}),
-      ...(headers !== undefined ? { headers } : {}),
       maxTokens: params.maxTokens,
       ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
       ...(params.metadata !== undefined ? { metadata: params.metadata as Record<string, unknown> } : {}),
       ...(signal ? { signal } : {}),
+      ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+      ...(auth.headers ? { headers: auth.headers } : {}),
+      ...(auth.env ? { env: auth.env } : {}),
     },
   );
 
@@ -124,14 +127,10 @@ function messageText(message: Message): string {
   }).join("\n");
 }
 
-async function resolveSamplingModel(
+function resolveSamplingModel(
   options: SamplingHandlerOptions,
   modelPreferences: ModelPreferences | undefined,
-): Promise<{
-  model: Model<Api>;
-  apiKey?: string;
-  headers?: ProviderHeaders;
-}> {
+): Model<Api> {
   const candidates: Model<Api>[] = [];
   const availableModels = options.modelRegistry.getAvailable();
 
@@ -153,26 +152,10 @@ async function resolveSamplingModel(
     addSamplingCandidate(candidates, model);
   }
 
-  const errors: string[] = [];
   const signal = options.getSignal();
-  for (const model of candidates) {
-    throwIfAborted(signal);
-    const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
-    throwIfAborted(signal);
-    if (auth.ok === false) {
-      errors.push(`${model.provider}/${model.id}: ${auth.error}`);
-      continue;
-    }
-    return {
-      model,
-      ...(auth.apiKey !== undefined ? { apiKey: auth.apiKey } : {}),
-      ...(auth.headers !== undefined ? { headers: auth.headers } : {}),
-    };
-  }
-
-  if (errors.length > 0) {
-    throw new Error(`No configured auth for MCP sampling model. ${errors.join("; ")}`);
-  }
+  throwIfAborted(signal);
+  const model = candidates[0];
+  if (model) return model;
   throw new Error("No DM model is available for MCP sampling");
 }
 

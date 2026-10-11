@@ -67,6 +67,7 @@ export type LanguageId =
 	| "jsonc"
 	| "julia"
 	| "kotlin"
+	| "lean"
 	| "less"
 	| "lua"
 	| "markdown"
@@ -153,6 +154,7 @@ export const PINNED_LANGUAGE_IDS = [
 	"jsonc",
 	"julia",
 	"kotlin",
+	"lean",
 	"less",
 	"lua",
 	"markdown",
@@ -197,13 +199,17 @@ export const PINNED_LANGUAGE_IDS = [
  * literal message below and `true` stops being assignable to it, so
  * `npm run build` fails at THIS line with the reason spelled out.
  */
-export const LANGUAGE_ID_PIN_IS_EXHAUSTIVE: Exclude<
+const LANGUAGE_ID_PIN_IS_EXHAUSTIVE: Exclude<
 	LanguageId,
 	(typeof PINNED_LANGUAGE_IDS)[number]
 > extends never
 	? true
 	: "a LanguageId is missing from PINNED_LANGUAGE_IDS in clients/language-registry.ts" =
 	true;
+// Not exported: its only job is to fail `npm run build`. The `void` reference
+// is what keeps oxlint's no-unused-vars (CI-gating via lint:js) and knip
+// quiet without giving it a consumer; tsc's noUnusedLocals does not flag it.
+void LANGUAGE_ID_PIN_IS_EXHAUSTIVE;
 
 export interface LanguageEntry {
 	/** Canonical, host-neutral language id. */
@@ -260,7 +266,9 @@ export const LANGUAGES: readonly LanguageEntry[] = [
 		id: "cpp",
 		kind: "cxx",
 		// The clang extension table (file-kinds.ts KIND_EXTENSIONS.cxx) minus the
-		// C header/source pair, which the `c` entry owns.
+		// C header/source pair, which the `c` entry owns. `.cuh` deliberately
+		// diverges from clang's table: CUDA/HIP projects use it for C++ headers,
+		// so it must reach the same cpp grammar and clangd path as `.cu`/`.hip`.
 		extensions: [
 			".c++",
 			".c++m",
@@ -271,6 +279,7 @@ export const LANGUAGES: readonly LanguageEntry[] = [
 			".cpp",
 			".cppm",
 			".cu",
+			".cuh",
 			".cxx",
 			".cxxm",
 			".hh",
@@ -295,6 +304,7 @@ export const LANGUAGES: readonly LanguageEntry[] = [
 			".cc",
 			".cpp",
 			".cu",
+			".cuh",
 			".cxx",
 			".hh",
 			".hip",
@@ -380,6 +390,7 @@ export const LANGUAGES: readonly LanguageEntry[] = [
 		extensions: [".kt", ".kts"],
 		grammar: "kotlin",
 	},
+	{ id: "lean", kind: "lean", extensions: [".lean"] },
 	{ id: "less", kind: "css", extensions: [".less"] },
 	{ id: "lua", kind: "lua", extensions: [".lua"], grammar: "lua" },
 	{ id: "markdown", kind: "markdown", extensions: [".md", ".mdx"] },
@@ -747,4 +758,5 @@ export const SCAN_LANGUAGE_PRIORITY: readonly (readonly LanguageId[])[] = [
 	["yaml"],
 	["toml"],
 	["prisma"],
+	["lean"],
 ];

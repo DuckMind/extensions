@@ -1,8 +1,10 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
+import { hashText } from "./finding-identity.js";
 import { getGlobalDmLensLogDir } from "./probe-home-state.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
+import { getTurnId } from "./turn-context.js";
 
 const READ_GUARD_LOG_DIR = getGlobalDmLensLogDir();
 const READ_GUARD_LOG_FILE = path.join(READ_GUARD_LOG_DIR, "read-guard.log");
@@ -31,9 +33,9 @@ const LOG_SNAPSHOT_VALIDATION = !["0", "false", "off"].includes(
 	SNAPSHOT_LOG_SETTING,
 );
 
-export const MAX_EDIT_BATCH_ITEMS = 100;
+const MAX_EDIT_BATCH_ITEMS = 100;
 
-export type EditBatchRejectionCode =
+type EditBatchRejectionCode =
 	| "oldtext_not_found"
 	| "oldtext_unrepresentable"
 	| "oldtext_duplicate"
@@ -79,13 +81,29 @@ export interface ReadGuardEditBatchSummary {
 
 let generatedCorrelationCounter = 0;
 
+const CORRELATION_ID_MAX = 64;
+const CORRELATION_ID_HASH_LENGTH = 16;
+
+/**
+ * Bound a host call id to {@link CORRELATION_ID_MAX} characters WITHOUT
+ * merging distinct ids (#3833). Every map and ledger keyed by a tool-call id
+ * (the attribution map, read widenings, the read-guard branch filter) trusts
+ * this to be injective. A plain `slice(0, 64)` was not: pi 0.99 codemode names
+ * nested calls `<parent>/<n>` and an OpenAI Responses parent id is ~80 chars,
+ * so `<parent>/1` and `<parent>/2` shared one key. Over the cap the id keeps a
+ * prefix (readable in logs) plus a hash of the FULL raw id. The result is
+ * itself <= 64 chars of the allowed alphabet, so re-sanitizing it is a no-op.
+ * Ids of 64 chars or fewer are unchanged.
+ */
 export function sanitizeCorrelationId(value: unknown): string | undefined {
 	if (typeof value !== "string" && typeof value !== "number") return undefined;
-	const sanitized = String(value)
-		.trim()
-		.replace(/[^a-zA-Z0-9._:-]/g, "_")
-		.slice(0, 64);
-	return sanitized.length > 0 ? sanitized : undefined;
+	const trimmed = String(value).trim();
+	const sanitized = trimmed.replace(/[^a-zA-Z0-9._:-]/g, "_");
+	if (sanitized.length <= CORRELATION_ID_MAX) {
+		return sanitized.length > 0 ? sanitized : undefined;
+	}
+	const prefixLength = CORRELATION_ID_MAX - CORRELATION_ID_HASH_LENGTH - 1;
+	return `${sanitized.slice(0, prefixLength)}-${hashText(trimmed, CORRELATION_ID_HASH_LENGTH)}`;
 }
 
 /** Prefer the host call token; otherwise create a bounded per-process token. */
@@ -221,6 +239,7 @@ export function createReadGuardEditBatchSummary(args: {
 export interface ReadGuardLogEntry {
 	event: string;
 	sessionId?: string;
+	turnId?: string;
 	/** Bounded host/tool-call correlation token, persisted inside metadata. */
 	correlationId?: string;
 	filePath: string;
@@ -270,12 +289,17 @@ export function shouldLogEvent(event: string): boolean {
 		// the per-file edits-cap trim. Idle-timeout eviction is deliberately
 		// EXCLUDED from this event (see read-guard.ts's evictFile doc
 		// comment) — it's routine housekeeping, not a fault, and its
-		// per-file cardinality is unbounded in a healthy session. Same
-		// rarity argument as #1913 for the reasons that DO fire: each is
+		// per-file cardinality is unbounded in a healthy session — except
+		// when it drops a write record (#3520), once per file per session.
+		// Same rarity argument as #1913 for the reasons that DO fire: each is
 		// rising-edge gated once per file per session, so always-on
 		// visibility costs nothing.
 		event === "read_file_evicted" ||
-		event === "edits_cap_trimmed"
+		event === "edits_cap_trimmed" ||
+		// #4131: a file's authorship ended because another writer changed its
+		// bytes. Once per authorship episode: the retired file needs a read or
+		// a known-content write before a writer can author it again.
+		event === "authorship_retired"
 	);
 }
 
@@ -372,6 +396,7 @@ export function logReadGuardEvent(entry: ReadGuardLogEntry): void {
 	writer.log({
 		ts: new Date().toISOString(),
 		...logEntry,
+		turnId: getTurnId(),
 		filePath: normalizeFilePath(logEntry.filePath),
 		metadata,
 	});

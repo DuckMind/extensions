@@ -8,6 +8,7 @@ import { normalizeMapKey } from "../path-utils.js";
 import { loadReverseDependencyIndexFromSnapshot } from "../reverse-deps.js";
 import { freshnessFromMtime } from "../freshness.js";
 import { logLatency } from "../latency-logger.js";
+import { recordDegradationOnce } from "../degradation-ledger.js";
 import { compareOrdinal } from "../string-utils.js";
 import { workspaceDiagnosticsCacheSessionStart } from "./workspace-diagnostics-session.js";
 import type { LSPDiagnostic } from "./client.js";
@@ -36,12 +37,17 @@ import {
  * `LSPWorkspaceDiagnosticResult.timedOut` in `./index.ts`) into
  * `WorkspaceDiagnosticsCacheEntry`.
  */
+// v3 (#2776): cached diagnostics must carry per-diagnostic `serverId`
+// provenance before replay, because primary/auxiliary partitioning is
+// server-owned rather than source-owned. v2 entries predate that contract and
+// are rejected so the owning server can re-collect them instead of silently
+// demoting old primary findings to auxiliary.
 // v2 (#1095): entries may carry an optional `contentHash` fingerprint of the
 // file bytes the cached diagnostics were computed against, so a `lookup` can
 // surface a content `binding` (boundToCurrentDisk) beyond the mtime proxy.
 // Legacy v1 entries are rejected by the version guard and re-scanned — a
 // deliberately clean break so no entry lacking the field is ever served.
-export const WORKSPACE_DIAGNOSTICS_CACHE_VERSION = 2;
+export const WORKSPACE_DIAGNOSTICS_CACHE_VERSION = 3;
 const CACHE_FILE = "lsp-workspace-diagnostics.json";
 
 export interface WorkspaceDiagnosticsCacheEntry {
@@ -242,7 +248,8 @@ export function clearWorkspaceDiagnosticsCacheAtAndAbove(
 //   "recompute", the same outcome a real refresh produces. The pre-#1754 map
 //   was unbounded; the bound is new and costs at most one extra sweep for a
 //   cwd that fell off the end.
-// - `normalizeMapKey` runs `realpathSync.native` on Windows. A handle re-runs
+// - `normalizeMapKey` runs `realpathSync.native` on Windows and, since #3098,
+//   on POSIX as well. A handle re-runs
 //   it only after the map has been invalidated, so an uninterrupted sweep pays
 //   that syscall once at context creation rather than once per `lookup()`, and
 //   an interrupted one pays it per check to stay correct if the cwd's realpath
@@ -261,9 +268,39 @@ export function loadWorkspaceDiagnosticsCache(
 	return readJsonCache<WorkspaceDiagnosticsCache>(cachePath(cwd), (parsed) => {
 		if (!parsed || typeof parsed !== "object") return undefined;
 		const cache = parsed as WorkspaceDiagnosticsCache;
-		if (cache.version !== WORKSPACE_DIAGNOSTICS_CACHE_VERSION) return undefined;
+		if (cache.version !== WORKSPACE_DIAGNOSTICS_CACHE_VERSION) {
+			if (cache.version === 1 || cache.version === 2) {
+				recordDegradationOnce({
+					kind: "lsp-workspace-cache-migration",
+					subject: path.resolve(cwd),
+					reason: `rejected v${cache.version} cache with ${
+						cache.entries && typeof cache.entries === "object"
+							? Object.keys(cache.entries).length
+							: 0
+					} entries during provenance migration`,
+				});
+			}
+			return undefined;
+		}
 		if (!cache.entries || typeof cache.entries !== "object") return undefined;
-		return cache;
+		const validEntries: Record<string, WorkspaceDiagnosticsCacheEntry> = {};
+		for (const [key, entry] of Object.entries(cache.entries)) {
+			if (!entry || typeof entry !== "object") continue;
+			if (
+				!Array.isArray(entry.diagnostics) ||
+				entry.diagnostics.some(
+					(diagnostic) =>
+						!diagnostic ||
+						typeof diagnostic !== "object" ||
+						typeof diagnostic.serverId !== "string" ||
+						diagnostic.serverId.length === 0,
+				)
+			) {
+				continue;
+			}
+			validEntries[key] = entry;
+		}
+		return { ...cache, entries: validEntries };
 	});
 }
 
@@ -548,6 +585,8 @@ export interface WorkspaceDiagnosticsCacheLookup {
  * thrown away).
  */
 export interface WorkspaceDiagnosticsCacheContext {
+	/** Cached complete imports for a file, when the reverse-dependency index covers it. */
+	importsFor(filePath: string): string[] | undefined;
 	/** Fresh cached result for `filePath` under `scopeKey`, or `undefined`
 	 * when there's no entry, the entry's scope doesn't match, or it fails the
 	 * mtime/dependency freshness check. */
@@ -575,7 +614,16 @@ export interface WorkspaceDiagnosticsCacheContext {
 		 *  when unavailable — `isEntryFresh` then fails open to mtime-only for
 		 *  this entry. */
 		sizeBytes?: number,
+		/** #3505: `Date.now()` taken before the file was read, the entry's
+		 *  `scannedAt`. Omit to stamp now. */
+		scannedAt?: number,
 	): void;
+	/**
+	 * #3505 (b): drop `filePath`'s entry. For a confirmed answer the sweep may
+	 * not persist (a workspace pull not bound to bytes dm-lens sent): the entry
+	 * it supersedes must not stay behind to be replayed.
+	 */
+	forget(filePath: string): void;
 	/** Best-effort disk write of everything recorded so far. Swallows any
 	 * write failure — a failed cache write should never fail the sweep that
 	 * produced the data. Safe to call more than once (subsequent calls are a
@@ -670,6 +718,9 @@ export function createWorkspaceDiagnosticsCacheContext(
 	};
 
 	return {
+		importsFor(filePath) {
+			return getImports(filePath);
+		},
 		lookup(filePath, scopeKey) {
 			// #1669 review N4: the epoch guarded `persist()` but not `lookup()` —
 			// an in-flight sweep kept REPLAYING disowned entries into its OWN
@@ -755,12 +806,20 @@ export function createWorkspaceDiagnosticsCacheContext(
 				scannedAt: entry.scannedAt,
 			};
 		},
-		record(filePath, scopeKey, diagnostics, mtimeMs, contentHash, sizeBytes) {
+		record(
+			filePath,
+			scopeKey,
+			diagnostics,
+			mtimeMs,
+			contentHash,
+			sizeBytes,
+			scannedAt = Date.now(),
+		) {
 			entries[cacheKeyFor(filePath)] = {
 				diagnostics,
 				count: diagnostics.length,
 				mtimeMs,
-				scannedAt: Date.now(),
+				scannedAt,
 				scopeKey,
 				// #1793: stamp whether THIS FILE actually had dependency
 				// knowledge this sweep (not just whether SOME index was
@@ -771,6 +830,10 @@ export function createWorkspaceDiagnosticsCacheContext(
 				...(contentHash !== undefined && { contentHash }),
 				...(sizeBytes !== undefined && { sizeBytes }),
 			};
+			dirty = true;
+		},
+		forget(filePath) {
+			delete entries[cacheKeyFor(filePath)];
 			dirty = true;
 		},
 		persist() {

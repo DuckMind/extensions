@@ -1,11 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
-import net from "node:net";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import { redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { loadSsrfConfig, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath, isLoopbackHostname } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const DEFAULT_API_VERSION = "v2";
@@ -35,12 +37,18 @@ interface FirecrawlConfig {
 	firecrawlApiKey?: unknown;
 	firecrawlApiVersion?: unknown;
 	firecrawlFreshScrape?: unknown;
+	firecrawlPdfMaxPages?: unknown;
+}
+
+interface FirecrawlPageMetadata {
+	numPages?: unknown;
+	totalPages?: unknown;
 }
 
 interface FirecrawlScrapeData {
 	title?: unknown;
 	markdown?: unknown;
-	metadata?: { title?: unknown };
+	metadata?: { title?: unknown } & FirecrawlPageMetadata;
 }
 
 interface FirecrawlSearchItem {
@@ -49,7 +57,7 @@ interface FirecrawlSearchItem {
 	snippet?: unknown;
 	url?: unknown;
 	markdown?: unknown;
-	metadata?: {
+	metadata?: FirecrawlPageMetadata & {
 		title?: unknown;
 		description?: unknown;
 		sourceURL?: unknown;
@@ -153,6 +161,28 @@ function allowFreshScrape(): boolean {
 	return configured;
 }
 
+function pdfParserOptions(): { parsers?: Array<{ type: "pdf"; maxPages: number }> } {
+	const configured = loadConfig().firecrawlPdfMaxPages;
+	if (configured === undefined || configured === null) return {};
+	if (typeof configured !== "number" || !Number.isInteger(configured) || configured < 1) {
+		throw new Error(`firecrawlPdfMaxPages in ${CONFIG_PATH} must be a positive integer`);
+	}
+	if (getApiVersion() === "v1") {
+		throw new Error(
+			`firecrawlPdfMaxPages in ${CONFIG_PATH} requires Firecrawl API v2; v1 has no PDF page cap. ` +
+			"Use firecrawlApiVersion \"v2\" or remove firecrawlPdfMaxPages",
+		);
+	}
+	return { parsers: [{ type: "pdf", maxPages: configured }] };
+}
+
+function withPdfTruncationNotice(content: string, metadata: FirecrawlPageMetadata | undefined): string {
+	const parsed = metadata?.numPages;
+	const total = metadata?.totalPages;
+	if (typeof parsed !== "number" || typeof total !== "number" || parsed >= total) return content;
+	return `${content}\n\n---\n\n*[Truncated: Only first ${parsed} of ${total} PDF pages parsed by Firecrawl]*`;
+}
+
 async function getApiKey(signal?: AbortSignal): Promise<string | null> {
 	const configKey = loadConfig().firecrawlApiKey;
 	return resolveCredential({
@@ -185,13 +215,6 @@ function ssrfOptions(options?: FirecrawlExtractOptions | FirecrawlSearchOptions)
 	};
 }
 
-function isLoopbackApiUrl(url: URL): boolean {
-	const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-	if (hostname === "localhost" || hostname === "::1") return true;
-	if (net.isIP(hostname) !== 4) return false;
-	return hostname.split(".")[0] === "127";
-}
-
 function firecrawlApiSsrfOptions(
 	options: FirecrawlExtractOptions | FirecrawlSearchOptions | undefined,
 	allowLoopback: boolean,
@@ -215,7 +238,7 @@ async function fetchFirecrawlApi(
 	init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
 	options: FirecrawlExtractOptions | FirecrawlSearchOptions | undefined,
 ): Promise<Response> {
-	const allowLoopback = isLoopbackApiUrl(new URL(url));
+	const allowLoopback = isLoopbackHostname(new URL(url).hostname);
 	let current = await validateRemoteUrl(url, firecrawlApiSsrfOptions(options, allowLoopback));
 	let headers = init.headers;
 	for (let redirects = 0; redirects <= DEFAULT_MAX_REDIRECTS; redirects++) {
@@ -239,27 +262,8 @@ function scrapeBody(url: string): Record<string, unknown> {
 		formats: ["markdown"],
 		onlyMainContent: true,
 		...(allowFreshScrape() ? {} : { lockdown: true }),
+		...pdfParserOptions(),
 	};
-}
-
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
 }
 
 function parseDomainFilter(domainFilter: string[] | undefined): DomainFilters {
@@ -297,6 +301,7 @@ function mapRecencyFilter(value: SearchOptions["recencyFilter"]): string | undef
 }
 
 function searchBody(query: string, options: FirecrawlSearchOptions, numResults: number, filters: DomainFilters): Record<string, unknown> {
+	const parserOptions = pdfParserOptions();
 	return {
 		query,
 		limit: numResults,
@@ -309,6 +314,7 @@ function searchBody(query: string, options: FirecrawlSearchOptions, numResults: 
 				formats: ["markdown"],
 				onlyMainContent: true,
 				...(allowFreshScrape() ? {} : { lockdown: true }),
+				...parserOptions,
 			},
 		} : {}),
 	};
@@ -319,13 +325,6 @@ function firstString(...values: unknown[]): string | null {
 		if (typeof value === "string" && value.trim()) return value.trim();
 	}
 	return null;
-}
-
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results.map((result) => {
-		if (result.snippet) return `${result.snippet}\nSource: ${result.title} (${result.url})`;
-		return `Source: ${result.title} (${result.url})`;
-	}).join("\n\n");
 }
 
 function mapSearchResults(data: unknown, numResults: number, filters: DomainFilters): {
@@ -349,7 +348,7 @@ function mapSearchResults(data: unknown, numResults: number, filters: DomainFilt
 		const snippet = firstString(item.description, item.snippet, item.metadata?.description) ?? "";
 		results.push({ title, url, snippet });
 		const markdown = firstString(item.markdown);
-		if (markdown) inlineContent.push({ url, title, content: markdown, error: null });
+		if (markdown) inlineContent.push({ url, title, content: withPdfTruncationNotice(markdown, item.metadata), error: null });
 		if (results.length >= numResults) break;
 	}
 	return { results, inlineContent };
@@ -413,7 +412,7 @@ export function isFirecrawlAvailable(): boolean {
 
 export async function searchWithFirecrawl(query: string, options: FirecrawlSearchOptions = {}): Promise<SearchResponse> {
 	requireBaseUrl();
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const filters = parseDomainFilter(options.domainFilter);
 	const envelope = await firecrawlFetch(
 		"search",
@@ -424,7 +423,7 @@ export async function searchWithFirecrawl(query: string, options: FirecrawlSearc
 		{ type: "api", query },
 	);
 	const mapped = mapSearchResults(envelope.data, numResults, filters);
-	const response: SearchResponse = { answer: buildAnswer(mapped.results), results: mapped.results };
+	const response: SearchResponse = { answer: formatSearchResultsAsAnswer(mapped.results), results: mapped.results };
 	if (options.includeContent && mapped.inlineContent.length > 0) response.inlineContent = mapped.inlineContent;
 	return response;
 }
@@ -451,5 +450,5 @@ export async function extractWithFirecrawl(
 	const title = typeof metadataTitle === "string" && metadataTitle.trim()
 		? metadataTitle.trim()
 		: typeof scrape.title === "string" ? scrape.title.trim() : "";
-	return { url, title, content, error: null };
+	return { url, title, content: withPdfTruncationNotice(content, scrape.metadata), error: null };
 }

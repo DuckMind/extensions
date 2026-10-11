@@ -2,16 +2,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { discoverAgentsAll, type AgentSource } from "../agents/agents.ts";
 import { isAsyncAvailable } from "../runs/background/async-execution.ts";
-import { formatSpawnBudgetSummary, getSpawnBudgetSnapshot } from "../runs/shared/spawn-budget.ts";
-import { getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
-import { decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, RUN_FANOUT_BUDGET_ENV } from "../runs/shared/run-fanout-budget.ts";
+import { formatSpawnBudgetSummary } from "../runs/shared/spawn-budget.ts";
 import { diagnoseIntercomBridge, type IntercomBridgeDiagnostic } from "../intercom/intercom-bridge.ts";
 import { discoverAvailableSkills, type SkillSource } from "../agents/skills.ts";
 import {
 	DIRS,
 	CHAIN_RUNS_DIR,
 	TEMP_ROOT_DIR,
+	type ActiveAsyncCapacitySnapshot,
 	type ExtensionConfig,
+	type SpawnBudgetSnapshot,
 	type SubagentState,
 	normalizeMaxSubagentSpawnsPerRun,
 	resolveMaxSubagentSpawnsPerRun,
@@ -39,6 +39,8 @@ interface DoctorReportInput {
 	requestedSessionDir?: string;
 	currentSessionFile?: string | null;
 	currentSessionId?: string | null;
+	spawnBudget: SpawnBudgetSnapshot;
+	activeAsyncCapacity: ActiveAsyncCapacitySnapshot;
 	orchestratorTarget?: string;
 	sessionError?: string;
 	expandTilde?: (value: string) => string;
@@ -167,7 +169,7 @@ function formatIntercomDiagnostic(diagnostic: IntercomBridgeDiagnostic, context:
 }
 
 function formatSpawnBudgetSection(input: DoctorReportInput): string[] {
-	const snapshot = getSpawnBudgetSnapshot(input.state, input.config, input.currentSessionId ?? input.state.currentSessionId);
+	const snapshot = input.spawnBudget;
 	return [
 		`- usage: ${formatSpawnBudgetSummary(snapshot)}`,
 		`- recent grants: ${snapshot.grantHistory.length === 0
@@ -178,14 +180,6 @@ function formatSpawnBudgetSection(input: DoctorReportInput): string[] {
 }
 
 function formatRunFanoutSection(input: DoctorReportInput): string[] {
-	try {
-		const inherited = decodeRunFanoutBudgetDescriptor(process.env[RUN_FANOUT_BUDGET_ENV]);
-		if (inherited) {
-			return [`- usage: ${formatRunFanoutBudget(getRunFanoutBudgetSnapshot(inherited)).replace(/^Run fan-out: /, "")}`, `- root run: ${inherited.rootRunId}`, "- reset boundary: cumulative claims are never released; a new top-level run creates a new budget"];
-		}
-	} catch (error) {
-		return [`- inherited budget: invalid — ${errorText(error)}`];
-	}
 	const configured = resolveMaxSubagentSpawnsPerRun(input.config.maxSubagentSpawnsPerRun);
 	const source = normalizeMaxSubagentSpawnsPerRun(process.env.DM_SUBAGENT_MAX_SPAWNS_PER_RUN) !== undefined
 		? "environment"
@@ -194,12 +188,7 @@ function formatRunFanoutSection(input: DoctorReportInput): string[] {
 }
 
 function formatActiveAsyncCapacitySection(input: DoctorReportInput): string[] {
-	const limit = resolveMaxActiveAsyncRunsPerSession(input.config.maxActiveAsyncRunsPerSession);
-	const sessionId = input.currentSessionId ?? input.state.currentSessionId;
-	const snapshot = sessionId
-		? getActiveAsyncCapacitySnapshot(sessionId, limit, { liveWorkflowRunIds: new Set(input.state.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(input.config.capacity?.abandonedSlotReleaseAfterMs) })
-		: { used: 0, limit: limit ?? 0 };
-	input.state.activeAsyncCapacity = snapshot;
+	const snapshot = input.activeAsyncCapacity;
 	return [
 		`- usage: ${snapshot.used}/${snapshot.limit || "unlimited"} used`,
 		"- scope: top-level async runs in the current parent session; foreground and nested workflow children are not charged again",
@@ -211,12 +200,17 @@ function formatPermissionSystemSection(): string[] {
 	const lines: string[] = [];
 	const parentSession = process.env["DM_SUBAGENT_PARENT_SESSION"] ?? "";
 	const trimmed = parentSession.trim();
-	if (trimmed) {
-		lines.push(`- parent session: set (${trimmed})`);
-	} else {
-		lines.push("- parent session: not set — ask forwarding from subprocess children will not reach a parent UI");
-	}
 	const isChild = process.env["DM_SUBAGENT_CHILD"] === "1";
+	if (isChild && trimmed) {
+		lines.push(`- runner parent session: set (${trimmed}) — explicit target for this dedicated child process`);
+	} else if (isChild) {
+		lines.push("- runner parent session: not set — this child process has no forwarding target");
+	} else if (trimmed) {
+		lines.push("- root parent session: ignored legacy process-global value — root sessions do not use it for routing");
+	} else {
+		lines.push("- root parent session: not set (healthy) — detached forwarding is attached at runner launch");
+	}
+	if (!isChild) lines.push("- foreground external ask forwarding: unavailable until the permission extension supports a session-scoped target");
 	lines.push(`- subagent process: ${isChild ? "yes (DM_SUBAGENT_CHILD=1)" : "no"}`);
 	// Whether dm-permission-system is installed and where it stores config is
 	// outside dm-subagents' control, so we only report the forwarding signal we
@@ -226,6 +220,7 @@ function formatPermissionSystemSection(): string[] {
 
 function formatWorkflowScriptSection(): string[] {
 	return [
+		"- launch: write a ```js workflow block in the reply, then call subagent({ workflow: true }); or pass a file as workflow: \"./path.js\"",
 		"- helpers: runs.run, runs.all, runs.steer, runs.status, runs.ref/refs, emit, console",
 		"- recovery: if runs.all is missing, reload or update dm-subagents; await Promise.all([runs.run(...)]) is also supported",
 	];

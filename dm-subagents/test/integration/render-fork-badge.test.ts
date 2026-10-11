@@ -5,6 +5,7 @@ import { keyText } from "@duckmind/dm-coding-agent";
 type RenderTheme = {
 	fg(name: string, text: string): string;
 	bold(text: string): string;
+	getThinkingBorderColor(level: string): (text: string) => string;
 };
 
 type RenderSubagentResult = (
@@ -41,9 +42,10 @@ let renderSubagentSummary: RenderSubagentSummary | undefined;
 const theme = {
 	fg: (_name: string, text: string) => text,
 	bold: (text: string) => text,
+	getThinkingBorderColor: (_level: string) => (text: string) => text,
 };
 const expandKey = keyText("app.tools.expand");
-const expandHint = `Press ${expandKey} for full output`;
+const expandHint = expandKey ? `Press ${expandKey} for full output` : "Configure the expand key for full output";
 
 const emptyUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 
@@ -171,7 +173,7 @@ describe("renderSubagentResult fork indicator", () => {
 		const lines = widget.render(120).map((line) => line.trimEnd());
 		assert.match(lines[0]!, /^\[fork\] Managed agents:/);
 		assert.match(lines[0]!, /…$/);
-		const hintLineIndex = lines.findIndex((line) => line.includes(expandHint) || (expandKey === "" && line.includes("Press ") && line.includes(" for full output")));
+		const hintLineIndex = lines.findIndex((line) => line.includes(expandHint));
 		assert.ok(hintLineIndex > 0);
 		assert.doesNotMatch(lines[0]!, /reviewer/);
 	});
@@ -213,7 +215,7 @@ describe("renderSubagentResult fork indicator", () => {
 		const text = widget.render(120).join("\n");
 		assert.match(text, /^Run status:/);
 		assert.match(text, /3 lines/);
-		assert.ok(text.includes(expandHint) || (expandKey === "" && text.includes("Press ") && text.includes(" for full output")));
+		assert.ok(text.includes(expandHint));
 		assert.doesNotMatch(text, /State: running/);
 	});
 
@@ -696,6 +698,47 @@ describe("renderSubagentResult fork indicator", () => {
 		assert.match(expanded, /✓ five · completed/);
 	});
 
+	it("keeps mixed workflow host diagnostics visible once while deduplicating child errors", () => {
+		const hostError = "CI command failed: executable not found";
+		const childError = "Child review failed";
+		for (const childFailed of [false, true]) {
+			const result = {
+				content: [{ type: "text" as const, text: "workflow failed" }],
+				isError: true,
+				details: {
+					mode: "workflow" as const,
+					results: [{
+						agent: "reviewer",
+						task: "Review changes",
+						exitCode: childFailed ? 1 : 0,
+						error: childFailed ? childError : undefined,
+						finalOutput: childFailed ? "" : "Review complete",
+						messages: [],
+						usage: emptyUsage,
+					}],
+					workflow: {
+						value: "workflow finished",
+						trace: [],
+						emits: [],
+						console: [],
+						receipt: {
+							hostSteps: [{
+								version: 1, kind: "host-step", monitorKind: "command",
+								id: "ci", label: "CI", state: "error", detail: hostError,
+								exitCode: 127, updatedAt: 1,
+							}],
+						},
+					},
+				},
+			};
+			for (const expanded of childFailed ? [true] : [false, true]) {
+				const text = withTerminalWidth(220, () => renderSubagentResult!(result, { expanded }, theme).render(220).join("\n"));
+				assert.equal(text.split(hostError).length - 1, 1, text);
+				if (expanded) assert.equal(text.split(childError).length - 1, childFailed ? 1 : 0, text);
+			}
+		}
+	});
+
 	it("renders a stale-running interrupted aggregate as paused", () => {
 		const result = {
 			content: [{ type: "text" as const, text: "paused" }],
@@ -804,7 +847,7 @@ describe("renderSubagentResult fork indicator", () => {
 		}, { expanded: false }, theme);
 
 		const text = widget.render(120).join("\n");
-		assert.match(text, /Press configured-expand-key for live detail/);
+		assert.match(text, /Configure the expand key for live detail/);
 		assert.match(text, /active 2s ago/);
 		assert.match(text, /⎿  read: package\.json \| 3\.0s/);
 		assert.match(text, /output: \/tmp\/reviewer_output\.md/);
@@ -837,7 +880,7 @@ describe("renderSubagentResult fork indicator", () => {
 				}],
 			},
 		}, { expanded: false }, theme).render(160).join("\n");
-		assert.match(single, /reviewer \(gpt-5\.5 · thinking high\)/);
+		assert.match(single, /reviewer \(openai-codex\/gpt-5\.5 · thinking high\)/);
 
 		const multi = renderSubagentResult!({
 			content: [{ type: "text", text: "(running...)" }],
@@ -850,8 +893,8 @@ describe("renderSubagentResult fork indicator", () => {
 				],
 			},
 		}, { expanded: false }, theme).render(160).join("\n");
-		assert.match(multi, /scan \(claude-haiku-4-5 · thinking low\)/);
-		assert.match(multi, /fix \(gpt-5-mini\)/);
+		assert.match(multi, /scan \(anthropic\/claude-haiku-4-5 · thinking low\)/);
+		assert.match(multi, /fix \(openai\/gpt-5-mini\)/);
 
 		const expanded = renderSubagentResult!({
 			content: [{ type: "text", text: "done" }],
@@ -868,7 +911,26 @@ describe("renderSubagentResult fork indicator", () => {
 				}],
 			},
 		}, { expanded: true }, theme).render(160).join("\n");
-		assert.match(expanded, /review \(gpt-5\.5 · thinking high\)/);
+		assert.match(expanded, /review \(openai-codex\/gpt-5\.5 · thinking high\)/);
+
+		const expandedSingle = renderSubagentResult!({
+			content: [{ type: "text", text: "done" }],
+			details: {
+				mode: "single",
+				results: [{
+					agent: "reviewer",
+					task: "review",
+					model: "router/auto",
+					exitCode: 0,
+					messages: [],
+					finalOutput: "done",
+					usage: emptyUsage,
+					progress: { index: 0, agent: "reviewer", status: "completed", task: "review", model: "openai-codex/gpt-6.1-sol", recentTools: [], recentOutput: [], toolCount: 0, tokens: 0, durationMs: 1 },
+				}],
+			},
+		}, { expanded: true }, theme).render(160).join("\n");
+		assert.match(expandedSingle, /openai-codex\/gpt-6\.1-sol/);
+		assert.doesNotMatch(expandedSingle, /router\/auto/);
 	});
 
 	it("strips repeated agent prefixes in expanded running multi-result rows", () => {

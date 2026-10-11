@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { pathsEqual } from "../../path-utils.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -9,6 +11,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
 import { parseToolRun } from "./utils/tool-failure.js";
 
@@ -100,15 +103,20 @@ export function findDetektConfig(cwd: string): string | undefined {
 }
 
 // detekt text output: /path/file.kt:10:5: error: Message [RuleId]
-function parseDetektOutput(raw: string, filePath: string): Diagnostic[] {
+function parseDetektOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	const pattern =
 		/^(.+?):(\d+):(\d+): (error|warning): (.+?)(?:\s+\[([^\]]+)\])?$/gm;
 
-	const absTarget = path.resolve(filePath);
+	const absTarget = path.resolve(cwd, filePath);
 	for (const match of raw.matchAll(pattern)) {
 		const [, file, lineStr, colStr, level, message, rule] = match;
-		if (path.resolve(file.trim()) !== absTarget) continue;
+		// #3278: one seam for reported-path attribution — see javac.ts.
+		if (!pathsEqual(path.resolve(cwd, file.trim()), absTarget)) continue;
 
 		const severity = level === "error" ? "error" : "warning";
 		const lineNum = Number.parseInt(lineStr, 10);
@@ -144,7 +152,7 @@ const detektRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "detekt");
 
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("detekt")) {
@@ -172,8 +180,15 @@ const detektRunner: RunnerDefinition = {
 		// read the same concatenated string. A nonzero exit that yields zero
 		// findings out of real output is a parser break, not clean Kotlin.
 		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-		const run = parseToolRun("detekt", { result, output: raw }, (out) =>
-			parseDetektOutput(out, ctx.filePath),
+		const run = parseToolRun(
+			"detekt",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (detekt 1.23 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(out) => parseDetektOutput(out, ctx.filePath, cwd),
 		);
 		if (run.skipped) return run.skipped;
 
@@ -184,11 +199,10 @@ const detektRunner: RunnerDefinition = {
 		}
 
 		const hasErrors = diagnostics.some((d) => d.severity === "error");
-		return {
+		return findingsResult(diagnostics, {
 			status: hasErrors ? "failed" : "succeeded",
-			diagnostics,
 			semantic: hasErrors ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

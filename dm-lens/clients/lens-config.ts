@@ -3,6 +3,7 @@ import {
 	resetIgnoredConfigWarnCache,
 	warnIgnoredConfigOnce,
 } from "./config-warn.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { errorClassName } from "./error-class.js";
 import * as path from "node:path";
 import {
@@ -17,14 +18,22 @@ import {
 import {
 	type ConfigLocation,
 	CANONICAL_GLOBAL_CONFIG_FILE,
+	canonicalPathIdentity,
 	getDmLensGlobalConfigPath,
+	getProductionGlobalConfigResolution,
 	GLOBAL_CONFIG_LOCATIONS,
 	LEGACY_ROOT_LSP_KEYS,
 } from "./config-locations.js";
 // Re-exported so this module's own, pre-existing import sites (`./lens-config.js`
 // / `../lens-config.js`) keep working. The function itself now lives in
 // `config-locations.ts` (#2426 review round 3, S1) — see the doc comment there.
-export { getDmLensGlobalConfigPath } from "./config-locations.js";
+export {
+	getDmLensGlobalConfigPath,
+	getProductionGlobalConfigResolution,
+	isResolvedGlobalConfigPath,
+	resolveGlobalConfigLocation,
+	resetGlobalConfigLocationCache,
+} from "./config-locations.js";
 import {
 	ignoredRecordCollector,
 	readConfigDocument,
@@ -36,6 +45,7 @@ import {
 	findNestedProjectMutationValue,
 	type DmLensProjectConfig,
 } from "./project-lens-config.js";
+import { readToolConfig } from "./tool-config.js";
 
 /**
  * The canonical global location, looked up rather than constructed, so a change
@@ -54,14 +64,19 @@ function globalCanonicalLocation(): ConfigLocation {
 	return location;
 }
 
-export type DmLensFormatMode = "deferred" | "immediate";
+type DmLensFormatMode = "deferred" | "immediate";
 
 /** The `{ enabled?: boolean }` section every registry flag key lives under. */
-export interface DmLensToggleConfig {
+interface DmLensToggleConfig {
 	enabled?: boolean;
 }
 
 export interface DmLensGlobalConfig {
+	tools?: Record<string, { enabled?: boolean }>;
+	startup?: {
+		mode?: "quick" | "full" | "minimal";
+		scans?: { enabled?: boolean };
+	};
 	/**
 	 * Gitignore-style patterns excluded from dm-lens scans across ALL projects.
 	 * Merged at LOWEST precedence: a project `.gitignore` or `.dm-lens.json`
@@ -135,6 +150,13 @@ export interface DmLensGlobalConfig {
 		 * messages. Findings are still cached for `lens_diagnostics` / `/lens-health`.
 		 */
 		enabled?: boolean;
+		/**
+		 * #2967: whether the session-start orientation demands pre-existing
+		 * blocking errors be fixed. Defaults true (the shipped wording). Set
+		 * false when the task's scope excludes pre-existing debt, so the
+		 * orientation stops telling the agent it must fix it.
+		 */
+		requirePreExistingFixes?: boolean;
 	};
 	turnSummary?: {
 		/**
@@ -178,9 +200,71 @@ function asConfigObject(value: unknown): Record<string, unknown> | undefined {
 		: undefined;
 }
 
+/**
+ * Report a probe-error RETENTION decision once (global-config-location PR,
+ * refs #2457; review H2 remedy B).
+ *
+ * Fired by `loadDmLensGlobalConfig` when it derived the path itself and the
+ * resolution retained a location whose existence probe THREW. The record
+ * names the retained path (subject) and the failed probe's error class;
+ * once per session via `recordDegradationOnce`. A successful
+ * non-canonical selection fires nothing (opt-in by file creation, visible
+ * via `dmlens_effective_config`).
+ */
+function reportGlobalConfigProbeRetention(): void {
+	const resolution = getProductionGlobalConfigResolution();
+	if (
+		resolution.source !== "legacy-default-unprobed" &&
+		resolution.source !== "pi-coding-agent-dir-unprobed"
+	) {
+		return;
+	}
+	recordDegradationOnce({
+		kind: "config-location-probe-failed",
+		subject: resolution.path,
+		// #3704/#3696: subject already carries the unbounded path; keep the
+		// fixed diagnostic ahead of it so the ledger cap cannot erase it.
+		reason: `existence probe failed (${resolution.existsProbeFailed?.errorClassName}); the location is retained as the config source and its read failures report through PILENS_CFG_0001`,
+		metadata: { subsystem: "lens-config", configPath: resolution.path },
+	});
+}
+
+/** Report a lower-precedence global config that exists beside the winner. */
+function reportGlobalConfigShadowing(): void {
+	const resolution = getProductionGlobalConfigResolution();
+	if (resolution.shadowedPath === undefined) return;
+	const winningPath = canonicalPathIdentity(resolution.path);
+	const shadowedPath = canonicalPathIdentity(resolution.shadowedPath);
+	recordDegradationOnce({
+		kind: "config-location-shadowed",
+		subject: winningPath,
+		reason: `shadowed global config ${shadowedPath}; winning path is the record subject`,
+		metadata: {
+			subsystem: "lens-config",
+			configPath: winningPath,
+			shadowedPath,
+		},
+		code: "PILENS_CFG_0010",
+	});
+}
+
 export function loadDmLensGlobalConfig(
-	configPath = getDmLensGlobalConfigPath(),
+	configPath?: string,
 ): DmLensGlobalConfig | undefined {
+	// An unresolvable existence probe on the derived path is the one decision
+	// that must carry its own bounded record (#3251 review H2 remedy B): the
+	// resolution RETAINED the location it could not evaluate, the read below
+	// reports its own `config-ignored` row when it fails, and this record
+	// names the retention decision itself - the failed probe's path and error
+	// class - so "different settings silently applying" is impossible.
+	// Explicit-path callers stay silent (#2427 quiet contract); the default
+	// parameter is evaluated FIRST so the body can tell derived from explicit.
+	const derivedPath = configPath === undefined;
+	if (derivedPath) {
+		reportGlobalConfigProbeRetention();
+		reportGlobalConfigShadowing();
+	}
+	const resolvedPath = configPath ?? getDmLensGlobalConfigPath();
 	const location = globalCanonicalLocation();
 	// #2445: this used to be `JSON.parse(fs.readFileSync(...))` inside a bare
 	// `catch { return undefined; }`, so a malformed `~/.dm-lens/config.json`
@@ -192,11 +276,11 @@ export function loadDmLensGlobalConfig(
 	// `reportConfigReadFailure` derives the subsystem from the DOCUMENT so the
 	// LSP loader's report of this file lands under `lens-config` as well and the
 	// warn-once latch collapses the two into one honest notice.
-	const outcome = readConfigDocument(configPath);
+	const outcome = readConfigDocument(resolvedPath);
 	if (outcome.status === "missing") return undefined;
 	if (outcome.status === "error") {
 		reportConfigReadFailure({
-			file: configPath,
+			file: resolvedPath,
 			location,
 			tier: "global",
 			error: outcome.error,
@@ -226,7 +310,7 @@ export function loadDmLensGlobalConfig(
 	// what was composed before it, on top of the whole-config record the catch
 	// adds.
 	const { note, records: notedRecords } = ignoredRecordCollector(
-		configPath,
+		resolvedPath,
 		"global",
 	);
 	try {
@@ -247,7 +331,7 @@ export function loadDmLensGlobalConfig(
 		// function still decides what a bad value is called.
 		const document = {
 			tier: "global" as const,
-			file: configPath,
+			file: resolvedPath,
 			location,
 			value: parsed,
 		};
@@ -261,6 +345,8 @@ export function loadDmLensGlobalConfig(
 		const raw = resolved.value;
 		const warnInvalid = note;
 		const config: Record<string, unknown> = {};
+		const toolConfig = readToolConfig(raw, warnInvalid);
+		if (toolConfig) config.tools = toolConfig;
 
 		for (const spec of LENS_FLAGS) {
 			if (spec.readGlobal) continue;
@@ -271,6 +357,25 @@ export function loadDmLensGlobalConfig(
 			? raw.ignore.filter((p): p is string => typeof p === "string")
 			: undefined;
 		if (ignore && ignore.length > 0) config.ignore = ignore;
+
+		const startup = asConfigObject(raw.startup);
+		if (startup) {
+			const startupConfig: DmLensGlobalConfig["startup"] = {};
+			const mode = startup.mode;
+			const scans = asConfigObject(startup.scans);
+			if (mode === "quick" || mode === "full" || mode === "minimal")
+				startupConfig.mode = mode;
+			else if ("mode" in startup)
+				warnInvalid('startup.mode must be "quick", "full", or "minimal"');
+			if (scans) {
+				if (typeof scans.enabled === "boolean") {
+					startupConfig.scans = { enabled: scans.enabled };
+				} else if ("enabled" in scans)
+					warnInvalid("startup.scans.enabled must be a boolean");
+			}
+			if (startupConfig.mode !== undefined || startupConfig.scans !== undefined)
+				config.startup = startupConfig;
+		}
 
 		const dispatch = asConfigObject(raw.dispatch);
 		if (dispatch) {
@@ -308,6 +413,23 @@ export function loadDmLensGlobalConfig(
 			} else {
 				warnInvalid(
 					"actionableWarnings.autoFix.maxFixes must be a non-negative finite number",
+				);
+			}
+		}
+
+		// #2967: a config-only sibling of `contextInjection.enabled` (no CLI
+		// flag), parsed here the way `actionableWarnings.autoFix.maxFixes` is.
+		// The section is already recognized through the flag registry.
+		const contextInjection = asConfigObject(raw.contextInjection);
+		if (contextInjection && "requirePreExistingFixes" in contextInjection) {
+			if (typeof contextInjection.requirePreExistingFixes === "boolean") {
+				config.contextInjection ??= {};
+				(
+					config.contextInjection as Record<string, unknown>
+				).requirePreExistingFixes = contextInjection.requirePreExistingFixes;
+			} else {
+				warnInvalid(
+					"contextInjection.requirePreExistingFixes must be a boolean",
 				);
 			}
 		}
@@ -398,7 +520,7 @@ export function loadDmLensGlobalConfig(
 		// caller of this guarantee, `config-core/` included, on ONE
 		// implementation rather than two that happen to agree today.
 		warnInvalidGlobalConfigOnce(
-			configPath,
+			resolvedPath,
 			`global config could not be interpreted (${errorClassName(error)}); configuration ignored`,
 			"PILENS_CFG_0008",
 		);

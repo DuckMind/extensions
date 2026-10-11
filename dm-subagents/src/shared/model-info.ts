@@ -66,6 +66,15 @@ export function resolveEffectiveThinking(model: string | undefined, configThinki
 	return THINKING_LEVELS.find((level) => level === configThinking);
 }
 
+/** The recorded thinking level of one child: the first known level among the places it is recorded. */
+export function childThinkingLevel(...sources: Array<{ thinking?: string } | undefined>): ThinkingLevel | undefined {
+	for (const source of sources) {
+		const level = THINKING_LEVELS.find((candidate) => candidate === source?.thinking);
+		if (level) return level;
+	}
+	return undefined;
+}
+
 export function splitKnownThinkingSuffix(model: string): { baseModel: string; thinkingSuffix: string } {
 	const colonIdx = model.lastIndexOf(":");
 	if (colonIdx === -1) return { baseModel: model, thinkingSuffix: "" };
@@ -75,6 +84,28 @@ export function splitKnownThinkingSuffix(model: string): { baseModel: string; th
 		baseModel: model.substring(0, colonIdx),
 		thinkingSuffix: `:${suffix}`,
 	};
+}
+
+/**
+ * Combine an observed model id with the provider that served it into `provider/id`.
+ * When the registry is available a known id resolves to its canonical `fullId`, so a
+ * provider-local id that repeats its provider (OpenRouter's `openrouter/auto-beta`,
+ * full id `openrouter/openrouter/auto-beta`) keeps that full form. Without the
+ * registry, an id already qualified for this provider is returned unchanged.
+ */
+export function qualifyModelWithProvider(
+	model: string | undefined,
+	provider: string | undefined,
+	availableModels?: ReadonlyArray<Pick<ModelInfo, "provider" | "id" | "fullId">>,
+): string | undefined {
+	if (!model) return undefined;
+	if (!provider) return model;
+	const exactFullId = availableModels?.find((entry) => entry.provider === provider && entry.fullId === model);
+	if (exactFullId) return exactFullId.fullId;
+	const idMatch = availableModels?.find((entry) => entry.provider === provider && entry.id === model);
+	if (idMatch) return idMatch.fullId;
+	if (model.startsWith(`${provider}/`)) return model;
+	return `${provider}/${model}`;
 }
 
 export function findModelInfo(model: string | undefined, availableModels: ModelInfo[] | undefined, preferredProvider?: string): ModelInfo | undefined {

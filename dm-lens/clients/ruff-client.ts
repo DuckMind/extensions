@@ -16,7 +16,9 @@ import {
 	resolveAvailableOrInstall,
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { isFileKind } from "./file-kinds.js";
+import { pathsEqual } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { resolveToolCwd } from "./tool-cwd.js";
 import { ruffConfigArgs } from "./tool-policy.js";
 
 // --- Types ---
@@ -82,8 +84,11 @@ export class RuffClient {
 
 	/**
 	 * Async auto-fix variant for pipeline use (non-blocking spawn).
-	 * `cwd` is the dispatch language root (used for config discovery); when
-	 * omitted it defaults to the file's directory.
+	 * `cwd` is the dispatch language root. It is the seam's starting point,
+	 * not the answer: `resolveToolCwd` walks from the file to the nearest
+	 * `pyproject.toml`/`ruff.toml`/`.ruff.toml` at or above it, capped inside
+	 * `cwd` (and at `$HOME` when there is none), so a file in a nested package
+	 * gets that package's config rather than the workspace-root one.
 	 */
 	async fixFileAsync(
 		filePath: string,
@@ -116,15 +121,20 @@ export class RuffClient {
 		try {
 			const before = await fs.promises.readFile(absolutePath, "utf-8");
 
+			// #2894: the root ruff resolves its config from now comes from the
+			// shared seam, not a local `cwd ?? path.dirname(file)`. `tool-policy.ts`
+			// requires the lint runner (`ruff.ts`, on `resolveRunnerCwd`) and this
+			// autofix path to consume the SAME policy; deriving the root two
+			// different ways is how they drift, and the hand-rolled form ignored a
+			// nested `pyproject.toml` whenever the caller passed a workspace root.
+			const ruffCwd = resolveToolCwd("runner", "ruff", absolutePath, {
+				...(cwd !== undefined && { cwd }),
+			}).cwd;
 			// Shared config-args seam (#1247): the lint runner consumes the same
 			// builder, so `check --fix` can never drift to ruff's default rule
 			// set when the project lacks its own config and the package-owned
 			// core.toml fallback applies.
-			const configArgs = ruffConfigArgs(cwd ?? path.dirname(absolutePath));
-			const spawnOpts = {
-				timeout: 10000,
-				cwd: cwd ?? path.dirname(absolutePath),
-			};
+			const configArgs = ruffConfigArgs(ruffCwd);
 
 			const pre = await safeSpawnAsync(
 				this.ruffCommand,
@@ -137,17 +147,17 @@ export class RuffClient {
 					...configArgs,
 					absolutePath,
 				],
-				spawnOpts,
+				{ timeout: 10000, cwd: ruffCwd },
 			);
 			const beforeDiags = pre.stdout?.trim()
-				? this.parseOutput(pre.stdout, absolutePath)
+				? this.parseOutput(pre.stdout, ruffCwd, absolutePath)
 				: [];
 			const fixableCount = beforeDiags.filter((d) => d.fixable).length;
 
 			const fix = await safeSpawnAsync(
 				this.ruffCommand,
 				["check", "--fix", ...configArgs, absolutePath],
-				{ timeout: 15000, cwd: cwd ?? path.dirname(absolutePath) },
+				{ timeout: 15000, cwd: ruffCwd },
 			);
 
 			if (fix.error) {
@@ -176,7 +186,30 @@ export class RuffClient {
 
 	// --- Internal ---
 
-	private parseOutput(output: string, filterFile?: string): RuffDiagnostic[] {
+	/**
+	 * `cwd` is the directory ruff RAN in, and it is REQUIRED: a default would
+	 * hide the wrong base at a call site that forgot it (#3284's D11).
+	 *
+	 * ruff's JSON `filename` is the `SourceFile`'s name verbatim — the JSON
+	 * renderer reads `span.file().path(resolver)` (ruff 0.16.8
+	 * `crates/ruff_db/src/diagnostic/render/json.rs:58,120`), which for a ruff
+	 * (not `ty`) diagnostic is `file.name()` (`crates/ruff_db/src/diagnostic/
+	 * mod.rs:1187-1193`), NOT the cwd-relative `relative_path` the text
+	 * renderers use (`mod.rs:1195-1204`). That name is
+	 * `SourceFileBuilder::new(path.to_string_lossy(), …)`
+	 * (`crates/ruff_linter/src/linter.rs:1049`) over a path the resolver has
+	 * already absolutized ("Normalize every path (e.g., convert from relative to
+	 * absolute)", `crates/ruff_workspace/src/resolver.rs:484`). So ruff echoes
+	 * the absolute path we hand it as argv: the BASE was already right here and
+	 * the fold deletes a `path.resolve` with no base — which silently meant the
+	 * EXTENSION's `process.cwd()`, not ruff's — rather than leaving it for a
+	 * future relative invocation to re-enable.
+	 */
+	private parseOutput(
+		output: string,
+		cwd: string,
+		filterFile?: string,
+	): RuffDiagnostic[] {
 		if (!output.trim()) return [];
 
 		try {
@@ -184,8 +217,18 @@ export class RuffClient {
 			const diagnostics: RuffDiagnostic[] = [];
 
 			for (const item of items) {
-				// Filter to single file if requested
-				if (filterFile && path.resolve(item.filename) !== filterFile) continue;
+				// Filter to single file if requested. #3278/#3286: one seam answers
+				// "is this reported diagnostic about the file I ran for?" — resolve
+				// the tool's spelling against the cwd the tool RAN in and compare
+				// through `pathsEqual`, the repo's on-disk identity predicate. A bare
+				// `!==` treats a spelling that differs only in case (the SAME file on
+				// Windows and on a case-folding POSIX mount) as a different file and
+				// drops every finding for the edited file (#209, #3277).
+				if (
+					filterFile &&
+					!pathsEqual(path.resolve(cwd, item.filename), filterFile)
+				)
+					continue;
 
 				diagnostics.push({
 					line: item.location.row - 1, // ruff is 1-indexed

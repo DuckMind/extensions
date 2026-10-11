@@ -10,6 +10,7 @@ import { test } from "node:test";
 const require = createRequire(import.meta.url);
 
 const extractorUrl = new URL("../pdf-extract.ts", import.meta.url).href;
+const fixtureUrl = new URL("./pdf-fixture.mjs", import.meta.url).href;
 
 test("extractPDFToMarkdown works on Node 22 without native Promise.try", () => {
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
@@ -26,6 +27,7 @@ test("extractPDFToMarkdown works on Node 22 without native Promise.try", () => {
 	);
 
 	assert.match(child.stdout, /Hello PDF/);
+	assert.match(child.stdout, /Second \(line\)/);
 });
 
 test("extractPDFToMarkdown uses Gemini before loading unpdf", () => {
@@ -168,11 +170,13 @@ function buildChildScript(
 	geminiMode = "none",
 	datalabMode = "none",
 	provider = null,
+	endpointMode = "none",
 ) {
 	return `
         import { mkdtemp, readFile, writeFile } from "node:fs/promises";
         import { tmpdir } from "node:os";
         import { join } from "node:path";
+        import { makePdf } from ${JSON.stringify(fixtureUrl)};
 
         process.on("uncaughtException", (error) => {
           console.error(error?.stack || error);
@@ -191,13 +195,21 @@ function buildChildScript(
         const geminiMode = ${JSON.stringify(geminiMode)};
         const datalabMode = ${JSON.stringify(datalabMode)};
         const provider = ${JSON.stringify(provider)};
+        const endpointMode = ${JSON.stringify(endpointMode)};
         const configDir = await mkdtemp(join(tmpdir(), "dm-web-access-pdf-config-"));
         process.env.DM_CODING_AGENT_DIR = configDir;
 
-        if (provider) {
+        if (provider || endpointMode !== "none") {
           await writeFile(
             join(configDir, "web-search.json"),
-            JSON.stringify({ pdf: { provider } }),
+            JSON.stringify({
+              pdf: {
+                ...(provider ? { provider } : {}),
+                ...(endpointMode !== "none"
+                  ? { endpointUrl: "http://127.0.0.1:9/parse" }
+                  : {}),
+              },
+            }),
           );
         }
 
@@ -215,10 +227,23 @@ function buildChildScript(
           delete process.env.DATALAB_API_KEY;
         }
 
-        if (geminiMode !== "none" || datalabMode !== "none") {
+        if (geminiMode !== "none" || datalabMode !== "none" || endpointMode !== "none") {
           globalThis.fetch = async (url, init) => {
             if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
             const urlString = String(url);
+            if (urlString.includes("127.0.0.1:9")) {
+              if (endpointMode === "fail") {
+                return new Response(JSON.stringify({ error: "parser down" }), {
+                  status: 500,
+                  statusText: "Internal Server Error",
+                  headers: { "content-type": "application/json" },
+                });
+              }
+              return new Response(JSON.stringify({ engine: "marker", markdown: "<!-- Page 1 -->\\nEndpoint PDF" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              });
+            }
             if (urlString.includes("generateContent")) {
               if (provider === "datalab" || provider === "unpdf") {
                 throw new Error("Gemini called but provider=" + provider);
@@ -301,45 +326,19 @@ function buildChildScript(
       console.log("Aborted");
     } else {
       const result = await extractPDFToMarkdown(
-        makePdf("Hello PDF"),
+        makePdf("Hello PDF\\nSecond (line)"),
         "https://example.test/hello.pdf",
         { outputDir },
       );
 
-      console.log(await readFile(result.outputPath, "utf8"));
+      const saved = await readFile(result.outputPath, "utf8");
+      if (result.content !== saved || result.chars !== saved.length) {
+        throw new Error("Returned PDF Markdown must match the saved file and character count");
+      }
+      console.log(saved);
       ${printOptions ? "console.log(JSON.stringify(globalThis.__piWebAccessUnpdfOptions));" : ""}
     }
 
-    function makePdf(text) {
-      const content = "BT /F1 24 Tf 72 720 Td (" + text + ") Tj ET";
-      const objects = [
-        "<< /Type /Catalog /Pages 2 0 R >>",
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        "<< /Length " + Buffer.byteLength(content, "ascii") + " >>\\nstream\\n" + content + "\\nendstream",
-      ];
-      let body = "%PDF-1.4\\n";
-      const offsets = [0];
-
-      for (let index = 0; index < objects.length; index += 1) {
-        offsets.push(Buffer.byteLength(body, "ascii"));
-        body += String(index + 1) + " 0 obj\\n" + objects[index] + "\\nendobj\\n";
-      }
-
-      const xrefOffset = Buffer.byteLength(body, "ascii");
-      body += "xref\\n0 " + String(objects.length + 1) + "\\n";
-      body += "0000000000 65535 f \\n";
-
-      for (const offset of offsets.slice(1)) {
-        body += String(offset).padStart(10, "0") + " 00000 n \\n";
-      }
-
-      body += "trailer\\n<< /Size " + String(objects.length + 1) + " /Root 1 0 R >>\\n";
-      body += "startxref\\n" + String(xrefOffset) + "\\n%%EOF\\n";
-
-      return new TextEncoder().encode(body).buffer;
-    }
   `;
 }
 
@@ -447,6 +446,79 @@ test("extractPDFToMarkdown provider=datalab without a key skips Gemini", () => {
 	);
 	assert.match(child.stdout, /Hello PDF/);
 	assert.doesNotMatch(child.stdout, /Gemini PDF/);
+});
+
+test("extractPDFToMarkdown auto order runs the endpoint parser before Datalab", () => {
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: buildChildScript(
+			extractorUrl,
+			false,
+			"success",
+			"success",
+			null,
+			"success",
+		),
+		encoding: "utf8",
+		maxBuffer: 2 * 1024 * 1024,
+	});
+
+	assert.equal(
+		child.status,
+		0,
+		"PDF endpoint-before-Datalab assertion failed in a child process. stderr summary:\n" +
+			errorSummary(child.stderr),
+	);
+	assert.match(child.stdout, /Endpoint PDF/);
+	assert.doesNotMatch(child.stdout, /Datalab PDF/);
+	assert.doesNotMatch(child.stdout, /Gemini PDF/);
+});
+
+test("extractPDFToMarkdown provider=endpoint falls back to unpdf when the parser fails", () => {
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: buildChildScript(
+			extractorUrl,
+			false,
+			"none",
+			"none",
+			"endpoint",
+			"fail",
+		),
+		encoding: "utf8",
+		maxBuffer: 2 * 1024 * 1024,
+	});
+
+	assert.equal(
+		child.status,
+		0,
+		"PDF endpoint-to-unpdf fallback assertion failed in a child process. stderr summary:\n" +
+			errorSummary(child.stderr),
+	);
+	assert.match(child.stdout, /Hello PDF/);
+});
+
+test("extractPDFToMarkdown provider=endpoint without pdf.endpointUrl is a clear error", () => {
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+			import { mkdtemp, writeFile } from "node:fs/promises";
+			import { tmpdir } from "node:os";
+			import { join } from "node:path";
+			process.env.DM_CODING_AGENT_DIR = await mkdtemp(join(tmpdir(), "dm-web-access-pdf-config-"));
+			delete process.env.PDF_ENDPOINT_URL;
+			await writeFile(
+				join(process.env.DM_CODING_AGENT_DIR, "web-search.json"),
+				JSON.stringify({ pdf: { provider: "endpoint" } }),
+			);
+			const { extractPDFToMarkdown } = await import(${JSON.stringify(extractorUrl)});
+			await extractPDFToMarkdown(new ArrayBuffer(8), "https://example.test/hello.pdf")
+				.then(() => { throw new Error("expected rejection"); })
+				.catch((error) => console.log(error.message));
+		`,
+		encoding: "utf8",
+		maxBuffer: 2 * 1024 * 1024,
+	});
+
+	assert.equal(child.status, 0, errorSummary(child.stderr));
+	assert.match(child.stdout, /requires a configured pdf\.endpointUrl/);
 });
 
 test("extractPDFToMarkdown provider=gemini skips Datalab even with a Datalab key", () => {

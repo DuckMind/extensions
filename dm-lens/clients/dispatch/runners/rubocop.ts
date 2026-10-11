@@ -8,7 +8,10 @@
  * Supports bundle exec (preferred in Bundler projects).
  */
 
+import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import {
 	getAutofixCapability,
 	getLinterPolicyForCwd,
@@ -22,6 +25,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { resolveCommandArgsWithInstallFallback } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 interface RubocopOffense {
 	severity: string;
@@ -51,13 +55,22 @@ const SEVERITY_MAP: Record<string, "error" | "warning" | "info"> = {
 	refactor: "info",
 };
 
-function parseRubocopJson(raw: string, filePath: string): Diagnostic[] {
+function parseRubocopJson(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	try {
 		const output: RubocopOutput = JSON.parse(raw);
 		const autofix = getAutofixCapability("rubocop");
 		const diagnostics: Diagnostic[] = [];
+		const absTarget = path.resolve(cwd, filePath);
 
 		for (const file of output.files) {
+			// #3295: `.rubocop.yml` `Include:`/`inherit_from` can widen the run past
+			// the argv, and each result carries its own `path`.
+			if (file.path && !pathsEqual(path.resolve(cwd, file.path), absTarget))
+				continue;
 			for (const offense of file.offenses) {
 				const severity = SEVERITY_MAP[offense.severity] ?? "warning";
 				diagnostics.push({
@@ -93,7 +106,7 @@ const rubocopRunner: RunnerDefinition = {
 	priority: PRIORITY.FORMAT_AND_LINT_PRIMARY,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "rubocop");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("rubocop")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -117,26 +130,28 @@ const rubocopRunner: RunnerDefinition = {
 			{ timeout: 30000, cwd },
 		);
 
-		// rubocop exits 0 = no offenses, 1 = offenses found, 2 = fatal error
-		if (result.status === 2) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
-		if (result.status === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const diagnostics = parseRubocopJson(result.stdout, ctx.filePath);
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
-		return {
-			status: hasErrors ? "failed" : "succeeded",
-			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
-		};
+		// EXIT TABLE (RuboCop 1.66 docs https://docs.rubocop.org/rubocop/usage/basic_usage.html): 0 = clean, 1 = offenses/findings, 2 = fatal/error or rejected
+		// invocation. A nonzero exit with valid JSON remains findings; a nonzero
+		// exit with empty or unparsable JSON is never clean (#1816).
+		const run = parseToolRun(
+			"rubocop",
+			{
+				result,
+				// Classify both streams so stderr-only failures reach the parse-error
+				// path, while parseOutput keeps RuboCop's native JSON parser on stdout.
+				output: `${result.stdout}${result.stderr}`,
+				exitCodes: { ran: [1, 2] },
+			},
+			(output) => parseRubocopJson(output, ctx.filePath, cwd),
+			{ parseOutput: result.stdout },
+		);
+		if (run.skipped) return run.skipped;
+		return finishParsedRun({
+			tool: "rubocop",
+			ctx,
+			result,
+			diagnostics: run.diagnostics,
+		});
 	},
 };
 

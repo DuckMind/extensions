@@ -1,5 +1,7 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd } from "../../tool-policy.js";
 import { findNearestDirWithAnyBasename } from "../../workspace-topology.js";
 import { PRIORITY } from "../priorities.js";
@@ -48,25 +50,41 @@ interface TflintOutput {
 	errors: Array<{ message: string }>;
 }
 
-function parseTflintOutput(raw: string, filePath: string): Diagnostic[] {
+function parseTflintOutput(
+	raw: string,
+	filePath: string,
+	toolCwd: string,
+): Diagnostic[] {
 	try {
 		const parsed = JSON.parse(raw) as TflintOutput;
 		const issues = parsed.issues ?? [];
 
-		return issues.map((issue) => {
+		// #3295: tflint loads EVERY `*.tf` in its working directory — `--filter` is
+		// best-effort — and names each issue's own `range.filename`, relative to
+		// the directory it ran in (`toolCwd`, which is the file's dir, not the
+		// runner cwd).
+		const absTarget = path.resolve(toolCwd, filePath);
+		return issues.flatMap((issue) => {
+			if (
+				issue.range?.filename &&
+				!pathsEqual(path.resolve(toolCwd, issue.range.filename), absTarget)
+			)
+				return [];
 			const severity = issue.rule.severity === "error" ? "error" : "warning";
-			return {
-				id: `tflint-${issue.rule.name}-${issue.range.start.line}`,
-				message: `[${issue.rule.name}] ${issue.message}`,
-				filePath,
-				line: issue.range.start.line,
-				column: issue.range.start.column,
-				severity,
-				semantic: severity === "error" ? "blocking" : "warning",
-				tool: "tflint",
-				rule: issue.rule.name,
-				fixable: false,
-			};
+			return [
+				{
+					id: `tflint-${issue.rule.name}-${issue.range.start.line}`,
+					message: `[${issue.rule.name}] ${issue.message}`,
+					filePath,
+					line: issue.range.start.line,
+					column: issue.range.start.column,
+					severity,
+					semantic: severity === "error" ? "blocking" : "warning",
+					tool: "tflint",
+					rule: issue.rule.name,
+					fixable: false,
+				},
+			];
 		});
 	} catch {
 		return [];
@@ -80,7 +98,7 @@ const tflintRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "tflint");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("tflint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -116,8 +134,14 @@ const tflintRunner: RunnerDefinition = {
 		// not a clean file. No exit-code table: tflint's nonzero codes are not
 		// verified against a real binary here, so the conservative
 		// nothing-to-parse rule stays the only discriminator.
-		const run = parseToolRun("tflint", { result }, (out) =>
-			parseTflintOutput(out, ctx.filePath),
+		const run = parseToolRun(
+			"tflint",
+			{
+				result,
+				// EXIT TABLE (TFLint 0.52 measured fixture): 0 clean; 1 error; 2 findings; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(out) => parseTflintOutput(out, absPath, fileDir),
 		);
 		if (run.skipped) return run.skipped;
 

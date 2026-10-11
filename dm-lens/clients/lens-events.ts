@@ -9,7 +9,7 @@ import {
 	type BusEmitGetter,
 } from "./live-bus-emitter.js";
 
-export const LENS_EVENT_VERSION = 1;
+const LENS_EVENT_VERSION = 1;
 
 export const LENS_EVENT_NAMES = {
 	analysisComplete: "dm-lens/analysis-complete",
@@ -19,7 +19,7 @@ export const LENS_EVENT_NAMES = {
 
 type LensEventName = (typeof LENS_EVENT_NAMES)[keyof typeof LENS_EVENT_NAMES];
 
-export interface LensTelemetryPayload {
+interface LensTelemetryPayload {
 	model: string;
 	sessionId: string;
 	turnIndex: number;
@@ -108,7 +108,8 @@ export function _resetForTests(): void {
 function emitLensEvent(eventName: LensEventName, payload: unknown): void {
 	setImmediate(() => {
 		const rawCwd = (payload as { cwd?: string }).cwd ?? process.cwd();
-		// M1: normalizeFilePath is a sync realpathSync.native on Windows — build
+		// M1: normalizeFilePath is a sync realpathSync.native on Windows, and on
+		// POSIX too since #3098 — build
 		// the resolveLiveBusEmitter log entry lazily so the ready-path (the
 		// common case) never pays it. Only the stale-session branch needs it.
 		const resolution = resolveLiveBusEmitter(liveEmitter, () => ({

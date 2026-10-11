@@ -1,13 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DM_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 
 export const DM_CODING_AGENT_PACKAGE = "@duckmind/dm-coding-agent";
 export const DM_SUBAGENT_PI_BINARY_ENV = "DM_SUBAGENT_PI_BINARY";
 
-export function findPiPackageRootFromEntry(
-	entryPoint: string,
-): string | undefined {
+export function findPiPackageRootFromEntry(entryPoint: string): string | undefined {
 	let dir = path.dirname(entryPoint);
 	while (dir !== path.dirname(dir)) {
 		const packageJsonPath = path.join(dir, "package.json");
@@ -15,7 +14,20 @@ export function findPiPackageRootFromEntry(
 			const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8")) as {
 				name?: unknown;
 			};
-			if (pkg.name === DM_CODING_AGENT_PACKAGE) return dir;
+			if (pkg.name === DM_CODING_AGENT_PACKAGE) {
+				// A development build may duplicate the host manifest under dist/.
+				// Its exports still refer to the containing package root.
+				const parent = path.dirname(dir);
+				const parentManifest = path.join(parent, "package.json");
+				if (path.basename(dir) === "dist" && fs.existsSync(parentManifest)) {
+					try {
+						if (JSON.parse(fs.readFileSync(parentManifest, "utf-8")).name === DM_CODING_AGENT_PACKAGE) return parent;
+					} catch {
+						// Keep the validated inner package if the parent is invalid.
+					}
+				}
+				return dir;
+			}
 		}
 		dir = path.dirname(dir);
 	}
@@ -23,9 +35,13 @@ export function findPiPackageRootFromEntry(
 }
 
 export function resolveInstalledPiPackageRoot(): string | undefined {
-	return findPiPackageRootFromEntry(
-		fileURLToPath(import.meta.resolve(DM_CODING_AGENT_PACKAGE)),
-	);
+	try {
+		return findPiPackageRootFromEntry(
+			fileURLToPath(import.meta.resolve(DM_CODING_AGENT_PACKAGE)),
+		);
+	} catch {
+		return undefined;
+	}
 }
 
 export function resolvePiPackageRoot(): string | undefined {
@@ -44,6 +60,7 @@ export interface PiSpawnDeps {
 	platform?: NodeJS.Platform;
 	execPath?: string;
 	argv1?: string;
+	bunVersion?: string;
 	existsSync?: (filePath: string) => boolean;
 	realpathSync?: (filePath: string) => string;
 	readFileSync?: (filePath: string, encoding: "utf-8") => string;
@@ -53,9 +70,27 @@ export interface PiSpawnDeps {
 	env?: NodeJS.ProcessEnv;
 }
 
+/** Compiled DM's entrypoint is virtual; execPath is the real (possibly renamed) image. */
+export function resolveBunPiExecutable(deps: PiSpawnDeps = {}): string | undefined {
+	const bunVersion = deps.bunVersion ?? process.versions.bun;
+	const entry = deps.argv1 ?? process.argv[1];
+	if (!bunVersion || !entry || !/^(?:\/\$bunfs\/|B:[\\/]~BUN[\\/])/.test(entry)) return undefined;
+	const env = deps.env ?? process.env;
+	return env[DM_SUBAGENT_PI_BINARY_ENV]?.trim() || (deps.execPath ?? process.execPath);
+}
+
 interface PiSpawnCommand {
 	command: string;
 	args: string[];
+}
+
+interface PiPackageJson {
+	name?: unknown;
+	bin?: string | Record<string, string>;
+}
+
+function isNodeScriptPath(filePath: string): boolean {
+	return /\.(?:mjs|cjs|js)$/i.test(filePath);
 }
 
 function isRunnableNodeScript(
@@ -63,7 +98,7 @@ function isRunnableNodeScript(
 	existsSync: (filePath: string) => boolean,
 ): boolean {
 	if (!existsSync(filePath)) return false;
-	return /\.(?:mjs|cjs|js)$/i.test(filePath);
+	return isNodeScriptPath(filePath);
 }
 
 function normalizePath(filePath: string): string {
@@ -75,6 +110,23 @@ function isStandalonePiExecutable(execPath: string): boolean {
 	return /^dm(?:\.exe)?$/i.test(executableName ?? "");
 }
 
+function resolvePiCliScriptFromPackageJson(
+	packageJsonPath: string,
+	readFileSync: (filePath: string, encoding: "utf-8") => string,
+	existsSync: (filePath: string) => boolean,
+): string | undefined {
+	const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as PiPackageJson;
+	if (packageJson.name !== DM_CODING_AGENT_PACKAGE) return undefined;
+	const binField = packageJson.bin;
+	const binPath =
+		typeof binField === "string"
+			? binField
+			: (binField?.dm ?? Object.values(binField ?? {})[0]);
+	if (!binPath) return undefined;
+	const candidate = path.resolve(path.dirname(packageJsonPath), binPath);
+	return isRunnableNodeScript(candidate, existsSync) ? candidate : undefined;
+}
+
 export function resolvePiCliScript(
 	deps: PiSpawnDeps = {},
 ): string | undefined {
@@ -84,6 +136,7 @@ export function resolvePiCliScript(
 		deps.readFileSync ??
 		((filePath, encoding) => fs.readFileSync(filePath, encoding));
 	const argv1 = deps.argv1 ?? process.argv[1];
+	const env = deps.env ?? process.env;
 
 	if (argv1) {
 		const argvPath = normalizePath(argv1);
@@ -99,38 +152,28 @@ export function resolvePiCliScript(
 		}
 	}
 
-	try {
-		const resolvePackageJson =
-			deps.resolvePackageJson ??
-			(() => {
-				const root = deps.piPackageRoot ?? resolvePiPackageRoot();
-				if (root) return path.join(root, "package.json");
-				const packageRoot = deps.resolvePackageEntry
-					? findPiPackageRootFromEntry(deps.resolvePackageEntry())
-					: resolveInstalledPiPackageRoot();
-				if (!packageRoot)
-					throw new Error(
-						`Could not resolve ${DM_CODING_AGENT_PACKAGE} package root`,
-					);
-				return path.join(packageRoot, "package.json");
-			});
-		const packageJsonPath = resolvePackageJson();
-		const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as {
-			bin?: string | Record<string, string>;
-		};
-		const binField = packageJson.bin;
-		const binPath =
-			typeof binField === "string"
-				? binField
-				: (binField?.dm ?? Object.values(binField ?? {})[0]);
-		if (!binPath) return undefined;
-		const candidate = path.resolve(path.dirname(packageJsonPath), binPath);
-		if (isRunnableNodeScript(candidate, existsSync)) {
-			return candidate;
+	const packageJsonCandidates: Array<() => string | undefined> = [];
+	if (deps.resolvePackageJson) packageJsonCandidates.push(deps.resolvePackageJson);
+	for (const root of [deps.piPackageRoot, env[DM_CODING_AGENT_PACKAGE_ROOT_ENV], resolvePiPackageRoot()]) {
+		const trimmed = root?.trim();
+		if (trimmed) packageJsonCandidates.push(() => path.join(trimmed, "package.json"));
+	}
+	packageJsonCandidates.push(() => {
+		const packageRoot = deps.resolvePackageEntry
+			? findPiPackageRootFromEntry(deps.resolvePackageEntry())
+			: resolveInstalledPiPackageRoot();
+		return packageRoot ? path.join(packageRoot, "package.json") : undefined;
+	});
+
+	for (const candidatePackageJson of packageJsonCandidates) {
+		try {
+			const packageJsonPath = candidatePackageJson();
+			if (!packageJsonPath) continue;
+			const candidate = resolvePiCliScriptFromPackageJson(packageJsonPath, readFileSync, existsSync);
+			if (candidate) return candidate;
+		} catch {
+			// Keep resolving; callers decide whether a PATH fallback is safe.
 		}
-	} catch {
-		// Verified CLI resolution is optional; falling back to `dm` lets PATH handle execution.
-		return undefined;
 	}
 
 	return undefined;
@@ -140,9 +183,16 @@ export function getPiSpawnCommand(
 	args: string[],
 	deps: PiSpawnDeps = {},
 ): PiSpawnCommand {
+	const platform = deps.platform ?? process.platform;
 	const env = deps.env ?? process.env;
 	const piBinary = env[DM_SUBAGENT_PI_BINARY_ENV]?.trim();
 	if (piBinary) {
+		if (platform === "win32" && isNodeScriptPath(piBinary)) {
+			return {
+				command: deps.execPath ?? process.execPath,
+				args: [piBinary, ...args],
+			};
+		}
 		return { command: piBinary, args };
 	}
 
@@ -157,6 +207,11 @@ export function getPiSpawnCommand(
 			command: execPath,
 			args: [piCliPath, ...args],
 		};
+	}
+	if (platform === "win32") {
+		throw new Error(
+			`Could not resolve the DM CLI on Windows. Set ${DM_SUBAGENT_PI_BINARY_ENV} or ensure ${DM_CODING_AGENT_PACKAGE} is installed.`,
+		);
 	}
 
 	return { command: "dm", args };

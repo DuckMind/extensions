@@ -23,6 +23,7 @@ import {
 } from "./cooperative-budget.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import { KIND_EXTENSIONS, type FileKind } from "./file-kinds.js";
+import { isTestFileName } from "./file-role.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { isAtOrAboveHomeDir, normalizeEphemeralMapKey } from "./path-utils.js";
 import { createSingleFlight, type SingleFlight } from "./single-flight.js";
@@ -41,6 +42,7 @@ import {
 	WordIndexFileTable,
 	WordPostingList,
 } from "./word-index-store.js";
+import { logLatency } from "./latency-logger.js";
 import { logWordIndex } from "./word-index-logger.js";
 
 /**
@@ -122,6 +124,11 @@ export interface WordIndex {
 	replacementStats?: { count: number; totalMs: number; maxMs: number };
 	/** Files whose wire contribution changed since the last serialized snapshot. */
 	dirtyFiles?: Set<string>;
+	/**
+	 * `agent_settled` released this index's serialized memo (#4124); the next
+	 * persist, which the debounce delayed past the settle, releases it again.
+	 */
+	releaseMemoAfterPersist?: boolean;
 	/**
 	 * Running over-estimate of distinct posting backing stores since the last
 	 * compaction (#2117). Incremental edits bump it by one per fresh private
@@ -220,8 +227,10 @@ const STOPWORDS = new Set([
 	"with",
 ]);
 
-const TEST_VENDOR_RE =
-	/(?:(^|[\\/])(?:tests?|__tests__|spec|specs|__mocks__|vendor|node_modules|examples?|fixtures?|\.git|dist|build|coverage)([\\/]|$))|(?:\.(?:test|spec)\.[a-z]+$)/i;
+// Retain the old directory alternatives and anchors; filename classification
+// belongs to file-role (#2928). The relevance multiplier remains 0.3.
+const VENDOR_DIR_RE =
+	/(^|[\\/])(?:tests?|__tests__|spec|specs|__mocks__|vendor|node_modules|examples?|fixtures?|\.git|dist|build|coverage)([\\/]|$)/i;
 
 const DOC_FILE_RE =
 	/\.(?:md|mdx|markdown|json|json5|jsonc|txt|rst|lock|ya?ml|toml|csv)$/i;
@@ -232,7 +241,7 @@ const BM25_K1 = 1.2;
 const BM25_B = 0.75;
 
 function isTestOrVendor(file: string): boolean {
-	return TEST_VENDOR_RE.test(file);
+	return isTestFileName(file) || VENDOR_DIR_RE.test(file);
 }
 
 function isDocFile(file: string): boolean {
@@ -1002,17 +1011,6 @@ async function updateWordIndexDocumentAsyncUnsafe(
 	return true;
 }
 
-/** Bounds shared by every word-index build path — keep the walk off the
- * critical path on large repos: cap the file count, and skip files too large
- * to be hand-written source (generated/bundled output the source filter
- * didn't already exclude).
- *
- * Deprecated (#776): `collectWordIndexDocs` below no longer reads this
- * constant directly — it derives its cap from `getWordIndexMaxFilesDerived`
- * (project-scale.ts's `maxProjectFiles` knob), which reproduces this same
- * 6,000 default at the default base. Kept exported for tests/callers that
- * still reference the literal. */
-export const WORD_INDEX_MAX_FILES = 6000;
 export const WORD_INDEX_MAX_BYTES = 512 * 1024;
 
 export type WordIndexPreflightFiles = Array<{
@@ -1048,9 +1046,9 @@ export async function collectWordIndexDocs(
 > {
 	const { collectSourceFilesAsync } = await import("./source-filter.js");
 	// #747 hardening: pass the cap INTO the walk — without it,
-	// `collectSourceFilesAsync` defaults to an unbounded traversal and the
-	// `WORD_INDEX_MAX_FILES` slice below only trims the result AFTER the whole
-	// tree (all of $HOME, on a misrooted cwd) has already been enumerated.
+	// `collectSourceFilesAsync` defaults to an unbounded traversal and any
+	// slice below would only trim the result AFTER the whole tree (all of
+	// $HOME, on a misrooted cwd) has already been enumerated.
 	// #760: the walk is additionally bounded by source-filter's default
 	// visited-entry budget (DEFAULT_MAX_SCAN_ENTRIES), so a mixed tree with few
 	// source files among a huge pile of non-source files can't force a
@@ -1122,13 +1120,13 @@ export interface WordIndexRefreshResult {
 	timings: WordIndexRefreshTimings;
 }
 
-export interface WordIndexRefreshTimings {
+interface WordIndexRefreshTimings {
 	sourceWalkMs: number;
 	statWalkMs: number;
 	refreshReadsMs: number;
 }
 
-export interface WordIndexRebuildRequired {
+interface WordIndexRebuildRequired {
 	mode: "full-required";
 	reason:
 		| "missing-incremental-metadata"
@@ -1151,7 +1149,7 @@ export interface WordIndexRefreshOptions {
 // Node's fs.promises.stat runs on libuv's threadpool (default 4 slots), so
 // real parallelism tops out there; the surplus workers are queue depth that
 // keeps the pool saturated without starving other threadpool consumers.
-export const WORD_INDEX_STAT_CONCURRENCY = 8;
+const WORD_INDEX_STAT_CONCURRENCY = 8;
 
 const WORD_INDEX_INCREMENTAL_CHURN_THRESHOLD = 0.3;
 // A ratio alone misclassifies one stale file in a three-file project as dense.
@@ -1477,10 +1475,13 @@ export async function refreshWordIndexIncrementally(
 // with no filter-specific plumbing of their own.
 
 /** The three supported inline query-filter prefixes (#1450). */
-export type WordIndexQueryFilterKey = "lang" | "file" | "ext";
+type WordIndexQueryFilterKey = "lang" | "file" | "ext";
 
-export const WORD_INDEX_QUERY_FILTER_KEYS: readonly WordIndexQueryFilterKey[] =
-	["lang", "file", "ext"];
+const WORD_INDEX_QUERY_FILTER_KEYS: readonly WordIndexQueryFilterKey[] = [
+	"lang",
+	"file",
+	"ext",
+];
 
 export interface WordIndexQueryFilter {
 	key: WordIndexQueryFilterKey;
@@ -1905,11 +1906,18 @@ interface SerializedWordIndexCache {
 	serialized: SerializedWordIndex;
 	slotByFileId: Map<number, number>;
 	tokensByFile: Map<string, Set<string>>;
+	wireBytes: number | null;
+	/** Stalled-run backstop; see {@link retainSerializedWordIndex}. */
+	backstopTimer?: ReturnType<typeof setTimeout>;
 }
 
 const serializedWordIndexCaches = new WeakMap<
 	WordIndex,
 	SerializedWordIndexCache
+>();
+const serializedWordIndexSources = new WeakMap<
+	SerializedWordIndex,
+	WordIndex
 >();
 
 /**
@@ -1924,6 +1932,101 @@ const serializedWordIndexCaches = new WeakMap<
 export interface WordIndexSerializeWork {
 	affectedTokenCount: number;
 	tookFullPath: boolean;
+}
+
+/** Bytes in the JSON wire representation most recently persisted for an index. */
+export function getWordIndexWireBytes(index: WordIndex): number | null {
+	return serializedWordIndexCaches.get(index)?.wireBytes ?? null;
+}
+
+/** Record the UTF-8 length the snapshot persist took while encoding this serialized index. */
+export function recordPersistedWordIndexWireBytes(
+	serialized: SerializedWordIndex | undefined,
+	wireBytes: number | undefined,
+): void {
+	if (!serialized || wireBytes === undefined) return;
+	const index = serializedWordIndexSources.get(serialized);
+	const cache = index && serializedWordIndexCaches.get(index);
+	if (cache?.serialized === serialized) cache.wireBytes = wireBytes;
+}
+
+// The serialized memo is also what makes a persist incremental (#2068, #2202):
+// an edit burst's per-edit persists stay O(dirty tokens) only while it is held
+// (measured on this repo, ~3,800 files: 27-34 ms / 12 MB incremental against
+// 432-527 ms / ~200 MB for a full re-serialize). So it is kept while a run
+// edits and released once per run at `agent_settled`
+// ({@link releaseWordIndexMemoAtSettle}), the idle point #4124 is about.
+//
+// The backstop covers a host that never emits `agent_settled` and a stalled
+// run. The maintainer's latency.log holds only n=2 intra-run gaps between
+// project_snapshot_persist records (5.8 s), too few to set a percentile, so
+// the default is a deliberately conservative 10 minutes, re-armed by every
+// serialize. `DM_LENS_WORD_INDEX_MEMO_BACKSTOP_MS` overrides it. Node clamps a
+// delay above 2^31-1 ms to 1 ms (and warns), which would release the memo at
+// once on every serialize, so a larger value is clamped to the maximum delay.
+// 0 and anything non-numeric or negative mean "use the default": a backstop
+// that fires immediately is the memo switched off, which is not what 0 asks.
+const DEFAULT_WORD_INDEX_MEMO_BACKSTOP_MS = 10 * 60_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function wordIndexMemoBackstopMs(): number {
+	const raw = Number(process.env.DM_LENS_WORD_INDEX_MEMO_BACKSTOP_MS);
+	return Number.isFinite(raw) && raw > 0
+		? Math.min(raw, MAX_TIMER_DELAY_MS)
+		: DEFAULT_WORD_INDEX_MEMO_BACKSTOP_MS;
+}
+
+/**
+ * Hold `entry` as `index`'s memo and (re)arm the backstop. The timer closure
+ * holds the index only weakly: a strong reference would keep a replaced
+ * session's index and its wire form alive for the whole delay.
+ */
+function retainSerializedWordIndex(
+	index: WordIndex,
+	entry: SerializedWordIndexCache,
+): void {
+	const prior = serializedWordIndexCaches.get(index);
+	if (prior) clearTimeout(prior.backstopTimer);
+	serializedWordIndexCaches.set(index, entry);
+	const ref = new WeakRef(index);
+	const timer = setTimeout(() => {
+		const target = ref.deref();
+		if (target) releaseWordIndexMemo(target, "backstop");
+	}, wordIndexMemoBackstopMs());
+	timer.unref?.();
+	entry.backstopTimer = timer;
+}
+
+/**
+ * Drop the incremental-serialize memo of `index`; the decoded index is
+ * untouched. One latency.log row per release of a held memo (a release of
+ * nothing is silent), so the settle and the backstop can each be observed.
+ */
+function releaseWordIndexMemo(
+	index: WordIndex,
+	trigger: "settle" | "post_settle_persist" | "backstop",
+): void {
+	const memo = serializedWordIndexCaches.get(index);
+	if (!memo) return;
+	clearTimeout(memo.backstopTimer);
+	serializedWordIndexCaches.delete(index);
+	logLatency({
+		type: "phase",
+		phase: "word_index_memo_released",
+		filePath: "<dm-lens>",
+		durationMs: 0,
+		metadata: { trigger, files: memo.serialized.files.length },
+	});
+}
+
+/** `agent_settled`: the run is over, so release the memo (now and after a pending persist). */
+export function releaseWordIndexMemoAtSettle(index: WordIndex): void {
+	releaseWordIndexMemo(index, "settle");
+	// A per-edit persist is debounced (1.5 s), so the run's last edit can persist
+	// after this settle; that persist would re-create the memo and hold it until
+	// the backstop. The mark makes that one persist release it again; any later
+	// edit's schedule clears it, so a new run keeps its memo.
+	index.releaseMemoAfterPersist = true;
 }
 
 let _lastSerializeWork: WordIndexSerializeWork | undefined;
@@ -1991,7 +2094,12 @@ function serializeWordIndexFull(index: WordIndex): SerializedWordIndexCache {
 		affectedTokenCount: postings.length,
 		tookFullPath: true,
 	};
-	return { serialized, slotByFileId, tokensByFile };
+	return {
+		serialized,
+		slotByFileId,
+		tokensByFile,
+		wireBytes: null,
+	};
 }
 
 /**
@@ -2113,7 +2221,12 @@ function serializeWordIndexIncrementally(
 		affectedTokenCount: affectedTokens.size,
 		tookFullPath: false,
 	};
-	return { serialized, slotByFileId, tokensByFile };
+	return {
+		serialized,
+		slotByFileId,
+		tokensByFile,
+		wireBytes: null,
+	};
 }
 
 export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
@@ -2121,7 +2234,8 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 	const cache = prior
 		? serializeWordIndexIncrementally(index, prior)
 		: serializeWordIndexFull(index);
-	serializedWordIndexCaches.set(index, cache);
+	retainSerializedWordIndex(index, cache);
+	serializedWordIndexSources.set(cache.serialized, index);
 	index.dirtyFiles?.clear();
 	return cache.serialized;
 }
@@ -2432,10 +2546,11 @@ export function deserializeWordIndex(
 		}
 	}
 	if (canonical) {
-		serializedWordIndexCaches.set(index, {
+		retainSerializedWordIndex(index, {
 			serialized: data,
 			slotByFileId,
 			tokensByFile,
+			wireBytes: null,
 		});
 	}
 
@@ -2639,6 +2754,10 @@ async function writeWordIndexSnapshot(
 		snapshot.wordIndex = serializeWordIndex(index);
 		const serializeMs = performance.now() - serializeStartedAt;
 		saveProjectSnapshot(cwd, snapshot);
+		if (index.releaseMemoAfterPersist) {
+			index.releaseMemoAfterPersist = false;
+			releaseWordIndexMemo(index, "post_settle_persist");
+		}
 		const writeMs = performance.now() - serializeStartedAt - serializeMs;
 		dbg?.(
 			`word-index persist: ${index.docCount} files, ${index.postings.size} tokens`,
@@ -2693,6 +2812,7 @@ export function scheduleWordIndexPersist(
 	dbg?: (msg: string) => void,
 ): void {
 	const key = path.resolve(cwd);
+	index.releaseMemoAfterPersist = false;
 	getWordIndexPersistScheduler().schedule(key, { cwd: key, index, dbg });
 }
 

@@ -12,7 +12,7 @@
  *
  *   builtin -> global -> project root -> nested-project -> env -> cli -> host
  *
- * It is `config-core`'s own `TIER_PRECEDENCE`, not a second ordering: this
+ * It is `config-core`'s own `SOURCE_TIERS`, not a second ordering: this
  * module places files into tiers and the core sorts them. `docs/configuration.md`
  * documents the same order once, and `tests/clients/config-resolve.test.ts`
  * walks it.
@@ -70,6 +70,7 @@ import {
 	CANONICAL_GLOBAL_CONFIG_FILE,
 	CANONICAL_PROJECT_CONFIG_FILE,
 	GLOBAL_CONFIG_LOCATIONS,
+	isResolvedGlobalConfigPath,
 	LEGACY_ROOT_LSP_KEYS,
 	LSP_NAMESPACE_KEY,
 	PROJECT_CONFIG_LOCATIONS,
@@ -231,6 +232,11 @@ function collectDocuments(
 	const documents: ConfigDocument[] = [];
 	for (const location of locations) {
 		const file = path.join(dir, location.relativePath);
+		// The global tier reads its file by absolute path; a candidate that IS
+		// that file is refused rather than adopted as a project/nested-project
+		// document, which would double-read and double-validate it
+		// (global-config-location PR, refs #2457).
+		if (tier !== "global" && isResolvedGlobalConfigPath(file)) continue;
 		const outcome = readConfigDocument(file);
 		if (outcome.status === "missing") continue;
 		if (outcome.status === "error") {
@@ -256,7 +262,7 @@ function collectDocuments(
  * is `nested-project`, which is what makes "nearest wins, per field" fall out
  * of the core's tier precedence instead of being re-implemented here.
  */
-export function collectDmLensConfigDocuments(
+function collectDmLensConfigDocuments(
 	options: ResolveDmLensConfigOptions,
 ): ConfigDocument[] {
 	const documents: ConfigDocument[] = [];
@@ -617,7 +623,7 @@ function assignRaw(
  * half-migrated the file it was written in is the defect this whole change
  * exists to remove.
  */
-export function configSources(
+function configSources(
 	documents: readonly ConfigDocument[],
 ): RawConfigSource[] {
 	const sources: RawConfigSource[] = [];
@@ -823,7 +829,7 @@ function record(input: {
  * (`/lsp/servers`) — because the two producers are different modules and neither
  * exists to serve this classification.
  */
-export type ConfigRecordOwner = "lsp" | "dm-lens";
+type ConfigRecordOwner = "lsp" | "dm-lens";
 
 /**
  * `undefined` for a record no key can attribute — the whole-file/whole-document
@@ -832,7 +838,7 @@ export type ConfigRecordOwner = "lsp" | "dm-lens";
  * duplicate notice about a config that failed to load is noise, while silence
  * about it is the failure mode this module exists to prevent.
  */
-export function configRecordOwner(
+function configRecordOwner(
 	record: MigrationRecord,
 ): ConfigRecordOwner | undefined {
 	const key = record.canonicalKey ?? record.key;
@@ -989,6 +995,7 @@ export type NoteIgnored = (
 	reason:
 		| string
 		| { readonly parseError: unknown; readonly sourceText?: string },
+	code?: ConfigDiagnosticCode,
 ) => void;
 
 /**
@@ -1028,9 +1035,9 @@ export function ignoredRecordCollector(
 	records: () => readonly MigrationRecord[];
 } {
 	const noted: MigrationRecord[] = [];
-	const note: NoteIgnored = (reason) => {
-		noted.push({
-			code: "PILENS_CFG_0001",
+	const note: NoteIgnored = (reason, code = "PILENS_CFG_0001") => {
+		let notedRecord = {
+			code: "PILENS_CFG_0001" as ConfigDiagnosticCode,
 			file: configPath,
 			key: "",
 			subject: migrationSubject(configPath, ""),
@@ -1041,7 +1048,9 @@ export function ignoredRecordCollector(
 							sourceText: reason.sourceText,
 						}),
 			tier,
-		});
+		};
+		if (code !== "PILENS_CFG_0001") notedRecord.code = code;
+		noted.push(notedRecord);
 	};
 	return {
 		note,

@@ -2,7 +2,6 @@ import { Buffer } from "node:buffer";
 
 export const SUBAGENT_CAPABILITY_CEILING_VERSION = 1 as const;
 export const SUBAGENT_CAPABILITY_CEILING_REGISTRY_KEY = "dm-subagents.capability-ceiling.v1";
-export const SUBAGENT_CAPABILITY_CEILING_ENV = "DM_SUBAGENT_CAPABILITY_CEILING_V1";
 
 export type SubagentCapabilityCeiling =
 	| { allowedTools: readonly string[]; allowedAgents?: readonly string[]; denyExtensions?: boolean }
@@ -22,6 +21,7 @@ export interface SubagentCapabilityAudit {
 	requestedTools?: string[];
 	effectiveTools: string[];
 	removedTools: string[];
+	excludeTools?: string[];
 	internalTools: string[];
 	extensionsDenied: boolean;
 	removedExtensionCount: number;
@@ -29,6 +29,7 @@ export interface SubagentCapabilityAudit {
 	effectiveMcpTools: string[];
 	agentAllowed: boolean;
 	agentRestrictionSources?: string[];
+	/** Builtin tools declared but unavailable on the host runtime. */
 }
 
 export interface RegisterSubagentCapabilityCeilingOptions {
@@ -60,6 +61,10 @@ function validateText(value: unknown, field: string): string {
 		throw new Error(`Invalid capability ceiling ${field}; expected a non-empty string without control characters (max 256 UTF-8 bytes).`);
 	}
 	return value.trim();
+}
+
+export function normalizeCapabilityCeilingAllowedAgents(values: unknown): string[] {
+	return normalizeCeiling({ allowedAgents: values } as SubagentCapabilityCeiling).allowedAgents!;
 }
 
 function normalizeCeiling(ceiling: SubagentCapabilityCeiling): ResolvedSubagentCapabilityCeiling {
@@ -166,7 +171,7 @@ export function resolveSubagentCapabilityCeiling(sessionId: string | undefined, 
 }
 
 export function resolveCurrentSubagentCapabilityCeiling(sessionId: string | undefined): ResolvedSubagentCapabilityCeiling | undefined {
-	return resolveSubagentCapabilityCeiling(sessionId, decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]));
+	return resolveSubagentCapabilityCeiling(sessionId, undefined);
 }
 
 export function isAgentAllowedByCapabilityCeiling(agentName: string, ceiling: ResolvedSubagentCapabilityCeiling | undefined): boolean {

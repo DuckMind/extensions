@@ -6,90 +6,19 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { WAIT_TOOL_ENABLED_ENV } from "../../src/runs/background/subagent-wait.ts";
-import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/dm-args.ts";
+import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 function parentToolEnv(agentDir?: string): NodeJS.ProcessEnv {
 	const env = { ...process.env };
 	delete env[SUBAGENT_CHILD_ENV];
-	delete env[SUBAGENT_FANOUT_CHILD_ENV];
 	delete env[WAIT_TOOL_ENABLED_ENV];
 	if (agentDir) env.DM_CODING_AGENT_DIR = agentDir;
 	return env;
 }
 
 describe("subagent extension child mode", () => {
-	it("defers persistence when startup config expires a cached exclusion", () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-model-exclusion-startup-"));
-		const exclusionPath = path.join(agentDir, "model-exclusions.json");
-		try {
-			const configDir = path.join(agentDir, "extensions", "subagent");
-			fs.mkdirSync(configDir, { recursive: true });
-			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ modelExclusions: { defaultTtlMs: 300_000 } }), "utf-8");
-			const recordedAt = Date.now() - 600_000;
-			const originalExpiry = Date.now() + 3_600_000;
-			fs.writeFileSync(exclusionPath, JSON.stringify({
-				version: 1,
-				exclusions: [{ provider: "openai", modelId: "old-model", reason: "503", recordedAt, expiresAt: originalExpiry }],
-			}), "utf-8");
-			const script = String.raw`
-				import registerSubagentExtension from "./index.ts";
-				import { isExcluded } from "./src/runs/shared/model-exclusions.ts";
-				const events = { on() { return () => {}; }, emit() {} };
-				const fakePi = new Proxy({
-					events,
-					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
-				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
-				registerSubagentExtension(fakePi);
-				if (isExcluded("old-model", "openai")) throw new Error("startup TTL clamp did not expire the cached exclusion in memory");
-			`;
-			const env = parentToolEnv(agentDir);
-			env.PI_MODEL_EXCLUSIONS_PATH = exclusionPath;
-			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
-			const persisted = JSON.parse(fs.readFileSync(exclusionPath, "utf-8")).exclusions[0] as { expiresAt: number };
-			assert.equal(persisted.expiresAt, originalExpiry);
-		} finally {
-			fs.rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("applies model exclusion TTL from extension config at registration", () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-model-exclusion-config-"));
-		const exclusionPath = path.join(agentDir, "model-exclusions.json");
-		try {
-			const configDir = path.join(agentDir, "extensions", "subagent");
-			fs.mkdirSync(configDir, { recursive: true });
-			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ modelExclusions: { defaultTtlMs: 300_000 } }), "utf-8");
-			const recordedAt = Date.now();
-			fs.writeFileSync(exclusionPath, JSON.stringify({
-				version: 1,
-				exclusions: [{ provider: "openai", modelId: "old-model", reason: "503", recordedAt, expiresAt: recordedAt + 3_600_000 }],
-			}), "utf-8");
-			const script = String.raw`
-				import * as fs from "node:fs";
-				import registerSubagentExtension from "./index.ts";
-				import { recordModelFailure } from "./src/runs/shared/model-exclusions.ts";
-				const events = { on() { return () => {}; }, emit() {} };
-				const fakePi = new Proxy({
-					events,
-					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
-				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
-				registerSubagentExtension(fakePi);
-				recordModelFailure({ modelId: "gpt-5", provider: "openai", reason: "test" });
-				const entries = JSON.parse(fs.readFileSync(process.env.PI_MODEL_EXCLUSIONS_PATH, "utf-8")).exclusions;
-				for (const entry of entries) {
-					if (entry.expiresAt - entry.recordedAt !== 300_000) throw new Error("configured model exclusion TTL was not applied: " + JSON.stringify(entry));
-				}
-			`;
-			const env = parentToolEnv(agentDir);
-			env.PI_MODEL_EXCLUSIONS_PATH = exclusionPath;
-			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
-		} finally {
-			fs.rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
-
 	it("collapses tool detail before direct subagent tool execution", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
@@ -111,10 +40,11 @@ describe("subagent extension child mode", () => {
 			});
 			registerSubagentExtension(fakePi);
 			if (!registeredTool) throw new Error("tool not registered");
+			if (registeredTool.exposure !== "model-only") throw new Error("codemode scripts must not call subagent, got exposure " + registeredTool.exposure);
 			const calls = [];
 			const ctx = {
 				cwd: process.cwd(),
-				hasUI: true,
+				isIdle() { return false; }, hasUI: true,
 				ui: {
 					setToolsExpanded(value) { calls.push(value); },
 					setWidget() {},
@@ -142,7 +72,7 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
-	it("renders only the public workflow execution mode", () => {
+	it("renders the workflow source without reading the script", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			const events = { on() { return () => {}; }, emit() {} };
@@ -155,56 +85,44 @@ describe("subagent extension child mode", () => {
 			registerSubagentExtension(fakePi);
 			if (!registeredTool) throw new Error("tool not registered");
 			const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
-			const workflow = registeredTool.renderCall({
-				workflowScript: "const scan = await runs.run('scan', {agent:'worker'}); return runs.all([{key:'correctness',agent:'reviewer'},{key:'tests',agent:'reviewer'}]);",
-			}, theme).text;
-			const foregroundWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run('publish', {agent:'worker'});", async: false }, theme).text;
-			const templateWorkflow = registeredTool.renderCall({ workflowScript: "return runs.run(\`template\`, {agent:'worker'});", async: false }, theme).text;
-			const commentedWorkflow = registeredTool.renderCall({ workflowScript: "// runs.run('ignored', {agent:'worker'})\nconst note = \"key: 'also-ignored'\"; return runs.run('real', {agent:'worker'});" }, theme).text;
-			const dynamicKeyWorkflow = registeredTool.renderCall({ workflowScript: "return runs.all([{key: 'review-' + item, agent: 'reviewer'}]);" }, theme).text;
-			const ordinaryKeyWorkflow = registeredTool.renderCall({ workflowScript: "const config = {key: 'secret'}; return runs.all([{agent: 'reviewer', config: {key: 'nested'}, key: 'review'}]);" }, theme).text;
-			if (!workflow.includes("background · 3 lanes: scan, correctness, tests")) throw new Error("expected workflow manifest, got " + workflow);
-			if (!foregroundWorkflow.includes("foreground · 1 lane: publish")) throw new Error("expected foreground workflow manifest, got " + foregroundWorkflow);
-			if (!templateWorkflow.includes("foreground · 1 lane: template")) throw new Error("expected static template lane, got " + templateWorkflow);
-			if (!commentedWorkflow.includes("background · 1 lane: real")) throw new Error("expected lexical lane filtering, got " + commentedWorkflow);
-			if (!dynamicKeyWorkflow.includes("workflow script · background")) throw new Error("expected dynamic key fallback, got " + dynamicKeyWorkflow);
-			if (!ordinaryKeyWorkflow.includes("background · 1 lane: review") || ordinaryKeyWorkflow.includes("secret") || ordinaryKeyWorkflow.includes("nested")) throw new Error("expected only runs.all child key, got " + ordinaryKeyWorkflow);
+			const rows = [
+				registeredTool.renderCall({ workflow: true, async: true }, theme).text,
+				registeredTool.renderCall({ workflow: "./ci/sweep.js" }, theme).text,
+				registeredTool.renderCall({ workflow: "review" }, theme).text,
+			];
+			const expected = ["subagent workflow (reply block) [async]", "subagent workflow ./ci/sweep.js", "subagent workflow review"];
+			if (JSON.stringify(rows) !== JSON.stringify(expected)) throw new Error("expected " + JSON.stringify(expected) + ", got " + JSON.stringify(rows));
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
-	it("shows omitted workflow async as background even when asyncByDefault is false", () => {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-workflow-manifest-config-"));
-		try {
-			const configDir = path.join(agentDir, "extensions", "subagent");
-			fs.mkdirSync(configDir, { recursive: true });
-			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncByDefault: false, forceTopLevelAsync: true }), "utf-8");
-			const script = String.raw`
-				import registerSubagentExtension from "./index.ts";
-				const events = { on() { return () => {}; }, emit() {} };
-				let registeredTool;
-				const fakePi = new Proxy({
-					events, registerTool(tool) { if (tool.name === "subagent") registeredTool = tool; },
-					registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
-				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
-				registerSubagentExtension(fakePi);
-				const theme = { fg(_name, text) { return text; }, bold(text) { return text; } };
-				const result = registeredTool.renderCall({
-					workflowScript: "return runs.run('scan' /* stable lane */, {agent:'worker'});",
-				}, theme).text;
-				const explicitForeground = registeredTool.renderCall({
-					workflowScript: "return runs.run('publish', {agent:'worker'});",
-					async: false,
-				}, theme).text;
-				if (!result.includes("background · 1 lane: scan")) throw new Error("expected workflow executor background manifest, got " + result);
-				if (!explicitForeground.includes("foreground · 1 lane: publish")) throw new Error("expected workflow executor foreground manifest, got " + explicitForeground);
-			`;
-			const env = parentToolEnv();
-			env.DM_CODING_AGENT_DIR = agentDir;
-			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
-		} finally {
-			fs.rmSync(agentDir, { recursive: true, force: true });
-		}
+	it("rejects model-sent workflowScript and workflowScriptPath on parent and fanout tools before execution", () => {
+		const script = String.raw`
+			import assert from "node:assert/strict";
+			import registerSubagentExtension from "./index.ts";
+			import registerFanoutChildSubagentExtension from "./src/extension/fanout-child.ts";
+			const tools = {};
+			const makePi = (name) => new Proxy({
+				events: { on() { return () => {}; }, emit() {} },
+				registerTool(tool) { if (tool.name === "subagent") tools[name] = tool; },
+				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(makePi("parent"));
+			registerFanoutChildSubagentExtension(makePi("fanout"), { fanoutChild: true, depth: 1, waitTool: { enabled: true }, fast: false });
+			const expanded = [];
+			const ctx = {
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
+				ui: { setToolsExpanded(value) { expanded.push(value); } },
+				sessionManager: { getSessionId() { return "session-test"; }, getSessionFile() { return null; }, getBranch() { return []; } },
+				modelRegistry: { getAvailable() { return []; } },
+			};
+			for (const tool of [tools.parent, tools.fanout]) {
+				await assert.rejects(tool.execute("model-script", { workflowScript: "return 1" }, new AbortController().signal, undefined, ctx), /workflowScript was removed.*subagent\(\{ workflow: true \}\)/);
+				await assert.rejects(tool.execute("model-path", { workflowScriptPath: "ci/sweep.js" }, new AbortController().signal, undefined, ctx), /workflowScriptPath was removed.*workflow: "\.\/path\/to\/script\.js"/);
+			}
+			assert.deepEqual(expanded, [], "rejected calls must not reach parent execution");
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
 
 	it("keeps registered tool errors actionable while successful results stay collapsed", () => {
@@ -485,7 +403,68 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
-	it("registers bg_wait and its compatibility alias and honors waitTool disabled config", () => {
+	it("rerenders slash results with the active theme after an appearance change", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-slash-renderer-theme-"));
+		try {
+			const script = String.raw`
+				import registerSubagentExtension from "./index.ts";
+				const handlers = new Map();
+				const events = { on() { return () => {}; }, emit() {} };
+				let slashRenderer;
+				const fakePi = new Proxy({
+					events,
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, sendMessage() {}, getSessionName() {},
+					registerMessageRenderer(type, renderer) { if (type === "subagent-slash-result") slashRenderer = renderer; },
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				const lightTheme = {
+					fg(name, text) { return "light-fg(" + name + ":" + text + ")"; },
+					bg(name, text) { return "light-bg(" + name + ":" + text + ")"; },
+					bold(text) { return "light-bold(" + text + ")"; },
+				};
+				const darkTheme = {
+					fg(name, text) { return "dark-fg(" + name + ":" + text + ")"; },
+					bg(name, text) { return "dark-bg(" + name + ":" + text + ")"; },
+					bold(text) { return "dark-bold(" + text + ")"; },
+				};
+				let currentTheme = lightTheme;
+				const ui = {
+					get theme() { return currentTheme; },
+					setWidget() {}, requestRender() {},
+					onTerminalInput() { return () => {}; },
+					setStatus() {}, notify() {},
+				};
+				const ctx = {
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true, ui,
+					sessionManager: { getSessionId() { return "slash-theme-session"; }, getSessionFile() { return null; }, getEntries() { return []; } },
+					modelRegistry: { getAvailable() { return []; } },
+				};
+				registerSubagentExtension(fakePi);
+				for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "startup" }, ctx);
+				if (!slashRenderer) throw new Error("slash renderer not registered");
+				const component = slashRenderer({ details: {
+					requestId: "slash-theme",
+					result: { content: [{ type: "text", text: "done" }], details: { mode: "single", results: [
+						{ agent: "worker", task: "theme", exitCode: 0, messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } },
+					] } },
+				} }, { expanded: false }, lightTheme);
+				const lightLines = component.render(120).join("\\n");
+				if (!lightLines.includes("light-bg(toolSuccessBg:")) throw new Error("initial theme was not rendered: " + lightLines);
+
+				currentTheme = darkTheme;
+				const darkLines = component.render(120).join("\\n");
+				if (!darkLines.includes("dark-bg(toolSuccessBg:")) throw new Error("active theme was not rendered after appearance change: " + darkLines);
+				if (darkLines.includes("light-bg(toolSuccessBg:")) throw new Error("slash result retained stale theme: " + darkLines);
+				for (const handler of handlers.get("session_shutdown") ?? []) await handler();
+			`;
+			const env = parentToolEnv(agentDir);
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("registers bg_wait and honors waitTool disabled config", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-wait-tool-config-"));
 		try {
 			const configDir = path.join(agentDir, "extensions", "subagent");
@@ -496,13 +475,11 @@ describe("subagent extension child mode", () => {
 				import registerSubagentExtension from "./index.ts";
 				const events = { on() { return () => {}; }, emit() {} };
 				let bgWaitTool;
-				let subagentWaitTool;
 				let legacyWaitRegistered = false;
 				const fakePi = new Proxy({
 					events,
 					registerTool(tool) {
 						if (tool.name === "bg_wait") bgWaitTool = tool;
-						if (tool.name === "subagent_wait") subagentWaitTool = tool;
 						if (tool.name === "wait") legacyWaitRegistered = true;
 					},
 					registerCommand() {},
@@ -517,11 +494,9 @@ describe("subagent extension child mode", () => {
 					},
 				});
 				registerSubagentExtension(fakePi);
-				if (!bgWaitTool || !subagentWaitTool) throw new Error("bg_wait and subagent_wait tools not registered");
-				if (legacyWaitRegistered) throw new Error("legacy wait tool must not be registered");
+				if (!bgWaitTool) throw new Error("bg_wait tool not registered");
+				if (!legacyWaitRegistered) throw new Error("wait compatibility tool not registered");
 				const result = await bgWaitTool.execute("bg-wait-disabled", {}, new AbortController().signal, undefined, {});
-				const aliasResult = await subagentWaitTool.execute("subagent-wait-disabled", {}, new AbortController().signal, undefined, {});
-				if (aliasResult.content[0].text !== result.content[0].text) throw new Error("subagent_wait alias behavior differs from bg_wait");
 				process.stdout.write(JSON.stringify(result.content[0].text));
 			`;
 
@@ -545,6 +520,89 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
+	it("yields registered root bg_wait for an owned nested supervisor request", () => {
+		const script = String.raw`
+			import assert from "node:assert/strict";
+			import * as fs from "node:fs";
+			import * as path from "node:path";
+			import registerSubagentExtension from "./index.ts";
+			import { updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
+			import { ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "./src/intercom/native-supervisor-channel.ts";
+			import { DIRS, INTERCOM_DETACH_REQUEST_EVENT } from "./src/shared/types.ts";
+
+			const handlers = new Map();
+			const eventHandlers = new Map();
+			const events = {
+				on(channel, handler) {
+					eventHandlers.set(channel, [...(eventHandlers.get(channel) ?? []), handler]);
+					return () => eventHandlers.set(channel, (eventHandlers.get(channel) ?? []).filter((candidate) => candidate !== handler));
+				},
+				emit(channel, payload) { for (const handler of eventHandlers.get(channel) ?? []) handler(payload); },
+			};
+			let bgWaitTool;
+			const fakePi = new Proxy({
+				events,
+				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
+				registerTool(tool) { if (tool.name === "bg_wait") bgWaitTool = tool; },
+				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+
+			const runId = "workflow-root-" + crypto.randomUUID();
+			const requestId = "nested-request-" + crypto.randomUUID();
+			const runtimeSessionId = "owner-runtime-" + crypto.randomUUID();
+			const ownerSessionId = "owner-session-" + crypto.randomUUID();
+			const asyncDir = path.join(DIRS.async, runId);
+			const channelDir = resolveSupervisorChannelDir("nested-reviewer-run", "reviewer", 0);
+			const requestFile = path.join(channelDir, "requests", requestId + ".json");
+			const ctx = {
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
+				sessionManager: {
+					getSessionId() { return ownerSessionId; },
+					getSessionFile() { return runtimeSessionId; },
+					getEntries() { return []; },
+				},
+				modelRegistry: { getAvailable() { return []; } },
+			};
+
+			try {
+				fs.mkdirSync(asyncDir, { recursive: true });
+				fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+					runId, sessionId: runtimeSessionId, mode: "workflow", state: "running",
+					startedAt: Date.now(), lastUpdate: Date.now(), cwd: process.cwd(), pid: process.pid,
+					steps: [{ agent: "worker", status: "running", index: 0 }],
+				}), "utf-8");
+				updateActiveRunIndex(asyncDir, "running");
+				registerSubagentExtension(fakePi);
+				for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "startup" }, ctx);
+				if (!bgWaitTool) throw new Error("bg_wait tool not registered");
+
+				const startedAt = Date.now();
+				const waiting = bgWaitTool.execute("nested-supervisor", { id: runId, timeoutMs: 1500 }, new AbortController().signal, undefined, ctx);
+				await new Promise((resolve) => setTimeout(resolve, 25));
+				ensureSupervisorChannelDir(channelDir);
+				fs.writeFileSync(requestFile, JSON.stringify({
+					type: "subagent.supervisor.request", id: requestId, createdAt: Date.now(), expiresAt: Date.now() + 60_000,
+					reason: "need_decision", message: "Choose the safe path", expectsReply: true,
+					orchestratorSessionId: ownerSessionId, runId: "nested-reviewer-run", agent: "reviewer", childIndex: 0,
+				}), "utf-8");
+				events.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId, runId: "nested-reviewer-run", agent: "reviewer", childIndex: 0 });
+
+				const result = await waiting;
+				assert.equal(result.isError, undefined);
+				assert.deepEqual(result.details.wait, {
+					reason: "supervisor_request", timedOut: false, activeRunIds: [runId], activeProviderItems: [],
+				});
+				assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "running");
+				assert.ok(Date.now() - startedAt < 1200, "bg_wait did not yield promptly");
+			} finally {
+				for (const handler of handlers.get("session_shutdown") ?? []) await handler();
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+				fs.rmSync(channelDir, { recursive: true, force: true });
+			}
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
+	});
+
 	it("does not restore the async widget from tool results when asyncWidget is disabled", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-async-widget-config-"));
 		try {
@@ -558,28 +616,75 @@ describe("subagent extension child mode", () => {
 				const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
 				const fakePi = new Proxy({
 					events,
-					on(channel, handler) { handlers.set(channel, handler); },
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 					sendMessage() {}, getSessionName() { return undefined; },
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const widgets = [];
 				const ctx = {
-					cwd: process.cwd(), hasUI: true,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
 					ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 					modelRegistry: { getAvailable() { return []; } },
 				};
 				registerSubagentExtension(fakePi);
-				handlers.get("session_start")({}, ctx);
+				for (const handler of handlers.get("session_start")) await handler({}, ctx);
 				widgets.length = 0;
 				eventHandlers.get("subagent:async-started")({ id: "widget-run", pid: 1, sessionId: "session-widget", mode: "single", agent: "worker", asyncDir: "/tmp/widget-run" });
-				handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+				for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 				const asyncWidgets = widgets.filter((entry) => entry.key === "subagent-async");
 				if (asyncWidgets.length < 2 || asyncWidgets.some((entry) => entry.value !== undefined)) throw new Error("async widget rendered despite disabled config: " + JSON.stringify(asyncWidgets));
-				handlers.get("session_shutdown")();
+				for (const handler of handlers.get("session_shutdown")) await handler();
 			`;
 			const env = parentToolEnv();
 			env.DM_CODING_AGENT_DIR = agentDir;
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("mounts the async widget with its configured fold and layout", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-async-widget-collapsed-config-"));
+		try {
+			const configDir = path.join(agentDir, "extensions", "subagent");
+			fs.mkdirSync(configDir, { recursive: true });
+			fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ asyncWidgetCollapsed: true, asyncWidgetLayout: "rows" }), "utf-8");
+			const script = String.raw`
+				import registerSubagentExtension from "./index.ts";
+				const eventHandlers = new Map();
+				const handlers = new Map();
+				const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
+				const fakePi = new Proxy({
+					events,
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+					sendMessage() {}, getSessionName() { return undefined; },
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				let widget;
+				const ctx = {
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
+					ui: {
+						setWidget(key, value) { if (key === "subagent-async") widget = value; },
+						requestRender() {}, getToolsExpanded() { return false; },
+						theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } },
+					},
+					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
+					modelRegistry: { getAvailable() { return []; } },
+				};
+				registerSubagentExtension(fakePi);
+				for (const handler of handlers.get("session_start")) await handler({}, ctx);
+				eventHandlers.get("subagent:async-started")({ id: "widget-run", pid: 1, sessionId: "session-widget", mode: "single", agent: "worker", asyncDir: "/tmp/widget-run" });
+				if (!widget) throw new Error("async widget was not mounted");
+				const component = widget({ requestRender() {} }, ctx.ui.theme);
+				const lines = component.render(120);
+				if (lines.length !== 1) throw new Error("configured collapsed widget must render one line: " + JSON.stringify(lines));
+				component.handleMouse({ type: "click", button: "left", y: 0, shift: false, alt: false, ctrl: false });
+				const unfolded = component.render(120);
+				if (unfolded.length !== 2 || !unfolded[0].includes("Async agents")) throw new Error("configured rows layout must render a header and one line for the run: " + JSON.stringify(unfolded));
+				for (const handler of handlers.get("session_shutdown")) await handler();
+			`;
+			const env = parentToolEnv(agentDir);
 			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
@@ -599,25 +704,25 @@ describe("subagent extension child mode", () => {
 				const events = { on(channel, handler) { eventHandlers.set(channel, handler); return () => {}; }, emit() {} };
 				const fakePi = new Proxy({
 					events,
-					on(channel, handler) { handlers.set(channel, handler); },
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 					sendMessage() {}, getSessionName() { return undefined; },
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const widgets = [];
 				const ctx = {
-					cwd: process.cwd(), hasUI: true,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
 					ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager: { getSessionId() { return "session-widget"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 					modelRegistry: { getAvailable() { return []; } },
 				};
 				registerSubagentExtension(fakePi);
-				handlers.get("session_start")({}, ctx);
+				for (const handler of handlers.get("session_start")) await handler({}, ctx);
 				widgets.length = 0;
 				eventHandlers.get("subagent:async-started")({ id: "widget-run", pid: 1, sessionId: "session-widget", mode: "workflow", agent: "worker", asyncDir: "/tmp/widget-run" });
-				handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+				for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 				const asyncWidgets = widgets.filter((entry) => entry.key === "subagent-async");
 				if (!asyncWidgets.some((entry) => entry.value !== undefined)) throw new Error("async widget was not rendered with FleetView enabled: " + JSON.stringify(asyncWidgets));
-				handlers.get("session_shutdown")();
+				for (const handler of handlers.get("session_shutdown")) await handler();
 			`;
 			const env = parentToolEnv();
 			env.DM_CODING_AGENT_DIR = agentDir;
@@ -643,7 +748,7 @@ describe("subagent extension child mode", () => {
 			process.env.HERDR_PANE_ID = "w1:p1";
 			const fakePi = new Proxy({
 				events,
-				on(channel, handler) { handlers.set(channel, handler); },
+				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 				exec(command, args) { herdrCommands.push({ command, args }); return Promise.resolve({ code: 0, stdout: "", stderr: "", killed: false }); },
 				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 				sendMessage() {}, getSessionName() { return undefined; },
@@ -651,7 +756,7 @@ describe("subagent extension child mode", () => {
 			const runId = "management-refresh-" + crypto.randomUUID();
 			const sessionId = "session-" + runId;
 			const ctx = {
-				cwd: process.cwd(), hasUI: true,
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
 				ui: { setWidget(key, value) { widgets.push({ key, value }); }, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 				sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 				modelRegistry: { getAvailable() { return []; } },
@@ -659,7 +764,7 @@ describe("subagent extension child mode", () => {
 			const asyncDir = path.join(DIRS.async, runId);
 			fs.rmSync(asyncDir, { recursive: true, force: true });
 			registerSubagentExtension(fakePi);
-			handlers.get("session_start")({}, ctx);
+			for (const handler of handlers.get("session_start")) await handler({}, ctx);
 			widgets.length = 0;
 			fs.mkdirSync(asyncDir, { recursive: true });
 			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
@@ -667,15 +772,82 @@ describe("subagent extension child mode", () => {
 				startedAt: Date.now(), lastUpdate: Date.now(), cwd: process.cwd(), pid: process.pid,
 			}), "utf-8");
 			updateActiveRunIndex(asyncDir, "running");
-			handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+			for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 			const fleetWidgets = widgets.filter((entry) => entry.key === "subagent-fleet-status");
 			if (!fleetWidgets.some((entry) => typeof entry.value === "function")) throw new Error("management result did not restore active fleet status: " + JSON.stringify(fleetWidgets));
-			if (!herdrCommands.some(({ args }) => args.includes("summary=⏳ 1 subagent"))) throw new Error("management result did not restore Herdr status: " + JSON.stringify(herdrCommands));
+			// The coordinator stays visible while contributing no subagent leaf.
+			if (!herdrCommands.some(({ args }) => args.includes("summary=⏳ 0 subagents"))) throw new Error("management result did not restore Herdr status: " + JSON.stringify(herdrCommands));
 			const herdrCommandCount = herdrCommands.length;
-			handlers.get("tool_result")({ toolName: "subagent" }, ctx);
+			for (const handler of handlers.get("tool_result")) await handler({ toolName: "subagent" }, ctx);
 			if (herdrCommands.length !== herdrCommandCount) throw new Error("unchanged active jobs redundantly refreshed Herdr status: " + JSON.stringify(herdrCommands));
-			handlers.get("session_shutdown")();
+			for (const handler of handlers.get("session_shutdown")) await handler();
 			fs.rmSync(asyncDir, { recursive: true, force: true });
+		`;
+		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
+	});
+
+	it("registers dm-web liveness for the current session and releases it on shutdown", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+			const handlers = new Map();
+			const listeners = new Map();
+			const events = {
+				on(channel, handler) {
+					let set = listeners.get(channel);
+					if (!set) listeners.set(channel, set = new Set());
+					set.add(handler);
+					return () => set.delete(handler);
+				},
+				emit(channel, payload) {
+					for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload);
+				},
+			};
+			const dm = new Proxy({
+				events,
+				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
+				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+				sendMessage(message) { if (message.customType === "subagent-notify") sent.push(message); }, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const sent = [];
+			const sessionId = "liveness-" + crypto.randomUUID();
+			const sessionFile = "/tmp/" + sessionId + ".jsonl";
+			let provider;
+			let released = 0;
+			const registryKey = Symbol.for("@agegr/dm-web/session-liveness/v1");
+			globalThis[registryKey] = {
+				version: 1,
+				register(value) {
+					provider = value;
+					return () => { released += 1; };
+				},
+			};
+			const ctx = {
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
+				ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
+				sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return sessionFile; }, getEntries() { return []; } },
+				modelRegistry: { getAvailable() { return []; } },
+			};
+			registerSubagentExtension(dm);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
+			if (provider?.name !== "dm-subagents" || provider?.sessionId !== sessionId || provider?.sessionFile !== sessionFile) {
+				throw new Error("liveness provider did not preserve exact session identity: " + JSON.stringify(provider));
+			}
+			if (provider.isActive()) throw new Error("idle runtime reported live work");
+			const completionOwnerId = currentCompletionOwnerId();
+			events.emit("subagent:async-started", { id: "run-1", sessionId: sessionFile, completionOwnerId, mode: "single", agent: "worker", asyncDir: "/tmp/" + sessionId + "-run" });
+			if (!provider.isActive()) throw new Error("queued async work was not reported live");
+			events.emit("subagent:async-complete", { id: "run-1", sessionId: sessionFile, completionOwnerId, success: true, summary: "done" });
+			if (!provider.isActive()) throw new Error("pending completion delivery was not reported live");
+			const deliveryDeadline = Date.now() + 2000;
+			while (sent.length === 0 && Date.now() < deliveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+			if (!provider.isActive()) throw new Error("an accepted completion wake was reported idle before DM started it");
+			for (const handler of handlers.get("message_start")) handler({ message: { role: "custom", ...sent[0] } });
+			while (provider.isActive() && Date.now() < deliveryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+			if (provider.isActive()) throw new Error("retained terminal work was reported live after delivery");
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" });
+			if (released !== 1) throw new Error("liveness registration was not released exactly once: " + released);
+			delete globalThis[registryKey];
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
 	});
@@ -684,6 +856,7 @@ describe("subagent extension child mode", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+			process.env.DM_SUBAGENT_PARENT_SESSION = "stale-legacy-root";
 			const completionOwnerId = currentCompletionOwnerId();
 			function createRuntime(sessionId) {
 				const eventListeners = new Map();
@@ -705,7 +878,7 @@ describe("subagent extension child mode", () => {
 				};
 				const dm = new Proxy({
 					events,
-					on(channel, handler) { handlers.set(channel, handler); },
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 					sendMessage() {}, getSessionName() { return undefined; },
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
@@ -715,7 +888,7 @@ describe("subagent extension child mode", () => {
 					getEntries() { return []; },
 				};
 				const ctx = {
-					cwd: process.cwd(), hasUI: false,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 					ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager,
 					modelRegistry: { getAvailable() { return []; } },
@@ -725,7 +898,8 @@ describe("subagent extension child mode", () => {
 
 			const first = createRuntime("independent-first");
 			registerSubagentExtension(first.dm);
-			first.handlers.get("session_start")({ reason: "startup" }, first.ctx);
+			for (const handler of first.handlers.get("session_start")) await handler({ reason: "startup" }, first.ctx);
+			if (process.env.DM_SUBAGENT_PARENT_SESSION !== undefined) throw new Error("first root retained a legacy parent identity");
 			first.events.emit("subagent:async-complete", {
 				id: "independent-baseline", agent: "worker", success: true, summary: "Baseline",
 				exitCode: 0, timestamp: Date.now(), sessionId: "independent-first", completionOwnerId,
@@ -734,9 +908,10 @@ describe("subagent extension child mode", () => {
 			if (baselineDeliveries === 0) throw new Error("first runtime did not register async-complete listeners");
 			const second = createRuntime("independent-second");
 			registerSubagentExtension(second.dm);
-			second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
+			for (const handler of second.handlers.get("session_start")) await handler({ reason: "startup" }, second.ctx);
+			if (process.env.DM_SUBAGENT_PARENT_SESSION !== undefined) throw new Error("second root published a parent identity");
 
-			await first.handlers.get("agent_end")({}, first.ctx);
+			for (const handler of first.handlers.get("agent_end")) await handler({}, first.ctx);
 			first.events.emit("subagent:async-complete", {
 				id: "independent-completion", agent: "worker", success: true, summary: "Done",
 				exitCode: 0, timestamp: Date.now(), sessionId: "independent-first", completionOwnerId,
@@ -745,11 +920,11 @@ describe("subagent extension child mode", () => {
 				throw new Error("first runtime no longer received async-complete after second registration");
 			}
 
-			await first.handlers.get("session_shutdown")();
-			if (process.env.DM_SUBAGENT_PARENT_SESSION !== "independent-second") {
-				throw new Error("independent shutdown cleared another runtime's parent session identity");
+			for (const handler of first.handlers.get("session_shutdown")) await handler();
+			if (process.env.DM_SUBAGENT_PARENT_SESSION !== undefined) {
+				throw new Error("independent shutdown restored a root parent session identity");
 			}
-			await second.handlers.get("agent_end")({}, second.ctx);
+			for (const handler of second.handlers.get("agent_end")) await handler({}, second.ctx);
 			second.events.emit("subagent:async-complete", {
 				id: "independent-second-completion", agent: "reviewer", success: true, summary: "Done",
 				exitCode: 0, timestamp: Date.now(), sessionId: "independent-second", completionOwnerId,
@@ -757,10 +932,27 @@ describe("subagent extension child mode", () => {
 			if ((second.eventDeliveries.get("subagent:async-complete") ?? 0) === 0) {
 				throw new Error("first runtime shutdown removed the second runtime's event subscription");
 			}
-			await second.handlers.get("session_shutdown")();
+			for (const handler of second.handlers.get("session_shutdown")) await handler();
 			if (process.env.DM_SUBAGENT_PARENT_SESSION !== undefined) {
-				throw new Error("owning shutdown left its parent session identity active");
+				throw new Error("final shutdown left a root parent session identity active");
 			}
+
+			const reverseFirst = createRuntime("reverse-first");
+			const reverseSecond = createRuntime("reverse-second");
+			registerSubagentExtension(reverseFirst.dm);
+			registerSubagentExtension(reverseSecond.dm);
+			for (const handler of reverseFirst.handlers.get("session_start")) await handler({ reason: "startup" }, reverseFirst.ctx);
+			for (const handler of reverseSecond.handlers.get("session_start")) await handler({ reason: "startup" }, reverseSecond.ctx);
+			for (const handler of reverseSecond.handlers.get("session_shutdown")) await handler();
+			if (process.env.DM_SUBAGENT_PARENT_SESSION !== undefined) throw new Error("reverse shutdown restored a root identity");
+			for (const handler of reverseFirst.handlers.get("agent_end")) await handler({}, reverseFirst.ctx);
+			reverseFirst.events.emit("subagent:async-complete", {
+				id: "reverse-completion", agent: "worker", success: true, summary: "Done",
+				exitCode: 0, timestamp: Date.now(), sessionId: "reverse-first", completionOwnerId,
+			});
+			if ((reverseFirst.eventDeliveries.get("subagent:async-complete") ?? 0) === 0) throw new Error("reverse shutdown removed the surviving runtime subscription");
+			for (const handler of reverseFirst.handlers.get("session_shutdown")) await handler();
+			if (process.env.DM_SUBAGENT_PARENT_SESSION !== undefined) throw new Error("reverse final shutdown restored a root identity");
 		`;
 
 		execFileSync(
@@ -779,12 +971,12 @@ describe("subagent extension child mode", () => {
 				const events = { on() { return () => {}; }, emit() {} };
 				const dm = new Proxy({
 					events,
-					on(channel, handler) { handlers.set(channel, handler); },
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 					sendMessage() {}, getSessionName() { return undefined; },
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const ctx = {
-					cwd: process.cwd(), hasUI: false,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 					ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager: { getSessionId() { return sessionId; }, getSessionFile() { return null; }, getEntries() { return []; } },
 					modelRegistry: { getAvailable() { return []; } },
@@ -795,18 +987,18 @@ describe("subagent extension child mode", () => {
 			const first = createRuntime("slash-first");
 			const second = createRuntime("slash-second");
 			registerSubagentExtension(first.dm);
-			first.handlers.get("session_start")({ reason: "startup" }, first.ctx);
+			for (const handler of first.handlers.get("session_start")) await handler({ reason: "startup" }, first.ctx);
 			registerSubagentExtension(second.dm);
-			second.handlers.get("session_start")({ reason: "startup" }, second.ctx);
+			for (const handler of second.handlers.get("session_start")) await handler({ reason: "startup" }, second.ctx);
 			const details = buildSlashInitialResult("slash-isolation", { agent: "worker", task: "Keep this snapshot" });
 			const liveVersion = getSlashRenderableSnapshot(details).version;
 			if (liveVersion <= 0) throw new Error("slash snapshot was not populated");
 
-			await first.handlers.get("session_shutdown")({ reason: "shutdown" });
+			for (const handler of first.handlers.get("session_shutdown")) await handler({ reason: "shutdown" });
 			if (getSlashRenderableSnapshot(details).version !== liveVersion) {
 				throw new Error("one runtime shutdown cleared another active runtime's slash snapshot");
 			}
-			await second.handlers.get("session_shutdown")({ reason: "shutdown" });
+			for (const handler of second.handlers.get("session_shutdown")) await handler({ reason: "shutdown" });
 			if (getSlashRenderableSnapshot(details).version !== 0) {
 				throw new Error("last runtime shutdown did not clear slash snapshots");
 			}
@@ -827,6 +1019,7 @@ describe("subagent extension child mode", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+			process.env.PI_OFFLINE = "1";
 			const completionOwnerId = currentCompletionOwnerId();
 			const pendingTimers = new Map();
 			const realSetTimeout = globalThis.setTimeout;
@@ -853,18 +1046,18 @@ describe("subagent extension child mode", () => {
 			const sent = [];
 			const fakePi = new Proxy({
 				events,
-				on(channel, handler) { handlers.set(channel, handler); },
+				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 				sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 			const ctx = {
-				cwd: process.cwd(), hasUI: false,
+				cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 				ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 				sessionManager: { getSessionId() { return "notify-shutdown-session"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 				modelRegistry: { getAvailable() { return []; } },
 			};
 			registerSubagentExtension(fakePi);
-			handlers.get("session_start")({}, ctx);
+			for (const handler of handlers.get("session_start")) await handler({}, ctx);
 			sent.length = 0;
 			events.emit("subagent:async-complete", {
 				id: "shutdown-held-completion", agent: "worker", success: true, summary: "Done",
@@ -873,7 +1066,7 @@ describe("subagent extension child mode", () => {
 			if (sent.length !== 0) throw new Error("completion was not queued before shutdown");
 			const heldTimers = [...pendingTimers.values()];
 			if (heldTimers.length === 0) throw new Error("completion did not schedule a timer");
-			handlers.get("session_shutdown")();
+			for (const handler of handlers.get("session_shutdown")) await handler();
 			if (pendingTimers.size !== 0) throw new Error("shutdown left completion timers pending");
 			for (const handler of heldTimers) handler();
 			if (sent.length !== 0) throw new Error("stale completion sent after shutdown");
@@ -902,6 +1095,7 @@ describe("subagent extension child mode", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
+			process.env.PI_OFFLINE = "1";
 			const completionOwnerId = currentCompletionOwnerId();
 			const pendingTimers = new Map();
 			const realSetTimeout = globalThis.setTimeout;
@@ -934,12 +1128,12 @@ describe("subagent extension child mode", () => {
 				const sent = [];
 				const dm = new Proxy({
 					events,
-					on(channel, handler) { handlers.set(channel, handler); },
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 					sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
 				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 				const ctx = {
-					cwd: process.cwd(), hasUI: false,
+					cwd: process.cwd(), isIdle() { return false; }, hasUI: false,
 					ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager,
 					modelRegistry: { getAvailable() { return []; } },
@@ -949,7 +1143,7 @@ describe("subagent extension child mode", () => {
 
 			const oldRuntime = createRuntime();
 			registerSubagentExtension(oldRuntime.dm);
-			oldRuntime.handlers.get("session_start")({ reason: "startup" }, oldRuntime.ctx);
+			for (const handler of oldRuntime.handlers.get("session_start")) await handler({ reason: "startup" }, oldRuntime.ctx);
 			const oldListenerCount = eventListeners.get("subagent:async-complete")?.size ?? 0;
 			if (oldListenerCount === 0) throw new Error("old runtime did not register async-complete listeners");
 			oldRuntime.sent.length = 0;
@@ -964,15 +1158,15 @@ describe("subagent extension child mode", () => {
 
 			const newRuntime = createRuntime();
 			registerSubagentExtension(newRuntime.dm);
-			newRuntime.handlers.get("session_start")({ reason: "reload" }, newRuntime.ctx);
+			for (const handler of newRuntime.handlers.get("session_start")) await handler({ reason: "reload" }, newRuntime.ctx);
 			if (eventListeners.get("subagent:async-complete")?.size !== oldListenerCount) {
 				throw new Error("replacement runtime did not restore its event subscriptions");
 			}
 			for (const [, handler] of oldCompletionTimers) handler();
 			if (oldRuntime.sent.length !== 0) throw new Error("stale completion sent after runtime cleanup");
-			await oldRuntime.handlers.get("session_shutdown")({ reason: "reload" });
+			for (const handler of oldRuntime.handlers.get("session_shutdown")) await handler({ reason: "reload" });
 			if (eventListeners.get("subagent:async-complete")?.size !== oldListenerCount
-				|| process.env.DM_SUBAGENT_PARENT_SESSION !== "notify-reload-session") {
+				|| process.env.DM_SUBAGENT_PARENT_SESSION !== undefined) {
 				throw new Error("stale shutdown changed the replacement runtime");
 			}
 
@@ -988,7 +1182,7 @@ describe("subagent extension child mode", () => {
 				handler();
 			}
 			if (newRuntime.sent.length !== 1) throw new Error("new notifier was not active after reload cleanup");
-			await newRuntime.handlers.get("session_shutdown")({ reason: "shutdown" });
+			for (const handler of newRuntime.handlers.get("session_shutdown")) await handler({ reason: "shutdown" });
 			globalThis.setTimeout = realSetTimeout;
 			globalThis.clearTimeout = realClearTimeout;
 		`;
@@ -1017,14 +1211,14 @@ describe("subagent extension child mode", () => {
 			const events = { on() { return () => {}; }, emit() {} };
 			const fakePi = new Proxy({
 				events,
-				on(channel, handler) { handlers.set(channel, handler); },
+				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 				sendMessage() {}, getSessionName() { return undefined; },
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 			let stale = false;
 			const ctx = {
 				cwd: process.cwd(),
-				get hasUI() {
+				isIdle() { return false; }, get hasUI() {
 					if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
 					return true;
 				},
@@ -1036,9 +1230,9 @@ describe("subagent extension child mode", () => {
 				modelRegistry: { getAvailable() { return []; } },
 			};
 			registerSubagentExtension(fakePi);
-			handlers.get("session_start")({ reason: "startup" }, ctx);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
 			stale = true;
-			handlers.get("session_shutdown")({ reason: "reload" });
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "reload" });
 		`;
 
 		try {
@@ -1073,7 +1267,7 @@ describe("subagent extension child mode", () => {
 			const sent = [];
 			const dm = new Proxy({
 				events,
-				on(channel, handler) { handlers.set(channel, handler); },
+				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
 				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
 				sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
@@ -1085,16 +1279,16 @@ describe("subagent extension child mode", () => {
 			fs.writeFileSync(newSession, "");
 			let currentSession = oldSession;
 			const sessionManager = { getSessionId() { return path.basename(currentSession); }, getSessionFile() { return currentSession; }, getEntries() { return []; } };
-			const ctx = { cwd: process.cwd(), hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager, modelRegistry: { getAvailable() { return []; } } };
+			const ctx = { cwd: process.cwd(), isIdle() { return false; }, hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager, modelRegistry: { getAvailable() { return []; } } };
 			registerSubagentExtension(dm);
-			handlers.get("session_start")({ reason: "startup" }, ctx);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
 			currentSession = newSession;
-			handlers.get("session_start")({ reason: "new", previousSessionFile: oldSession }, ctx);
+			for (const handler of handlers.get("session_start")) await handler({ reason: "new", previousSessionFile: oldSession }, ctx);
 			const owner = currentCompletionOwnerId();
 			events.emit("subagent:async-complete", { id: "old-owned", agent: "worker", success: true, summary: "old", timestamp: 1, sessionId: oldSession, completionOwnerId: owner });
 			events.emit("subagent:async-complete", { id: "foreign", agent: "worker", success: true, summary: "foreign", timestamp: 2, sessionId: path.join(sessions, "foreign.jsonl"), completionOwnerId: owner });
 			if (sent.length !== 1) throw new Error("expected only the claimed predecessor completion, got " + sent.length);
-			await handlers.get("session_shutdown")({ reason: "quit" });
+			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" });
 		`;
 
 		try {
@@ -1112,12 +1306,14 @@ describe("subagent extension child mode", () => {
 			const events = { on() { return () => {}; }, emit() {} };
 			const commands = [];
 			const renderers = [];
+			const entryRenderers = [];
 			const fakePi = new Proxy({
 				events,
 				registerTool() {},
 				registerCommand(name) { commands.push(name); },
 				registerShortcut() {},
 				registerMessageRenderer(type) { renderers.push(type); },
+				registerEntryRenderer(type) { entryRenderers.push(type); },
 				sendMessage() {},
 				getSessionName() { return undefined; },
 			}, {
@@ -1129,6 +1325,9 @@ describe("subagent extension child mode", () => {
 			registerSubagentExtension(fakePi);
 			if (!commands.includes("subagents-watchdog")) throw new Error("watchdog command not registered: " + commands.join(", "));
 			if (!renderers.includes("subagent_watchdog_warning")) throw new Error("watchdog renderer not registered: " + renderers.join(", "));
+			if (!renderers.includes("subagent_supervisor_request")) throw new Error("supervisor request renderer not registered: " + renderers.join(", "));
+			if (!entryRenderers.includes("subagent_supervisor_reply")) throw new Error("supervisor reply entry renderer not registered: " + entryRenderers.join(", "));
+			if (!entryRenderers.includes("subagent_watchdog_warning")) throw new Error("watchdog entry renderer not registered: " + entryRenderers.join(", "));
 		`;
 
 		execFileSync(
@@ -1145,7 +1344,70 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
-	it("returns before registering anything for non-fanout children", () => {
+	it("renders every message dm-subagents shows in main as a one-line [subagent] block", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const events = { on() { return () => {}; }, emit() {} };
+			const messageRenderers = [];
+			const entryRenderers = [];
+			const fakePi = new Proxy({
+				events,
+				registerTool() {},
+				registerCommand() {},
+				registerShortcut() {},
+				registerMessageRenderer(type, renderer) { messageRenderers.push([type, renderer]); },
+				registerEntryRenderer(type, renderer) { entryRenderers.push([type, renderer]); },
+				sendMessage() {},
+				getSessionName() { return undefined; },
+			}, {
+				get(target, prop) {
+					if (prop in target) return target[prop];
+					return () => undefined;
+				},
+			});
+			registerSubagentExtension(fakePi);
+			const theme = { fg: (_token, text) => text, bg: (_token, text) => text, bold: (text) => text };
+			const shown = (component) => component.render(120).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd()).filter((line) => line.trim());
+			const blocks = { messages: [], entries: [] };
+			for (const [type, renderer] of messageRenderers) {
+				if (type.startsWith("subagent-slash")) continue;
+				blocks.messages.push([type, shown(renderer({ role: "custom", customType: type, content: "Saved text", display: true, timestamp: 1 }, { expanded: false, outputPad: 1 }, theme))]);
+			}
+			for (const [type, renderer] of entryRenderers) blocks.entries.push([type, shown(renderer({ type: "custom", customType: type, data: undefined }, { expanded: false }, theme))]);
+			console.log(JSON.stringify({ messageTypes: messageRenderers.map(([type]) => type).sort(), entryTypes: entryRenderers.map(([type]) => type).sort(), blocks }));
+		`;
+
+		const output = JSON.parse(execFileSync(
+			process.execPath,
+			["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script],
+			{ cwd: projectRoot, env: parentToolEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+		).trim().split("\n").at(-1)!) as { messageTypes: string[]; entryTypes: string[]; blocks: { messages: Array<[string, string[]]>; entries: Array<[string, string[]]> } };
+
+		assert.deepEqual(output.messageTypes, [
+			"subagent-completion-unanswered",
+			"subagent-completion-unhandled",
+			"subagent-incremental-child-notify",
+			"subagent-notify",
+			"subagent-slash-result",
+			"subagent-slash-text-result",
+			"subagent-supervisor-blocked",
+			"subagent-supervisor-unanswered",
+			"subagent-wait-subscription",
+			"subagent-workflow-result-write-failed",
+			"subagent_control_notice",
+			"subagent_steering_notice",
+			"subagent_supervisor_request",
+			"subagent_watchdog_clarification",
+			"subagent_watchdog_warning",
+		]);
+		assert.deepEqual(output.entryTypes, ["subagent_supervisor_reply", "subagent_watchdog_warning"]);
+		for (const [type, lines] of [...output.blocks.messages, ...output.blocks.entries]) {
+			assert.equal(lines.length, 1, type);
+			assert.match(lines[0]!, /^ \[subagent\] .+ \(ctrl\+o to expand\)$/, type);
+		}
+	});
+
+	it("returns before registering anything in a child-hosting process", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			const calls = [];
@@ -1173,16 +1435,15 @@ describe("subagent extension child mode", () => {
 				"--eval",
 				script,
 			],
-			{ cwd: projectRoot, env: { ...parentToolEnv(), [SUBAGENT_CHILD_ENV]: "1", [SUBAGENT_FANOUT_CHILD_ENV]: "0" }, stdio: "pipe" },
+			{ cwd: projectRoot, env: { ...parentToolEnv(), [SUBAGENT_CHILD_ENV]: "1" }, stdio: "pipe" },
 		);
 	});
 
-	it("returns before registering anything for fanout children", () => {
+	it("returns before registering anything when the child host flag is set after import", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
-			import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "./src/runs/shared/dm-args.ts";
+			import { SUBAGENT_CHILD_ENV } from "./src/runs/shared/child-runtime-config.ts";
 			process.env[SUBAGENT_CHILD_ENV] = "1";
-			process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
 			const calls = [];
 			const fakePi = new Proxy({}, {
 				get(target, prop) {
@@ -1213,18 +1474,42 @@ describe("subagent extension child mode", () => {
 		);
 	});
 
+	it("tells the user to restart DM when the installed version changed after load", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-stale-load-"));
+		for (const file of ["index.ts", "package.json", "src/runs/shared/herdr-dm-protocol.ts", "src/shared/package-version.ts"]) {
+			fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+			fs.copyFileSync(path.join(projectRoot, file), path.join(root, file));
+		}
+		const script = String.raw`
+			import * as fs from "node:fs";
+			import registerSubagentExtension from "./index.ts";
+			registerSubagentExtension({});
+			const manifest = JSON.parse(fs.readFileSync("package.json", "utf-8"));
+			fs.writeFileSync("package.json", JSON.stringify({ ...manifest, version: "999.0.0" }));
+			try { registerSubagentExtension({}); } catch (error) { console.log(error.message); }
+		`;
+		const output = execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", script], {
+			cwd: root,
+			env: { ...parentToolEnv(), [SUBAGENT_CHILD_ENV]: "1" },
+			encoding: "utf-8",
+		});
+		const loaded = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8")).version;
+		assert.equal(output.trim(), `dm-subagents 999.0.0 is installed, but this DM process still has ${loaded} loaded. Restart DM to load the update; /reload cannot replace extension modules that Node has already loaded.`);
+	});
+
 	it("does not double-register the child-safe subagent tool when index and fanout-child both load", () => {
 		const script = String.raw`
 			import registerSubagentExtension from "./index.ts";
 			import registerFanoutChildSubagentExtension from "./src/extension/fanout-child.ts";
-			import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "./src/runs/shared/dm-args.ts";
+			import { SUBAGENT_CHILD_ENV } from "./src/runs/shared/child-runtime-config.ts";
 			process.env[SUBAGENT_CHILD_ENV] = "1";
-			process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+			const childRuntime = { fanoutChild: true, depth: 1, waitTool: { enabled: true }, fast: false };
 
 			const registeredNames = new Set();
 			const registrations = [];
 			function makePi(source) {
 				return {
+					on() {},
 					events: { on() { return () => {}; }, emit() {} },
 					registerTool(tool) {
 						if (registeredNames.has(tool.name)) {
@@ -1238,7 +1523,7 @@ describe("subagent extension child mode", () => {
 			}
 
 			registerSubagentExtension(makePi("index.ts"));
-			registerFanoutChildSubagentExtension(makePi("fanout-child.ts"));
+			registerFanoutChildSubagentExtension(makePi("fanout-child.ts"), childRuntime);
 			if (registrations.length !== 1 || registrations[0].name !== "subagent" || registrations[0].source !== "fanout-child.ts") {
 				throw new Error("expected only fanout-child.ts to register subagent, got " + JSON.stringify(registrations));
 			}
@@ -1262,27 +1547,25 @@ describe("subagent extension child mode", () => {
 		const script = String.raw`
 			import assert from "node:assert/strict";
 			import registerFanoutChildSubagentExtension from "./src/extension/fanout-child.ts";
-			import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "./src/runs/shared/dm-args.ts";
-			process.env[SUBAGENT_CHILD_ENV] = "1";
-			process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
 			let registeredTool;
 			const fakePi = {
+				on() {},
 				events: { on() { return () => {}; }, emit() {} },
 				registerTool(tool) { registeredTool = tool; },
 				getSessionName() { return undefined; },
 			};
-			registerFanoutChildSubagentExtension(fakePi);
+			registerFanoutChildSubagentExtension(fakePi, { fanoutChild: true, depth: 1, waitTool: { enabled: true }, fast: false });
 			if (!registeredTool) throw new Error("tool not registered");
 			const ctx = {
 				cwd: process.cwd(),
-				hasUI: false,
+				isIdle() { return false; }, hasUI: false,
 				sessionManager: { getSessionId() { return "session-test"; }, getSessionFile() { return null; } },
 				modelRegistry: { getAvailable() { return []; } },
 			};
 			const list = await registeredTool.execute("list-check", { action: "list" }, new AbortController().signal, undefined, ctx);
 			if (list.isError) throw new Error("list should be allowed: " + JSON.stringify(list.content));
 			await assert.rejects(
-				registeredTool.execute("create-check", { action: "create", config: { name: "x" } }, new AbortController().signal, undefined, ctx),
+				registeredTool.execute("create-check", { action: "create", options: { config: { name: "x" } } }, new AbortController().signal, undefined, ctx),
 				/not available from child-safe subagent fanout mode/,
 			);
 			await assert.rejects(
@@ -1290,7 +1573,7 @@ describe("subagent extension child mode", () => {
 				/not available from child-safe subagent fanout mode/,
 			);
 			await assert.rejects(
-				registeredTool.execute("grant-check", { action: "grant-spawn-budget", additional: 1 }, new AbortController().signal, undefined, { ...ctx, hasUI: true }),
+				registeredTool.execute("grant-check", { action: "grant-spawn-budget", options: { additional: 1 } }, new AbortController().signal, undefined, { ...ctx, hasUI: true }),
 				/root interactive parent session/,
 			);
 		`;

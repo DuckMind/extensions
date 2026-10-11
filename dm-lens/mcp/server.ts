@@ -19,14 +19,23 @@
  * corrupt the message stream.
  */
 
+import { setProjectTrustState } from "../clients/project-trust.js";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	finalizeToolResult,
+	finalizeToolResultWithDelivery,
+	renderToolText as toolText,
+	stripResultDetails,
+} from "../tools/render-compact.js";
 import { AstGrepClient } from "../clients/ast-grep-client.js";
 import { CacheManager } from "../clients/cache-manager.js";
 import {
 	getDegradationSummary,
+	incrementDegradationCount,
+	recordDegradationOnce,
 	renderDegradationLines,
 } from "../clients/degradation-ledger.js";
 import {
@@ -74,12 +83,32 @@ import {
 	type WarmTurnEndResponse,
 } from "../clients/lens-engine.js";
 import { createAstGrepReplaceTool } from "../tools/ast-grep-replace.js";
-import { createAstGrepSearchTool } from "../tools/ast-grep-search.js";
+import {
+	astGrepDumpCompatibilityResult,
+	createAstGrepSearchTool,
+} from "../tools/ast-grep-search.js";
 import { createLensDiagnosticsTool } from "../tools/lens-diagnostics.js";
 import { peekMcpSessionRuntime } from "../clients/mcp/session.js";
-import { createLspDiagnosticsTool } from "../tools/lsp-diagnostics.js";
+import { loadDmLensGlobalConfig } from "../clients/lens-config.js";
+import { loadDmLensProjectConfig } from "../clients/project-lens-config.js";
+import {
+	resolveLensToolEnabled,
+	toolRegistryEntryForMcp,
+} from "../clients/tool-config.js";
+import {
+	endSituationalToolTelemetry,
+	observeSituationalToolCall,
+	startSituationalToolTelemetrySession,
+} from "../clients/situational-tool-telemetry.js";
+import { logExtension, flushExtensionLog } from "../clients/extension-log.js";
 import { createLspNavigationTool } from "../tools/lsp-navigation.js";
 import { shouldInitializeSessionRoot } from "../clients/lsp/session-roots.js";
+import {
+	findIgnoredArguments,
+	ignoredArgumentsStructured,
+	refusalResult,
+	withIgnoredArguments,
+} from "./tool-arguments.js";
 import {
 	computeBuildStamp,
 	STALE_SERVED_BY_FRESH,
@@ -333,103 +362,119 @@ function startIpcServer(): void {
 		// line and ignores anything after it.
 		socket.on(
 			"data",
-			createWarmIpcLineReader((line) => {
-				void requestQueue.enqueue(async () => {
-					try {
-						if (isWarmBuildStale()) {
-							console.error(
-								"[dm-lens-mcp] warm request: build stale, replying with an error",
-							);
-							socket.end(`${JSON.stringify({ error: "warm build stale" })}\n`);
-							return;
-						}
-						const parsed = JSON.parse(line) as Partial<
-							WarmTurnEndRequest & WarmAnalyzeRequest
-						>;
-						if ((parsed as { route?: string }).route === "turn-end-ack") {
-							if (
-								parsed.version !== WARM_TURN_END_SCHEMA_VERSION ||
-								typeof (parsed as { deliveryId?: unknown }).deliveryId !==
-									"string"
-							) {
-								socket.end(
-									`${JSON.stringify({ error: `turn-end ack schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
-								);
-								return;
-							}
-							const turnCwd = parsed.cwd ?? DEFAULT_CWD;
-							if (!isWithinServerWorkspace(turnCwd)) {
-								socket.end(
-									`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end-ack", turnCwd) })}\n`,
-								);
-								return;
-							}
-							const acknowledged = acknowledgeTurnEnd(
-								turnCwd,
-								(parsed as { deliveryId: string }).deliveryId,
-							);
-							socket.end(
-								`${JSON.stringify({
-									result: {
-										route: "turn-end-ack",
-										version: WARM_TURN_END_SCHEMA_VERSION,
-										acknowledged,
-									},
-								})}\n`,
-							);
-							return;
-						}
-						if (parsed.route === "turn-end") {
-							if (parsed.version !== WARM_TURN_END_SCHEMA_VERSION) {
-								socket.end(
-									`${JSON.stringify({ error: `turn-end schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
-								);
-								return;
-							}
-							const turnCwd = parsed.cwd ?? DEFAULT_CWD;
-							if (!isWithinServerWorkspace(turnCwd)) {
-								socket.end(
-									`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end", turnCwd) })}\n`,
-								);
-								return;
-							}
-							// #1274: a client that already gave up (hook timeout, killed
-							// Claude Code) leaves a destroyed socket. Starting a heavy
-							// pass whose reply nobody can read is pure waste; the findings
-							// stay in the cache for the next Stop either way.
-							if (socket.destroyed) {
+			createWarmIpcLineReader(
+				(line) => {
+					void requestQueue.enqueue(async () => {
+						try {
+							if (isWarmBuildStale()) {
 								console.error(
-									`[dm-lens-mcp] warm turn-end: client gone before the pass started (${turnCwd})`,
+									"[dm-lens-mcp] warm request: build stale, replying with an error",
+								);
+								socket.end(
+									`${JSON.stringify({ error: "warm build stale" })}\n`,
 								);
 								return;
 							}
-							console.error(`[dm-lens-mcp] warm turn-end: ${turnCwd}`);
-							await ensureReady(turnCwd);
-							const delivery = await runTurnEndForIpc(turnCwd);
-							const result: WarmTurnEndResponse = {
-								route: "turn-end",
-								version: WARM_TURN_END_SCHEMA_VERSION,
-								turnEnd: delivery.outcome.turnEnd,
-								tests: delivery.outcome.tests,
-								deliveryId: delivery.deliveryId,
-							};
+							const parsed = JSON.parse(line) as Partial<
+								WarmTurnEndRequest & WarmAnalyzeRequest
+							>;
+							if ((parsed as { route?: string }).route === "turn-end-ack") {
+								if (
+									parsed.version !== WARM_TURN_END_SCHEMA_VERSION ||
+									typeof (parsed as { deliveryId?: unknown }).deliveryId !==
+										"string"
+								) {
+									socket.end(
+										`${JSON.stringify({ error: `turn-end ack schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
+									);
+									return;
+								}
+								const turnCwd = parsed.cwd ?? DEFAULT_CWD;
+								if (!isWithinServerWorkspace(turnCwd)) {
+									socket.end(
+										`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end-ack", turnCwd) })}\n`,
+									);
+									return;
+								}
+								const acknowledged = acknowledgeTurnEnd(
+									turnCwd,
+									(parsed as { deliveryId: string }).deliveryId,
+								);
+								socket.end(
+									`${JSON.stringify({
+										result: {
+											route: "turn-end-ack",
+											version: WARM_TURN_END_SCHEMA_VERSION,
+											acknowledged,
+										},
+									})}\n`,
+								);
+								return;
+							}
+							if (parsed.route === "turn-end") {
+								if (parsed.version !== WARM_TURN_END_SCHEMA_VERSION) {
+									socket.end(
+										`${JSON.stringify({ error: `turn-end schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
+									);
+									return;
+								}
+								const turnCwd = parsed.cwd ?? DEFAULT_CWD;
+								if (!isWithinServerWorkspace(turnCwd)) {
+									socket.end(
+										`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end", turnCwd) })}\n`,
+									);
+									return;
+								}
+								// #1274: a client that already gave up (hook timeout, killed
+								// Claude Code) leaves a destroyed socket. Starting a heavy
+								// pass whose reply nobody can read is pure waste; the findings
+								// stay in the cache for the next Stop either way.
+								if (socket.destroyed) {
+									console.error(
+										`[dm-lens-mcp] warm turn-end: client gone before the pass started (${turnCwd})`,
+									);
+									return;
+								}
+								console.error(`[dm-lens-mcp] warm turn-end: ${turnCwd}`);
+								await ensureReady(turnCwd);
+								const delivery = await runTurnEndForIpc(turnCwd);
+								const result: WarmTurnEndResponse = {
+									route: "turn-end",
+									version: WARM_TURN_END_SCHEMA_VERSION,
+									turnEnd: delivery.outcome.turnEnd,
+									tests: delivery.outcome.tests,
+									deliveryId: delivery.deliveryId,
+								};
+								socket.end(`${JSON.stringify({ result })}\n`);
+								return;
+							}
+							const req = parsed as WarmAnalyzeRequest;
+							console.error(`[dm-lens-mcp] warm analyze: ${req.file}`);
+							const result = await analyzeFile(req.file, req.cwd, {
+								registerTurnState: true,
+								updateGraph: true,
+							});
 							socket.end(`${JSON.stringify({ result })}\n`);
-							return;
+						} catch (err) {
+							socket.end(`${JSON.stringify({ error: String(err) })}\n`);
 						}
-						const req = parsed as WarmAnalyzeRequest;
-						console.error(`[dm-lens-mcp] warm analyze: ${req.file}`);
-						const result = await analyzeFile(req.file, req.cwd, {
-							registerTurnState: true,
-							updateGraph: true,
-						});
-						socket.end(`${JSON.stringify({ result })}\n`);
-					} catch (err) {
-						socket.end(`${JSON.stringify({ error: String(err) })}\n`);
-					}
-				});
-			}),
+					});
+				},
+				{
+					label: "mcp-warm-server",
+					// #3383: a peer that never terminates its request line gets the same
+					// error reply every other unusable request gets, instead of this
+					// process holding its bytes until the client's timeout.
+					onOverflow: () =>
+						socket.end(
+							`${JSON.stringify({ error: "warm request line exceeded the framing limit" })}\n`,
+						),
+				},
+			),
 		);
-		socket.on("error", () => socket.destroy());
+		// The stream is already destroyed when this handler runs; the listener
+		// remains the surviving teardown witness, while destroy() was a no-op.
+		socket.on("error", () => {});
 	});
 
 	ipc.on("error", (err) => {
@@ -481,24 +526,6 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 	send({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
-/**
- * A tool result: human-readable text first, full JSON appended for the agent.
- * `compact` omits indentation (#512) — for token-efficient tools like
- * module_report the ~30% saved on the wire is worth losing pretty-printing
- * for a payload the agent parses, not reads formatted.
- */
-function toolText(
-	summary: string,
-	structured?: unknown,
-	compact = false,
-): { content: { type: "text"; text: string }[] } {
-	const text =
-		structured === undefined
-			? summary
-			: `${summary}\n\n\`\`\`json\n${JSON.stringify(structured, compact ? undefined : null, compact ? undefined : 2)}\n\`\`\``;
-	return { content: [{ type: "text" as const, text }] };
-}
-
 // --- Graph-staleness signal (#536) -------------------------------------------
 //
 // Extends #514's honesty-warning shape from "missing node" (module_report's
@@ -541,6 +568,15 @@ function graphStalenessNote(
 
 // --- Tools -------------------------------------------------------------------
 
+// #4300: this process runs outside pi; its caller owns workspace trust.
+setProjectTrustState("trusted");
+logExtension({
+	subsystem: "project-trust",
+	level: "debug",
+	message:
+		"mcp: workspace trust belongs to the MCP client; pi trust not consulted",
+});
+
 const cacheManager = new CacheManager();
 // #536: investigated wiring the same `flushPending` 4th arg pi's index.ts passes
 // (() => flushDebouncedToolResults()) before reading dmlens_diagnostics. Verdict:
@@ -554,6 +590,8 @@ const cacheManager = new CacheManager();
 // nothing — a no-op dressed as a fix, not a real parity gap. The 4th arg is left
 // at its default (`async () => {}`, already a no-op) rather than importing and
 // wiring a flush with nothing to flush.
+const isLensGuardEnabled = () =>
+	Boolean(createMcpHost(undefined, DEFAULT_CWD).getFlag("lens-guard"));
 const lensDiagnosticsTool = createLensDiagnosticsTool(
 	cacheManager,
 	() => DEFAULT_CWD,
@@ -566,6 +604,13 @@ const lensDiagnosticsTool = createLensDiagnosticsTool(
 	// an MCP session context exists there is no session to compare against and
 	// validation skips the check, which is the honest classification.
 	() => peekMcpSessionRuntime(),
+	// #2860: without this, the default `() => true` applies on the MCP
+	// surface and every confirmed-clean LSP probe unconditionally resyncs the
+	// commit-gate `turn-end-findings` record even when the project has
+	// `lens-guard` off — a config bypass on a durable cross-surface store.
+	// Matches index.ts:1656 and the two sibling readers
+	// (clients/runtime-tool-call.ts, clients/runtime-tool-result.ts).
+	() => isLensGuardEnabled(),
 );
 const astGrepClient = new AstGrepClient();
 const astGrepSearchTool = createAstGrepSearchTool(astGrepClient);
@@ -580,7 +625,6 @@ const astGrepReplaceTool = createAstGrepReplaceTool(astGrepClient);
 const lspNavigationTool = createLspNavigationTool((name, cwd) =>
 	createMcpHost(undefined, cwd ?? DEFAULT_CWD).getFlag(name),
 );
-const lspDiagnosticsTool = createLspDiagnosticsTool();
 
 // Wrapped pi tools already declare their params as typebox (which IS JSON
 // Schema). Emit that directly as the MCP inputSchema (+ the MCP-only `cwd`)
@@ -607,10 +651,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_analyze",
 		description:
-			"Run dm-lens's per-edit dispatch pipeline (LSP + linters + structural " +
-			"rules) on a single file and return its diagnostics plus the latency " +
-			"record for that dispatch (same schema as latency.log). The core review " +
-			"probe: shows a change's real behavioral + perf impact on a real file.",
+			"Run dm-lens's per-edit dispatch pipeline on one file. Example: analyze `src/app.ts` after an edit.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -640,17 +681,13 @@ const ALL_TOOLS = [
 	},
 	{
 		name: "dmlens_diagnostics",
-		description:
-			"Query dm-lens's diagnostic state across ALL runners (not just LSP). " +
-			"mode=delta (current turn, instant), mode=all (every dispatched file this " +
-			"session), mode=full (expensive project-wide active scan).",
+		description: lensDiagnosticsTool.description,
 		inputSchema: schemaWithCwd(lensDiagnosticsTool.parameters),
 	},
 	{
 		name: "dmlens_latency",
 		description:
-			"Return recent dispatch latency reports (latency.log schema: per-file " +
-			"total duration + per-runner timings). The review-loop measurement surface.",
+			"Return recent dispatch latency reports. Example: limit results to 5.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -668,19 +705,13 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_rebuild",
 		description:
-			"Rebuild dm-lens so subsequent `dmlens_analyze mode=fresh` runs reflect " +
-			"the latest commit. Runs `npm run build` (in-place dev layout) or " +
-			"`npm run build:dist` (precompiled dist layout), matching how this server " +
-			"was launched. The missing link that makes the review loop honest: " +
-			"commit → dmlens_rebuild → dmlens_analyze mode=fresh.",
+			"Rebuild dm-lens so later fresh analyses use the latest commit. Example: rebuild after changing a tool.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "dmlens_project_scan",
 		description:
-			"Cheap project-wide scan (tree-sitter + fact rules) across source files, " +
-			"returning structural/quality diagnostics. Complements dmlens_diagnostics " +
-			"mode=full (which adds active LSP).",
+			"Scan project files for structural and quality diagnostics. Example: cap the scan with `maxFiles: 20`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -700,17 +731,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_symbol_search",
 		description:
-			"Ranked identifier search over the persisted word index (BM25 + priors " +
-			"that demote tests/vendor and doc files). Answers 'which files are most " +
-			"relevant to <query>' by identifier — first step of the discovery funnel: " +
-			"symbol_search finds candidate files, dmlens_module_report explains one, " +
-			"dmlens_read_symbol reads a body. Complements grep (raw substrings) and " +
-			"LSP (exact symbols). Each hit's `startLine`/`endLine` mark its best-matching " +
-			"line (offset=startLine, limit=endLine-startLine+1 for a one-line peek) — " +
-			"use dmlens_module_report on `file` for the real outline. Returns " +
-			"`available: false` with a retry hint if the index isn't built yet for this " +
-			"workspace (dmlens_session_start builds it, or it self-builds in the background " +
-			"on first query).",
+			"Find relevant files by ranked identifier search. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: search `authenticate user` before dmlens_module_report.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -742,23 +763,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_module_report",
 		description:
-			"Structured, navigable overview of a source module — a token-efficient " +
-			"substitute for reading the whole file. Returns each symbol's " +
-			"name/kind/signature/line-range (plus a first-line `doc` summary when a " +
-			"doc comment is attached), plus who-uses-this, risk flags, and ranked " +
-			"recommendedReads. To read a symbol's body: call dmlens_read_symbol (or " +
-			"read) with offset=startLine, limit=endLine-startLine+1 on THIS report's " +
-			"`file` — those aren't repeated per symbol. Prefer this before a full " +
-			"read; then use dmlens_read_symbol for the exact body. Single mode: " +
-			"tree-sitter outline + review-graph who-uses-this + inline executable " +
-			"extraction; degrades to outline-only when no cached graph is available " +
-			"(this path never calls LSP). `semantic.source` reports whether graph " +
-			"data was used. Pass `blastRadius: true` for the cross-file blast radius " +
-			"(transitive dependents as ranked file reads, read-only over the cached " +
-			"graph). Pass `callGraph: true` for bounded derived callers/callees; a " +
-			"cold or stale call-graph cache is reported explicitly, never as zero calls. " +
-			'`view: "compact"` returns a line-oriented text rendering ' +
-			"(cheapest option) instead of JSON. An outline shows shape, not bodies.",
+			"Return a navigable source-module outline with references and read handles. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: use dmlens_module_report on `src/app.ts` before dmlens_read_symbol.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -809,24 +814,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_project_report",
 		description:
-			"Project-level orientation from the review graph — 'orient me in this " +
-			"project' before drilling into any one file. First step of a wider " +
-			"discovery funnel: dmlens_project_report orients, dmlens_module_report " +
-			"explains a file, dmlens_read_symbol reads a body. Six capped, ranked " +
-			"sections: a trust header (graph freshness, file coverage, " +
-			"edge-resolution-quality mix), hubs (top fan-in files — the repo's " +
-			"contract surface), entry points (near-zero fan-in / high fan-out files " +
-			"— activation/CLI/mains), a directory-level subsystem map (import " +
-			"cycles + layering violations, e.g. a forbidden clients/ -> tools/ " +
-			"edge), risk hotspots (fan-in × max per-symbol cyclomatic complexity), " +
-			"and suspected dead weight (zero-importer files, shipped with a " +
-			"low-confidence disclaimer). Every file line carries a `suggestedNext` " +
-			"module_report call. No per-symbol detail and no prose summary — " +
-			"structural facts only. Read-only over the cached graph: returns " +
-			"`available: false` with a retry hint on a cold cache and kicks off a " +
-			'background build (never blocks this call). `view: "compact"` returns ' +
-			"a line-oriented text rendering instead of JSON. Pass `focus` to " +
-			"re-rank every section toward a task hint.",
+			"Orient in a project from its review graph. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: use dmlens_project_report before choosing a file.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -853,15 +841,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_read_symbol",
 		description:
-			"Return the verbatim source of a single named symbol " +
-			"(function/class/method/interface/type) in a file — a targeted, cheap " +
-			"alternative to reading the whole file. Pair with dmlens_module_report: it " +
-			"finds the symbol, this shows its body. Includes an attached doc comment " +
-			"when one exists. Accepts a dotted `Class.method` name to resolve a " +
-			"member, falling back to a plain lookup when the qualifier doesn't " +
-			"resolve. A miss embeds the ~3 nearest symbol names in the file. When " +
-			"multiple same-file symbols share a name, the first is returned with an " +
-			"ambiguity note; pass `kind` to pick a specific one.",
+			"Return one symbol's verbatim source. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. Example: use dmlens_read_symbol after dmlens_module_report identifies `parseConfig`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -884,12 +864,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_read_enclosing",
 		description:
-			"Return the verbatim source for the smallest useful symbol/callback " +
-			"enclosing a line in a file. Use after dmlens_ast_grep_search, " +
-			"dmlens_diagnostics, or dmlens_lsp_navigation locations when you need " +
-			"exact body text without reading the whole file. Uses tree-sitter only — " +
-			"no LSP or graph build. MCP has no read-guard, so unlike the pi tool this " +
-			"does not record edit-coverage.",
+			"Return the smallest symbol or callback enclosing a line. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. Example: use dmlens_read_enclosing after a diagnostic points to line 42.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -933,26 +908,13 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_health",
 		description:
-			"dm-lens runtime health for THIS server: alive LSP servers, last dispatch " +
-			"summary, session diagnostic counts, how many resolved config leaves each " +
-			"source tier decided, and the total CPU/RAM footprint attributable to " +
-			"dm-lens across every process it owns (host + LSP children) machine-wide, " +
-			"from the shared instance registry.",
+			"Return dm-lens runtime health for this server. Example: call it after a slow analysis.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "dmlens_effective_config",
 		description:
-			"The resolved dm-lens configuration with the provenance of every " +
-			"decision: which file and source tier each setting came from, the trust " +
-			"decision that applied, and which config files contributed. Pass `file` " +
-			"to also get, for that path, its canonical language, EVERY LSP server " +
-			"with the reason it was selected or denied — including which tier's " +
-			"config denied it, which a nearer file cannot lift — and the lint/format " +
-			"runners that would dispatch. This is the answer to 'why is X running / " +
-			"why is X not running' without reading logs. Redacted by construction: " +
-			"it reports sources, never values — no environment values, no command " +
-			"arguments beyond the binary itself, and config paths are home-relative.",
+			"Explain resolved configuration and provenance. Response is redacted by construction: it contains no environment values, no command arguments beyond the binary, and home-relative paths; a tier-denied LSP decision cannot be lifted by a nearer config. Example: pass `file` to explain one selection.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -972,12 +934,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_session_start",
 		description:
-			"Run dm-lens's real session_start lifecycle: warm the dominant-language " +
-			"LSP (so subsequent dmlens_analyze is LSP-complete), establish the " +
-			"error-debt baseline (tests/build pass-state) + complexity baselines, and " +
-			"kick off knip/jscpd/type-coverage/dep/secrets project scans. Returns " +
-			"project guidance + baseline; scan results land in caches (query via " +
-			"dmlens_diagnostics afterwards). Run once per workspace before reviewing.",
+			"Initialize dm-lens for a workspace. Example: run once before reviewing a project.",
 		inputSchema: {
 			type: "object",
 			properties: { cwd: { type: "string" } },
@@ -986,13 +943,7 @@ const ALL_TOOLS = [
 	{
 		name: "dmlens_turn_end",
 		description:
-			"Run dm-lens's real turn_end lifecycle over the files changed this turn: " +
-			"knip dead-code + jscpd duplication (incremental), circular-dep checks, " +
-			"tests on affected targets, cascade to dependents, and the actionable/" +
-			"code-quality warning aggregation. Returns the turn-end advisory + test " +
-			"findings. `files` is OPTIONAL — dmlens_analyze (and the PostToolUse hook) " +
-			"auto-register edited files into turn-state, so you can call this with no " +
-			"args after a series of edits; pass `files` to add any not analyzed.",
+			"Summarize checks for files changed this turn. Example: pass `files` for an unanalysed file.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1007,41 +958,31 @@ const ALL_TOOLS = [
 		},
 	},
 	{
+		name: "dmlens_session_end",
+		description:
+			"End the MCP connection's telemetry session and write its bounded situational-tool telemetry line. This is terminal for the connection.",
+		inputSchema: {
+			type: "object",
+			properties: {},
+		},
+	},
+	{
 		name: "dmlens_ast_grep_search",
 		description:
-			"Structural (AST) code search via ast-grep — match by code structure, not " +
-			"text. Use complete patterns with arguments (e.g. 'console.log($MSG)', " +
-			"'function $NAME($$$ARGS) { $$$BODY }'), or use nodeKind to find every " +
-			"node of a known grammar kind. Metavariables do not match text inside " +
-			"quoted string literals; use an exact string or grep for wildcard text. " +
-			"This is the same schema and synthesis path as the pi tool.",
+			"Search code by AST structure rather than text. Example: find calls with `console.log($MSG)`.",
 		inputSchema: schemaWithCwd(astGrepSearchTool.parameters),
 	},
 	{
 		name: "dmlens_ast_grep_replace",
 		description:
-			"Structural (AST) find-and-rewrite via ast-grep, e.g. pattern='var $X' " +
-			"rewrite='let $X'. DRY-RUN by default (apply=false shows the diff); set " +
-			"apply=true to write the changes to disk.",
+			"Find and rewrite code by AST structure; preview by default. Example: set `apply: false` to inspect a diff.",
 		inputSchema: schemaWithCwd(astGrepReplaceTool.parameters),
 	},
 	{
 		name: "dmlens_lsp_navigation",
 		description:
-			"LSP code navigation: definition, typeDefinition, declaration, " +
-			"references, hover, documentSymbol, " +
-			"workspaceSymbol, implementation, call hierarchy (prepareCallHierarchy/" +
-			"incomingCalls/outgoingCalls), rename, codeAction, executeCommand " +
-			"(allowlisted, dry-run by default) — exact + type-aware, " +
-			"~50ms. Use before changing a signature to see every caller.",
+			'Navigate source with language-server operations. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
 		inputSchema: schemaWithCwd(lspNavigationTool.parameters),
-	},
-	{
-		name: "dmlens_lsp_diagnostics",
-		description:
-			"Pure LSP diagnostics for a file, directory, or batch of files (type " +
-			"errors only — narrower than dmlens_diagnostics, which spans all runners).",
-		inputSchema: schemaWithCwd(lspDiagnosticsTool.parameters),
 	},
 ];
 // #920: published packages cannot rebuild themselves safely because their
@@ -1050,6 +991,18 @@ const ALL_TOOLS = [
 const TOOLS = canRebuildDmLens(REPO_ROOT)
 	? ALL_TOOLS
 	: ALL_TOOLS.filter((tool) => tool.name !== "dmlens_rebuild");
+
+function enabledToolsForCwd(cwd: string) {
+	const global = loadDmLensGlobalConfig();
+	const project = loadDmLensProjectConfig(cwd);
+	return TOOLS.filter((tool) => {
+		const entry = toolRegistryEntryForMcp(tool.name);
+		return (
+			entry !== undefined &&
+			resolveLensToolEnabled(entry.name, global, project.raw)
+		);
+	});
+}
 
 function formatAnalyze(
 	result: McpAnalyzeResult,
@@ -1061,7 +1014,7 @@ function formatAnalyze(
 	// read as "clean" — a known limit on large projects (warm mode / re-run once
 	// the persistent server has indexed gives complete LSP coverage).
 	const lspNote = result.lsp
-		? ` · lsp ${result.lsp.diagnosticCount} (${result.lsp.status}, ${result.lsp.durationMs}ms)`
+		? ` · lsp ${result.lsp.diagnosticCount} (${result.lsp.status}${result.lsp.failureKind ? `: ${result.lsp.failureKind}` : ""}, ${result.lsp.durationMs}ms)`
 		: "";
 	const summary =
 		`${path.relative(cwd, result.filePath) || result.filePath} [${mode}] — ` +
@@ -1137,6 +1090,38 @@ async function callTool(
 	name: string,
 	args: Record<string, unknown>,
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+	if (name === "dmlens_lsp_diagnostics") {
+		recordDegradationOnce({
+			kind: "lsp-diagnostics-compatibility",
+			subject: "lsp_diagnostics",
+			reason: "retired tool name redirected to dmlens_diagnostics source=lsp",
+		});
+		name = "dmlens_diagnostics";
+		args = {
+			...args,
+			source: "lsp",
+			// #2860: the retired tool's contract was always "path or paths is
+			// required" (tools/lsp-diagnostics.ts's own early return) — it never
+			// had a bare "sweep the whole workspace" mode. `scope: "paths"` is a
+			// no-op for source=lsp (lens-diagnostics.ts only special-cases
+			// scope==="workspace"), so whatever `path`/`paths` the caller sent
+			// (or didn't) passes straight through to the probe's own path/paths
+			// handling unchanged, reproducing master's behavior exactly —
+			// including its error when neither is present. Mapping absent
+			// `paths` to `scope:"workspace"` here previously caused every
+			// no-args call to substitute `cwd` and run a whole-project LSP sweep
+			// instead (root-eviction smoke: 129 sweeps, 180s timeout x3).
+			scope: "paths",
+		};
+	}
+	if (name === "dmlens_ast_grep_dump") {
+		recordDegradationOnce({
+			kind: "ast-grep-dump-compatibility",
+			subject: "ast_grep_dump",
+			reason: "retired tool name redirected to ast_grep_search dump mode",
+		});
+		return astGrepDumpCompatibilityResult(args, "mcp");
+	}
 	if (name === "dmlens_analyze") {
 		const file = args.file;
 		if (typeof file !== "string" || file.length === 0) {
@@ -1262,7 +1247,8 @@ async function callTool(
 		if (truncationNotice) summaryLines.push(truncationNotice);
 		// #1107 phase 2: same "reached the seam but nothing rendered it" gap as
 		// #784's scanTruncationNotice, for the generated-name skip counters.
-		const skipNotice = generatedSkipNotice(snapshot);
+		// #2535: render the MCP-callable tool names on this route.
+		const skipNotice = generatedSkipNotice(snapshot, "mcp");
 		if (skipNotice) summaryLines.push(skipNotice);
 		return toolText(summaryLines.join("\n"), {
 			filesScanned: snapshot.filesScanned,
@@ -1542,7 +1528,10 @@ async function callTool(
 		const header = `${result.kind} ${result.name}${ambiguityNote}${sigSuffix}  ${path.relative(cwd, result.path)}:${result.startLine}-${result.endLine}`;
 		return {
 			content: [
-				{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` },
+				{
+					type: "text" as const,
+					text: `${header}\n\n${result.source ?? ""}`,
+				},
 			],
 		};
 	}
@@ -1603,7 +1592,10 @@ async function callTool(
 		const header = `${result.kind} ${result.name}  ${path.relative(cwd, result.path)}:${range}`;
 		return {
 			content: [
-				{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` },
+				{
+					type: "text" as const,
+					text: `${header}\n\n${result.source ?? ""}`,
+				},
 			],
 		};
 	}
@@ -1663,6 +1655,9 @@ async function callTool(
 					`${turnEnd.lastRunAt ? ` (last ran ${turnEnd.lastRunAt})` : ""}` +
 					`${turnEnd.lastSkipReason ? ` — last skip: ${turnEnd.lastSkipReason}${turnEnd.lastSkipAt ? ` at ${turnEnd.lastSkipAt}` : ""}` : ""}`
 				: "Stop-hook turn-end: no activity recorded (hook not installed, or no Stop yet)",
+			turnEnd?.failed
+				? `Analyzer invocations: ${turnEnd.failed} failed; last ${turnEnd.lastFailureOperation} failure at ${turnEnd.lastFailureAt}: ${turnEnd.lastFailureReason}`
+				: "Analyzer invocations: no failures recorded",
 			healthConfigLine(configProvenance),
 			footprint
 				? `Resource footprint: ${footprint.instanceCount} dm-lens instance(s) · ` +
@@ -1737,9 +1732,10 @@ async function callTool(
 			args,
 			new AbortController().signal,
 			undefined,
-			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+			// #2535: the shared tool renders host-callable advisory names.
+			{ cwd, host: "mcp" },
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return out;
 	}
 
 	if (name === "dmlens_latency") {
@@ -1778,6 +1774,11 @@ async function callTool(
 		return toolText(lines.filter(Boolean).join("\n"), outcome);
 	}
 
+	if (name === "dmlens_session_end") {
+		endSituationalToolTelemetry();
+		return toolText("Session ended.");
+	}
+
 	if (name === "dmlens_turn_end") {
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		await ensureReady(cwd);
@@ -1804,24 +1805,23 @@ async function callTool(
 			args,
 			new AbortController().signal,
 			undefined,
-			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+			{ cwd, resultMaxItems: Number.POSITIVE_INFINITY },
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return out;
 	}
 
-	if (name === "dmlens_lsp_navigation" || name === "dmlens_lsp_diagnostics") {
+	if (name === "dmlens_lsp_navigation") {
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		await ensureReady(cwd);
-		const tool =
-			name === "dmlens_lsp_navigation" ? lspNavigationTool : lspDiagnosticsTool;
+		const tool = lspNavigationTool;
 		const out = (await tool.execute(
 			"mcp",
 			args,
 			new AbortController().signal,
 			undefined,
 			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return out;
 	}
 
 	return { ...toolText(`Unknown tool: ${name}`), isError: true };
@@ -1854,7 +1854,7 @@ async function callTool(
 //   dmlens_session_start, dmlens_turn_end      — mutate warm LSP/graph state;
 //     must run in-process, can't be forked fresh.
 //   dmlens_ast_grep_search, dmlens_ast_grep_replace,
-//   dmlens_lsp_navigation, dmlens_lsp_diagnostics — depend on the warm LSP
+//   dmlens_lsp_navigation, dmlens_diagnostics — depend on the warm LSP
 //     fleet / ast-grep client instances; no fresh-fork machinery exists for
 //     them today (only dmlens_analyze's worker.ts loads a fresh dispatch
 //     graph) and the LSP fleet specifically CANNOT be recreated cheaply per
@@ -1883,7 +1883,6 @@ const WARN_ONLY_STALE_TOOLS = new Set([
 	"dmlens_ast_grep_search",
 	"dmlens_ast_grep_replace",
 	"dmlens_lsp_navigation",
-	"dmlens_lsp_diagnostics",
 	"dmlens_read_symbol",
 	"dmlens_read_enclosing",
 	"dmlens_effective_config",
@@ -1921,6 +1920,7 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 
 	switch (method) {
 		case "initialize": {
+			startSituationalToolTelemetrySession("mcp");
 			const requested = params?.protocolVersion;
 			sendResult(id ?? null, {
 				protocolVersion:
@@ -1938,17 +1938,86 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 			if (!isNotification) sendResult(id ?? null, {});
 			return;
 		case "tools/list":
-			sendResult(id ?? null, { tools: TOOLS });
+			sendResult(id ?? null, { tools: enabledToolsForCwd(DEFAULT_CWD) });
 			return;
 		case "tools/call": {
 			const name = params?.name;
-			const args =
-				params?.arguments && typeof params.arguments === "object"
-					? (params.arguments as Record<string, unknown>)
-					: {};
+			// #3749: `arguments` is an object. Absent, null and an empty array (what
+			// some clients send for "no arguments") mean none; any other non-object
+			// used to be read as `{}` (or, for a non-empty array, as keys "0", "1"),
+			// dropping what the caller sent.
+			const rawArguments: unknown = params?.arguments;
+			const argumentsAreObject =
+				typeof rawArguments === "object" &&
+				rawArguments !== null &&
+				!Array.isArray(rawArguments);
+			const args = argumentsAreObject
+				? (rawArguments as Record<string, unknown>)
+				: {};
 			if (typeof name !== "string") {
 				sendError(id ?? null, -32602, "tools/call requires a string 'name'");
 				return;
+			}
+			if (
+				!argumentsAreObject &&
+				rawArguments !== undefined &&
+				rawArguments !== null &&
+				!(Array.isArray(rawArguments) && rawArguments.length === 0)
+			) {
+				sendError(
+					id ?? null,
+					-32602,
+					"tools/call 'arguments' must be an object",
+				);
+				return;
+			}
+			const enabledName =
+				name === "dmlens_lsp_diagnostics" ? "dmlens_diagnostics" : name;
+			if (
+				name !== "dmlens_ast_grep_dump" &&
+				name !== "dmlens_rebuild" &&
+				!enabledToolsForCwd(
+					typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD,
+				).some((tool) => tool.name === enabledName)
+			) {
+				sendResult(
+					id ?? null,
+					stripResultDetails(
+						finalizeToolResult({
+							...toolText(`Unknown or disabled tool: ${name}`),
+							isError: true,
+						}),
+					),
+				);
+				return;
+			}
+			// #3749: one check for every tool, against the schema `tools/list`
+			// advertises. The retired alias resolves to the canonical tool's schema.
+			const inputSchema = ALL_TOOLS.find(
+				(tool) => tool.name === enabledName,
+			)?.inputSchema;
+			const argumentReport = inputSchema
+				? findIgnoredArguments(inputSchema, args)
+				: undefined;
+			if (argumentReport) {
+				incrementDegradationCount({
+					kind: "mcp-ignored-arguments",
+					subject: name,
+					reason: `ignored argument(s): ${ignoredArgumentsStructured(argumentReport).ignoredArguments.join(", ")}`,
+				});
+				const refused = refusalResult(name, argumentReport);
+				if (refused) {
+					sendResult(
+						id ?? null,
+						stripResultDetails(finalizeToolResult(refused)),
+					);
+					return;
+				}
+			}
+			const entry = toolRegistryEntryForMcp(name);
+			if (entry && "situational" in entry && entry.situational) {
+				startSituationalToolTelemetrySession("mcp");
+				observeSituationalToolCall(entry.name);
 			}
 			// #544 self-heal: if auto-session was supposed to fire on `initialize`
 			// (DM_LENS_MCP_AUTO_SESSION=1) but never completed successfully — never
@@ -1963,6 +2032,9 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 				// see the forcedFresh branch inside callTool. Every other tool that
 				// depends on warm-only process state gets an honest-degrade warning
 				// instead, so the warm boundary never silently serves old code.
+				// The warning precedes the #2800 item 7 gate, so it is part of the
+				// payload the byte bound protects (kept in the retained tail) and
+				// its bytes land in the footer's delivered figure.
 				if (
 					WARN_ONLY_STALE_TOOLS.has(name) &&
 					!result.isError &&
@@ -1970,16 +2042,29 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 				) {
 					result = withStaleWarning(result);
 				}
-				sendResult(id ?? null, result);
+				// #2800 item 7: the payload bound runs first with the footer's own
+				// size reserved, then the footer is stamped with the delivered
+				// payload's byte count and the bound's truncated flag.
+				if (argumentReport)
+					result = withIgnoredArguments(result, name, argumentReport);
+				const delivery = finalizeToolResultWithDelivery(result);
+				// The gate consumed `details` for the footer's diag lines above;
+				// strip it so the wire carries only the bounded text (#2852 N1).
+				sendResult(id ?? null, stripResultDetails(delivery.result));
 			} catch (err) {
 				// Surface as a tool error (isError), not a transport error, so the
 				// agent sees the message instead of a dead request.
-				sendResult(id ?? null, {
-					...toolText(
-						`dm-lens tool '${name}' failed: ${(err as Error).message}`,
+				sendResult(
+					id ?? null,
+					stripResultDetails(
+						finalizeToolResult({
+							...toolText(
+								`dm-lens tool '${name}' failed: ${(err as Error).message}`,
+							),
+							isError: true,
+						}),
 					),
-					isError: true,
-				});
+				);
 			}
 			return;
 		}
@@ -1992,15 +2077,20 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 
 // --- stdio read loop (newline-delimited JSON) --------------------------------
 
-let buffer = "";
 process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk: string) => {
-	buffer += chunk;
-	let newlineIndex = buffer.indexOf("\n");
-	while (newlineIndex !== -1) {
-		const line = buffer.slice(0, newlineIndex).trim();
-		buffer = buffer.slice(newlineIndex + 1);
-		if (line.length > 0) {
+// #3383: framed by the shared reader, so the partial line this loop holds
+// between chunks has a ceiling. It used to be `buffer += chunk` with none: a
+// host that never sent a newline grew one JS string until V8 refused the next
+// concatenation with `RangeError: Invalid string length` — raised inside this
+// `data` handler, where nothing can catch it, which is the ending #3375 fixed
+// for child output. `continuous` because this is a stream of requests, not one
+// request per connection like every socket reader.
+process.stdin.on(
+	"data",
+	createWarmIpcLineReader(
+		(raw) => {
+			const line = raw.trim();
+			if (line.length === 0) return;
 			let request: JsonRpcRequest | undefined;
 			try {
 				request = JSON.parse(line) as JsonRpcRequest;
@@ -2008,11 +2098,23 @@ process.stdin.on("data", (chunk: string) => {
 				sendError(null, -32700, "Parse error");
 			}
 			if (request) void handleRequest(request);
-		}
-		newlineIndex = buffer.indexOf("\n");
-	}
+		},
+		{
+			label: "mcp-stdio",
+			continuous: true,
+			onOverflow: () =>
+				sendError(
+					null,
+					-32700,
+					"Parse error: request line exceeded the framing limit",
+				),
+		},
+	),
+);
+process.stdin.on("end", () => {
+	endSituationalToolTelemetry();
+	void flushExtensionLog().finally(() => process.exit(0));
 });
-process.stdin.on("end", () => process.exit(0));
 
 startIpcServer();
 console.error(`[dm-lens-mcp] ready (cwd=${DEFAULT_CWD})`);

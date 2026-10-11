@@ -47,18 +47,16 @@ function makeChain(name: string, source: ChainConfig["source"]): ChainConfig {
 	};
 }
 
+const NO_USAGE = {
+	spawnBudget: { used: 0, configuredLimit: null, granted: 0, limit: null, remaining: null, grantRemaining: null, grantHistory: [] },
+	activeAsyncCapacity: { used: 0, limit: 0 },
+};
+
 describe("buildDoctorReport", () => {
 	it("formats a bounded successful environment summary", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-doctor-success-"));
 		try {
 			const state = makeState(root);
-			state.subagentSpawns = {
-				sessionId: "session-abc123",
-				count: 3,
-				configuredLimit: 4,
-				granted: 1,
-				grantHistory: [{ sessionId: "session-abc123", amount: 1, grantedAt: 0, previousLimit: 4, limit: 5 }],
-			};
 			const paths = {
 				tempRootDir: path.join(root, "temp-root"),
 				asyncDir: path.join(root, "async"),
@@ -73,6 +71,8 @@ describe("buildDoctorReport", () => {
 				state,
 				currentSessionFile: path.join(root, "sessions", "parent.jsonl"),
 				currentSessionId: "session-abc123",
+				spawnBudget: { used: 3, configuredLimit: 4, granted: 1, limit: 5, remaining: 2, grantRemaining: 3, grantHistory: [{ sessionId: "session-abc123", amount: 1, grantedAt: 0, previousLimit: 4, limit: 5 }] },
+				activeAsyncCapacity: { used: 0, limit: 2 },
 				orchestratorTarget: "subagent-chat-abc123",
 				expandTilde: (value) => value.replace(/^~\//, `${root}/home/`),
 				paths,
@@ -121,7 +121,7 @@ describe("buildDoctorReport", () => {
 			assert.match(report, /cumulative claims are never released; a new top-level run creates a new budget/);
 			assert.match(report, /Active async capacity\n- usage: 0\/2 used/);
 			assert.match(report, /terminal state plus matching observed process-terminal proof, or abandoned-timeout for failed runs with a dead runner PID and stale activity when enabled; false keeps unknown-proof slots/);
-			assert.match(report, /Workflow script\n- helpers: runs\.run, runs\.all, runs\.steer, runs\.status, runs\.ref\/refs, emit, console/);
+			assert.match(report, /Workflow script\n- launch: write a ```js workflow block in the reply, then call subagent\(\{ workflow: true \}\); or pass a file as workflow: "\.\/path\.js"\n- helpers: runs\.run, runs\.all, runs\.steer, runs\.status, runs\.ref\/refs, emit, console/);
 			assert.match(report, /if runs\.all is missing, reload or update dm-subagents; await Promise\.all\(\[runs\.run\(\.\.\.\)\]\) is also supported/);
 			assert.match(report, /- skills: total 2 \(project 1, user-package 1\)/);
 			assert.match(report, /- bridge: active/);
@@ -141,6 +141,7 @@ describe("buildDoctorReport", () => {
 				cwd: root,
 				config: { maxSubagentSpawnsPerRun: 12 },
 				state: makeState(root),
+				...NO_USAGE,
 				deps: {
 					isAsyncAvailable: () => true,
 					discoverAgentsAll: () => ({ builtin: [], user: [], project: [], chains: [], userDir: root, projectDir: root, userChainDir: root, projectChainDir: root, userSettingsPath: path.join(root, "user.json"), projectSettingsPath: path.join(root, "project.json") }),
@@ -156,6 +157,43 @@ describe("buildDoctorReport", () => {
 		}
 	});
 
+	it("distinguishes dedicated runner forwarding from root state", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-doctor-parent-routing-"));
+		const previousChild = process.env.DM_SUBAGENT_CHILD;
+		const previousParent = process.env.DM_SUBAGENT_PARENT_SESSION;
+		const report = () => buildDoctorReport({
+			cwd: root, config: {}, state: makeState(root), ...NO_USAGE,
+			deps: {
+				isAsyncAvailable: () => true,
+				discoverAgentsAll: () => ({ builtin: [], user: [], project: [], chains: [], userDir: root, projectDir: root, userChainDir: root, projectChainDir: root, userSettingsPath: path.join(root, "user.json"), projectSettingsPath: path.join(root, "project.json") }),
+				discoverAvailableSkills: () => [],
+				diagnoseIntercomBridge: () => ({ active: false, mode: "off", wantsIntercom: false, supervisorChannelAvailable: false, extensionDir: "none" }),
+			},
+		});
+		try {
+			process.env.DM_SUBAGENT_CHILD = "1";
+			process.env.DM_SUBAGENT_PARENT_SESSION = "launch-parent";
+			const runnerReport = report();
+			assert.match(runnerReport, /runner parent session: set \(launch-parent\) — explicit target for this dedicated child process/);
+			assert.doesNotMatch(runnerReport, /foreground external ask forwarding/);
+
+			delete process.env.DM_SUBAGENT_CHILD;
+			process.env.DM_SUBAGENT_PARENT_SESSION = "legacy-root";
+			const legacyReport = report();
+			assert.match(legacyReport, /root parent session: ignored legacy process-global value — root sessions do not use it for routing/);
+			assert.match(legacyReport, /foreground external ask forwarding: unavailable until the permission extension supports a session-scoped target/);
+
+			delete process.env.DM_SUBAGENT_PARENT_SESSION;
+			assert.match(report(), /root parent session: not set \(healthy\) — detached forwarding is attached at runner launch/);
+		} finally {
+			if (previousChild === undefined) delete process.env.DM_SUBAGENT_CHILD;
+			else process.env.DM_SUBAGENT_CHILD = previousChild;
+			if (previousParent === undefined) delete process.env.DM_SUBAGENT_PARENT_SESSION;
+			else process.env.DM_SUBAGENT_PARENT_SESSION = previousParent;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps reporting when a directory or discovery check fails", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-doctor-failure-"));
 		try {
@@ -165,6 +203,7 @@ describe("buildDoctorReport", () => {
 				cwd: root,
 				config: {},
 				state: makeState(root),
+				...NO_USAGE,
 				paths: {
 					tempRootDir: root,
 					asyncDir: asyncPath,

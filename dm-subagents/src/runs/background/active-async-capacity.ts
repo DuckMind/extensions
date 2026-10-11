@@ -5,14 +5,16 @@ import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { TEMP_ROOT_DIR, type ActiveAsyncCapacitySnapshot, type AsyncStatus } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { checkPidLiveness, type PidLiveness } from "./stale-run-reconciler.ts";
+import { currentPidNamespaceScope } from "./pid-namespace.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
+import { isTerminalAsyncState as terminalState, readWorkflowChildEvidence, readWorkflowChildProcessEvidence } from "./workflow-terminal-proof.ts";
 
 export const ACTIVE_ASYNC_CAPACITY_DIR = path.join(TEMP_ROOT_DIR, "session-active-async-capacity");
 export const DEFAULT_ABANDONED_SLOT_RELEASE_AFTER_MS = 20 * 60 * 1000;
 export const MIN_ABANDONED_SLOT_RELEASE_AFTER_MS = 5 * 60 * 1000;
 export const MAX_ABANDONED_SLOT_RELEASE_AFTER_MS = 24 * 60 * 60 * 1000;
 
-export interface ActiveAsyncCapacityOwnerV1 {
+export interface ActiveAsyncCapacityOwner {
 	version: 1;
 	reservationToken: string;
 	ownerSessionId: string;
@@ -29,10 +31,11 @@ export interface ActiveAsyncCapacityOwnerV1 {
 }
 
 export interface ActiveAsyncCapacityHandle {
-	readonly owner: ActiveAsyncCapacityOwnerV1;
+	readonly owner: ActiveAsyncCapacityOwner;
 	markStarted(runnerProcessInstanceId: string): void;
 	markWorkflowStarted(): void;
 	rollback(): boolean;
+	rollbackBeforeRunnerProceed(runnerProcessInstanceId: string): boolean;
 	reconcile(liveWorkflowRunIds?: ReadonlySet<string>): ActiveAsyncCapacitySnapshot;
 }
 
@@ -42,10 +45,12 @@ interface CapacityOptions {
 	token?: () => string;
 	abandonedSlotReleaseAfterMs?: number | false;
 	pidLiveness?: (pid: number) => PidLiveness;
+	pidNamespaceScope?: () => string | undefined;
 	afterSlotRename?: (releasedDir: string) => void;
+	writeOwner?: (filePath: string, owner: ActiveAsyncCapacityOwner) => void;
 }
 
-export interface ActiveAsyncCapacityReleaseEvidence {
+interface AbandonedRunnerEvidence {
 	releasedBy: "abandoned-timeout";
 	processProof: "unknown";
 	runnerPid: "gone";
@@ -53,13 +58,25 @@ export interface ActiveAsyncCapacityReleaseEvidence {
 	abandonedSlotReleaseAfterMs: number;
 }
 
+/** A workflow's own status PID is the parent DM host, so workflow evidence names its dead child runners instead. */
+interface AbandonedWorkflowEvidence {
+	releasedBy: "abandoned-timeout";
+	processProof: "unknown";
+	controller: "unregistered";
+	workflowEndedAgeMs: number;
+	abandonedChildren: Array<{ runId: string; lastActivityAgeMs: number }>;
+	abandonedSlotReleaseAfterMs: number;
+}
+
+export type ActiveAsyncCapacityReleaseEvidence = AbandonedRunnerEvidence | AbandonedWorkflowEvidence;
+
 export type ActiveAsyncCapacityReleaseVerdict =
 	| { state: "releasable"; reason: string; evidence?: ActiveAsyncCapacityReleaseEvidence }
 	| { state: "retained"; reason: string }
 	| { state: "not-owned"; reason: string };
 
 export interface ActiveAsyncCapacityInspection {
-	owner?: ActiveAsyncCapacityOwnerV1;
+	owner?: ActiveAsyncCapacityOwner;
 	relation: "current" | "source" | "none";
 	slotDir?: string;
 	release: ActiveAsyncCapacityReleaseVerdict;
@@ -98,9 +115,9 @@ function slotDir(poolDir: string, slot: number): string {
 	return path.join(poolDir, `slot-${slot}`);
 }
 
-function parseOwner(value: unknown): ActiveAsyncCapacityOwnerV1 | undefined {
+function parseOwner(value: unknown): ActiveAsyncCapacityOwner | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const owner = value as Partial<ActiveAsyncCapacityOwnerV1>;
+	const owner = value as Partial<ActiveAsyncCapacityOwner>;
 	if (owner.version !== 1
 		|| typeof owner.reservationToken !== "string" || !owner.reservationToken
 		|| typeof owner.ownerSessionId !== "string" || !owner.ownerSessionId
@@ -114,10 +131,10 @@ function parseOwner(value: unknown): ActiveAsyncCapacityOwnerV1 | undefined {
 	if (owner.sourceRunId !== undefined && typeof owner.sourceRunId !== "string") return undefined;
 	if (owner.runnerProcessInstanceId !== undefined && (typeof owner.runnerProcessInstanceId !== "string" || !owner.runnerProcessInstanceId)) return undefined;
 	if (owner.runnerStartedAt !== undefined && (typeof owner.runnerStartedAt !== "number" || !Number.isFinite(owner.runnerStartedAt))) return undefined;
-	return owner as ActiveAsyncCapacityOwnerV1;
+	return owner as ActiveAsyncCapacityOwner;
 }
 
-function readOwner(dir: string): ActiveAsyncCapacityOwnerV1 | undefined {
+function readOwner(dir: string): ActiveAsyncCapacityOwner | undefined {
 	try {
 		return parseOwner(JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf-8")));
 	} catch {
@@ -140,7 +157,7 @@ function snapshotFor(sessionId: string, limit: number | undefined, rootDir: stri
 	return { used: occupiedSlots(sessionDir(sessionId, rootDir)).length, limit: limit ?? 0 };
 }
 
-function matchingOwner(dir: string, expected: ActiveAsyncCapacityOwnerV1): ActiveAsyncCapacityOwnerV1 | undefined {
+function matchingOwner(dir: string, expected: ActiveAsyncCapacityOwner): ActiveAsyncCapacityOwner | undefined {
 	const owner = readOwner(dir);
 	return owner?.reservationToken === expected.reservationToken
 		&& owner.runId === expected.runId
@@ -174,7 +191,7 @@ function withSlotClaim<T>(dir: string, operation: () => T): { acquired: true; va
 	}
 }
 
-function removeOwnedSlot(dir: string, expected: ActiveAsyncCapacityOwnerV1, options: CapacityOptions, requireUnstarted = false, release?: ActiveAsyncCapacityReleaseVerdict): boolean {
+function removeOwnedSlot(dir: string, expected: ActiveAsyncCapacityOwner, options: CapacityOptions, requireUnstarted = false, release?: ActiveAsyncCapacityReleaseVerdict): boolean {
 	if (requireUnstarted && (expected.runnerProcessInstanceId || expected.runnerStartedAt)) return false;
 	const claimed = withSlotClaim(dir, () => {
 		const current = matchingOwner(dir, expected);
@@ -191,7 +208,7 @@ function removeOwnedSlot(dir: string, expected: ActiveAsyncCapacityOwnerV1, opti
 	return claimed.acquired && claimed.value;
 }
 
-function appendAbandonedReleaseEvent(asyncDir: string, owner: ActiveAsyncCapacityOwnerV1, evidence: ActiveAsyncCapacityReleaseEvidence, now: number): void {
+function appendAbandonedReleaseEvent(asyncDir: string, owner: ActiveAsyncCapacityOwner, evidence: ActiveAsyncCapacityReleaseEvidence, now: number): void {
 	try {
 		const eventsPath = path.join(asyncDir, "events.jsonl");
 		fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
@@ -207,11 +224,7 @@ function appendAbandonedReleaseEvent(asyncDir: string, owner: ActiveAsyncCapacit
 	}
 }
 
-function terminalState(state: AsyncStatus["state"]): boolean {
-	return state !== "queued" && state !== "running" && state !== "paused";
-}
-
-function runnerReleaseVerdict(owner: ActiveAsyncCapacityOwnerV1, status: AsyncStatus | null, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
+function runnerReleaseVerdict(owner: ActiveAsyncCapacityOwner, status: AsyncStatus | null, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
 	if (!status) return { state: "retained", reason: "status file is missing or unreadable" };
 	if (!owner.runnerProcessInstanceId) return { state: "retained", reason: "runner process identity has not been recorded" };
 	if (status.sessionId !== owner.ownerSessionId) return { state: "retained", reason: `status session ${status.sessionId ?? "unknown"} does not match owner session ${owner.ownerSessionId}` };
@@ -233,12 +246,14 @@ function runnerReleaseVerdict(owner: ActiveAsyncCapacityOwnerV1, status: AsyncSt
 		: abandonedRunnerReleaseVerdict(status, proof?.state ?? "missing", options);
 }
 
-function abandonedRunnerReleaseVerdict(status: AsyncStatus, proofState: string, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
+function abandonedRunnerReleaseVerdict(status: AsyncStatus, proofState: string, options: CapacityOptions): { state: "retained"; reason: string } | { state: "releasable"; reason: string; evidence: AbandonedRunnerEvidence } {
 	const proofReason = `process-terminal proof is ${proofState}`;
 	const thresholdMs = resolveAbandonedSlotReleaseAfterMs(options.abandonedSlotReleaseAfterMs);
 	if (thresholdMs === false) return { state: "retained", reason: `${proofReason}; abandoned-timeout policy is disabled` };
 	if (status.state !== "failed") return { state: "retained", reason: `${proofReason}; abandoned-timeout policy requires a failed run, not ${status.state}` };
 	if (typeof status.pid !== "number" || !Number.isInteger(status.pid) || status.pid < 1) return { state: "retained", reason: `${proofReason}; runner PID is missing or invalid` };
+	// A PID from another namespace can look dead here while the runner is alive.
+	if (status.pidNamespaceScope !== undefined && status.pidNamespaceScope !== (options.pidNamespaceScope ?? currentPidNamespaceScope)()) return { state: "retained", reason: `${proofReason}; runner PID namespace differs from this process, so liveness is unknown` };
 	const liveness = (options.pidLiveness ?? checkPidLiveness)(status.pid);
 	if (liveness !== "dead") return { state: "retained", reason: `${proofReason}; runner PID liveness is ${liveness}` };
 	const lastActivityAt = status.lastActivityAt ?? status.lastUpdate ?? status.endedAt;
@@ -246,7 +261,7 @@ function abandonedRunnerReleaseVerdict(status: AsyncStatus, proofState: string, 
 	const now = options.now?.() ?? Date.now();
 	const lastActivityAgeMs = Math.max(0, now - lastActivityAt);
 	if (lastActivityAgeMs <= thresholdMs) return { state: "retained", reason: `${proofReason}; last activity age ${lastActivityAgeMs}ms has not exceeded abandoned-timeout ${thresholdMs}ms` };
-	const evidence: ActiveAsyncCapacityReleaseEvidence = {
+	const evidence: AbandonedRunnerEvidence = {
 		releasedBy: "abandoned-timeout",
 		processProof: "unknown",
 		runnerPid: "gone",
@@ -260,39 +275,57 @@ function abandonedRunnerReleaseVerdict(status: AsyncStatus, proofState: string, 
 	};
 }
 
-function workflowReleaseVerdict(owner: ActiveAsyncCapacityOwnerV1, status: AsyncStatus | null, liveWorkflowRunIds: ReadonlySet<string>): ActiveAsyncCapacityReleaseVerdict {
+function workflowReleaseVerdict(owner: ActiveAsyncCapacityOwner, status: AsyncStatus | null, liveWorkflowRunIds: ReadonlySet<string>, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
 	if (!status) return { state: "retained", reason: "status file is missing or unreadable" };
 	if (status.sessionId !== owner.ownerSessionId) return { state: "retained", reason: `status session ${status.sessionId ?? "unknown"} does not match owner session ${owner.ownerSessionId}` };
 	if (status.runId !== owner.runId) return { state: "retained", reason: `status run ${status.runId} does not match owner run ${owner.runId}` };
 	if (status.mode !== "workflow") return { state: "retained", reason: `status mode is ${status.mode}, not workflow` };
 	if (!terminalState(status.state)) return { state: "retained", reason: `workflow is still ${status.state}` };
 	if (liveWorkflowRunIds.has(owner.runId)) return { state: "retained", reason: "workflow controller is still live" };
-	for (const step of status.steps ?? []) {
-		const label = step.workflowKey ?? step.agent;
-		if (step.status === "pending" || step.status === "running" || step.status === "paused") return { state: "retained", reason: `workflow child ${label} is still ${step.status}` };
-		if (typeof step.async !== "boolean") return { state: "retained", reason: `workflow child ${label} is missing async classification` };
-		if (!step.async) continue;
-		if (!step.runId) return { state: "retained", reason: `async workflow child ${label} is missing run id` };
-		const childDir = path.join(path.dirname(owner.asyncDir), step.runId);
-		if (!fs.existsSync(childDir)) return { state: "retained", reason: `async workflow child ${label} directory is missing` };
-		const childStatus = readStatus(childDir);
-		if (!childStatus) return { state: "retained", reason: `async workflow child ${label} status is missing or unreadable` };
-		if (!terminalState(childStatus.state)) return { state: "retained", reason: `async workflow child ${label} is still ${childStatus.state}` };
-		if (!childStatus.processTerminal?.runnerProcessInstanceId) return { state: "retained", reason: `async workflow child ${label} has no runner process identity` };
-		const proof = readProcessTerminal(childDir, {
-			runId: step.runId,
-			runnerProcessInstanceId: childStatus.processTerminal.runnerProcessInstanceId,
-		});
-		if (proof?.state !== "observed" || proof.runId !== step.runId) return { state: "retained", reason: `async workflow child ${label} process-terminal proof is ${proof?.state ?? "missing"}` };
-	}
-	return { state: "releasable", reason: "workflow is terminal, controller is gone, and async children have observed proof" };
+	const evidence = readWorkflowChildProcessEvidence(owner.asyncDir, status.steps);
+	if (evidence.state === "observed") return { state: "releasable", reason: "workflow is terminal, controller is gone, and async children have observed proof" };
+	return abandonedWorkflowReleaseVerdict(owner, status, evidence.reason, options);
 }
 
-function ownerReleaseVerdict(owner: ActiveAsyncCapacityOwnerV1, liveWorkflowRunIds: ReadonlySet<string>, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
+/** Every unresolved async child must itself pass the abandoned runner policy; any other unresolved child keeps the slot. */
+function abandonedWorkflowReleaseVerdict(owner: ActiveAsyncCapacityOwner, status: AsyncStatus, proofReason: string, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
+	const thresholdMs = resolveAbandonedSlotReleaseAfterMs(options.abandonedSlotReleaseAfterMs);
+	if (thresholdMs === false) return { state: "retained", reason: `${proofReason}; abandoned-timeout policy is disabled` };
+	if (!status.steps) return { state: "retained", reason: proofReason };
+	if (typeof status.endedAt !== "number" || !Number.isFinite(status.endedAt)) return { state: "retained", reason: `${proofReason}; workflow end timestamp is missing or invalid` };
+	const workflowEndedAgeMs = (options.now?.() ?? Date.now()) - status.endedAt;
+	if (workflowEndedAgeMs <= thresholdMs) return { state: "retained", reason: `${proofReason}; workflow ended ${workflowEndedAgeMs}ms ago, within abandoned-timeout ${thresholdMs}ms` };
+	const abandonedChildren: AbandonedWorkflowEvidence["abandonedChildren"] = [];
+	for (const step of status.steps) {
+		const child = readWorkflowChildEvidence(owner.asyncDir, step);
+		if (!child || child.state === "resolved") continue;
+		const unresolved = child.unresolvedProof;
+		if (!unresolved) return { state: "retained", reason: child.reason };
+		if (unresolved.status.sessionId !== owner.ownerSessionId) return { state: "retained", reason: `${child.reason}; child session ${unresolved.status.sessionId ?? "unknown"} does not match owner session ${owner.ownerSessionId}` };
+		const verdict = abandonedRunnerReleaseVerdict(unresolved.status, unresolved.proofState, options);
+		if (verdict.state !== "releasable") return { state: "retained", reason: `async workflow child ${unresolved.status.runId}: ${verdict.reason}` };
+		abandonedChildren.push({ runId: unresolved.status.runId, lastActivityAgeMs: verdict.evidence.lastActivityAgeMs });
+	}
+	const evidence: AbandonedWorkflowEvidence = {
+		releasedBy: "abandoned-timeout",
+		processProof: "unknown",
+		controller: "unregistered",
+		workflowEndedAgeMs,
+		abandonedChildren,
+		abandonedSlotReleaseAfterMs: thresholdMs,
+	};
+	return {
+		state: "releasable",
+		reason: `${evidence.releasedBy}: ${proofReason}; workflow controller is unregistered; failed async children ${abandonedChildren.map((child) => child.runId).join(", ")} have dead runner PIDs; process proof unknown; workflow ended ${workflowEndedAgeMs}ms ago, over ${thresholdMs}ms`,
+		evidence,
+	};
+}
+
+function ownerReleaseVerdict(owner: ActiveAsyncCapacityOwner, liveWorkflowRunIds: ReadonlySet<string>, options: CapacityOptions): ActiveAsyncCapacityReleaseVerdict {
 	const status = readStatus(owner.asyncDir);
 	return owner.kind === "runner"
 		? runnerReleaseVerdict(owner, status, options)
-		: workflowReleaseVerdict(owner, status, liveWorkflowRunIds);
+		: workflowReleaseVerdict(owner, status, liveWorkflowRunIds, options);
 }
 
 function capacitySessionDirs(rootDir: string, sessionId?: string): string[] {
@@ -363,7 +396,7 @@ export function getActiveAsyncCapacitySnapshot(
 	return reconcileActiveAsyncCapacity(sessionId, limit, options);
 }
 
-function createSlot(poolDir: string, owner: ActiveAsyncCapacityOwnerV1): boolean {
+function createSlot(poolDir: string, owner: ActiveAsyncCapacityOwner): boolean {
 	const destination = slotDir(poolDir, owner.slot);
 	fs.mkdirSync(poolDir, { recursive: true, mode: 0o700 });
 	try {
@@ -378,8 +411,9 @@ function createSlot(poolDir: string, owner: ActiveAsyncCapacityOwnerV1): boolean
 	return true;
 }
 
-function handleFor(owner: ActiveAsyncCapacityOwnerV1, limit: number, options: CapacityOptions, rollbackOwner?: ActiveAsyncCapacityOwnerV1): ActiveAsyncCapacityHandle {
+function handleFor(owner: ActiveAsyncCapacityOwner, limit: number, options: CapacityOptions, rollbackOwner?: ActiveAsyncCapacityOwner): ActiveAsyncCapacityHandle {
 	const rootDir = options.rootDir ?? ACTIVE_ASYNC_CAPACITY_DIR;
+	const writeOwner = options.writeOwner ?? writePrivateAtomicJson;
 	const dir = slotDir(sessionDir(owner.ownerSessionId, rootDir), owner.slot);
 	return {
 		owner,
@@ -388,14 +422,10 @@ function handleFor(owner: ActiveAsyncCapacityOwnerV1, limit: number, options: Ca
 				const current = matchingOwner(dir, owner);
 				if (!current) return false;
 				const next = { ...current, runnerProcessInstanceId, runnerStartedAt: options.now?.() ?? Date.now() };
-				// Mark memory first. If persistence fails after the process starts, caller
-				// cleanup must retain the occupied slot instead of rolling it back.
+				// Mark memory first so pre-proceed cleanup can distinguish a failed durable
+				// bind from an unrelated unstarted reservation.
 				Object.assign(owner, next);
-				try {
-					writePrivateAtomicJson(path.join(dir, "owner.json"), next);
-				} catch (error) {
-					console.error(`Failed to bind active async capacity to runner '${runnerProcessInstanceId}'; capacity will remain occupied:`, error);
-				}
+				writeOwner(path.join(dir, "owner.json"), next);
 				return true;
 			});
 			if (!claimed.acquired || !claimed.value) throw new Error(`Active async capacity ownership changed for run '${owner.runId}'.`);
@@ -427,6 +457,26 @@ function handleFor(owner: ActiveAsyncCapacityOwnerV1, limit: number, options: Ca
 			});
 			return claimed.acquired && claimed.value;
 		},
+		rollbackBeforeRunnerProceed(runnerProcessInstanceId) {
+			const claimed = withSlotClaim(dir, () => {
+				const current = matchingOwner(dir, owner);
+				if (!current) return false;
+				const boundToRunner = current.runnerProcessInstanceId === runnerProcessInstanceId;
+				const bindingFailedBeforeProceed = current.runnerProcessInstanceId === undefined && current.runnerStartedAt === undefined && owner.runnerProcessInstanceId === runnerProcessInstanceId;
+				if (!boundToRunner && !bindingFailedBeforeProceed) return false;
+				if (rollbackOwner) {
+					writePrivateAtomicJson(path.join(dir, "owner.json"), rollbackOwner);
+					Object.assign(owner, rollbackOwner);
+					return true;
+				}
+				const releasedDir = path.join(path.dirname(dir), `.${path.basename(dir)}.released-${randomUUID()}`);
+				fs.renameSync(dir, releasedDir);
+				options.afterSlotRename?.(releasedDir);
+				fs.rmSync(releasedDir, { recursive: true, force: true });
+				return true;
+			});
+			return claimed.acquired && claimed.value;
+		},
 		reconcile(liveWorkflowRunIds) {
 			return reconcileActiveAsyncCapacity(owner.ownerSessionId, limit, { ...options, rootDir, liveWorkflowRunIds });
 		},
@@ -444,7 +494,7 @@ export function acquireActiveAsyncCapacity(
 	const poolDir = sessionDir(input.sessionId, rootDir);
 	const token = options.token?.() ?? randomUUID();
 	for (let slot = 0; slot < input.limit; slot++) {
-		const owner: ActiveAsyncCapacityOwnerV1 = {
+		const owner: ActiveAsyncCapacityOwner = {
 			version: 1,
 			reservationToken: token,
 			ownerSessionId: input.sessionId,
@@ -477,7 +527,7 @@ export function transferActiveAsyncCapacity(
 			if (!current || !status || status.runId !== input.sourceRunId || status.state === "queued" || status.state === "running") {
 				throw new Error(`Active async capacity source '${input.sourceRunId}' is not transferable.`);
 			}
-			const next: ActiveAsyncCapacityOwnerV1 = {
+			const next: ActiveAsyncCapacityOwner = {
 				...current,
 				runId: input.runId,
 				sourceRunId: input.sourceRunId,

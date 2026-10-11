@@ -6,7 +6,11 @@
  * observation channel, not a delivery acknowledgement.
  */
 
-import type { ExtensionAPI } from "@duckmind/dm-coding-agent";
+import { statSync } from "node:fs";
+import { debuglog } from "node:util";
+import type { AgentMessage } from "@duckmind/dm-agent-core";
+import type { ExtensionAPI, ExtensionContext } from "@duckmind/dm-coding-agent";
+import { onDmBeforeSettle, type AgentBeforeSettleEvent, type AgentBeforeSettleEventResult } from "../../shared/dm-settlement.ts";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import {
 	type CompletionBatchConfig,
@@ -14,10 +18,12 @@ import {
 	createCompletionBatcher,
 	resolveCompletionBatchConfig,
 } from "./completion-batcher.ts";
-import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type ParallelHandoffReference, type ScheduleOrigin, type SubagentState } from "../../shared/types.ts";
+import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type ChildWatchdogProgress, type ChildWatchdogWarningSummary, type ParallelHandoffReference, type ScheduleOrigin, type SubagentState } from "../../shared/types.ts";
 import { safeTerminalText } from "../../shared/display-text.ts";
+import type { ParentWake } from "../../shared/parent-wake.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { isUnexplainedProcessSignal } from "../shared/process-signal.ts";
+import { capSummaryOutputs } from "../shared/single-output.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 
 export interface SubagentNotifyChildOutput {
@@ -25,19 +31,32 @@ export interface SubagentNotifyChildOutput {
 	runId?: string;
 	agent?: string;
 	status: string;
+	/** Latest detached revival of this failed child, e.g. `Revived → <run>: completed`. */
+	revival?: string;
 	savedOutputPath?: string;
+	outputArtifactPath?: string;
+	structuredOutputPath?: string;
+	outputArtifactError?: RetainedPathError;
+	structuredOutputError?: RetainedPathError;
+	error?: string;
 	preview: string;
 	previewTruncated?: boolean;
 	previewUnavailableReason?: string;
 }
 
+export type SubagentNotifyWatchdogBlocker = Pick<ChildWatchdogWarningSummary, "summary" | "addressed" | "stalemate"> & { agent: string };
+
 export interface SubagentNotifyDetails {
+	workflowReceiptPath?: string;
+	asyncDir?: string;
 	agent: string;
 	status: "completed" | "failed" | "paused" | "stopped";
 	source?: "async" | "foreground";
 	taskInfo?: string;
 	resultPreview: string;
 	durationMs?: number;
+	/** The finished run's id; for a workflow it equals workflowRunId. */
+	runId?: string;
 	workflowRunId?: string;
 	childRuns?: Array<{ runId: string; workflowKey?: string; agent?: string; status?: string }>;
 	childOutputs?: SubagentNotifyChildOutput[];
@@ -47,6 +66,17 @@ export interface SubagentNotifyDetails {
 	handoffPath?: string;
 	/** Present when a durable schedule launched the run. */
 	scheduleOrigin?: ScheduleOrigin;
+	watchdogBlockers?: SubagentNotifyWatchdogBlocker[];
+}
+
+export interface IncrementalChildCompletion {
+	workflowRunId: string;
+	childKey: string;
+	childRunId?: string;
+	outcome: "completed" | "failed" | "paused" | "stopped";
+	outputReference?: string;
+	error?: string;
+	workflowRunning: boolean;
 }
 
 export interface CompletionNotification {
@@ -72,12 +102,18 @@ export interface CompletionNotification {
 		agent?: string;
 		status?: string;
 		state?: string;
+		revival?: string;
 		success?: boolean;
 		output?: string;
+		error?: string;
 		structuredOutput?: unknown;
+		structuredOutputPath?: string;
 		outputState?: "present" | "absent" | "unknown";
 		outputReference?: string | { path?: string };
+		savedOutputPath?: string;
 		artifactPaths?: { outputPath?: string };
+		outputSaveError?: string;
+		artifactOutputSaveFailed?: true;
 		detached?: boolean;
 		exitCode?: number | null;
 		processSignal?: string | null;
@@ -85,7 +121,9 @@ export interface CompletionNotification {
 		timedOut?: boolean;
 		stopped?: boolean;
 		turnBudgetExceeded?: boolean;
+		watchdog?: ChildWatchdogProgress;
 	}>;
+	watchdog?: ChildWatchdogProgress;
 	timestamp?: number;
 	durationMs?: number;
 	cwd?: string;
@@ -102,6 +140,7 @@ export interface CompletionNotification {
 	intercomDelivered?: boolean;
 	parallelHandoff?: ParallelHandoffReference;
 	scheduleOrigin?: ScheduleOrigin;
+	asyncDir?: string;
 }
 
 interface NotifyTimerApi {
@@ -114,17 +153,36 @@ export interface RegisterSubagentNotifyOptions {
 	timers?: NotifyTimerApi;
 	now?: () => number;
 	ownership?: Pick<ResultDeliveryOwnership, "owns">;
+	sendRegistry?: CompletionSendRegistry;
 }
 
 export interface CompletionNotifier {
 	deliver(result: CompletionNotification): Promise<boolean>;
+	/** True while a completion is batched, being sent, or accepted as a wake that DM has not started yet. */
+	hasPendingDelivery(): boolean;
+	/** Releases a completion wake once DM starts it (native message_start). */
+	messageStarted(message: AgentMessage): void;
+	/** Adopts wakes a reloaded notifier left queued for the same session manager and session UUID. */
+	bindSession(sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId">): void;
+	/** Drops queued wakes unless the session is only reloading extensions. */
+	sessionShutdown(reason: string | undefined): void;
+	/** Send every batched completion now instead of waiting for its batch timer. */
+	flush(): void;
 	dispose(): void;
 }
 
-const CHILD_OUTPUT_PREVIEW_MAX_BYTES = 4 * 1024;
+const CHILD_OUTPUT_PREVIEW_MAX_BYTES = 2_000;
+const ERROR_LINE_MAX_BYTES = 300;
 const CHILD_OUTPUT_PREVIEW_COUNT = 8;
 const PREVIEW_TRUNCATION_MARKER = "...[preview truncated]";
+const COMPLETION_SEND_TTL_MS = 10 * 60 * 1000;
+const COMPLETION_SEND_REGISTRY_CAP = 4_096;
 type CompletionChild = NonNullable<CompletionNotification["results"]>[number];
+interface RetainedPathError { path: string; code?: string; message: string }
+type RetainedPathProjection =
+	| { status: "verified"; path: string }
+	| { status: "unavailable" }
+	| { status: "error"; error: RetainedPathError };
 
 function truncateUtf8Head(value: string, maxBytes: number): { text: string; truncated: boolean } {
 	const bytes = Buffer.from(value, "utf8");
@@ -153,10 +211,31 @@ function childSavedOutputPath(child: CompletionChild): string | undefined {
 	return outputPathFromReference(child.outputReference);
 }
 
+function nonemptyPath(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function retainedChildPath(value: unknown, producerConfirmed = false): RetainedPathProjection {
+	const path = nonemptyPath(value);
+	if (!path) return { status: "unavailable" };
+	if (producerConfirmed) return { status: "verified", path };
+	try {
+		return statSync(path).isFile() ? { status: "verified", path } : { status: "unavailable" };
+	} catch (error) {
+		const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
+		if (code === "ENOENT" || code === "ENOTDIR") return { status: "unavailable" };
+		return { status: "error", error: { path, ...(code ? { code } : {}), message: error instanceof Error ? error.message : String(error) } };
+	}
+}
+
+function formatRetainedPathError(label: string, error: RetainedPathError): string {
+	return `  ${label} verification failed: stat ${error.code ? boundedSafeText(error.code, 32) : "unknown"}; path=${boundedSafeText(error.path, 384)}; ${boundedSafeText(error.message, 512)}`;
+}
+
 function childStatus(child: CompletionChild, workflowState?: string): string {
 	const knownStatus = child.status === "complete"
 		? "completed"
-		: child.status === "completed" || child.status === "failed" || child.status === "paused" || child.status === "stopped" || child.status === "detached"
+		: child.status === "running" || child.status === "completed" || child.status === "failed" || child.status === "paused" || child.status === "stopped" || child.status === "detached"
 			? child.status
 		: undefined;
 	if (knownStatus) return knownStatus;
@@ -183,11 +262,23 @@ function structuredOutputText(value: unknown): string | undefined {
 	}
 }
 
+function isDegenerateOutput(text: string): boolean {
+	return !text.trim() || text.trim() === "</think>";
+}
+
+function firstErrorLine(error: unknown): string | undefined {
+	if (typeof error !== "string") return undefined;
+	const line = error.split("\n").find((part) => part.trim())?.trim();
+	return line ? boundedSafeText(line, ERROR_LINE_MAX_BYTES) : undefined;
+}
+
 function childInlinePreview(child: CompletionChild): { preview?: string; truncated?: boolean; unavailableReason?: string } {
 	const output = typeof child.output === "string" ? child.output : "";
 	const outputReference = childSavedOutputPath(child);
 	const referenceOnly = Boolean(outputReference && output.trim().startsWith("Output saved to:"));
-	const raw = child.outputState === "absent" || referenceOnly ? structuredOutputText(child.structuredOutput) : output || structuredOutputText(child.structuredOutput);
+	const raw = child.outputState === "absent" || referenceOnly
+		? structuredOutputText(child.structuredOutput)
+		: isDegenerateOutput(output) ? structuredOutputText(child.structuredOutput) ?? output : output;
 	if (!raw?.trim()) {
 		return { unavailableReason: referenceOnly ? "saved output is file-only" : "no safe inline output" };
 	}
@@ -206,7 +297,14 @@ function formatChildOutputBlock(children: SubagentNotifyChildOutput[] | undefine
 		const runId = child.runId ? boundedSafeText(child.runId) : "unavailable";
 		const status = boundedSafeText(child.status) || "unavailable";
 		lines.push(`- key=${key} run=${runId} status=${status}`);
+		if (child.revival) lines.push(`  ${boundedSafeText(child.revival)}`);
 		lines.push(`  Saved output: ${child.savedOutputPath ? boundedSafeText(child.savedOutputPath) : "unavailable"}`);
+		if (child.outputArtifactPath) lines.push(`  Output artifact (retention-managed): ${boundedSafeText(child.outputArtifactPath)}`);
+		if (child.structuredOutputPath) lines.push(`  Structured output (retention-managed): ${boundedSafeText(child.structuredOutputPath)}`);
+		if (child.outputArtifactError) lines.push(formatRetainedPathError("Output artifact", child.outputArtifactError));
+		if (child.structuredOutputError) lines.push(formatRetainedPathError("Structured output", child.structuredOutputError));
+		if (child.error) lines.push(`  Error: ${child.error}`);
+		if (child.previewTruncated && !child.savedOutputPath && !child.outputArtifactPath) lines.push("  Full output unavailable");
 		if (index >= CHILD_OUTPUT_PREVIEW_COUNT) {
 			lines.push("  Preview: unavailable (notice preview budget exceeded)");
 			continue;
@@ -243,25 +341,47 @@ function formatChildRun(child: { runId: string; workflowKey?: string; agent?: st
 
 function formatCorrelationLines(details: SubagentNotifyDetails): string[] {
 	return [
+		details.asyncDir ? `Retention-managed async directory: ${boundedSafeText(details.asyncDir)}` : undefined,
 		details.workflowRunId ? `Workflow run: ${details.workflowRunId}` : undefined,
 		details.childRuns?.length ? `Child runs: ${details.childRuns.map(formatChildRun).join(", ")}` : undefined,
 		details.reconciledFromDetachedChild ? `Reconciled detached child: ${details.reconciledFromDetachedChild}` : undefined,
 	].filter((line): line is string => line !== undefined);
 }
 
+const WATCHDOG_BLOCKERS_HEADING = "Watchdog blockers:";
+
+function formatWatchdogBlockerLines(details: SubagentNotifyDetails): string[] {
+	if (!details.watchdogBlockers?.length) return [];
+	return [WATCHDOG_BLOCKERS_HEADING, ...details.watchdogBlockers.map((blocker) => `- ${blocker.agent}: ${blocker.summary} (${blocker.stalemate ? "stalemate" : blocker.addressed ? "addressed" : "unaddressed"})`)];
+}
+
+// A stalemate blocker parses back as unaddressed; acceptance treats both as unresolved.
+function parseWatchdogBlockerLines(lines: string[]): SubagentNotifyWatchdogBlocker[] {
+	const blockers: SubagentNotifyWatchdogBlocker[] = [];
+	for (const line of lines) {
+		const match = line.match(/^- (.+?): (.+) \((addressed|unaddressed|stalemate)\)$/);
+		if (!match) break;
+		blockers.push({ agent: match[1]!, summary: match[2]!, addressed: match[3] === "addressed", stalemate: match[3] === "stalemate" });
+	}
+	return blockers;
+}
+
 export function formatSingleCompletion(details: SubagentNotifyDetails): string {
 	const sessionLine = formatSessionLine(details);
 	const correlationLines = formatCorrelationLines(details);
+	const watchdogLines = formatWatchdogBlockerLines(details);
 	const taskKind = details.source === "foreground" ? "Detached foreground task" : "Background task";
 	const scheduleLine = details.scheduleOrigin
 		? `Scheduled run from **${details.scheduleOrigin.name ?? details.scheduleOrigin.id}** (schedule ${details.scheduleOrigin.id}).`
 		: undefined;
 	return [
 		`${taskKind} ${details.status}: **${details.agent}**${details.taskInfo ?? ""}`,
+		details.workflowReceiptPath ? `Workflow receipt: ${details.workflowReceiptPath}` : undefined,
 		"",
 		scheduleLine,
 		scheduleLine ? "" : undefined,
 		formatResultPreview(details),
+		...(watchdogLines.length ? ["", ...watchdogLines] : []),
 		details.handoffPath ? "" : undefined,
 		details.handoffPath ? `Parallel handoff: ${details.handoffPath}` : undefined,
 		correlationLines.length && !details.handoffPath ? "" : undefined,
@@ -273,11 +393,49 @@ export function formatSingleCompletion(details: SubagentNotifyDetails): string {
 		.join("\n");
 }
 
+export function scheduledCompletionTriggersTurn(origin: ScheduleOrigin | undefined, outcome: string): boolean {
+	return !(origin?.quiet === true && outcome === "completed");
+}
+
+/**
+ * Child settlement is useful context, but an ordinary successful child does not
+ * establish the workflow's dependency barrier while its workflow is running.
+ * Keep actionable outcomes waking the parent, and preserve a terminal child as
+ * the barrier for hosts that do not emit a separate workflow completion wake.
+ */
+export function incrementalChildCompletionTriggersTurn(
+	child: Pick<IncrementalChildCompletion, "outcome" | "workflowRunning">,
+	origin: ScheduleOrigin | undefined,
+): boolean {
+	if (child.workflowRunning && child.outcome === "completed") return false;
+	return scheduledCompletionTriggersTurn(origin, child.outcome);
+}
+
+export function formatIncrementalChildCompletion(child: IncrementalChildCompletion): string {
+	const statusText = child.outcome === "completed" ? "completed"
+		: child.outcome === "failed" ? "failed"
+			: child.outcome === "paused" ? "paused (needs attention)"
+				: "stopped";
+	const workflowStatus = child.workflowRunning ? "workflow still running" : "workflow finished";
+	return [
+		`Workflow child ${statusText}: **${child.childKey}**`,
+		`Workflow run: ${child.workflowRunId}`,
+		...(child.childRunId ? [`Child run: ${child.childRunId}`] : []),
+		...(child.outputReference ? [`Output: ${child.outputReference}`] : []),
+		...(child.error ? [`Error: ${child.error}`] : []),
+		`Status: ${workflowStatus}`,
+	].join("\n");
+}
+
 export function parseSubagentNotifyContent(content: string): SubagentNotifyDetails | undefined {
 	const lines = content.split("\n");
 	const match = (lines[0] ?? "").match(/^(Background task|Detached foreground task) (completed|failed|paused|stopped): \*\*(.+?)\*\*(?:\s+(\([^)]*\)))?$/);
 	if (!match) return undefined;
-	let body = lines.slice(2);
+	// Only the header slot before the blank separator can carry a receipt.
+	// Identical lines anywhere in model output remain preview text.
+	const receiptHeader = lines[1]?.startsWith("Workflow receipt: ") && lines[2] === "";
+	const workflowReceiptPath = receiptHeader ? lines[1]!.slice("Workflow receipt: ".length) : undefined;
+	let body = lines.slice(receiptHeader ? 3 : 2);
 	// Restore the schedule origin so a re-rendered notice keeps its attribution and
 	// does not fold the line into the result preview.
 	const scheduleMatch = (body[0] ?? "").match(/^Scheduled run from \*\*(.+?)\*\* \(schedule (.+?)\)\.$/);
@@ -300,7 +458,9 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 	const workflowRunIndex = body.findIndex((line) => line.startsWith("Workflow run: "));
 	const childRunsIndex = body.findIndex((line) => line.startsWith("Child runs: "));
 	const reconciledIndex = body.findIndex((line) => line.startsWith("Reconciled detached child: "));
-	const metadataIndexes = [sessionIndex, handoffIndex, workflowRunIndex, childRunsIndex, reconciledIndex].filter((index) => index >= 0);
+	const watchdogIndex = body.findIndex((line) => line === WATCHDOG_BLOCKERS_HEADING);
+	const watchdogBlockers = watchdogIndex >= 0 ? parseWatchdogBlockerLines(body.slice(watchdogIndex + 1)) : [];
+	const metadataIndexes = [sessionIndex, handoffIndex, workflowRunIndex, childRunsIndex, reconciledIndex, watchdogIndex].filter((index) => index >= 0);
 	const firstMetadataIndex = metadataIndexes.length ? Math.min(...metadataIndexes) : body.length;
 	const resultEnd = firstMetadataIndex > 0 && body[firstMetadataIndex - 1]?.trim() === "" ? firstMetadataIndex - 1 : firstMetadataIndex;
 	const resultPreview = body.slice(0, resultEnd).join("\n").trim() || "(no output)";
@@ -331,11 +491,13 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 		...(match[1] === "Detached foreground task" ? { source: "foreground" as const } : {}),
 		...(match[4] ? { taskInfo: match[4] } : {}),
 		...(parsedScheduleOrigin ? { scheduleOrigin: parsedScheduleOrigin } : {}),
+		...(workflowReceiptPath ? { workflowReceiptPath } : {}),
 		resultPreview,
 		...(handoffPath ? { handoffPath } : {}),
 		...(workflowRunId ? { workflowRunId } : {}),
 		...(childRuns?.length ? { childRuns } : {}),
 		...(reconciledFromDetachedChild ? { reconciledFromDetachedChild } : {}),
+		...(watchdogBlockers.length ? { watchdogBlockers } : {}),
 		...(sessionLabel && sessionValue ? { sessionLabel, sessionValue } : {}),
 	};
 }
@@ -348,7 +510,9 @@ export function formatGroupedCompletion(details: SubagentNotifyDetails[]): strin
 		if (!detail) continue;
 		const sessionLine = formatSessionLine(detail);
 		blocks.push(`${index + 1}. ${detail.agent}${detail.taskInfo ?? ""}${detail.scheduleOrigin ? ` — scheduled run from ${detail.scheduleOrigin.name ?? detail.scheduleOrigin.id} (schedule ${detail.scheduleOrigin.id})` : ""}`);
+		if (detail.workflowReceiptPath) blocks.push(`Workflow receipt: ${detail.workflowReceiptPath}`);
 		blocks.push(formatResultPreview(detail));
+		blocks.push(...formatWatchdogBlockerLines(detail));
 		if (detail.handoffPath) blocks.push(`Parallel handoff: ${detail.handoffPath}`);
 		blocks.push(...formatCorrelationLines(detail));
 		if (sessionLine) blocks.push(sessionLine);
@@ -357,7 +521,31 @@ export function formatGroupedCompletion(details: SubagentNotifyDetails[]): strin
 	return blocks.join("\n").trimEnd();
 }
 
+const notificationDebug = debuglog("dm-subagents-notify");
+type TraceIdentity = Pick<CompletionNotification, "id" | "runId" | "source">;
+type NotificationReason = "disposed" | "missing_session" | "foreground_session_mismatch" | "not_owned"
+	| "intercom_delivered" | "deduped_ttl" | "deduped_pending" | "batch_deferred"
+	| "emit_foreground_session_mismatch" | "emit_not_owned" | "send_joined" | "send_accepted" | "send_failed" | "dispose_pending";
+
+// Slice before sanitizing: diagnostic work and each identity are bounded even for
+// malformed result metadata. Never include task/output, paths, or error bodies.
+function traceIdentity(result: TraceIdentity): TraceIdentity {
+	const identity = (value: unknown) => typeof value === "string"
+		? value.slice(0, 128).replace(/[^a-zA-Z0-9_.:-]/g, "_") : undefined;
+	return { id: identity(result.id), runId: identity(result.runId), source: result.source === "foreground" ? "foreground" : "async" };
+}
+
+function traceNotification(reason: NotificationReason, result?: TraceIdentity): void {
+	if (!notificationDebug.enabled) return;
+	try {
+		notificationDebug("%s", JSON.stringify({ reason, ...(result ? traceIdentity(result) : {}) }));
+	} catch {
+		// Diagnostics must never change delivery acknowledgement.
+	}
+}
+
 interface PendingCompletion {
+	trace?: TraceIdentity;
 	key: string;
 	details: SubagentNotifyDetails;
 	sessionId: string;
@@ -366,22 +554,129 @@ interface PendingCompletion {
 	resolve(accepted: boolean): void;
 }
 
-function sendCompletion(dm: Pick<ExtensionAPI, "sendMessage">, items: PendingCompletion[]): boolean {
+export interface CompletionSendClaim {
+	owned: boolean;
+	outcome: Promise<boolean>;
+	settle?(accepted: boolean): void;
+}
+
+export interface CompletionSendRegistry {
+	claim(key: string, now: number): CompletionSendClaim;
+}
+
+interface CompletionSendEntry {
+	outcome: Promise<boolean>;
+	resolve(accepted: boolean): void;
+	deliveredAt?: number;
+}
+
+/** A fresh registry is injectable so tests and separately scoped runtimes stay isolated. */
+export function createCompletionSendRegistry(
+	ttlMs = COMPLETION_SEND_TTL_MS,
+	cap = COMPLETION_SEND_REGISTRY_CAP,
+): CompletionSendRegistry {
+	const entries = new Map<string, CompletionSendEntry>();
+	const prune = (now: number) => {
+		for (const [key, entry] of entries) {
+			if (entry.deliveredAt !== undefined && now - entry.deliveredAt > ttlMs) entries.delete(key);
+		}
+		if (entries.size <= cap) return;
+		for (const [key, entry] of entries) {
+			if (entries.size <= cap) break;
+			if (entry.deliveredAt !== undefined) entries.delete(key);
+		}
+	};
+	return {
+		claim(key, now) {
+			prune(now);
+			const existing = entries.get(key);
+			if (existing) return { owned: false, outcome: existing.outcome };
+			let resolve!: (accepted: boolean) => void;
+			const entry: CompletionSendEntry = {
+				outcome: new Promise<boolean>((settle) => { resolve = settle; }),
+				resolve: (accepted) => resolve(accepted),
+			};
+			entries.set(key, entry);
+			return {
+				owned: true,
+				outcome: entry.outcome,
+				settle(accepted) {
+					if (entries.get(key) !== entry) return;
+					if (accepted) {
+						entry.deliveredAt = now;
+						prune(now);
+					} else {
+						entries.delete(key);
+					}
+					entry.resolve(accepted);
+				},
+			};
+		},
+	};
+}
+
+const completionSendRegistrySymbol = Symbol.for("dm-subagents.completion-send-registry.v1");
+const processGlobal = globalThis as typeof globalThis & { [completionSendRegistrySymbol]?: CompletionSendRegistry };
+const processCompletionSendRegistry = processGlobal[completionSendRegistrySymbol]
+	?? (processGlobal[completionSendRegistrySymbol] = createCompletionSendRegistry());
+
+// Reload replaces extension instances, not DM's session manager or queued wakes.
+// A manager can change sessions; retain wakes only while its UUID is unchanged.
+type QueuedWakes = { sessionId: string; wakes: string[]; unansweredCompletions: Map<string, { reminded: boolean }> };
+const queuedWakesSymbol = Symbol.for("dm-subagents.queued-completion-wakes.v2");
+const wakeGlobal = globalThis as typeof globalThis & { [queuedWakesSymbol]?: WeakMap<object, QueuedWakes> };
+const queuedWakes = wakeGlobal[queuedWakesSymbol] ?? (wakeGlobal[queuedWakesSymbol] = new WeakMap<object, QueuedWakes>());
+
+type NotifyRunDetails = Omit<SubagentNotifyDetails, "resultPreview" | "childOutputs"> & {
+	childOutputs?: Array<Omit<SubagentNotifyChildOutput, "preview" | "previewTruncated" | "previewUnavailableReason">>;
+};
+
+function notifyRunDetails({ resultPreview: _preview, childOutputs, ...run }: SubagentNotifyDetails): NotifyRunDetails {
+	return {
+		...run,
+		...(childOutputs ? { childOutputs: childOutputs.map(({ preview: _childPreview, previewTruncated: _truncated, previewUnavailableReason: _reason, ...child }) => child) } : {}),
+	};
+}
+
+const COMPLETION_ACTION = "Read the saved results above and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.";
+const HELD_COMPLETION_ACTION = "The user stopped the parent turn. Report these results at the user's next prompt and do not resume the stopped task unless asked.";
+function sendCompletion(dm: Pick<ParentWake, "sendMessage" | "isHeld">, items: PendingCompletion[], unstartedWakes: string[], unansweredCompletions: Map<string, { reminded: boolean }>, updateSettleSubscription: () => void): boolean {
 	if (items.length === 0) return true;
 	const details = items.map((item) => item.details);
-	const content = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
+	const triggerTurn = items.some((item) => item.triggerTurn);
+	const formatted = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
+	const held = dm.isHeld();
+	const content = triggerTurn ? `${formatted}\n\nParent action: ${held ? HELD_COMPLETION_ACTION : COMPLETION_ACTION}` : formatted;
 	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
+	// A held notice starts no wake, so the silent-wake reminder must not later tell the model to resume the stopped task.
+	const tracked = triggerTurn && !held;
+	// DM can queue an accepted wake behind the current turn or past agent_settled.
+	// Recorded before sending in case DM starts the message synchronously.
+	if (tracked) {
+		unstartedWakes.push(content);
+		unansweredCompletions.set(content, { reminded: false });
+		updateSettleSubscription();
+	}
 	try {
-		dm.sendMessage(
+		const appended = dm.sendMessage(
 			{
 				customType: "subagent-notify",
 				content,
 				display,
+				// DM does not send details to the model. Hosts match runs by id; the text previews stay in content only.
+				details: { runs: details.map(notifyRunDetails) },
 			},
-			{ triggerTurn: items.some((item) => item.triggerTurn) },
+			{ triggerTurn },
 		);
+		// An idle parent's appended notice gets no message_start; its wake prompt holds liveness instead.
+		if (appended && tracked) unstartedWakes.splice(unstartedWakes.lastIndexOf(content), 1);
 		return true;
 	} catch {
+		if (tracked) {
+			unstartedWakes.splice(unstartedWakes.lastIndexOf(content), 1);
+			unansweredCompletions.delete(content);
+			updateSettleSubscription();
+		}
 		return false;
 	}
 }
@@ -409,8 +704,11 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		|| summary.startsWith("Paused after interrupt.")
 	);
 	const status = stopped ? "stopped" : paused ? "paused" : result.success ? "completed" : "failed";
-	const taskInfo =
-		result.taskIndex !== undefined && result.totalTasks !== undefined
+	const runningChildren = (result.mode === "workflow" || agent === "workflow")
+		? result.results?.filter((child) => childStatus(child) === "running").length ?? 0 : 0;
+	const taskInfo = runningChildren > 0
+		? ` (${status === "completed" ? "dispatch complete; " : ""}${runningChildren} ${runningChildren === 1 ? "child" : "children"} running or uncollected)`
+		: result.taskIndex !== undefined && result.totalTasks !== undefined
 			? ` (${result.taskIndex + 1}/${result.totalTasks})`
 			: undefined;
 
@@ -418,8 +716,41 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		? result.parallelHandoff as { path?: unknown }
 		: undefined;
 	const handoffPath = typeof parallelHandoff?.path === "string" ? parallelHandoff.path : undefined;
+	const receipt = result.workflowReceipt;
+	const receiptPath = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+		? (receipt as Record<string, unknown>).path : undefined;
+	const workflowReceiptPath = typeof receiptPath === "string" && receiptPath ? receiptPath : undefined;
 	const rawRunId = typeof result.runId === "string" ? result.runId : typeof result.id === "string" ? result.id : undefined;
 	const workflowRunId = (result.mode === "workflow" || agent === "workflow") && rawRunId ? rawRunId : undefined;
+	const directChild = !workflowRunId && result.results?.length === 1 ? result.results[0]! : undefined;
+	const directStructuredPreview = directChild
+		? childInlinePreview(directChild).preview
+		: undefined;
+	const directSummary = summary.trim();
+	const directAgent = typeof directChild?.agent === "string" ? directChild.agent : agent;
+	const directSummaryBody = directAgent && summary.trimStart().startsWith(`${directAgent}:\n`)
+		? summary.trimStart().slice(directAgent.length + 2)
+		: directSummary;
+	const directDegenerateSummary = directChild
+		&& isDegenerateOutput(typeof directChild.output === "string" ? directChild.output : "")
+		&& isDegenerateOutput(directSummaryBody)
+		&& structuredOutputText(directChild.structuredOutput) !== undefined;
+	const directNoOutputSummary = directChild && (!directSummary
+		|| directSummary === "(no output)"
+		|| (directAgent && directSummary === `${directAgent}:\n(no output)`));
+	const outputPreview = directStructuredPreview && (directNoOutputSummary || directDegenerateSummary)
+		? `Structured output:\n${directStructuredPreview}`
+		: capSummaryOutputs(summary, result.results);
+	// A failed child that produced output reports that output as its summary, so its error needs its own line.
+	const errorSources = status === "completed" ? [] : [
+		{ agent: undefined, error: result.error },
+		...(workflowRunId ? [] : result.results ?? []).filter((child) => child.success !== true).map((child) => ({ agent: child.agent, error: child.error })),
+	];
+	const errorLines = [...new Set(errorSources.flatMap(({ agent: errorAgent, error }) => {
+		const line = firstErrorLine(error);
+		return line && !outputPreview.includes(line) ? [`Error${errorAgent && (result.results?.length ?? 0) > 1 ? ` (${errorAgent})` : ""}: ${line}`] : [];
+	}))];
+	const resultPreview = errorLines.length ? `${errorLines.join("\n")}\n\n${outputPreview}` : outputPreview;
 	const childRuns = result.results?.flatMap((child) => {
 		const runId = typeof child.runId === "string" && child.runId.trim() ? child.runId.trim() : undefined;
 		const workflowKey = typeof child.workflowKey === "string" && child.workflowKey.trim() ? child.workflowKey.trim() : undefined;
@@ -437,12 +768,24 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 			const workflowKey = typeof child.workflowKey === "string" && child.workflowKey.trim() ? child.workflowKey.trim() : undefined;
 			const runId = typeof child.runId === "string" && child.runId.trim() ? child.runId.trim() : undefined;
 			const savedOutputPath = childSavedOutputPath(child);
+			const outputArtifact = child.artifactOutputSaveFailed === true ? { status: "unavailable" as const } : retainedChildPath(child.artifactPaths?.outputPath);
+			const structuredOutput = child.stopped === true || child.timedOut === true
+				? { status: "unavailable" as const }
+				: retainedChildPath(child.structuredOutputPath, child.structuredOutput !== undefined);
+			const status = childStatus(child, result.state);
+			const error = status === "completed" || status === "running" ? undefined : firstErrorLine(child.error);
 			return {
 				...(workflowKey ? { workflowKey } : {}),
 				...(runId ? { runId } : {}),
 				...(typeof child.agent === "string" ? { agent: child.agent } : {}),
-				status: childStatus(child, result.state),
+				status,
+				...(typeof child.revival === "string" && child.revival ? { revival: child.revival } : {}),
 				...(savedOutputPath ? { savedOutputPath } : {}),
+				...(outputArtifact.status === "verified" ? { outputArtifactPath: outputArtifact.path } : {}),
+				...(structuredOutput.status === "verified" ? { structuredOutputPath: structuredOutput.path } : {}),
+				...(outputArtifact.status === "error" ? { outputArtifactError: outputArtifact.error } : {}),
+				...(structuredOutput.status === "error" ? { structuredOutputError: structuredOutput.error } : {}),
+				...(error ? { error } : {}),
 				...(inline.preview ? { preview: inline.preview } : { preview: "" }),
 				...(inline.truncated ? { previewTruncated: true } : {}),
 				...(inline.unavailableReason ? { previewUnavailableReason: inline.unavailableReason } : {}),
@@ -450,6 +793,18 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		})
 		: undefined;
 	const reconciledFromDetachedChild = typeof result.reconciledFromDetachedChild === "string" ? result.reconciledFromDetachedChild : undefined;
+	const asyncDir = nonemptyPath(result.asyncDir);
+	const watchdogBlockers: SubagentNotifyWatchdogBlocker[] = [];
+	const watchdogConcerns: string[] = [];
+	const collectWatchdogFindings = (owner: string, progress: ChildWatchdogProgress | undefined) => {
+		for (const warning of progress?.warnings ?? []) {
+			if (warning.importance !== "high") continue;
+			if (warning.severity === "blocker") watchdogBlockers.push({ agent: owner, summary: warning.summary, addressed: warning.addressed, stalemate: warning.stalemate });
+			else watchdogConcerns.push(`${owner}: ${warning.summary}\nEvidence: ${warning.evidence}\nRecommended action: ${warning.recommendedAction}`);
+		}
+	};
+	collectWatchdogFindings(agent, result.watchdog);
+	for (const child of result.results ?? []) collectWatchdogFindings(typeof child.agent === "string" ? child.agent : agent, child.watchdog);
 	const session =
 		result.shareUrl
 			? { label: "Session", value: result.shareUrl }
@@ -466,38 +821,48 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		agent,
 		status,
 		...(scheduleOrigin ? { scheduleOrigin } : {}),
+		...(workflowReceiptPath ? { workflowReceiptPath } : {}),
+		...(asyncDir ? { asyncDir } : {}),
 		...(result.source ? { source: result.source } : {}),
 		...(taskInfo ? { taskInfo } : {}),
-		resultPreview: summary,
+		resultPreview: watchdogConcerns.length ? `${resultPreview}\n\nHigh-importance watchdog concerns:\n${watchdogConcerns.map((warning) => `- ${warning}`).join("\n")}` : resultPreview,
 		...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
 		...(handoffPath ? { handoffPath } : {}),
+		...(rawRunId ? { runId: rawRunId } : {}),
 		...(workflowRunId ? { workflowRunId } : {}),
 		...(childRuns.length ? { childRuns } : {}),
 		...(childOutputs?.length ? { childOutputs } : {}),
 		...(reconciledFromDetachedChild ? { reconciledFromDetachedChild } : {}),
+		...(watchdogBlockers.length ? { watchdogBlockers } : {}),
 		...(session ? { sessionLabel: session.label, sessionValue: session.value } : {}),
 	};
 }
 
 export default function registerSubagentNotify(
-	dm: ExtensionAPI,
+	dm: Pick<ExtensionAPI, "events"> & Partial<Pick<ExtensionAPI, "on">> & Pick<ParentWake, "sendMessage" | "isHeld">,
 	state: Pick<SubagentState, "currentSessionId" | "completionOwnerId">,
 	options: RegisterSubagentNotifyOptions = {},
 ): CompletionNotifier {
 	const seen = new Map<string, number>();
 	const pending = new Map<string, Promise<boolean>>();
-	const ttlMs = 10 * 60 * 1000;
+	const ttlMs = COMPLETION_SEND_TTL_MS;
 	const now = options.now ?? Date.now;
+	const sendRegistry = options.sendRegistry ?? processCompletionSendRegistry;
 	const batchConfig = resolveCompletionBatchConfig(options.batchConfig);
 	const batchers = new Map<string, CompletionBatcher<PendingCompletion>>();
+	let unstartedWakes: string[] = [];
+	let unansweredCompletions = new Map<string, { reminded: boolean }>();
+	let bound = false;
 	let disposed = false;
+	let unsubscribeSettle: (() => void) | undefined;
 	const ownsResult = options.ownership?.owns
 		?? ((sessionId: string, completionOwnerId: unknown) => sessionId === state.currentSessionId
 			&& typeof completionOwnerId === "string"
 			&& completionOwnerId === state.completionOwnerId);
 
-	const settle = (items: PendingCompletion[], accepted: boolean) => {
+	const settle = (items: PendingCompletion[], accepted: boolean, reason?: NotificationReason) => {
 		for (const item of items) {
+			if (reason) traceNotification(reason, item.trace);
 			pending.delete(item.key);
 			if (accepted) markSeenWithTtl(seen, item.key, now(), ttlMs);
 			item.resolve(accepted);
@@ -510,10 +875,24 @@ export default function registerSubagentNotify(
 			const owned = item.details.source === "foreground"
 				? item.sessionId === state.currentSessionId
 				: ownsResult(item.sessionId, item.completionOwnerId);
+			if (!owned) traceNotification(item.details.source === "foreground" ? "emit_foreground_session_mismatch" : "emit_not_owned", item.trace);
 			(owned ? accepted : rejected).push(item);
 		}
 		settle(rejected, false);
-		settle(accepted, sendCompletion(dm, accepted));
+		const claimed: Array<{ item: PendingCompletion; claim: CompletionSendClaim }> = [];
+		for (const item of accepted) {
+			const claim = sendRegistry.claim(item.key, now());
+			if (claim.owned) {
+				claimed.push({ item, claim });
+				continue;
+			}
+			traceNotification("send_joined", item.trace);
+			void claim.outcome.then((outcome) => settle([item], outcome, outcome ? undefined : "send_failed"));
+		}
+		const claimedItems = claimed.map(({ item }) => item);
+		const sent = sendCompletion(dm, claimedItems, unstartedWakes, unansweredCompletions, updateSettleSubscription);
+		for (const { claim } of claimed) claim.settle?.(sent);
+		settle(claimedItems, sent, sent ? "send_accepted" : "send_failed");
 	};
 	const getBatcher = (result: CompletionNotification) => {
 		const key = completionBatchKey(result);
@@ -531,17 +910,35 @@ export default function registerSubagentNotify(
 	};
 
 	const deliver = (result: CompletionNotification): Promise<boolean> => {
-		if (disposed || typeof result.sessionId !== "string") return Promise.resolve(false);
+		if (disposed || typeof result.sessionId !== "string") {
+			traceNotification(disposed ? "disposed" : "missing_session", result);
+			return Promise.resolve(false);
+		}
 		if (result.source === "foreground") {
-			if (result.sessionId !== state.currentSessionId) return Promise.resolve(false);
-		} else if (!ownsResult(result.sessionId, result.completionOwnerId)) return Promise.resolve(false);
-		if (result.intercomDelivered === true) return Promise.resolve(true);
+			if (result.sessionId !== state.currentSessionId) {
+				traceNotification("foreground_session_mismatch", result);
+				return Promise.resolve(false);
+			}
+		} else if (!ownsResult(result.sessionId, result.completionOwnerId)) {
+			traceNotification("not_owned", result);
+			return Promise.resolve(false);
+		}
+		if (result.intercomDelivered === true) {
+			traceNotification("intercom_delivered", result);
+			return Promise.resolve(true);
+		}
 		const key = buildCompletionKey(result, "notify");
 		const seenAt = seen.get(key);
-		if (seenAt !== undefined && now() - seenAt <= ttlMs) return Promise.resolve(true);
+		if (seenAt !== undefined && now() - seenAt <= ttlMs) {
+			traceNotification("deduped_ttl", result);
+			return Promise.resolve(true);
+		}
 		if (seenAt !== undefined) seen.delete(key);
 		const inFlight = pending.get(key);
-		if (inFlight) return inFlight;
+		if (inFlight) {
+			traceNotification("deduped_pending", result);
+			return inFlight;
+		}
 		const details = buildCompletionDetails(result);
 		let resolve!: (accepted: boolean) => void;
 		const completion = new Promise<boolean>((settleCompletion) => { resolve = settleCompletion; });
@@ -551,9 +948,10 @@ export default function registerSubagentNotify(
 			details,
 			sessionId: result.sessionId,
 			completionOwnerId: result.completionOwnerId,
-			triggerTurn: result.triggerTurn !== false,
+			triggerTurn: result.triggerTurn !== false && scheduledCompletionTriggersTurn(result.scheduleOrigin, details.status),
 			resolve,
 		};
+		if (notificationDebug.enabled) item.trace = traceIdentity(result);
 		if (details.source === "foreground") {
 			emit([item]);
 			return completion;
@@ -564,11 +962,68 @@ export default function registerSubagentNotify(
 			emit([item]);
 			return completion;
 		}
+		if (batchConfig.enabled) traceNotification("batch_deferred", item.trace);
 		batcher.push(item);
 		return completion;
 	};
 
+	const handleBeforeSettle = (event: AgentBeforeSettleEvent): AgentBeforeSettleEventResult | undefined => {
+		if (disposed || event.outcome !== "completed" || event.continue || event.context.pendingMessages.length)
+			return;
+		const messages = event.context.contextMessages;
+		const ignored: Array<[string, { reminded: boolean }]> = [];
+		for (const [content, notice] of unansweredCompletions) {
+			const index = messages.findLastIndex(message => message.role === "custom"
+				&& message.customType === "subagent-notify" && message.content === content);
+			if (index === -1) {
+				// Removed by compaction or branch switch; never revive a stale notice.
+				unansweredCompletions.delete(content);
+				continue;
+			}
+			const acted = messages.slice(index + 1).some(message => message.role === "assistant"
+				&& Array.isArray(message.content) && message.content.some(part => part.type === "toolCall"
+					|| (part.type === "text" && part.text?.trim())));
+			if (acted) {
+				unansweredCompletions.delete(content);
+				continue;
+			}
+			ignored.push([content, notice]);
+		}
+		updateSettleSubscription();
+		if (!ignored.length)
+			return;
+		const fresh = ignored.filter(([, notice]) => !notice.reminded);
+		if (fresh.length) {
+			for (const [, notice] of fresh)
+				notice.reminded = true;
+			return {
+				entries: [...event.entries, {
+					type: "custom_message", customType: "subagent-completion-unanswered", display: true,
+					content: "Completion wake ended silently. See the subagent completion notices above. " + COMPLETION_ACTION,
+				}],
+				continue: true,
+			};
+		}
+		for (const [content] of ignored)
+			unansweredCompletions.delete(content);
+		updateSettleSubscription();
+		return {
+			entries: [...event.entries, {
+				type: "custom_message", customType: "subagent-completion-unhandled", display: true,
+				content: "UNHANDLED: no response to the subagent completion notices above. Reminder budget exhausted; results remain saved. No work was rerun or approval inferred.",
+			}],
+		};
+	};
+	const updateSettleSubscription = (): void => {
+		if (!disposed && unansweredCompletions.size && !unsubscribeSettle)
+			unsubscribeSettle = onDmBeforeSettle(dm, handleBeforeSettle);
+		if (disposed || !unansweredCompletions.size) {
+			unsubscribeSettle?.();
+			unsubscribeSettle = undefined;
+		}
+	};
 	const unsubscribeAsync = dm.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (data) => {
+		if ((data as CompletionNotification).awaitedByWorkflow === true) return;
 		void deliver(data as CompletionNotification);
 	});
 	const unsubscribeForeground = dm.events.on(SUBAGENT_FOREGROUND_COMPLETE_EVENT, (data) => {
@@ -577,11 +1032,50 @@ export default function registerSubagentNotify(
 
 	return {
 		deliver,
+		hasPendingDelivery: () => pending.size > 0 || unstartedWakes.length > 0,
+		messageStarted(message) {
+			if (message.role !== "custom" || message.customType !== "subagent-notify") return;
+			const index = unstartedWakes.indexOf(message.content as string);
+			if (index !== -1) unstartedWakes.splice(index, 1);
+		},
+		bindSession(sessionManager) {
+			if (disposed) return;
+			const sessionId = sessionManager.getSessionId(); // UUID, not state.currentSessionId's possible file path.
+			const retained = queuedWakes.get(sessionManager);
+			const wakes = retained?.sessionId === sessionId ? retained.wakes : [];
+			const unanswered = retained?.sessionId === sessionId && retained.unansweredCompletions instanceof Map
+				? retained.unansweredCompletions
+				: new Map<string, { reminded: boolean }>(wakes.map(content => [content, { reminded: false }]));
+			// Before the first bind, local wakes belong to this session; after it, to the previous one.
+			if (!bound) {
+				wakes.push(...unstartedWakes);
+				for (const [content, notice] of unansweredCompletions) unanswered.set(content, notice);
+			}
+			bound = true;
+			unstartedWakes = wakes;
+			unansweredCompletions = unanswered;
+			queuedWakes.set(sessionManager, { sessionId, wakes, unansweredCompletions });
+			updateSettleSubscription();
+		},
+		sessionShutdown(reason) {
+			if (reason !== "reload") {
+				unstartedWakes.length = 0;
+				unansweredCompletions.clear();
+			}
+			unsubscribeSettle?.();
+			unsubscribeSettle = undefined;
+		},
+		flush() {
+			for (const batcher of batchers.values()) batcher.flush();
+		},
 		dispose() {
 			if (disposed) return;
 			disposed = true;
-			for (const batcher of batchers.values()) settle(batcher.dispose(), false);
+			updateSettleSubscription();
+			for (const batcher of batchers.values()) settle(batcher.dispose(), false, "dispose_pending");
 			batchers.clear();
+			// Retained state belongs to the session manager; disposal must not erase it on reload.
+			unansweredCompletions = new Map();
 			for (const unsubscribe of [unsubscribeAsync, unsubscribeForeground]) {
 				try {
 					unsubscribe?.();

@@ -1,13 +1,13 @@
 {
   "name": "dm-lens",
-  "version": "4.1.3",
+  "version": "4.4.3",
   "description": "Real-time code feedback for DM \u2014 LSP, linters, formatters, type-checking, and structural analysis.",
   "type": "module",
   "main": "./index.ts",
   "bin": {
-    "dm-lens": "mcp/cli.ts",
-    "dm-lens-mcp": "mcp/server.ts",
-    "dm-lens-analyze": "mcp/analyze-cli.ts"
+    "dm-lens": "dist/mcp/cli.js",
+    "dm-lens-mcp": "dist/mcp/server.js",
+    "dm-lens-analyze": "dist/mcp/analyze-cli.js"
   },
   "license": "MIT",
   "author": "Apostolos Mantzaris",
@@ -30,6 +30,7 @@
     "rules/",
     "skills/",
     "vendor/",
+    "dist/",
     "scripts/lib/",
     "README.md",
     "LICENSE"
@@ -37,7 +38,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit --project tsconfig.json",
     "test": "node --test __tests__/package-manifest.test.mjs",
-    "verify": "npm run typecheck && npm test"
+    "build:dist": "tsc --project tsconfig.dist.json",
+    "verify": "npm run typecheck && npm test && npm run build:dist"
   },
   "dm": {
     "extensions": [
@@ -49,14 +51,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/apmantza/pi-lens.git"
+    "url": "git+https://github.com/DuckMind/extensions.git"
   },
   "bugs": {
-    "url": "https://github.com/apmantza/pi-lens/issues"
+    "url": "https://github.com/DuckMind/extensions/issues"
   },
-  "homepage": "https://github.com/apmantza/pi-lens#readme",
+  "homepage": "https://github.com/DuckMind/extensions/tree/main/dm-lens#readme",
   "dependencies": {
-    "@ast-grep/cli": "^0.45.0",
+    "@ast-grep/cli": "0.45.3",
     "@ast-grep/napi": "^0.45.0",
     "js-yaml": "^5.2.2",
     "minimatch": "^10.2.6",

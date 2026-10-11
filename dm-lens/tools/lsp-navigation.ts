@@ -16,16 +16,20 @@ import {
 } from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
 import { uriToPath } from "../clients/path-utils.js";
+import { escapeRegExp } from "../clients/string-utils.js";
 import { isRecordableProjectPath } from "../clients/file-utils.js";
 import { compactRenderResult } from "./render-compact.js";
 import {
 	applyWorkspaceEdit,
+	refuseStaleWorkspaceEdit,
 	summarizeWorkspaceEdit,
+	workspaceEditTextPaths,
 } from "../clients/lsp/edits.js";
+import { hashDiagnosticContent } from "../clients/lsp/diagnostic-binding.js";
 import {
 	getLSPService,
 	type LSPWorkspaceScopeAttribution,
-} from "../clients/lsp/index.js";
+} from "../clients/lsp/capabilities.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
 import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
 import { SYMBOL_KIND_NAMES } from "../clients/lsp-document-symbols.js";
@@ -114,10 +118,6 @@ function emptyReasonForOperation(operation: LspNavigationOperation): string {
 	if (operation === "incomingCalls" || operation === "outgoingCalls")
 		return "no-call-hierarchy-results";
 	return "no-results";
-}
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 type SymbolColumnResolution = {
@@ -697,27 +697,163 @@ async function openFileBestEffort(
 	lspService: ReturnType<typeof getLSPService>,
 	filePath: string,
 	waitForDiagnostics = false,
-): Promise<void> {
+): Promise<string | undefined> {
 	let fileContent: string | undefined;
 	try {
 		fileContent = nodeFs.readFileSync(filePath, "utf-8");
 	} catch {
-		return;
+		return undefined;
 	}
-	if (!fileContent) return;
+	// #3601: an empty file is still content a caller can hold the edit to; the
+	// read is returned and the touch below is skipped exactly as before.
+	if (fileContent === "") return "";
 	try {
-		if (typeof lspService.touchFile === "function") {
-			await lspService.touchFile(filePath, fileContent, {
-				diagnostics: waitForDiagnostics ? "document" : "none",
-				source: "lsp_navigation",
-				clientScope: waitForDiagnostics ? "all" : "primary",
-			});
-		} else {
-			await lspService.openFile(filePath, fileContent);
-		}
+		// #2598: `touchFile` is defined unconditionally on the real `LSPService`
+		// (clients/lsp/index.ts), so the former `typeof … === "function"` hedge
+		// and its `openFile` arm were reachable only from a partial test double
+		// (AGENTS.md shape 7). Nothing here reads the result — a touch that
+		// resolves no clients is already the no-op this helper wants.
+		await lspService.touchFile(filePath, fileContent, {
+			diagnostics: waitForDiagnostics ? "document" : "none",
+			source: "lsp_navigation",
+			clientScope: waitForDiagnostics ? "all" : "primary",
+		});
 	} catch {
 		/* LSP server may not be ready yet — proceed anyway */
 	}
+	return fileContent;
+}
+
+/**
+ * #3601: how far before the rename request a file's mtime may sit and still
+ * count as "written after the request". Filesystem timestamps are coarse: FAT
+ * stores 2 s, HFS+ 1 s, ext4/APFS/NTFS well under 1 ms, and Linux stamps a
+ * write with a tick-coarse clock that can trail `Date.now()` by several ms. A
+ * write made just after the request can therefore carry an mtime a little
+ * before it, so 2 s (the coarsest common granularity) is the margin. The cost
+ * is a false refusal for an unopened file written within 2 s before the
+ * request; the failure it prevents is an overwrite.
+ */
+const RENAME_MTIME_MARGIN_MS = 2000;
+
+/**
+ * #3601: the content every file this rename's edit writes text to must still
+ * hold, keyed the way `applyWorkspaceEdit` keys expected content (the file's
+ * realpath). The rename's own target uses the content the pre-rename
+ * `openFileBestEffort` read and sent to the server. Any other file:
+ * - a file the language client has open: the server computed from the last
+ *   send made before the request (`requestedAtMs`, taken just before it, on the
+ *   same connection). The disk must hash to the client's last send, and that
+ *   send's bytes must not have changed at or after `requestedAtMs`: a
+ *   hook-synced write after the request makes the disk equal the last send
+ *   while the server answered from the one before it.
+ * - a file it has not opened: best effort only. The file is refused when its
+ *   mtime is at or after `requestedAtMs` minus the margin. This cannot prove
+ *   the server read the current bytes: the server answers from a copy it read
+ *   earlier, and dm-lens does not tell it about a write it did not make, so an
+ *   external write older than the margin that the server's own file watching
+ *   missed, or a write that keeps the old mtime, is applied at the server's
+ *   offsets (#3747).
+ * - a file the client first opened at or after `requestedAtMs` (#3827): the
+ *   server answered from its own copy, and that first `didOpen` stamps the
+ *   file as changed although no byte did. It takes the unopened rule only when
+ *   its mtime is older than the client's start by the margin: then the server
+ *   could only have read the bytes it holds now, and the first open adds none.
+ *   Only that first send's stamp is skipped: the disk must still hash to the
+ *   last send, and the record must still hold the first send's bytes, or the
+ *   file is refused (a write that keeps the old mtime after the first open).
+ *   A file written after the client started (a pi write whose sync lands as
+ *   that first open, say) keeps the send check and its stamp, which refuses it:
+ *   the server may hold the load-time copy, not these bytes. A client that
+ *   reports no start makes no such claim.
+ * The read that passed either check is the content the apply is then held to.
+ * A file the edit creates, or one that cannot be read, is left out of the map,
+ * matching every other `expectedContent` caller.
+ */
+function captureRenameExpectedContent(
+	lspService: ReturnType<typeof getLSPService>,
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	cwd: string,
+	targetFilePath: string,
+	targetContent: string | undefined,
+	requestedAtMs: number,
+): Map<string, string> {
+	const expected = new Map<string, string>();
+	let targetRealPath: string | undefined;
+	if (targetContent !== undefined) {
+		try {
+			targetRealPath = nodeFs.realpathSync.native(targetFilePath);
+		} catch {
+			targetRealPath = undefined;
+		}
+	}
+	for (const diskPath of workspaceEditTextPaths(edit)) {
+		let realPath: string;
+		let content: string;
+		let mtimeMs: number;
+		try {
+			realPath = nodeFs.realpathSync.native(diskPath);
+			content = nodeFs.readFileSync(realPath, "utf-8");
+			// Stat AFTER the read: a write before the read is then visible in the
+			// mtime, and one after it is caught by the apply-time comparison.
+			mtimeMs = nodeFs.statSync(realPath).mtimeMs;
+		} catch {
+			continue;
+		}
+		if (targetContent !== undefined && realPath === targetRealPath) {
+			expected.set(realPath, targetContent);
+			continue;
+		}
+		const tracked = lspService.getTrackedContent(diskPath, cwd);
+		// #3827: a file this client first opened at or after the request, and
+		// that nobody wrote since the client started, was unopened when the
+		// server answered and held the bytes the disk holds: the first open adds
+		// none, so its stamp is skipped. The disk must still hold the first
+		// open's bytes, then the unopened rule below applies.
+		const firstOpenedAfterRequest =
+			tracked !== undefined && (tracked.openedAtMs ?? 0) >= requestedAtMs;
+		const quietSinceClientStart =
+			tracked?.clientStartedAtMs !== undefined &&
+			mtimeMs < tracked.clientStartedAtMs - RENAME_MTIME_MARGIN_MS;
+		const sent =
+			firstOpenedAfterRequest && quietSinceClientStart ? undefined : tracked;
+		if (sent !== undefined) {
+			if (
+				sent.hash !== hashDiagnosticContent(content) ||
+				(sent.changedAtMs ?? requestedAtMs) >= requestedAtMs
+			) {
+				refuseStaleWorkspaceEdit(
+					diskPath,
+					"it changed after the language server computed the rename from it",
+				);
+			}
+		} else if (
+			tracked !== undefined &&
+			(tracked.hash !== hashDiagnosticContent(content) ||
+				tracked.openedHash !== tracked.hash)
+		) {
+			// #3827 verify r2 F4: the exemption skips only the first open's own
+			// stamp. A disk that no longer holds the last send, or a record whose
+			// bytes changed after its first send, was written after that open
+			// although the mtime says otherwise (#3747's mtime-kept write).
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				"it changed after the language client first opened it, after the rename was requested",
+			);
+		} else if (mtimeMs >= requestedAtMs) {
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				"it was written after the rename was requested and the language server has no open copy, so it may not have read these bytes",
+			);
+		} else if (mtimeMs >= requestedAtMs - RENAME_MTIME_MARGIN_MS) {
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				`it was modified within ${RENAME_MTIME_MARGIN_MS / 1000} s of the rename request; retry`,
+			);
+		}
+		expected.set(realPath, content);
+	}
+	return expected;
 }
 
 export function createLspNavigationTool(
@@ -739,29 +875,8 @@ export function createLspNavigationTool(
 		name: "lsp_navigation" as const,
 		label: "LSP Navigate",
 		description:
-			"Navigate code using LSP (Language Server Protocol). LSP is enabled by default; disable with --no-lsp.\n" +
-			"Operations:\n" +
-			"- definition: Jump to where a symbol is defined\n" +
-			"- typeDefinition: Jump to the definition of a symbol's TYPE (e.g. the class/interface of a variable)\n" +
-			"- declaration: Jump to a symbol's declaration (e.g. an extern/forward decl, distinct from its definition)\n" +
-			"- references: Find all usages of a symbol\n" +
-			"- hover: Get type/doc info at a position\n" +
-			"- signatureHelp: Show callable signatures at cursor\n" +
-			"- documentSymbol: List all symbols (functions/classes/vars) in a file\n" +
-			"- findSymbol: Search document symbols in a file by name/detail with optional kind/top-level/exact filters\n" +
-			"- workspaceSymbol: Search symbols across the whole project (best with path context)\n" +
-			"- codeAction: Find available quick fixes/refactors at a range\n" +
-			"- rename: Compute or apply workspace edits for renaming a symbol\n" +
-			"- rename_file: Preview/apply LSP-aware source file rename notifications\n" +
-			"- implementation: Jump to interface implementations\n" +
-			"- prepareCallHierarchy: Get callable item at position (for incoming/outgoing)\n" +
-			"- incomingCalls: Find all functions/methods that CALL this function\n" +
-			"- outgoingCalls: Find all functions/methods CALLED by this function\n" +
-			"- executeCommand: Run a server-advertised command via workspace/executeCommand. HARDENED: allowlisted to commands the server advertised; dry-run by default (reports whether advertised) — set apply:true to actually run. Pass command (+ optional commandArguments).\n" +
-			"- workspaceDiagnostics: List all diagnostics tracked by active LSP clients\n" +
-			"- capabilities: Show cached operation support for active LSP servers\n\n" +
-			"Line and character are 1-based (as shown in editors). For position-based operations, prefer passing symbol when you know the line but not the exact character; character can be omitted or -1 and dm-lens will resolve the symbol column. Use symbol#N for repeated symbols on the same line (1-based occurrence).",
-		promptSnippet: "Find definitions, references, and hover info via LSP",
+			'Navigate source with language-server operations such as definition, references, hover, and rename. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
+		promptSnippet: "Navigate definitions and references with LSP",
 		renderResult: compactRenderResult<{
 			operation?: string;
 			resultCount?: number;
@@ -783,100 +898,86 @@ export function createLspNavigationTool(
 		parameters: Type.Object({
 			operation: Type.String({
 				description:
-					"LSP operation to perform. Valid values: " +
-					VALID_OPERATIONS.join(", "),
+					"LSP operation to perform. Valid values: definition, typeDefinition, declaration, references, hover, signatureHelp, documentSymbol, findSymbol, workspaceSymbol, codeAction, rename, rename_file, implementation, prepareCallHierarchy, incomingCalls, outgoingCalls, executeCommand, workspaceDiagnostics, capabilities.",
 			}),
 			path: Type.Optional(
 				Type.String({
-					description:
-						"Absolute or relative file path. Required for file-scoped operations; optional for workspaceSymbol/workspaceDiagnostics.",
+					description: "Target file path.",
 				}),
 			),
 			line: Type.Optional(
 				Type.Number({
-					description:
-						"Line number (1-based). Required for definition/references/hover/implementation",
+					description: "1-based line number.",
 				}),
 			),
 			character: Type.Optional(
 				Type.Number({
-					description:
-						"Character offset (1-based). Optional when symbol is provided; use -1 to force symbol-column resolution.",
+					description: "1-based character offset.",
 				}),
 			),
 			symbol: Type.Optional(
 				Type.String({
-					description:
-						"Symbol name on the target line for automatic character resolution. Use symbol#N to select the Nth occurrence on the line.",
+					description: "Symbol for automatic character resolution.",
 				}),
 			),
 			endLine: Type.Optional(
 				Type.Number({
-					description:
-						"End line (1-based). Optional; used by codeAction range.",
+					description: "1-based range end line.",
 				}),
 			),
 			endCharacter: Type.Optional(
 				Type.Number({
-					description:
-						"End character (1-based). Optional; used by codeAction range.",
+					description: "1-based range end character.",
 				}),
 			),
 			newName: Type.Optional(
 				Type.String({
-					description: "Required for rename operation.",
+					description: "New symbol name.",
 				}),
 			),
 			newFilePath: Type.Optional(
 				Type.String({
-					description: "Required for rename_file operation.",
+					description: "New file path.",
 				}),
 			),
 			apply: Type.Optional(
 				Type.Boolean({
-					description:
-						"rename/executeCommand: apply for real. rename defaults to preview; executeCommand defaults to a dry-run that only reports whether the command is advertised — set apply:true to actually run it.",
+					description: "Apply a mutation instead of previewing it.",
 				}),
 			),
 			command: Type.Optional(
 				Type.String({
-					description:
-						"executeCommand only: the server command id to run. Must be one the server advertised (see the capabilities operation).",
+					description: "Server command identifier.",
 				}),
 			),
 			commandArguments: Type.Optional(
 				Type.Array(Type.Unknown(), {
-					description:
-						"executeCommand only: arguments array passed to workspace/executeCommand.",
+					description: "Arguments for the server command.",
 				}),
 			),
 			query: Type.Optional(
 				Type.String({
-					description:
-						"Symbol name to search. Used by workspaceSymbol and findSymbol.",
+					description: "Symbol search query.",
 				}),
 			),
 			kinds: Type.Optional(
 				Type.Array(Type.String(), {
-					description:
-						"findSymbol only: restrict matches to symbol kind labels such as function, class, method, variable, interface.",
+					description: "Symbol-kind filters.",
 				}),
 			),
 			exactMatch: Type.Optional(
 				Type.Boolean({
-					description:
-						"findSymbol only: match whole symbol names/details exactly instead of substring matching.",
+					description: "Require an exact symbol match.",
 				}),
 			),
 			topLevelOnly: Type.Optional(
 				Type.Boolean({
-					description: "findSymbol only: do not search nested child symbols.",
+					description: "Exclude nested symbols.",
 				}),
 			),
 			maxResults: Type.Optional(
 				Type.Number({
-					description:
-						"findSymbol only: maximum matches to return. Default 20.",
+					description: "Maximum symbol matches.",
 				}),
 			),
 			callHierarchyItem: Type.Optional(
@@ -906,10 +1007,7 @@ export function createLspNavigationTool(
 							}),
 						}),
 					},
-					{
-						description:
-							"Call hierarchy item. Required for incomingCalls/outgoingCalls",
-					},
+					{},
 				),
 			),
 		}),
@@ -918,12 +1016,25 @@ export function createLspNavigationTool(
 			params: Record<string, unknown>,
 			_signal: AbortSignal,
 			_onUpdate: unknown,
-			ctx: { cwd?: string },
+			ctx: {
+				cwd?: string;
+				sessionManager?: { getSessionId?: () => string };
+			},
 		) {
+			// #3763: before the first await, so the rename's bookkeeping drops
+			// once this session is replaced (`context.session`, #3576).
+			const session = mutationDeps?.runtime?.captureSessionGeneration?.();
 			const startedAt = Date.now();
 			let supported: boolean | null = null;
 			let diagnosticsMode: "pull" | "push-only" | "unknown" = "unknown";
 			let columnResolution: SymbolColumnResolution | undefined;
+			// #3601: the content the rename's pre-flight `openFileBestEffort` read,
+			// held as the expected content for the rename's own target file.
+			let openedFileContent: string | undefined;
+			// #3601: when the rename request was last sent; a touched file whose
+			// send changed, or (unopened) whose mtime is, at or after it is refused
+			// (see the capture).
+			let renameRequestedAtMs = 0;
 			let mutationContext: LspMutationContext | undefined;
 			let requestedApply = false;
 			const workspaceScopeAttribution: LSPWorkspaceScopeAttribution = {};
@@ -1101,10 +1212,16 @@ export function createLspNavigationTool(
 					operation === "executeCommand" ? "lsp-execute-command" : "lsp-rename";
 				mutationContext = {
 					cwd,
+					sessionId: ctx.sessionManager?.getSessionId?.(),
 					correlationId: newLspMutationCorrelationId(_toolCallId),
+					// #4187 R4-1: the call whose `tool_call` licensed the paths it
+					// named; the workspace edit's other files (a rename's importers)
+					// are unlicensed, so they end an authorship instead of advancing it.
+					toolCallId: _toolCallId,
 					tool: `lsp_navigation:${operation}`,
 					source: mutationSource,
 					...mutationDeps,
+					session,
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined
 						: mutationDeps?.readGuard,
@@ -1383,7 +1500,7 @@ export function createLspNavigationTool(
 					);
 				}
 
-				await openFileBestEffort(lspService, filePath);
+				openedFileContent = await openFileBestEffort(lspService, filePath);
 			}
 
 			// Convert 1-based editor coords to 0-based LSP coords.
@@ -1527,6 +1644,7 @@ export function createLspNavigationTool(
 								"__BADINPUT__ newName parameter required for rename",
 							);
 						}
+						renameRequestedAtMs = Date.now();
 						const edit = await lspService.rename(
 							filePath,
 							lspLine,
@@ -1543,6 +1661,18 @@ export function createLspNavigationTool(
 						}
 						const applied = await applyWorkspaceEdit(edit, ctx.cwd || ".", {
 							mutationContext,
+							// #3601: the server computed this edit from the bytes each touched
+							// file held when it answered. A file that changed in between is
+							// refused inside pi's queue, before any write, so the edit never
+							// lands on text it was not computed for.
+							expectedContent: captureRenameExpectedContent(
+								lspService,
+								edit,
+								ctx.cwd || ".",
+								filePath,
+								openedFileContent,
+								renameRequestedAtMs,
+							),
 						});
 						for (const touchedFile of applied.files) {
 							try {
@@ -1711,7 +1841,11 @@ export function createLspNavigationTool(
 						"implementation",
 					].includes(operation);
 				if (shouldRetryOnEmpty) {
-					await openFileBestEffort(lspService, filePath, true);
+					openedFileContent = await openFileBestEffort(
+						lspService,
+						filePath,
+						true,
+					);
 					result = await runOperation();
 				}
 

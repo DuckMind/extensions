@@ -8,6 +8,10 @@
  */
 
 import * as path from "node:path";
+import {
+	parseInlineSuppressionRuleIds,
+	splitInlineSuppressionPayload,
+} from "./inline-suppressions.js";
 
 const HASH_COMMENT_EXTENSIONS = new Set([
 	".py",
@@ -62,13 +66,21 @@ export function insertSuppressComment(
 	const match =
 		existingAbove !== undefined ? suppressRe.exec(existingAbove) : null;
 	if (match && existingAbove !== undefined) {
-		const rules = match[2]
+		const prefix = match[1];
+		const payload = match[2];
+		if (prefix === undefined || payload === undefined) return content;
+		const { ruleList, trailingReason } = splitInlineSuppressionPayload(payload);
+		const rules = ruleList
 			.split(",")
 			.map((r) => r.trim())
 			.filter(Boolean);
-		if (!rules.includes(rule)) rules.push(rule);
+		const ruleIds = parseInlineSuppressionRuleIds(ruleList);
+		if (!ruleIds.includes(rule)) rules.push(rule);
 		lines[aboveIdx] =
-			existingAbove.slice(0, match.index) + match[1] + rules.join(", ");
+			existingAbove.slice(0, match.index) +
+			prefix +
+			rules.join(", ") +
+			trailingReason;
 		return lines.join("\n");
 	}
 	// Match the indentation of the flagged line so the inserted comment lines

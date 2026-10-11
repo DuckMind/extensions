@@ -4,8 +4,6 @@ import type {
 	ImpactCascadeResult,
 } from "./review-graph/types.js";
 
-export type { CascadeIndeterminate };
-
 export interface CascadeNeighborResult {
 	filePath: string;
 	reason: "imports" | "calls" | "references" | "fallback";
@@ -62,6 +60,14 @@ export interface CascadeRun {
 	 * (`skipReason: "error"`) can surface too.
 	 */
 	indeterminate?: CascadeIndeterminate;
+	/**
+	 * #3168 F3: the #1444 publish stamp of the resolved-found observation this
+	 * run was built from (`publishedAt`, threaded through the resolved-found
+	 * plumb). The carried-render age label renders from it. Absent on the
+	 * deferred-compute re-park arm, which has no stamp and falls to the
+	 * neutral wording.
+	 */
+	observedAt?: number;
 	/**
 	 * #1443: how many turn boundaries this run has survived without being
 	 * consumed. Stamped by `RuntimeCoordinator.beginTurn` when it carries a run

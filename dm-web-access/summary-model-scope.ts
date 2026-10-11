@@ -1,15 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
+import type { ExtensionContext } from "@duckmind/dm-coding-agent";
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 export type SummaryThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
-interface SummaryModelScopeContext {
-	cwd: string;
-	isProjectTrusted(): boolean;
-}
 
 export interface ModelLike {
 	provider: string;
@@ -45,39 +37,12 @@ export function findModelWithProviderRouting<T extends ModelLike>(
 	return routed ?? registry.find(provider, id);
 }
 
-function getAgentDir(): string {
-	return process.env.DM_CODING_AGENT_DIR || join(homedir(), ".dm", "agent");
-}
-
-function readSettings(path: string): Record<string, unknown> {
-	if (!existsSync(path)) return {};
-	const raw = readFileSync(path, "utf8");
-	try {
-		return JSON.parse(raw) as Record<string, unknown>;
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${path}: ${message}`);
-	}
-}
-
-export function loadEnabledModelPatterns(ctx: SummaryModelScopeContext): string[] | null {
-	const globalSettings = readSettings(join(getAgentDir(), "settings.json"));
-	const projectSettings = ctx.isProjectTrusted()
-		? readSettings(join(ctx.cwd, ".dm", "settings.json"))
-		: {};
-	const value = Object.hasOwn(projectSettings, "enabledModels")
-		? projectSettings.enabledModels
-		: globalSettings.enabledModels;
-	if (value === undefined) return null;
-	if (!Array.isArray(value)) throw new Error("enabledModels must be an array");
-	return value
-		.filter((item): item is string => typeof item === "string")
-		.map(item => item.trim())
-		.filter(Boolean);
-}
-
-export function summaryModelValue(model: ModelLike): string {
-	return `${model.provider}/${model.id}`;
+/**
+ * DM resolves `--models` and `enabledModels` against the available catalogue and exposes the
+ * result as `ctx.scopedModels`; an empty scope means every available model is allowed.
+ */
+export function isModelInScope(model: ModelLike, scopedModels: ReadonlyArray<{ model: ModelLike }>): boolean {
+	return scopedModels.length === 0 || scopedModels.some(scoped => scoped.model.provider === model.provider && scoped.model.id === model.id);
 }
 
 export function splitThinkingSuffix(value: string): { value: string; thinkingLevel?: SummaryThinkingLevel } {
@@ -89,37 +54,11 @@ export function splitThinkingSuffix(value: string): { value: string; thinkingLev
 		: { value };
 }
 
-function stripThinkingSuffix(pattern: string): string {
- return splitThinkingSuffix(pattern).value;
-}
 
-function globToRegExp(pattern: string): RegExp {
-	let source = "^";
-	for (const char of pattern) {
-		if (char === "*") {
-			source += ".*";
-		} else if (char === "?") {
-			source += ".";
-		} else {
-			source += char.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-		}
-	}
-	return new RegExp(`${source}$`, "i");
-}
-
-export function modelMatchesEnabledPatterns(model: ModelLike, patterns: string[] | null): boolean {
-	if (patterns === null) return true;
-	const value = summaryModelValue(model).toLowerCase();
-	const id = model.id.toLowerCase();
-	for (const rawPattern of patterns) {
-		const pattern = stripThinkingSuffix(rawPattern.trim()).toLowerCase();
-		if (!pattern) continue;
-		if (pattern.includes("*") || pattern.includes("?")) {
-			const regex = globToRegExp(pattern);
-			if (regex.test(value) || regex.test(id)) return true;
-			continue;
-		}
-		if (pattern === value || pattern === id) return true;
-	}
-	return false;
+/** Older DM hosts omit scopedModels from extension contexts. Stay on the
+ * current model rather than selecting a different, potentially excluded model.
+ */
+export function getDmScopedModels(ctx: { model?: ModelLike; scopedModels?: ReadonlyArray<{ model: ModelLike }> }): ReadonlyArray<{ model: ModelLike }> {
+	const scoped = ctx.scopedModels;
+	return Array.isArray(scoped) ? scoped : ctx.model ? [{ model: ctx.model }] : [];
 }

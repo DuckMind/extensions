@@ -1,0 +1,797 @@
+/**
+ * Foreground children run as in-process dm sessions. These tests drive
+ * `runSync` against the scripted child session factory and check the seams
+ * the in-process launch owns: hook config, steering, interrupt, timeout,
+ * structured output capture, disposal, and detach.
+ */
+
+import { describe, it, before, after, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type { MockPi } from "../support/helpers.ts";
+import { createMockPi, createTempDir, events, makeAgent, makeAgentConfigs, removeTempDir } from "../support/helpers.ts";
+import { runSync } from "../../src/runs/foreground/execution.ts";
+import { buildRunnerChildLaunch } from "../../src/runs/background/runner-child-launch.ts";
+import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
+import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
+import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
+import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
+
+async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!read()) {
+		if (Date.now() > deadline) throw new Error("Timed out waiting for test condition.");
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
+describe("in-process foreground child", () => {
+	let tempDir: string;
+	let mockPi: MockPi;
+	const savedEnv = { ...process.env };
+
+	before(() => {
+		mockPi = createMockPi();
+		mockPi.install();
+	});
+
+	after(() => {
+		mockPi.uninstall();
+	});
+
+	beforeEach(() => {
+		tempDir = createTempDir();
+		mockPi.reset();
+		process.env.DM_SUBAGENT_CHILD_AGENT = savedEnv.DM_SUBAGENT_CHILD_AGENT ?? "";
+		delete process.env.DM_SUBAGENT_CHILD_AGENT;
+	});
+
+	after(() => removeTempDir(tempDir));
+
+	it("passes the child hooks a typed config built without the environment", async () => {
+		process.env.DM_SUBAGENT_CHILD_AGENT = "leaked-parent-value";
+		try {
+			mockPi.onCall({ output: "done" });
+			const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "hooks-config", index: 3, waitToolEnabled: false });
+			assert.equal(result.exitCode, 0);
+			const [session] = mockPi.sessions;
+			assert.ok(session, "child session was created");
+			assert.equal(session.launch.runtime.agent, "echo");
+			assert.equal(session.launch.runtime.runId, "hooks-config");
+			assert.equal(session.launch.runtime.childIndex, 3);
+			assert.equal(session.launch.runtime.fanoutChild, false);
+			assert.equal(session.launch.runtime.waitTool.enabled, false);
+			assert.equal(session.launch.runtime.steerInbox, undefined, "in-process children have no steer inbox");
+			assert.equal(session.launch.runtime.depth, 1);
+			assert.equal(session.task?.startsWith("Task: Task"), true);
+			assert.equal(session.launch.systemPrompt?.startsWith('<active_agent name="echo"/>'), true);
+			assert.deepEqual(session.launch.storage, { kind: "memory" });
+		} finally {
+			delete process.env.DM_SUBAGENT_CHILD_AGENT;
+		}
+	});
+
+	it("records the parent session in the run metadata and passes its file to the child session", async () => {
+		mockPi.onCall({ output: "done" });
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "parent-link",
+			parentSessionId: "parent-session-id",
+			parentSessionFile,
+			artifactsDir: path.join(tempDir, "artifacts"),
+			artifactConfig: { enabled: true, includeInput: false, includeOutput: false, includeMetadata: true },
+		});
+		assert.equal(result.exitCode, 0);
+		assert.ok(result.artifactPaths?.metadataPath);
+		const metadata = JSON.parse(fs.readFileSync(result.artifactPaths.metadataPath, "utf-8")) as { parentSessionId?: string };
+		assert.equal(metadata.parentSessionId, "parent-session-id");
+		assert.equal(mockPi.sessions[0]?.launch.parentSessionFile, parentSessionFile);
+	});
+
+	it("passes a detached runner step's parent session file to the child session", () => {
+		const launch = buildRunnerChildLaunch({
+			agent: "worker",
+			task: "Work",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			parentSessionFile: "/sessions/parent.jsonl",
+		}, { cwd: tempDir, id: "parent-file-runner", flatIndex: 0 }, { sessionEnabled: true, sessionDir: path.join(tempDir, "run-0"), watchdogStatus() {} });
+		assert.equal(launch.session.parentSessionFile, "/sessions/parent.jsonl");
+	});
+
+	it("projects authoritative native-machine Git evidence into the public foreground result", async () => {
+		mockPi.onCall({ output: "done" }); const base = childSessionFactory(); const wrapped: ChildSessionFactory = { async create(input) { const child = await base.create(input); Object.defineProperty(child, "machineEvidence", { value: { machineId: "remote-machine", initial: { head: "aaa", dirty: false }, final: { head: "bbb", dirty: true } } }); return child; }, dispose: () => base.dispose() };
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "native-git-evidence", waitToolEnabled: false, childSessionFactory: wrapped });
+		assert.deepEqual(result.nativeMachine, { provider: "herdr", machineId: "remote-machine", initialGit: { head: "aaa", dirty: false }, finalGit: { head: "bbb", dirty: true } });
+	});
+
+	it("adds the fanout hook and nested route only for fanout-authorized children", async () => {
+		const route = createNestedRoute("hooks-fanout");
+		try {
+			mockPi.onCall({ output: "done" });
+			const result = await runSync(tempDir, [makeAgent("delegator", { tools: ["read", "subagent"] })], "delegator", "Task", {
+				runId: "hooks-fanout",
+				nestedRoute: route,
+			});
+			assert.equal(result.exitCode, 0);
+			const [session] = mockPi.sessions;
+			assert.equal(session?.launch.runtime.fanoutChild, true);
+			assert.deepEqual(session?.launch.runtime.nestedRoute, route);
+			assert.deepEqual(session?.launch.runtime.nestedParent, { parentRunId: "hooks-fanout", parentChildIndex: 0, depth: 1, path: [{ runId: "hooks-fanout", stepIndex: 0, agent: "delegator" }] });
+			assert.deepEqual(session?.launch.tools, ["read", "subagent"]);
+		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
+	it("routes steer and follow-up to the child session", async () => {
+		const release = path.join(tempDir, "release");
+		mockPi.onCall({ steps: [{ waitForPath: release, jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "steered" }], model: "mock/test-model", stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }] }] });
+		let controls: ForegroundChildSessionControls | undefined;
+		const run = runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "steer-session",
+			onChildSession: (next) => { controls = next; },
+		});
+		await waitFor(() => controls !== undefined);
+		await controls!.steer("Focus on tests.");
+		await controls!.followUp("Then update docs.");
+		fs.writeFileSync(release, "go");
+		const result = await run;
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(mockPi.sessions[0]?.steers, [
+			{ text: "Focus on tests.", mode: "steer" },
+			{ text: "Then update docs.", mode: "followUp" },
+		]);
+	});
+
+	it("does not abort when a steer arrives after the final stop and turn_start is delayed", async () => {
+		mockPi.onCall({
+			jsonl: [events.assistantMessage("before steer")],
+			keepAliveAfterFinalMessageMs: 15_000,
+			queuedMessageTurnStartDelayMs: 1400,
+			queuedMessageOutput: "after steer",
+		});
+		let controls: ForegroundChildSessionControls | undefined;
+		const run = runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "queued-steer-after-final",
+			onChildSession: (next) => { controls = next; },
+		});
+		await waitFor(() => controls !== undefined && mockPi.sessions[0]?.scriptedFinalEmitted === true);
+		await controls!.steer("Continue after the final stop.");
+		const result = await run;
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.error, undefined);
+		assert.equal(result.finalOutput, "after steer");
+		assert.equal(mockPi.sessions[0]?.aborted, false);
+		assert.deepEqual(mockPi.sessions[0]?.steers, [{ text: "Continue after the final stop.", mode: "steer" }]);
+	});
+
+	for (const type of ["turn_start", "agent_start", "auto_retry_start"]) {
+		it(`foreground keeps resumed work alive after ${type}`, async () => {
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.assistantMessage("before continuation"), { type }] },
+					// Queued steering/follow-up work is allowed to outlive the old final-stop grace.
+					{ delay: 1400, jsonl: [events.assistantMessage("after continuation")] },
+				],
+			});
+			const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: `resumed-${type}` });
+			assert.equal(result.exitCode, 0, result.error);
+			assert.equal(result.finalOutput, "after continuation");
+			assert.equal(mockPi.sessions[0]?.aborted, false);
+		});
+	}
+
+	it("aborts the child session on interrupt and disposes it", async () => {
+		mockPi.onCall({ hangUntilAbort: true });
+		const interrupt = new AbortController();
+		const run = runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "interrupt-session", interruptSignal: interrupt.signal });
+		await waitFor(() => mockPi.sessions.length === 1);
+		await waitFor(() => mockPi.sessions[0]?.task !== undefined);
+		interrupt.abort();
+		const result = await run;
+		assert.equal(result.interrupted, true);
+		assert.equal(result.exitCode, 0);
+		assert.equal(mockPi.sessions[0]?.aborted, true);
+		assert.equal(mockPi.sessions[0]?.disposed, true);
+	});
+
+	it("aborts the child session on timeout and disposes it", async () => {
+		mockPi.onCall({ hangUntilAbort: true });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "timeout-session", timeoutMs: 60 });
+		assert.equal(result.timedOut, true);
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /timed out after 60ms/);
+		assert.equal(mockPi.sessions[0]?.aborted, true);
+		assert.equal(mockPi.sessions[0]?.disposed, true);
+	});
+
+	it("disposes the child session after a normal completion", async () => {
+		mockPi.onCall({ output: "finished" });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "dispose-session" });
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.finalOutput, "finished");
+		assert.equal(mockPi.sessions[0]?.settled, true);
+		assert.equal(mockPi.sessions[0]?.disposed, true);
+	});
+
+	it("reports the run only after the child session's shutdown work finished", async () => {
+		mockPi.onCall({ output: "done" });
+		let shutdownDone = false;
+		const inner = childSessionFactory();
+		const wrapped: ChildSessionFactory = {
+			...inner,
+			create: async (launch) => {
+				const session = await inner.create(launch);
+				const dispose = session.dispose.bind(session);
+				session.dispose = () => dispose().then(() => new Promise<void>((resolve) => setTimeout(() => { shutdownDone = true; resolve(); }, 30)));
+				return session;
+			},
+		};
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "dispose-order", childSessionFactory: wrapped });
+		assert.equal(result.exitCode, 0);
+		assert.equal(shutdownDone, true);
+	});
+
+	it("captures structured output in memory", async () => {
+		const structured = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, tempDir);
+		mockPi.onCall({ structuredOutput: { ok: true } });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "structured-memory", structuredOutput: structured });
+		assert.equal(result.exitCode, 0, result.error);
+		assert.deepEqual(result.structuredOutput, { ok: true });
+		assert.equal(mockPi.sessions[0]?.launch.runtime.structuredOutput?.schema.type, "object");
+		assert.deepEqual(JSON.parse(fs.readFileSync(structured.outputPath, "utf-8")), { ok: true });
+	});
+
+	it("preserves captured structured evidence when a later provider error fails the run", async () => {
+		const structured = createStructuredOutputRuntime(
+			{ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			tempDir,
+			{ acceptanceReport: "optional" },
+		);
+		const acceptanceReport = { criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "captured" }] };
+		mockPi.onCall({
+			structuredOutputCapture: { ok: true },
+			structuredOutputAcceptanceReport: acceptanceReport,
+			jsonl: [
+				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true }, acceptanceReport } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "error", errorMessage: "later provider failure", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+			],
+		});
+
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "structured-then-error", acceptance: false, structuredOutput: structured });
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /later provider failure/);
+		assert.equal(result.progress?.status, "failed");
+		assert.deepEqual(result.structuredOutput, { ok: true });
+		assert.deepEqual((result as SingleResult & { structuredAcceptanceReport?: unknown }).structuredAcceptanceReport, acceptanceReport);
+		assert.deepEqual(JSON.parse(fs.readFileSync(structured.outputPath, "utf-8")), { ok: true });
+		assert.deepEqual(JSON.parse(fs.readFileSync(structured.acceptanceReportPath!, "utf-8")), acceptanceReport);
+	});
+
+	it("preserves captured structured evidence when the run is explicitly aborted", async () => {
+		const structured = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, tempDir);
+		const controller = new AbortController();
+		mockPi.onCall({
+			structuredOutputCapture: { ok: true },
+			jsonl: [
+				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				{ type: "tool_execution_end", toolName: "structured_output" },
+			],
+			hangUntilAbort: true,
+		});
+
+		const run = runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "structured-then-abort", acceptance: false, structuredOutput: structured, signal: controller.signal });
+		await waitFor(() => mockPi.sessions[0]?.scriptedFinalEmitted === true);
+		controller.abort();
+		const result = await run;
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /stopped before completion/i);
+		assert.equal(result.progress?.status, "failed");
+		assert.deepEqual(result.structuredOutput, { ok: true });
+		assert.deepEqual(JSON.parse(fs.readFileSync(structured.outputPath, "utf-8")), { ok: true });
+	});
+
+	it("keeps a rejected structured invocation absent and failed", async () => {
+		const structured = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, tempDir);
+		mockPi.onCall({ jsonl: [
+			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: "invalid" } } },
+			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
+			{ type: "tool_execution_end", toolName: "structured_output", isError: true },
+		] });
+
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "structured-invalid", acceptance: false, structuredOutput: structured });
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /Structured output validation failed/);
+		assert.equal(result.structuredOutputFailed, true);
+		assert.equal(result.structuredOutput, undefined);
+		assert.equal(fs.existsSync(structured.outputPath), false);
+	});
+
+	it("fails when the child never calls structured_output", async () => {
+		const structured = createStructuredOutputRuntime({ type: "object" }, tempDir);
+		mockPi.onCall({ output: "prose only" });
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "structured-missing", structuredOutput: structured });
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /Missing structured_output call/);
+		assert.equal(result.structuredOutputFailed, true);
+		assert.equal(result.structuredOutput, undefined);
+	});
+
+	it("keeps a detached child running in-process and delivers its terminal result", async () => {
+		const release = path.join(tempDir, "release-detach");
+		mockPi.onCall({ steps: [{ waitForPath: release, jsonl: [{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "after detach" }], model: "mock/test-model", stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }] }] });
+		let detach: ((reason?: string) => boolean) | undefined;
+		let terminal: SingleResult | undefined;
+		const receipt = await new Promise<SingleResult>((resolve, reject) => {
+			runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+				runId: "detach-session",
+				onDetachReady: (next) => { detach = next; },
+				onDetachReceipt: () => true,
+				onDetachedExit: (result) => { terminal = result; },
+			}).then(resolve, reject);
+			void waitFor(() => detach !== undefined && mockPi.sessions[0]?.task !== undefined).then(() => {
+				assert.equal(detach!("user request"), true);
+			}, reject);
+		});
+		assert.equal(receipt.detached, true);
+		assert.equal(receipt.detachedReason, "user request");
+		assert.equal(mockPi.sessions[0]?.aborted, false, "detach must not abort the session");
+		await disposeChildSessions();
+		assert.equal(mockPi.sessions[0]?.aborted, false, "parent session shutdown must not abort a detached child");
+		fs.writeFileSync(release, "go");
+		await waitFor(() => terminal !== undefined);
+		assert.equal(terminal?.exitCode, 0);
+		assert.equal(terminal?.finalOutput, "after detach");
+		assert.equal(terminal?.detachedReason, "user request");
+		assert.equal(mockPi.sessions[0]?.disposed, true);
+	});
+
+	it("reports a parent session shutdown as the reason an attached child stopped", async () => {
+		mockPi.onCall({ hangUntilAbort: true });
+		const run = runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "shutdown-attached" });
+		await waitFor(() => mockPi.sessions[0]?.task !== undefined);
+		await disposeChildSessions();
+		const result = await run;
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.error, "Subagent stopped because the parent session shut down.");
+	});
+});
+
+/** A dm module stub whose loader reads `process.env` after an await, the way a real extension load does. */
+function stubPi(session: Record<string, unknown> = {}, onReload?: () => void): PiCodingAgentModule {
+	return {
+		ModelRuntime: { create: async () => ({}) },
+		SettingsManager: { create: () => ({}) },
+		DefaultResourceLoader: class { async reload() { await new Promise((resolve) => setTimeout(resolve, 10)); onReload?.(); } },
+		SessionManager: { inMemory: () => ({}) },
+		resolveCliModel: () => ({}),
+		createAgentSession: async () => ({ session: { bindExtensions: async () => {}, dispose() {}, extensionRunner: { hasHandlers: () => false }, subscribe: () => () => {}, prompt: async () => {}, abort: async () => {}, steer: async () => {}, followUp: async () => {}, messages: [], sessionId: "s", ...session } }),
+	} as unknown as PiCodingAgentModule;
+}
+const stubLaunch: ChildSessionLaunch = { cwd: process.cwd(), storage: { kind: "memory" }, extensionPaths: [], ambientExtensions: false, hooks: [], noSkills: true, noContextFiles: true, runtime: { fanoutChild: false, depth: 1, waitTool: { enabled: false }, fast: false } as ChildSessionLaunch["runtime"] };
+
+describe("default child session factory", () => {
+	it("serializes process env through extension loading and session start across concurrent launches", async () => {
+		const seen: string[] = [];
+		const bound: string[] = [];
+		const bindExtensions = async () => { await new Promise((resolve) => setTimeout(resolve, 10)); bound.push(process.env.DM_SUBAGENT_TEST_ENV ?? ""); };
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi({ bindExtensions }, () => { seen.push(process.env.DM_SUBAGENT_TEST_ENV ?? ""); }) });
+		await Promise.all([
+			factory.create({ ...stubLaunch, processEnv: { DM_SUBAGENT_TEST_ENV: "a" } }),
+			factory.create({ ...stubLaunch, processEnv: { DM_SUBAGENT_TEST_ENV: "b" } }),
+		]);
+		delete process.env.DM_SUBAGENT_TEST_ENV;
+		assert.deepEqual(seen, ["a", "b"]);
+		assert.deepEqual(bound, ["a", "b"]);
+	});
+
+	it("marks each child's loader as reloaded so dm resets its extension cache", async () => {
+		const flags: boolean[] = [];
+		const dm = stubPi();
+		dm.DefaultResourceLoader = class { loaded = false; async reload() { flags.push(this.loaded); } } as unknown as PiCodingAgentModule["DefaultResourceLoader"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		await factory.create(stubLaunch);
+		await factory.create(stubLaunch);
+		assert.deepEqual(flags, [true, true]);
+	});
+
+	it("registers the host codemode provider only for children allowed to select it", async () => {
+		const registrations: string[] = [];
+		const loaded: Array<{ names: string[]; ambient: boolean; paths: string[] }> = [];
+		const dm = Object.assign(stubPi(), {
+			createCodemodeExtension: () => (api: { registerTool: (tool: { name: string }) => void }) => api.registerTool({ name: "codemode" }),
+		});
+		dm.DefaultResourceLoader = class {
+			private options: ConstructorParameters<PiCodingAgentModule["DefaultResourceLoader"]>[0];
+			constructor(options: ConstructorParameters<PiCodingAgentModule["DefaultResourceLoader"]>[0]) { this.options = options; }
+			async reload() {
+				const factories = this.options.extensionFactories ?? [];
+				const names: string[] = [];
+				for (const factory of factories) {
+					await factory({ registerTool: (tool: { name: string }) => {
+						names.push(tool.name);
+						registrations.push(tool.name);
+					} } as never);
+				}
+				loaded.push({ names, ambient: !this.options.noExtensions, paths: this.options.additionalExtensionPaths ?? [] });
+			}
+		} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		const hooks = [{ name: "existing-child-hook", factory() {} }];
+		const requested = { ...stubLaunch, hooks, tools: ["codemode", "read"], extensionPaths: ["/provided.ts"], ambientExtensions: true };
+		await factory.create(requested);
+		await factory.create({ ...requested, tools: ["read"] });
+		await factory.create({ ...requested, runtime: { ...requested.runtime, capabilityCeiling: { version: 1, denyExtensions: true, sources: ["test"] } } });
+		await factory.create({ ...stubLaunch, excludeTools: ["codemode"] });
+		assert.deepEqual(registrations, ["codemode"]);
+		assert.deepEqual(loaded, [
+			{ names: ["codemode"], ambient: true, paths: ["/provided.ts"] },
+			{ names: [], ambient: true, paths: ["/provided.ts"] },
+			{ names: [], ambient: true, paths: ["/provided.ts"] },
+			{ names: [], ambient: false, paths: [] },
+		]);
+		// The supported older SDK has no codemode export. Do not require it for ordinary children.
+		await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() }).create({ ...stubLaunch, tools: ["read"] });
+	});
+
+	it("runs the child prompt filter first and the child boundary last without reordering other extensions", async () => {
+		const orderedPaths: string[][] = [];
+		const dm = stubPi();
+		dm.DefaultResourceLoader = class {
+			private readonly options: { extensionsOverride?: (base: { extensions: Array<{ path: string }>; errors: unknown[]; runtime: object }) => { extensions: Array<{ path: string }>; errors: unknown[]; runtime: object } };
+			private result = { extensions: [] as Array<{ path: string }>, errors: [] as unknown[], runtime: {} };
+			constructor(options: typeof this.options) { this.options = options; }
+			async reload() {
+				const base = {
+					extensions: [
+						{ path: "/ambient/first.ts" },
+						{ path: "/ambient/claude-bridge.ts" },
+						{ path: "<inline:dm-subagents:prompt-runtime>" },
+						{ path: "<inline:dm-subagents:prompt-boundary>" },
+						{ path: "/ambient/last.ts" },
+						{ path: "<inline:dm-subagents:completion-intent>" },
+					],
+					errors: [] as unknown[],
+					runtime: {},
+				};
+				this.result = this.options.extensionsOverride?.(base) ?? base;
+				orderedPaths.push(this.result.extensions.map(({ path: extensionPath }) => extensionPath));
+			}
+			getExtensions() { return this.result; }
+		} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
+
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		await factory.create({ ...stubLaunch, ambientExtensions: true });
+
+		assert.deepEqual(orderedPaths[0], [
+			"<inline:dm-subagents:prompt-runtime>",
+			"/ambient/first.ts",
+			"/ambient/claude-bridge.ts",
+			"/ambient/last.ts",
+			"<inline:dm-subagents:completion-intent>",
+			"<inline:dm-subagents:prompt-boundary>",
+		]);
+	});
+
+	it("resolves models from providers queued during child extension loading", async () => {
+		const registeredProviders: string[] = [];
+		const registeredNativeProviders: string[] = [];
+		let refreshed = false;
+		let pendingRuntime: { pendingProviderRegistrations: unknown[]; pendingNativeProviderRegistrations: unknown[] } | undefined;
+		const dm = stubPi();
+		dm.ModelRuntime = { create: async () => ({ registerProvider: (name: string) => { registeredProviders.push(name); }, registerNativeProvider: (provider: { id: string }) => { registeredNativeProviders.push(provider.id); }, refresh: async () => { refreshed = true; } }) } as unknown as PiCodingAgentModule["ModelRuntime"];
+		dm.DefaultResourceLoader = class {
+			runtime = {
+				pendingProviderRegistrations: [{ name: "router", config: { models: [{ id: "mimo-v2.5" }] }, extensionPath: "/extensions/router.ts" }],
+				pendingNativeProviderRegistrations: [{ provider: { id: "native-router", models: [{ id: "native-model" }] }, extensionPath: "/extensions/native-router.ts" }],
+			};
+			async reload() { pendingRuntime = this.runtime; }
+			getExtensions() { return { extensions: [], errors: [], runtime: this.runtime }; }
+		} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
+		dm.resolveCliModel = (({ cliModel }) => {
+			assert.equal(cliModel, "router/mimo-v2.5");
+			assert.deepEqual(registeredProviders, ["router"]);
+			assert.deepEqual(registeredNativeProviders, ["native-router"]);
+			assert.equal(refreshed, true);
+			return { model: { provider: "router", id: "mimo-v2.5" } };
+		}) as unknown as PiCodingAgentModule["resolveCliModel"];
+		dm.createAgentSession = (async ({ model }) => ({ session: { bindExtensions: async () => {}, dispose() {}, extensionRunner: { hasHandlers: () => false }, subscribe: () => () => {}, prompt: async () => {}, abort: async () => {}, steer: async () => {}, followUp: async () => {}, messages: [], sessionId: "s", model } })) as unknown as PiCodingAgentModule["createAgentSession"];
+
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		const child = await factory.create({ ...stubLaunch, model: "router/mimo-v2.5" });
+
+		assert.equal(child.modelId, "router/mimo-v2.5");
+		assert.deepEqual(pendingRuntime?.pendingProviderRegistrations, []);
+		assert.deepEqual(pendingRuntime?.pendingNativeProviderRegistrations, []);
+	});
+
+	it("reports the context window an extension raised while the child session started", async () => {
+		const session = { model: { provider: "openai-codex", id: "gpt-6-sol", contextWindow: 272_000 }, async bindExtensions() { this.model = { ...this.model, contextWindow: 1_050_000 }; } };
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi(session) });
+		const child = await factory.create(stubLaunch);
+
+		assert.equal(child.contextWindow, 1_050_000);
+	});
+
+	it("resolves queued providers when the loader has no native provider queue", async () => {
+		const registeredProviders: string[] = [];
+		let refreshed = false;
+		let pendingRuntime: { pendingProviderRegistrations?: unknown[] } | undefined;
+		const dm = stubPi();
+		dm.ModelRuntime = { create: async () => ({ registerProvider: (name: string) => { registeredProviders.push(name); }, registerNativeProvider: () => {}, refresh: async () => { refreshed = true; } }) } as unknown as PiCodingAgentModule["ModelRuntime"];
+		dm.DefaultResourceLoader = class {
+			runtime = {
+				pendingProviderRegistrations: [{ name: "router", config: { models: [{ id: "mimo-v2.5" }] }, extensionPath: "/extensions/router.ts" }],
+			};
+			async reload() { pendingRuntime = this.runtime; }
+			getExtensions() { return { extensions: [], errors: [], runtime: this.runtime }; }
+		} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
+		dm.resolveCliModel = (({ cliModel }) => {
+			assert.equal(cliModel, "router/mimo-v2.5");
+			assert.deepEqual(registeredProviders, ["router"]);
+			assert.equal(refreshed, true);
+			return { model: { provider: "router", id: "mimo-v2.5" } };
+		}) as unknown as PiCodingAgentModule["resolveCliModel"];
+		dm.createAgentSession = (async ({ model }) => ({ session: { bindExtensions: async () => {}, dispose() {}, extensionRunner: { hasHandlers: () => false }, subscribe: () => () => {}, prompt: async () => {}, abort: async () => {}, steer: async () => {}, followUp: async () => {}, messages: [], sessionId: "s", model } })) as unknown as PiCodingAgentModule["createAgentSession"];
+
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		const child = await factory.create({ ...stubLaunch, model: "router/mimo-v2.5" });
+
+		assert.equal(child.modelId, "router/mimo-v2.5");
+		assert.deepEqual(pendingRuntime?.pendingProviderRegistrations, []);
+	});
+
+	it("reports a missing extension cache reset when the child loads extension files", async () => {
+		const errors: string[] = [];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() });
+		await factory.create({ ...stubLaunch, onExtensionError: (error) => errors.push(error.extensionPath) });
+		await factory.create({ ...stubLaunch, extensionPaths: ["/tmp/ext.ts"], onExtensionError: (error) => errors.push(error.extensionPath) });
+		assert.deepEqual(errors, ["<loader>"]);
+	});
+
+	it("drops skills that extensions add to a child when inheritSkills is false", async () => {
+		const host = await import("@duckmind/dm-coding-agent");
+		const skillDir = createTempDir("dm-subagents-ext-skill-");
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: ext-skill\ndescription: Contributed by an extension.\n---\nBody\n");
+		try {
+			for (const noSkills of [true, false]) {
+				let loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]> | undefined;
+				const dm = stubPi();
+				dm.SettingsManager = { create: () => host.SettingsManager.inMemory() } as unknown as PiCodingAgentModule["SettingsManager"];
+				dm.DefaultResourceLoader = class extends host.DefaultResourceLoader {
+					constructor(options: ConstructorParameters<PiCodingAgentModule["DefaultResourceLoader"]>[0]) { super(options); loader = this; }
+				};
+				await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm }).create({ ...stubLaunch, noSkills });
+				// The same call DM's session makes with an extension's resources_discover skillPaths.
+				loader!.extendResources({ skillPaths: [{ path: skillDir, metadata: { source: "ext", scope: "temporary", origin: "top-level" } }] });
+				const names = loader!.getSkills().skills.map((skill) => skill.name);
+				if (noSkills) assert.deepEqual(names, []);
+				else assert.equal(names.filter((name) => name === "ext-skill").length, 1);
+			}
+		} finally {
+			removeTempDir(skillDir);
+		}
+	});
+
+	it("reads project resources only when the launching session trusts the project", async () => {
+		const host = await import("@duckmind/dm-coding-agent");
+		const projectDir = createTempDir("dm-subagents-project-trust-");
+		fs.mkdirSync(path.join(projectDir, ".dm"));
+		fs.writeFileSync(path.join(projectDir, ".dm", "SYSTEM.md"), "project system prompt");
+		try {
+			for (const projectTrusted of [true, false]) {
+				let loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]> | undefined;
+				const dm = stubPi();
+				dm.SettingsManager = host.SettingsManager;
+				dm.DefaultResourceLoader = class extends host.DefaultResourceLoader {
+					constructor(options: ConstructorParameters<PiCodingAgentModule["DefaultResourceLoader"]>[0]) { super(options); loader = this; }
+				};
+				await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm }).create({ ...stubLaunch, cwd: projectDir, projectTrusted });
+				assert.equal(loader!.getSystemPrompt() === "project system prompt", projectTrusted);
+			}
+		} finally {
+			removeTempDir(projectDir);
+		}
+	});
+
+	it("records the launching session as the parent of a new child session", async () => {
+		const host = await import("@duckmind/dm-coding-agent");
+		const dir = createTempDir("dm-subagents-parent-session-");
+		try {
+			const parentSessionFile = path.join(dir, "parent.jsonl");
+			const forkedFile = path.join(dir, "forks", "forked.jsonl");
+			fs.mkdirSync(path.join(dir, "run-0"));
+			fs.mkdirSync(path.dirname(forkedFile));
+			fs.writeFileSync(forkedFile, `${JSON.stringify({ type: "session", version: 3, id: "forked", timestamp: new Date().toISOString(), cwd: dir, parentSession: "/sessions/source.jsonl" })}\n`);
+			const managers: InstanceType<typeof host.SessionManager>[] = [];
+			const dm = stubPi();
+			dm.SessionManager = host.SessionManager;
+			const createAgentSession = dm.createAgentSession;
+			dm.createAgentSession = (async (options: { sessionManager: InstanceType<typeof host.SessionManager> }) => {
+				managers.push(options.sessionManager);
+				return createAgentSession(options as Parameters<typeof createAgentSession>[0]);
+			}) as typeof createAgentSession;
+			const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+			const storages: ChildSessionLaunch["storage"][] = [
+				{ kind: "file", sessionFile: path.join(dir, "run-0", "session.jsonl") },
+				{ kind: "dir", sessionDir: path.join(dir, "run-1") },
+				{ kind: "file", sessionFile: forkedFile },
+			];
+			for (const storage of storages) await factory.create({ ...stubLaunch, cwd: dir, storage, parentSessionFile });
+			const headers = managers.map((manager) => {
+				manager.appendMessage({ role: "user", content: "Task", timestamp: Date.now() });
+				manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Done" }], api: "test", provider: "test", model: "test", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() });
+				return JSON.parse(fs.readFileSync(manager.getSessionFile()!, "utf-8").split("\n")[0]!) as { parentSession?: string };
+			});
+			// DM records a fork's parent as the parent's session file; a forked child keeps the parent its fork recorded.
+			assert.deepEqual(headers.map((header) => header.parentSession), [parentSessionFile, parentSessionFile, "/sessions/source.jsonl"]);
+		} finally {
+			removeTempDir(dir);
+		}
+	});
+
+	it("preserves an initialized parent theme when creating a child session", async () => {
+		const themeKey = Symbol.for("@duckmind/dm-coding-agent:theme");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previousTheme = globals[themeKey];
+		const initialized: Array<string | undefined> = [];
+		const dm = stubPi();
+		dm.initTheme = ((themeName?: string) => { initialized.push(themeName); }) as PiCodingAgentModule["initTheme"];
+		dm.SettingsManager = { create: () => ({ getTheme: () => "vesper-light/vesper-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		globals[themeKey] = { name: "vesper-light" };
+		try {
+			await factory.create(stubLaunch);
+			assert.deepEqual(initialized, []);
+		} finally {
+			if (previousTheme === undefined) delete globals[themeKey];
+			else globals[themeKey] = previousTheme;
+		}
+	});
+
+	it("initializes the theme in a headless runner process", async () => {
+		const themeKey = Symbol.for("@duckmind/dm-coding-agent:theme");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previousTheme = globals[themeKey];
+		const initialized: Array<string | undefined> = [];
+		const dm = stubPi();
+		dm.initTheme = ((themeName?: string) => { initialized.push(themeName); }) as PiCodingAgentModule["initTheme"];
+		dm.SettingsManager = { create: () => ({ getTheme: () => "vesper-light/vesper-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		delete globals[themeKey];
+		try {
+			await factory.create(stubLaunch);
+			assert.deepEqual(initialized, ["vesper-light/vesper-dark"]);
+		} finally {
+			if (previousTheme !== undefined) globals[themeKey] = previousTheme;
+		}
+	});
+
+	it("disposes the session when bindExtensions rejects", async () => {
+		let disposed = 0;
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi({ bindExtensions: async () => { throw new Error("bind failed"); }, dispose: () => { disposed += 1; } }) });
+		await assert.rejects(factory.create(stubLaunch), /bind failed/);
+		assert.equal(disposed, 1);
+	});
+
+	it("leaves detached children running on dispose and keeps the shared runtime", async () => {
+		let aborted = 0;
+		let runtimes = 0;
+		const dm = stubPi({ abort: async () => { aborted += 1; } });
+		dm.ModelRuntime = { create: async () => { runtimes += 1; return {}; } } as unknown as PiCodingAgentModule["ModelRuntime"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
+		const child = await factory.create(stubLaunch);
+		child.detached = true;
+		await factory.dispose();
+		assert.equal(aborted, 0);
+		assert.equal(child.shutDown, undefined);
+		await factory.create(stubLaunch);
+		assert.equal(runtimes, 1, "runtime is kept while a detached child runs");
+	});
+
+	it("bounds the wait for a stuck session_shutdown handler", { timeout: 2_000 }, async () => {
+		const factory = createDefaultChildSessionFactory({ shutdownTimeoutMs: 50, loadPiCodingAgent: async () => stubPi({ extensionRunner: { hasHandlers: () => true, emit: () => new Promise(() => {}) } }) });
+		(await factory.create(stubLaunch)).dispose();
+		await factory.dispose();
+	});
+});
+
+/** DM 0.99's built-in MCP seam: MCP registers `mcp__srv__*` as `codemode` after the session starts, `builtin:` entries load only when their path is requested, and `tools` declares allowlisted direct tools. */
+function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add", "srv/add"]]) {
+	const registry = new Map<string, string>();
+	const loaded: Array<{ name: string; replaceable?: boolean }> = [];
+	const lifecycle: string[] = [];
+	let allowlist: string[] = [];
+	// DM's getAllTools() exposes tool metadata, not the MCP registration exposure.
+	const dm = stubPi({ extensionRunner: { hasHandlers: () => true, emit: async () => { lifecycle.push("session_shutdown"); } }, dispose: () => { lifecycle.push("dispose"); }, getAllTools: () => [...registry].map(([name]) => ({ name })).filter(({ name }) => allowlist.includes(name)), getActiveToolNames: () => [...registry].filter(([name, exposure]) => exposure === "direct" && allowlist.includes(name)).map(([name]) => name) });
+	Object.assign(dm, { createMcpExtension: () => (api: { registerTool(tool: { name: string; label: string; exposure: string }): void }) => {
+		setTimeout(() => { for (const [name, label] of tools) api.registerTool({ name: name!, label: label!, exposure: "codemode" }); }, 20);
+	} });
+	dm.DefaultResourceLoader = class {
+		private readonly options: { additionalExtensionPaths: string[]; extensionFactories: Array<(api: unknown) => unknown> };
+		constructor(options: typeof this.options) { this.options = options; }
+		async reload() {
+			if (this.options.additionalExtensionPaths.includes("builtin:mcp")) {
+				loaded.push({ name: "mcp", replaceable: true });
+				for (const factory of this.options.extensionFactories) {
+					await factory({ registerTool: (tool: { name: string; exposure: string }) => { registry.set(tool.name, tool.exposure); } });
+				}
+			}
+		}
+	} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
+	const createSession = dm.createAgentSession;
+	dm.createAgentSession = ((options: { tools?: string[] }) => { allowlist = options.tools ?? []; return createSession(options); }) as PiCodingAgentModule["createAgentSession"];
+	return { dm, registry, loaded, lifecycle };
+}
+
+describe("selected built-in MCP tools in a child session", () => {
+	const mcpLaunch: ChildSessionLaunch = { ...stubLaunch, tools: ["read", "mcp__srv__echo"], builtinMcpTools: [{ name: "mcp__srv__echo", selector: "srv/echo" }] };
+
+	it("declares exactly the selected tools as direct and hides the other MCP tools", async () => {
+		const mcp = builtinMcpPi();
+		await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm }).create(mcpLaunch);
+		assert.deepEqual(mcp.loaded, [{ name: "mcp", replaceable: true }]);
+		assert.deepEqual([...mcp.registry], [["mcp__srv__echo", "direct"], ["mcp__srv__add", "hidden"]]);
+	});
+
+	it("grants a server's tools for its configured name and for its `-`→`_` form", async () => {
+		const name = "mcp__codebase_memory__list_projects";
+		for (const selector of ["codebase-memory", "codebase_memory", "codebase_memory/list_projects"]) {
+			const mcp = builtinMcpPi([[name, "codebase-memory/list_projects"]]);
+			await createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 200, loadPiCodingAgent: async () => mcp.dm }).create({ ...stubLaunch, tools: [name], builtinMcpTools: [{ name, selector }] });
+			assert.deepEqual([...mcp.registry], [[name, "direct"]], selector);
+		}
+	});
+
+	it("fails the launch and shuts the session down when a selected tool never registers", async () => {
+		const mcp = builtinMcpPi();
+		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 30, loadPiCodingAgent: async () => mcp.dm });
+		await assert.rejects(factory.create({ ...mcpLaunch, tools: [...mcpLaunch.tools!, "mcp__gone__x"], builtinMcpTools: [...mcpLaunch.builtinMcpTools!, { name: "mcp__gone__x", selector: "gone" }] }), /did not register in the child session: mcp__gone__x\. The MCP server may have failed to connect/);
+		assert.deepEqual(mcp.lifecycle, ["session_shutdown", "dispose"]);
+	});
+
+	it("does not expose a tool whose name DM gave to a different raw tool than the selector names", async () => {
+		const mcp = builtinMcpPi([["mcp__srv__a_b", "srv/a_b"]]);
+		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 50, loadPiCodingAgent: async () => mcp.dm });
+		await assert.rejects(factory.create({ ...stubLaunch, tools: ["mcp__srv__a_b"], builtinMcpTools: [{ name: "mcp__srv__a_b", selector: "srv/a.b" }] }), /did not register in the child session: mcp__srv__a_b\./);
+		assert.deepEqual([...mcp.registry], [["mcp__srv__a_b", "hidden"]]);
+	});
+
+	it("does not hold other child launches while it waits for MCP tools", async () => {
+		const mcp = builtinMcpPi();
+		let waitEnded = false;
+		const waiting = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 500, loadPiCodingAgent: async () => mcp.dm })
+			.create({ ...mcpLaunch, builtinMcpTools: [{ name: "mcp__gone__x", selector: "gone" }] }).finally(() => { waitEnded = true; });
+		while (mcp.loaded.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+		await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() }).create(stubLaunch);
+		assert.equal(waitEnded, false);
+		await assert.rejects(waiting, /mcp__gone__x/);
+	});
+
+	it("shuts down a child still waiting for MCP tools when the factory is disposed", async () => {
+		const mcp = builtinMcpPi();
+		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 5_000, loadPiCodingAgent: async () => mcp.dm });
+		const creating = factory.create({ ...mcpLaunch, builtinMcpTools: [{ name: "mcp__gone__x", selector: "gone" }] });
+		while (mcp.loaded.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		await factory.dispose();
+		assert.deepEqual(mcp.lifecycle, ["session_shutdown", "dispose"]);
+		await assert.rejects(creating, /disposed while the child waited for its MCP tools/);
+	});
+
+	it("loads no built-in MCP when no tools are selected", async () => {
+		const mcp = builtinMcpPi();
+		await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm }).create({ ...stubLaunch, builtinMcpTools: [] });
+		assert.deepEqual(mcp.loaded, []);
+	});
+
+	it("rejects selected tools when the host DM has no built-in MCP", async () => {
+		await assert.rejects(createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() }).create(mcpLaunch), /mcp__srv__echo\) need a DM version with built-in MCP/);
+	});
+});

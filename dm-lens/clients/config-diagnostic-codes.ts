@@ -37,7 +37,7 @@ export const STABILITY_TIER_KEY = "x-stability";
  * The closed tier vocabulary. `experimental` fields may change or be removed
  * in a minor; `stable` fields are covered by the compatibility guarantee.
  */
-export const STABILITY_TIERS = ["experimental", "stable"] as const;
+const STABILITY_TIERS = ["experimental", "stable"] as const;
 
 export type StabilityTier = (typeof STABILITY_TIERS)[number];
 
@@ -186,6 +186,10 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * suppressed" about a configuration that applied nothing at all.
 	 */
 	PILENS_CFG_0008: "config resolution failed; whole configuration ignored",
+	/** A tool key is unknown or names a required, non-disableable tool. */
+	PILENS_CFG_0009: "unknown or non-disableable tool config key ignored",
+	/** A lower-precedence supported global config file was shadowed by the winner. */
+	PILENS_CFG_0010: "lower-precedence global config file shadowed",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
 export type ConfigDiagnosticCode = keyof typeof CONFIG_DIAGNOSTIC_CODES;
@@ -231,7 +235,7 @@ export const CONFIG_DIAGNOSTIC_MARKER_PATTERN = /\[(PILENS_CFG_\d{4})\]/;
 
 // --- Deprecation windows (policy point 4) ---
 
-export type DeprecatedConfigSurfaceKind = "key" | "file";
+type DeprecatedConfigSurfaceKind = "key" | "file";
 
 export interface DeprecatedConfigSurface {
 	/** A config KEY name, or a config FILE path/basename. */
@@ -277,7 +281,7 @@ export interface DeprecatedConfigSurface {
  * announces, never one that already shipped — has a single place to be wrong.
  */
 const LSP_DEPRECATION_WINDOW = {
-	deprecatedSince: "4.2.0",
+	deprecatedSince: "4.1.4",
 	removeNotBefore: "5.0.0",
 } as const;
 

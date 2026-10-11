@@ -1,5 +1,7 @@
 import "./clients/console-guard-install.js";
 import { BoundedSet } from "./clients/bounded-cache.js";
+import { bounded, withDeadline } from "./clients/deadline-utils.js";
+import { HOOK_WALL_BUDGET_MS } from "./clients/hook-budgets.js";
 import {
 	closeModuleLoadConsoleWindow,
 	installConsoleGuard,
@@ -15,6 +17,10 @@ import {
 	renderDegradationLines,
 } from "./clients/degradation-ledger.js";
 import {
+	TOOL_REGISTRY,
+	toolRegistryEntryForPi,
+} from "./clients/tool-config.js";
+import {
 	adoptProjectTrustFromPorts,
 	assertInstallAllowed,
 	readProjectTrustFromContext,
@@ -26,6 +32,7 @@ import {
 	suppressesUserNotify,
 	supportsTuiWidget,
 } from "./clients/extension-mode.js";
+import { randomUUID } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -40,29 +47,50 @@ import {
 	markAnalyzerBootstrapShutdown,
 	peekBootstrapClients,
 	requestBootstrapClients,
+	getAgentBehaviorClient,
 	type SessionBootstrapAccess,
 } from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
 // #1561 F2: the retire hook re-syncs the gate latch and the persisted record
 // the same way the per-dispatch path does, so a retired blocker stops gating
 // the commit.
-import { retireInlineBlockerAndResyncGuard } from "./clients/git-guard.js";
-import { resolvePackagePath } from "./clients/package-root.js";
+import { resolveSkillPaths } from "./clients/skills-resolver.js";
 import {
-	clearWidgetState,
-	exportWidgetState,
 	getFailedLspServerIds,
 	getSessionLanguages,
-	importWidgetState,
-	type PersistedWidgetState,
 	reconcileCascadeNeighborLspErrors,
 	renderWidget,
 	scheduleStaleReconcile,
 	setRenderCallback,
+	wireWidgetDispositionSubscriber,
 } from "./clients/widget-state.js";
 import { selectLspStatus } from "./clients/lsp-status.js";
-import type { PersistedReadGuardState } from "./clients/read-guard.js";
-import { registerMutationBridge } from "./clients/mutation-bridge.js";
+import {
+	branchToolResultIds,
+	logReadGuardBranchMove,
+	READ_GUARD_CELL,
+	readSessionHeaderId,
+} from "./clients/read-guard-branch.js";
+import {
+	adoptHandoff,
+	beginScope,
+	discardHandoff,
+	forwardHandoff,
+	type LineageHandle,
+	logScopeTransition,
+	retireScope,
+	reserveSessionStart,
+	type SessionScope,
+	scopeCell,
+	startKey,
+	stashHandoff,
+	successorStartKey,
+} from "./clients/session-scope.js";
+import { sanitizeCorrelationId } from "./clients/read-guard-logger.js";
+import {
+	type MutationBridgeDeps,
+	registerMutationBridge,
+} from "./clients/mutation-bridge.js";
 import {
 	OBSERVED_TRACKED_MAX_FILES,
 	refreshObservedMutationLedger,
@@ -74,16 +102,27 @@ import {
 	storedLineHashesFor,
 } from "./clients/observed-mutation-sources.js";
 import { classifyMutatingTool } from "./clients/mutating-tool.js";
+import { isEditClassToolResult } from "./clients/bash-file-access.js";
 import { resolveLanguageRootForFile } from "./clients/language-profile.js";
 import { countFileLines } from "./clients/read-guard-tool-lines.js";
 import { registerReadBridge } from "./clients/read-bridge.js";
-import { normalizeFilePath } from "./clients/path-utils.js";
-import { isRecordableProjectPath } from "./clients/file-utils.js";
 import {
-	dropStaleFiles,
+	type IOBridgeDeps,
+	recordIOEntry,
+	registerIOBridge,
+} from "./clients/io-bridge.js";
+import {
+	rebindableProcessBridgeDeps,
+	type BridgeActivation,
+} from "./clients/process-bridge.js";
+import { isExternalOrVendorFile } from "./clients/path-utils.js";
+import {
+	isPathIgnoredByProject,
+	isRecordableProjectPath,
+} from "./clients/file-utils.js";
+import {
 	loadSessionState,
-	saveSessionState,
-	sessionStartMode,
+	persistScope,
 } from "./clients/session-state-store.js";
 import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
 import {
@@ -101,7 +140,17 @@ import {
 	resolveDmLensFlagWithSource,
 } from "./clients/lens-config.js";
 import { LENS_FLAGS } from "./clients/lens-flag-registry.js";
+import {
+	LENS_TOOL_NAMES,
+	resolveLensToolEnabled,
+} from "./clients/tool-config.js";
+import { recordDegradationOnce } from "./clients/degradation-ledger.js";
+import { flushAllNdjsonWriters } from "./clients/ndjson-logger.js";
 import { wrapToolsForCompactLine } from "./clients/tool-render.js";
+import {
+	finalizeToolResultWithDelivery,
+	renderToolText,
+} from "./tools/render-compact.js";
 import { loadDmLensProjectConfig } from "./clients/project-lens-config.js";
 import { initLensEventsGetter } from "./clients/lens-events.js";
 import { wireBusEmitterGetter } from "./clients/bus-publish.js";
@@ -109,6 +158,7 @@ import { wireDiagnosticsBusEmitterGetter } from "./clients/diagnostics-publish.j
 import { wireDispositionBusEmitterGetter } from "./clients/disposition-publish.js";
 import { wireFormatEventsBusEmitterGetter } from "./clients/format-events-publish.js";
 import { emitBusEventRollupAtSessionEnd } from "./clients/bus-events-logger.js";
+import { emitFenceRollupAtSessionEnd } from "./clients/generation-guard.js";
 import {
 	emitVerifiedPathAttributionRollup,
 	resetVerifiedPathAttributionGuessCount,
@@ -125,7 +175,8 @@ import {
 import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js";
 import { buildResolvedFoundCascadeRun } from "./clients/cascade-format.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
-import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
+import { getLSPService, resetLSPService } from "./clients/lsp/capabilities.js";
+import { shouldInitializeSessionRoot } from "./clients/lsp/session-roots.js";
 import { warmLspService } from "./clients/lsp-lazy.js";
 import {
 	sweepOrphans,
@@ -165,8 +216,8 @@ import {
 	consumeTurnEndFindings,
 } from "./clients/runtime-context.js";
 import {
+	consumeStagedTestRunnerFindings,
 	deliverStagedTestRunnerFindings,
-	registerTestRunnerMessageRenderer,
 	stageTestRunnerDelivery,
 } from "./clients/test-runner-delivery.js";
 import {
@@ -174,9 +225,11 @@ import {
 	RuntimeCoordinator,
 } from "./clients/runtime-coordinator.js";
 import { handleSessionStart } from "./clients/runtime-session.js";
+import { resetTurnContext } from "./clients/turn-context.js";
 import { handleToolCall } from "./clients/runtime-tool-call.js";
 import {
 	isStaleExtensionCtxError,
+	surfaceHandlerCrash,
 	wrapSessionEventHandler,
 	wrapSessionEventHandlerWithResult,
 } from "./clients/session-event-guard.js";
@@ -185,6 +238,8 @@ import {
 	decideSessionStart,
 	decrementSecondarySessionCount,
 	getActivePrimaryRoot,
+	namedSuccessorReason,
+	expiredSuccessorReason,
 	noteSessionShutdown,
 	releasePrimarySession,
 	probeCtxActive,
@@ -192,6 +247,7 @@ import {
 import {
 	clearLastAnalyzedStateCache,
 	flushDebouncedToolResults,
+	handleToolExecutionEnd,
 	handleToolResult,
 } from "./clients/runtime-tool-result.js";
 import { cancelLSPIdleReset, handleTurnEnd } from "./clients/runtime-turn.js";
@@ -202,7 +258,6 @@ import {
 } from "./clients/quiet-window.js";
 import { setAmbientAbortSignal } from "./clients/safe-spawn.js";
 import { initI18n, t } from "./i18n.js";
-import { createAstGrepDumpTool } from "./tools/ast-dump.js";
 import {
 	createActivateToolsTool,
 	type ActivatableToolInfo,
@@ -212,7 +267,6 @@ import { createLensDiagnosticMarkTool } from "./tools/lens-diagnostic-mark.js";
 import { createAstGrepReplaceTool } from "./tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "./tools/ast-grep-search.js";
 import { createAstGrepOutlineTool } from "./tools/ast-grep-outline.js";
-import { createLspDiagnosticsTool } from "./tools/lsp-diagnostics.js";
 import { createLspNavigationTool } from "./tools/lsp-navigation.js";
 import {
 	createModuleReportTool,
@@ -245,17 +299,29 @@ import {
 const LOOP_BLOCK_IDENTITY = "<dm-lens>";
 import {
 	isFreshSessionStart,
+	getRememberedLazyTools,
 	planToolSet,
 	recordToolSetMutation,
+	rememberLazyTools,
 	supportsDeferredTools,
 } from "./clients/tool-set-policy.js";
 import {
+	endSituationalToolTelemetry,
+	observeSituationalToolActivation,
+	observeSituationalToolCall,
+	startSituationalToolTelemetrySession,
+} from "./clients/situational-tool-telemetry.js";
+import {
 	type CacheContextInjectionSlice,
+	type CacheContextPlacement,
 	clearCachePrefixSession,
 	emitCacheUsageSummaryAtSessionEnd,
 	logCacheUsage,
 	observeCacheContext,
 	observeCachePrefix,
+	recordToolResultDelivery,
+	resetCacheFindingIdentitiesSession,
+	recordTurnEndAdvisoryBytes,
 } from "./clients/cache-observability.js";
 import {
 	buildStartupTimingRecords,
@@ -290,6 +356,10 @@ import {
 } from "./clients/session-start-observability.js";
 import { normalizeToolDefinition } from "./clients/tool-definition.js";
 import { warmFormatters } from "./clients/formatters-lazy.js";
+import {
+	noteHostSessionManager,
+	setHostFileMutationQueueLoader,
+} from "./clients/file-mutation-queue.js";
 
 type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
 let loadedDispatchIntegration: DispatchIntegration | undefined;
@@ -548,33 +618,72 @@ const cacheManager = new CacheManager();
 // ONCE (flag below, same pattern as registerCascadeTierReconcileTask) and
 // have it read the CURRENT activation's pi/flag closures through this
 // holder, refreshed on every activation — never a stale captured `pi`.
-let _readBridgeRegistered = false;
-let _readBridgeGetFlag:
+let _bridgeGetFlag:
 	| ((name: string) => boolean | string | undefined)
 	| undefined;
 // #2423: the mutation bridge is the write-side sibling of the read bridge and
 // follows its registration discipline exactly — mount once per process, refresh
 // the flag getter on every activation.
-let _mutationBridgeRegistered = false;
-let _mutationBridgeGetFlag:
-	| ((name: string) => boolean | string | undefined)
-	| undefined;
+// #3654: the unified I/O bridge composes the read-guard and the mutation
+// seam; it follows the same once-per-process discipline and is mounted in the
+// same first-wins pass as the two v1 shims it supersedes.
+
+/**
+ * Read a bridge flag without letting a session replacement obstruct the
+ * producer. The flag is advisory: if its captured ctx is stale, treating it
+ * as unset records the read/write instead of creating a false read-before-edit
+ * failure. This is the inverse of runtime-tool-result.ts's authorship rule,
+ * where absent evidence must never grant authority; both fail toward not
+ * obstructing the user at their respective seams.
+ */
+function getBridgeFlag(
+	getter: ((name: string) => boolean | string | undefined) | undefined,
+	bridge: "read" | "mutation" | "io",
+	name = "no-read-guard",
+): boolean | string | undefined {
+	try {
+		return getter?.(name);
+	} catch (err) {
+		if (!isStaleExtensionCtxError(err)) throw err;
+		recordDegradationOnce({
+			kind: "extension-ctx-stale",
+			subject: `${bridge}-bridge`,
+			reason: `${bridge}-bridge flag read met a stale extension ctx; treating the flag as unset`,
+		});
+		return undefined;
+	}
+}
 let _turnSummaryEmitRegistered = false;
-let _turnSummaryEmitCtx:
-	| {
-			pi: ExtensionAPI;
-			getLensFlag: (name: string) => boolean | string | undefined;
-			isLensEnabled: () => boolean;
-	  }
+type TurnSummaryEmitCtx = {
+	runtime: RuntimeCoordinator;
+	pi: ExtensionAPI;
+	getLensFlag: (name: string) => boolean | string | undefined;
+	isLensEnabled: () => boolean;
+};
+let _turnSummaryEmitCtxGetter:
+	| (() => TurnSummaryEmitCtx | undefined)
 	| undefined;
 let _testRunnerDeliveryRegistered = false;
 let _nextTestRunnerDeliveryOwnerId = 0;
+/**
+ * A memo cap, not a mirror of the session-root registry's own bound (#2518).
+ * It used to be described as matching that registry so an uninitializable root
+ * could not stay served; the check below asks the registry directly instead, so
+ * the two numbers no longer have to agree for the answer to be right.
+ */
 const LSP_CONFIG_CWD_CAP = 128;
 const _lspConfigInitializedCwds = new BoundedSet<string>(LSP_CONFIG_CWD_CAP);
 
 async function ensureLSPConfigInitialized(cwd: string): Promise<void> {
 	const normalizedCwd = path.resolve(cwd);
-	if (_lspConfigInitializedCwds.has(normalizedCwd)) return;
+	// #2518: the memo alone is not enough, exactly as in `mcp/server.ts`'s
+	// `ensureReady`. `initLSPConfig` also runs from `clients/runtime-session.ts`
+	// and `clients/lens-engine.ts`, which this memo never sees, so the registry
+	// can evict this cwd while the memo still calls it initialized — and the
+	// evicted entry carries the operator's `disabledServers` denial with it.
+	if (!shouldInitializeSessionRoot(normalizedCwd, _lspConfigInitializedCwds)) {
+		return;
+	}
 	await initLSPConfig(normalizedCwd);
 	_lspConfigInitializedCwds.add(normalizedCwd);
 }
@@ -662,6 +771,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// the log instead of pi's frame. Host-initiated output stays on the real
 	// console, because it runs outside every window.
 	const pi = withConsoleCaptureWindows(hostPi);
+	// #3506: dm-lens' format and autofix writers join pi's per-file mutation
+	// queue. The lookup runs on the first write. It reaches the running host's
+	// copy of the package when jiti transpiles dm-lens (its native import fails
+	// on the host-provided static imports) and can reach a second copy where
+	// those resolve natively; clients/file-mutation-queue.ts checks which, and
+	// a host without the export records a degradation.
+	setHostFileMutationQueueLoader(
+		() => import("@duckmind/dm-coding-agent"),
+	);
 	const testRunnerDeliveryOwnerId = `activation-${++_nextTestRunnerDeliveryOwnerId}`;
 	// Event contexts belong to the activation that owns this factory closure.
 	// The process-global latest ctx remains only a boot-window fallback.
@@ -673,6 +791,27 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// misclassify its context/message_end/shutdown as primary. Closure ownership
 	// avoids a shared mutable "last session" race between sibling activations.
 	let ownedSessionRole: "primary" | "concurrent-secondary" | undefined;
+	// #3849: this activation's own holder id in the registry entry, and the
+	// root it asked to hold as a declined secondary. Its shutdown ends only
+	// this holder's record, so a hold already ended by a primary reload, a cap
+	// eviction or an add that found no entry cannot free another holder's root.
+	const secondaryRootHolder = `secondary:${randomUUID()}`;
+	let ownedSecondaryRoot: string | undefined;
+	// #3611: the session scope THIS activation serves, set once at its
+	// session_start and retired at its session_shutdown. Activation equals
+	// session (pi re-runs this factory on every transition except /tree).
+	let scope: SessionScope | undefined;
+	// #3613: turn_end can deliver after another in-process activation has
+	// started its next session and changed the live coordinator scope. Keep the
+	// identity that owned this turn, rather than resolving ownership at delivery
+	// time after the secondary's scope has been overwritten.
+	let turnStartScope: SessionScope | undefined;
+	// #3881: this activation's primary session_start is still in flight
+	// (before its hand-off adoption ran), with its start reason. pi does not
+	// stop a concurrent reload while it awaits the start's emit.
+	let startInFlight:
+		| { reason: string | undefined; shutDown: boolean }
+		| undefined;
 	const classifyOwnedSessionEmission = (
 		ctx: unknown,
 		sessionId: string | undefined,
@@ -690,7 +829,14 @@ function activateExtension(hostPi: ExtensionAPI) {
 			? "secondary"
 			: ownedSessionRole === "primary"
 				? "primary"
-				: noteSessionShutdown(ctx, sessionId, root);
+				: noteSessionShutdown(
+						ctx,
+						sessionId,
+						root,
+						// #4106: a role-less shutdown in a named gap is told
+						// apart by this session's key.
+						startKey(getSessionFile(ctx), getSessionManager(ctx)),
+					);
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	const rememberOwnEventCtx = (ctx: any): void => {
 		if (!ctx) return;
@@ -761,6 +907,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		getReadGuard: () => runtime.readGuard,
 		dbg,
 	});
+	wireWidgetDispositionSubscriber({ events: pi.events });
 	const astGrepClient = new AstGrepClient();
 
 	type LspStatusTheme = {
@@ -775,6 +922,17 @@ function activateExtension(hostPi: ExtensionAPI) {
 		theme: LspStatusTheme,
 	) {
 		try {
+			// #3099: opt-in off mode. Publishing undefined removes the key entirely
+			// so a host that renders extension statuses stops showing it at all —
+			// stronger than compact, which still publishes a glyph. Checked first
+			// and before any of the selection work below: off outranks compact
+			// when both are set, since there is nothing left to render compactly
+			// once the key itself is gone. Nothing leaves the surface — the ids
+			// stay reachable through /lens-tools and lens_health.
+			if (getLensFlag("lens-hide-lsp-status") === true) {
+				setStatus("dm-lens-lsp", undefined);
+				return;
+			}
 			// Active and Failed coexist (#170): show the working servers in green
 			// AND any language whose servers all failed in red, side by side. A
 			// failed server is suppressed when a live sibling covers its language
@@ -785,18 +943,30 @@ function activateExtension(hostPi: ExtensionAPI) {
 				getSessionLanguages(),
 			);
 			const parts: string[] = [];
+			// #3099: opt-in compact rendering. Server names stay the default (#267);
+			// the compact form trades them for one glyph per state group so the line
+			// fits a statusline that cannot spare the width. Nothing leaves the
+			// surface — the ids stay reachable through /lens-tools and lens_health.
+			const compact = getLensFlag("lens-compact-lsp-status") === true;
+			const activeText = compact
+				? "LSP ✓"
+				: `LSP Active: ${activeIds.join(", ")}`;
+			const failedText = compact
+				? "LSP ✗"
+				: `LSP Failed: ${failedIds.join(", ")}`;
+			const inactiveText = compact ? "LSP ✗" : "LSP Inactive";
 			if (activeIds.length > 0) {
-				parts.push(theme.fg("success", `LSP Active: ${activeIds.join(", ")}`));
+				parts.push(theme.fg("success", activeText));
 			}
 			if (failedIds.length > 0) {
-				parts.push(theme.fg("error", `LSP Failed: ${failedIds.join(", ")}`));
+				parts.push(theme.fg("error", failedText));
 			}
 			// Inactive is a passive state (no server running for this file, or the
 			// idle timer released them) — not a fault. Render it neutral/grey, not
 			// red, only when there is nothing else to show.
 			setStatus(
 				"dm-lens-lsp",
-				parts.length > 0 ? parts.join(" · ") : theme.fg("dim", "LSP Inactive"),
+				parts.length > 0 ? parts.join(" · ") : theme.fg("dim", inactiveText),
 			);
 		} catch (err) {
 			// Theme may not be fully initialized during early session startup.
@@ -847,6 +1017,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 			default: spec.default,
 		});
 	}
+	pi.registerFlag("no-tool", {
+		description: "Disable a lens tool for this session (repeatable).",
+		type: "string",
+	});
 
 	const globalConfig = loadDmLensGlobalConfig();
 	function getLensFlag(
@@ -882,60 +1056,144 @@ function activateExtension(hostPi: ExtensionAPI) {
 			runtime.projectRoot,
 		).source;
 	}
+	const noToolFlag = (): string | undefined => {
+		const value = pi.getFlag("no-tool");
+		const cliValues = process.argv
+			.filter((arg) => arg.startsWith("--no-tool="))
+			.map((arg) => arg.slice("--no-tool=".length));
+		if (typeof value === "string") cliValues.unshift(value);
+		return cliValues.length > 0 ? cliValues.join(",") : undefined;
+	};
+	const isToolEnabled = (name: string): boolean =>
+		resolveLensToolEnabled(
+			name,
+			globalConfig,
+			loadDmLensProjectConfig(runtime.projectRoot).raw,
+			noToolFlag(),
+		);
+	const disabledToolNames = LENS_TOOL_NAMES.filter(
+		(name) => !isToolEnabled(name),
+	);
+	const formatDisabledToolNames = (names: readonly string[]): string => {
+		const shown = names.slice(0, 8);
+		const omitted = names.length - shown.length;
+		const suffix = omitted > 0 ? ` and ${omitted} more` : "";
+		return `${shown.join(", ")}${suffix} (${names.length} total)`;
+	};
 
 	let lensEnabled = !getLensFlag("no-lens");
 
-	// Read-bridge: refresh the flag getter on every factory activation so the
+	// Bridges: refresh the flag getter on every factory activation so the
 	// live getLensFlag closure is always used (same pattern as _turnSummaryEmitCtx).
-	// Register the singleton once — subsequent activations only refresh the getter.
-	_readBridgeGetFlag = getLensFlag;
-	if (!_readBridgeRegistered) {
-		_readBridgeRegistered = true;
-		registerReadBridge({
-			getReadGuard: () => runtime.readGuard,
-			getTurnIndex: () => runtime.turnIndex,
-			peekWriteIndex: () => runtime.peekWriteIndex(),
-			isRecordable(filePath: string): boolean {
-				if (_readBridgeGetFlag?.("no-read-guard")) return false;
-				return isRecordableProjectPath(filePath, runtime.projectRoot);
-			},
-		});
-	}
+	// Each singleton is registered once; later activations only refresh the getter.
+	_bridgeGetFlag = getLensFlag;
 
 	// Mutation bridge (#2423): same live-getter discipline as the read bridge.
 	// An in-process producer that writes a file outside dm-lens's tool-event
 	// path records it here, and the same bookkeeping runs.
-	_mutationBridgeGetFlag = getLensFlag;
-	if (!_mutationBridgeRegistered) {
-		_mutationBridgeRegistered = true;
-		registerMutationBridge({
-			getRuntime: () => runtime,
-			getCacheManager: () => cacheManager,
-			getProjectRoot: () => runtime.projectRoot || process.cwd(),
-			getDispatchCwd: (filePath: string) =>
-				resolveLanguageRootForFile(
-					filePath,
-					runtime.projectRoot || process.cwd(),
-				),
-			countFileLines,
-			// #2465: unlike the read bridge above (whose whole purpose IS the
-			// read-guard stamp, so `no-read-guard` correctly disables it
-			// entirely), this bridge also drives turn-state and the change-log
-			// receipt. `no-read-guard` gates ONLY the read-guard stamp — the same
-			// canonical split `clients/runtime-tool-result.ts` applies at
-			// `recordWritten` (:1859) — so it must not appear in the recordability
-			// gate `recordMutationThroughSeam` early-returns on. That gate stays
-			// path-scope only (ignored/vendor); the flag is threaded separately
-			// below via `shouldStampReadGuard`.
-			isRecordable(filePath: string): boolean {
-				return isRecordableProjectPath(filePath, runtime.projectRoot);
-			},
-			shouldStampReadGuard(): boolean {
-				return !_mutationBridgeGetFlag?.("no-read-guard");
-			},
-			dbg,
+	const mutationBridgeDeps: MutationBridgeDeps = {
+		getRuntime: () => runtime,
+		getCacheManager: () => cacheManager,
+		getProjectRoot: () => runtime.projectRoot || process.cwd(),
+		getDispatchCwd: (filePath: string) =>
+			resolveLanguageRootForFile(
+				filePath,
+				runtime.projectRoot || process.cwd(),
+			),
+		countFileLines,
+		// #2465: unlike the read bridge below (whose whole purpose IS the
+		// read-guard stamp, so `no-read-guard` correctly disables it
+		// entirely), this bridge also drives turn-state and the change-log
+		// receipt. `no-read-guard` gates ONLY the read-guard stamp — the same
+		// canonical split `clients/runtime-tool-result.ts` applies at
+		// `recordWritten` (:1859) — so it must not appear in the recordability
+		// gate `recordMutationThroughSeam` early-returns on. That gate stays
+		// path-scope only (ignored/vendor); the flag is threaded separately
+		// below via `shouldStampReadGuard`.
+		isRecordable(filePath: string): boolean {
+			return isRecordableProjectPath(filePath, runtime.projectRoot);
+		},
+		shouldStampReadGuard(): boolean {
+			return !getBridgeFlag(_bridgeGetFlag, "mutation");
+		},
+		dbg,
+	};
+	// Unified File I/O bridge (#3654): the v2 surface. It composes the mutation
+	// seam with the read guard and the confirmed-delete lifecycle. The v1 read
+	// shim below runs this same body with these same deps, and the v1 mutation
+	// shim calls the bookkeeping owner the v2 mutate facet also calls, so a v1
+	// producer gets the unified behavior (disk-evidence reads, the
+	// `dmlens:format:queued` publish) without changing its own call.
+	const ioBridgeDeps: IOBridgeDeps = {
+		...mutationBridgeDeps,
+		getReadGuard: () => runtime.readGuard,
+		getTurnIndex: () => runtime.turnIndex,
+		peekWriteIndex: () => runtime.peekWriteIndex(),
+		getFlag: (name: string, bridge?: "read" | "mutation" | "io") =>
+			getBridgeFlag(_bridgeGetFlag, bridge ?? "io", name),
+		isExternalOrVendorFile: (filePath: string) =>
+			isExternalOrVendorFile(filePath, runtime.projectRoot),
+		isPathIgnoredByProject: (filePath: string) =>
+			isPathIgnoredByProject(filePath, runtime.projectRoot, false),
+		// #3654: resolved lazily through the live LSP client seam, so a test mock
+		// of `clients/lsp/capabilities.js` that predates this bridge (and so omits the
+		// named export) cannot break the delete path. This is exactly what the
+		// module-level `notifyExternalFileChange` does
+		// (`getLSPService().notifyExternalFileChange(...)`), so the real path is
+		// unchanged.
+		notifyExternalFileChange: (filePath: string, type: number) =>
+			getLSPService().notifyExternalFileChange(filePath, type),
+		nodeFs: { existsSync: nodeFs.existsSync, statSync: nodeFs.statSync },
+	};
+
+	const recordBridgeUnavailable = (): void => {
+		recordDegradationOnce({
+			kind: "process-bridge-unavailable",
+			subject: "primary-session-gap",
+			reason:
+				"bridge call refused while no live primary session owns its dependencies",
 		});
-	}
+	};
+	const preSessionActivation = { role: "pre-session" as const };
+	const registerPrimaryBridges = (activation?: BridgeActivation): void => {
+		const scopedActivation =
+			activation &&
+			typeof activation === "object" &&
+			"role" in activation &&
+			(activation.role === "primary" || activation.role === "secondary")
+				? (activation as SessionScope)
+				: undefined;
+		if (
+			scopedActivation &&
+			(scopedActivation.role !== "primary" || !scopedActivation.isLive())
+		)
+			return;
+		registerReadBridge(
+			{
+				onUnavailable: recordBridgeUnavailable,
+				isRecordable(filePath: string): boolean {
+					// Unknown during a replacement/reload records the read. The guard is
+					// the obstruction here, so failure must fall toward not blocking the
+					// user's later edit; recording while disabled is harmless.
+					if (getBridgeFlag(_bridgeGetFlag, "read")) return false;
+					return isRecordableProjectPath(filePath, runtime.projectRoot);
+				},
+				forward: (entry) => recordIOEntry(entry, ioBridgeDeps),
+			},
+			activation,
+		);
+		registerMutationBridge(
+			{ ...mutationBridgeDeps, onUnavailable: recordBridgeUnavailable },
+			activation,
+		);
+		registerIOBridge(
+			{ ...ioBridgeDeps, onUnavailable: recordBridgeUnavailable },
+			activation,
+		);
+	};
+	// Mount at factory activation so third-party producers can call the bridge
+	// before the first session_start. A primary scope rebinds the cell later.
+	registerPrimaryBridges(preSessionActivation);
 	// Automatic context injection (the `context` hook). Independent of lensEnabled
 	// so tools/LSP/read-guard/formatting keep running when it is off. Precedence:
 	// env override → CLI flag → global config, all resolved inside getLensFlag
@@ -944,15 +1202,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 	let lensWidgetVisible = globalConfig?.widget?.visible !== false;
 	let mountedLensWidgetUi: LensWidgetUi | undefined;
 	let widgetMountFailureLogged = false;
-	// #190 Phase 2: snapshot of the source session's diagnostics, captured at
-	// `session_before_fork` and adopted by the forked session at the subsequent
-	// `session_start` (reason="fork"). In-memory hand-off (same process) — avoids
-	// deriving the source id from a file path (the id lives in the file header).
-	let pendingForkSnapshot: PersistedWidgetState | undefined;
-	// #1041: the source session's read-guard read-set, stashed at
-	// `session_before_fork` alongside the widget snapshot so a forked session
-	// adopts its parent's read history (same in-memory hand-off pattern).
-	let pendingForkReadGuard: PersistedReadGuardState | undefined;
 	type LensWidgetTui = { requestRender: () => void };
 	type LensWidgetTheme = { fg: (color: string, s: string) => string };
 	type LensWidgetComponent = {
@@ -1001,6 +1250,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 		setWidget(
 			"dm-lens",
 			(tui: LensWidgetTui, theme: LensWidgetTheme) => {
+				// #3959: read once per mount, like the other session-scoped flags.
+				const compactWidget = getLensFlag("lens-compact-widget") === true;
 				renderInvalidator = () => tui.requestRender();
 				setRenderCallback(() => {
 					scheduleStaleReconcile();
@@ -1009,7 +1260,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 				return {
 					render: (width: number) => {
 						scheduleStaleReconcile();
-						return renderWidget(width, theme);
+						return renderWidget(width, theme, { compact: compactWidget });
 					},
 					invalidate: () => {
 						renderInvalidator = undefined;
@@ -1050,11 +1301,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 			dbg(`turn-summary renderer registration failed: ${registerRendererErr}`);
 		}
 	}
-	// #2366: test failures are a persistent, non-context custom entry. The
-	// delivery task still checks appendEntry at fire time; this registration is
-	// capability detection only and never authorizes a sendMessage fallback.
-	registerTestRunnerMessageRenderer(pi);
-
 	// --- Commands ---
 
 	pi.registerCommand("lens-toggle", {
@@ -1110,7 +1356,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			if (!changed) {
 				notifyUi(
 					ctx,
-					"dm-lens widget is not supported by this pi version.",
+					"dm-lens widget is not supported by this DM version.",
 					"warning",
 				);
 				return;
@@ -1249,7 +1495,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			);
 
 			const lines: string[] = [
-				t("lens.health.title", "🩺 PI-LENS HEALTH"),
+				t("lens.health.title", "🩺 DM-LENS HEALTH"),
 				`Session started: ${startedAt} (${sessionAgeStr} ago)`,
 				"",
 				t("lens.health.crashes", "Pipeline crashes (session): {count}", {
@@ -1259,6 +1505,31 @@ function activateExtension(hostPi: ExtensionAPI) {
 					count: crashEntries.length,
 				}),
 			];
+
+			// Lazy and bounded: lens-engine is not on the session-start eager
+			// allowlist, and only the health command needs the effective config.
+			const effectiveTools = (
+				await withDeadline(
+					import("./clients/lens-engine.js").then(({ effectiveConfig }) =>
+						effectiveConfig({
+							cwd: runtime.projectRoot,
+							noTools: noToolFlag(),
+						}),
+					),
+					{ ms: 5_000 },
+				)
+			).tools;
+			const enabledTools = effectiveTools
+				.filter((tool) => tool.enabled)
+				.map((tool) => tool.name);
+			const disabledTools = effectiveTools
+				.filter((tool) => !tool.enabled)
+				.map((tool) => tool.name);
+			lines.push("", `Tools enabled: ${enabledTools.join(", ") || "none"}`);
+			if (disabledTools.length > 0) {
+				lines.push(`Tools disabled: ${formatDisabledToolNames(disabledTools)}`);
+			}
+			lines.push("Skills: managed by pi package filters");
 			const slopScoreLine = dispatchIntegration.getDispatchSlopScoreLine();
 
 			if (crashEntries.length > 0) {
@@ -1388,6 +1659,26 @@ function activateExtension(hostPi: ExtensionAPI) {
 				}
 			}
 
+			// #3255 round-3 verify: a pi user with no Stop hook and no `/lens-perf`
+			// read had no automatic notice that this session lost its warm
+			// incumbent to a renamed endpoint — the remedy (restart the peer) is
+			// not something the local fallback can discover. Rendered through the
+			// SHARED renderer on a summary filtered to that one kind, so the
+			// wording cannot drift from `/lens-perf` and `dmlens_health` (the
+			// #2515 divergence this repo already paid for once) and `/lens-health`
+			// gains no output for any other degradation.
+			try {
+				lines.push(
+					...renderDegradationLines(
+						getDegradationSummary().filter(
+							(group) => group.kind === "warm-ipc-endpoint-missing",
+						),
+					),
+				);
+			} catch {
+				// best-effort — a health-line render must never break /lens-health
+			}
+
 			// LSP status
 			const lspClients = getLSPService().getStatus();
 			if (lspClients.length > 0) {
@@ -1478,7 +1769,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			};
 
 			const lines: string[] = [
-				"🔧 PI-LENS TOOLS STATUS",
+				"🔧 DM-LENS TOOLS STATUS",
 				"",
 				`Installed: ${statuses.filter((s) => s.installed).length}/${statuses.length}`,
 			];
@@ -1587,7 +1878,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// owns the same tool name, registerTool throws and would abort extension load.
 	// Catch the collision silently so both extensions can coexist.
 	//
-	// Always-active tools (6): stay on for every turn — cheap, broadly useful,
+	// Always-active tools (5): stay on for every turn — cheap, broadly useful,
 	// or (in the loader's case) required to bootstrap dynamic activation below.
 	const alwaysActiveTools = [
 		createLensDiagnosticsTool(
@@ -1601,62 +1892,38 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// (widget-state's allDiagnostics) using the SAME write-ordering token
 			// source pipeline.ts's per-edit recordDiagnostics calls draw from, so
 			// a scan-originated write can't clobber a concurrent newer per-edit
-			// write (or vice versa).
-			() => runtime.nextWriteIndex(),
+			// write (or vice versa). #3540: ordered turn first, as the pipeline's.
+			() => runtime.nextWriteOrderToken(),
 			captureLspStatusRepaint,
 			() => runtime,
-		),
-		createLspDiagnosticsTool(
-			// #571: same reconciliation wiring as lens_diagnostics mode=full, for
-			// the standalone on-demand check.
-			() => runtime.nextWriteIndex(),
-			// #1561: and the same confirmed result must retire this file's stale
-			// inline blocker, not only correct the footer. The eviction is logged so
-			// it is confirmable from the runtime log rather than from the absence of
-			// complaints (#1432 Gap 1).
-			// #1561 F2: the retire also recomputes the commit-gate latch and the
-			// persisted record — see `retireInlineBlockerAndResyncGuard`.
-			({ filePath, writeIndex, coveredSources, cwd }) => {
-				const retired = retireInlineBlockerAndResyncGuard({
-					runtime,
-					cacheManager,
-					cwd,
-					filePath,
-					writeIndex,
-					coveredSources,
-					lensGuardEnabled: getLensFlag("lens-guard") === true,
-				});
-				if (retired) {
-					dbg(
-						`inline_blocker: retired for ${filePath} — lsp_diagnostics confirmed clean (writeIndex ${writeIndex ?? "none"}, covered ${coveredSources.join(",") || "none"})`,
-					);
-				}
-			},
+			() => Boolean(getLensFlag("lens-guard")),
 		),
 		createSymbolSearchTool(() => runtime.projectRoot),
-		createEffectiveConfigTool(() => runtime.projectRoot),
+		createEffectiveConfigTool(() => runtime.projectRoot, noToolFlag),
 		createProjectReportTool(() => runtime.projectRoot),
 		createModuleReportTool(() => runtime.projectRoot),
 		createReadSymbolTool(
 			() => runtime.projectRoot,
 			// Read-substitute tie-in (#245): a returned symbol body is a genuine read
 			// of that range, so record it as read-guard coverage for the symbol.
-			(filePath, symbol) =>
+			(filePath, symbol, toolCallId) =>
 				runtime.readGuard.recordSymbolRead(
 					filePath,
 					symbol,
 					runtime.turnIndex,
 					runtime.peekWriteIndex(),
+					sanitizeCorrelationId(toolCallId),
 				),
 		),
 		createReadEnclosingTool(
 			() => runtime.projectRoot,
-			(filePath, symbol) =>
+			(filePath, symbol, toolCallId) =>
 				runtime.readGuard.recordSymbolRead(
 					filePath,
 					symbol,
 					runtime.turnIndex,
 					runtime.peekWriteIndex(),
+					sanitizeCorrelationId(toolCallId),
 				),
 		),
 	];
@@ -1669,9 +1936,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// dm-lens's behavior before this feature existed.
 	const lazyTools = [
 		createAstGrepSearchTool(astGrepClient),
-		createAstGrepReplaceTool(astGrepClient),
+		createAstGrepReplaceTool(astGrepClient, () =>
+			runtime.captureSessionGeneration(),
+		),
 		createAstGrepOutlineTool(astGrepClient),
-		createAstGrepDumpTool(astGrepClient),
 		createLspNavigationTool((name, cwd) => getLensFlag(name, cwd), {
 			runtime,
 			cacheManager,
@@ -1684,56 +1952,72 @@ function activateExtension(hostPi: ExtensionAPI) {
 				model: runtime.telemetryModelId,
 				provider: runtime.telemetryProviderId,
 			}),
+			() => runtime.captureSessionGeneration(),
 		),
 	];
-	const LAZY_TOOL_CATALOG: ActivatableToolInfo[] = [
-		{
-			name: "ast_grep_search",
-			summary:
-				"AST-aware structural code search across ~40 languages (ast-grep patterns).",
-		},
-		{
-			name: "ast_grep_replace",
-			summary:
-				"AST-aware structural code rewrite/refactor (ast-grep patterns).",
-		},
-		{
-			name: "ast_grep_outline",
-			summary:
-				"Syntax-only file/dir structure (symbols/imports/exports/members) via ast-grep outline — no index/LSP.",
-		},
-		{
-			name: "ast_grep_dump",
-			summary:
-				"Dump the tree-sitter AST for a source snippet to discover node kinds/field names.",
-		},
-		{
-			name: "lsp_navigation",
-			summary:
-				"IDE-style LSP navigation: definition, references, implementation, rename, call hierarchy.",
-		},
-		{
-			name: "lens_diagnostic_mark",
-			summary:
-				"Record a disposition for a diagnostic: false-positive / suppress (inline ignore comment) / defer (this session) / flagged (to fix).",
-		},
-	];
-	// #1453: the lazy tools the model activated in THIS logical conversation.
-	// Extension closure state outlives a session rebuild (the runner keeps the
-	// activated extension; it does not re-run this factory), which is exactly
-	// what lets a fork/reload/resume restore the parent's tool posture. Reset
-	// on startup/new, carried across fork/reload/resume — see the session_start
-	// handler below.
-	const rememberedLazyTools = new Set<string>();
+	const LAZY_TOOL_CATALOG: ActivatableToolInfo[] = TOOL_REGISTRY.filter(
+		(
+			entry,
+		): entry is Extract<
+			(typeof TOOL_REGISTRY)[number],
+			{ situational: true }
+		> => "situational" in entry && entry.situational === true,
+	).map(({ name, summary }) => ({ name, summary }));
+	const enabledLazyTools = new Set(
+		LAZY_TOOL_CATALOG.filter((tool) => isToolEnabled(tool.name)).map(
+			(tool) => tool.name,
+		),
+	);
+	const filteredLazyTools = lazyTools.filter((tool) =>
+		enabledLazyTools.has((tool as { name: string }).name),
+	);
+	const filteredLazyCatalog = LAZY_TOOL_CATALOG.filter((tool) =>
+		enabledLazyTools.has(tool.name),
+	);
+	// #1453/#2889: activation memory is module-owned and keyed by pi's session
+	// file, so it survives this factory re-run while staying conversation-local.
+	const getSessionFile = (ctx: unknown): string | undefined => {
+		try {
+			return (
+				ctx as {
+					sessionManager?: { getSessionFile?: () => string | undefined };
+				}
+			)?.sessionManager?.getSessionFile?.();
+		} catch {
+			return undefined;
+		}
+	};
+	// #3819: a file-less hand-off slot's ticket is bound to pi's session
+	// manager. A stale ctx throws on the read.
+	const getSessionManager = (ctx: unknown): unknown => {
+		try {
+			return (ctx as { sessionManager?: unknown }).sessionManager;
+		} catch {
+			return undefined;
+		}
+	};
 	const activateToolsTool = createActivateToolsTool(
 		pi as unknown as {
 			getActiveTools?: () => string[];
 			setActiveTools?: (names: string[]) => void;
 		},
-		LAZY_TOOL_CATALOG,
+		filteredLazyCatalog,
 		{
 			onActivated: (names) => {
-				for (const name of names) rememberedLazyTools.add(name);
+				observeSituationalToolActivation(names);
+				// #3612: this activation's session scope owns its activations.
+				rememberLazyTools(scope, names);
+			},
+			onRejected: (name) => {
+				if (
+					LENS_TOOL_NAMES.includes(name as (typeof LENS_TOOL_NAMES)[number])
+				) {
+					recordDegradationOnce({
+						kind: "tool-disabled",
+						subject: name,
+						reason: `disabled by tools.${name}.enabled`,
+					});
+				}
 			},
 			deferredToolSupport: (ctx) => {
 				try {
@@ -1760,19 +2044,74 @@ function activateExtension(hostPi: ExtensionAPI) {
 	const toolsToRegister = [
 		...alwaysActiveTools,
 		activateToolsTool,
-		...lazyTools,
-	];
+		...filteredLazyTools,
+	].filter(
+		(tool) =>
+			tool.name === "dm_lens_activate_tools" || isToolEnabled(tool.name),
+	);
 	for (const tool of compactToolLineEnabled
 		? wrapToolsForCompactLine(toolsToRegister as any)
 		: toolsToRegister) {
 		try {
-			pi.registerTool(normalizeToolDefinition(tool) as any);
+			const normalized = normalizeToolDefinition(tool) as Record<
+				string,
+				unknown
+			>;
+			const execute = normalized.execute;
+			if (typeof execute === "function") {
+				const recordDelivery = (
+					delivery: {
+						deliveredBytes: number;
+						truncated: boolean;
+					},
+					args: unknown[],
+				) => {
+					if (!lensEnabled) return;
+					try {
+						const ctx = args[4];
+						const sessionId = getStableSessionId(ctx);
+						recordToolResultDelivery({
+							sessionId,
+							sessionRole: classifyOwnedSessionEmission(ctx, sessionId),
+							bytes: delivery.deliveredBytes,
+							truncated: delivery.truncated,
+						});
+					} catch {
+						// Observability must never break tool delivery.
+					}
+				};
+				normalized.execute = (...args: unknown[]) =>
+					Promise.resolve(execute(...args)).then(
+						(result) => {
+							const delivery = finalizeToolResultWithDelivery(
+								result as Parameters<typeof finalizeToolResultWithDelivery>[0],
+							);
+							// #2800 item 7: the per-turn cache_usage row sums each delivered
+							// tool result's bytes. The SDK hands the live ExtensionContext as
+							// the fifth execute argument, so attribution mirrors the
+							// message_end handler: stable session id plus this activation's
+							// owned role.
+							recordDelivery(delivery, args);
+							return delivery.result;
+						},
+						(err) => {
+							const text = err instanceof Error ? err.message : String(err);
+							const delivery = finalizeToolResultWithDelivery({
+								...renderToolText(text),
+								isError: true,
+							});
+							recordDelivery(delivery, args);
+							return delivery.result;
+						},
+					);
+			}
+			pi.registerTool(normalized as any);
 		} catch {
 			// another extension already registered a tool with this name
 		}
 	}
 
-	// Dynamic tooling (#pi 0.80.x+): deactivate the 6 situational tools so they
+	// Dynamic tooling (#pi 0.80.x+): deactivate the 5 situational tools so they
 	// start inactive and the model must call `dm_lens_activate_tools` to bring
 	// them in (next-turn visibility, per the docs' loader pattern). This used
 	// to run synchronously right here, immediately after registration — but
@@ -1792,22 +2131,93 @@ function activateExtension(hostPi: ExtensionAPI) {
 
 	// Project rules scan result and per-turn state live in RuntimeCoordinator.
 
-	// --- Register skills with pi ---
+	// --- Skills ---
+	// The four shipped skills are declared by the `pi.skills` manifest
+	// (`./skills`), which pi loads for every package install and filters with
+	// the settings package filters (`packages[].skills`: `[]`, `!pattern`,
+	// `-path`) — those filters narrow manifest resources only.
+	//
+	// This handler used to contribute `skillPaths: [<packageRoot>/skills]`. pi
+	// merges extension-contributed paths raw (`ResourceLoader.extendResources`
+	// -> `loadSkills`, which loads a directory wholesale), bypassing the
+	// `enabled` flag the package filter sets, so it re-added every skill the
+	// user excluded (#1416, observed on 4.3.0 against pi 0.99.2 and 1.0.0).
+	// It contributes nothing now; a direct `extensions`/`-e` load never reads
+	// the manifest and so delivers no skills, but that is not a documented
+	// install (`pi install npm:` / `git:` / `./path`, README "Install").
+	//
+	// The call is kept for #2626: `resolveSkillPaths` records ONE bounded
+	// `skills-dir-missing` degradation and one `skills_resolved` latency row
+	// when pi's own discovery rule would load nothing there, so a missing
+	// manifest skills dir stays visible. Its path result is deliberately not
+	// contributed (#1416).
 	pi.on("resources_discover", async (_event, _ctx) => {
-		// Resolve skills relative to the package root (nearest package.json), not the
-		// module's own directory — under the compiled dist/ layout (#182) the module
-		// lives in dist/ but skills/ stays at the package root, so a module-relative
-		// join lands on the non-existent dist/skills/ and skills silently fail to load
-		// (#205). resolvePackagePath walks up to package.json, correct for both the
-		// source (index.ts at root) and dist (dist/index.js) layouts.
-		const skillsDir = resolvePackagePath(import.meta.url, "skills");
-
-		return {
-			skillPaths: [skillsDir],
-		};
+		void resolveSkillPaths(import.meta.url);
 	});
 
 	// --- Events ---
+
+	// Dynamic tooling (#pi 0.80.x+): put this session's active tool set back to
+	// the posture its conversation had: the always-active baseline plus exactly
+	// the lazy tools (LAZY_TOOL_CATALOG) the model activated via
+	// dm_lens_activate_tools. session_start is the correct lifecycle point for
+	// this call (#643; see the comment left at the old call site above, right
+	// after tool registration, for why it can never succeed there).
+	//
+	// #1453: this RESTORES, it does not merely shrink. Every session_start
+	// reason arrives with all registered dm-lens tools active, because the
+	// host builds a fresh AgentSession with `includeAllExtensionTools: true` on
+	// fork/reload/resume just as it does on startup, and never persists an
+	// active-tool set per session. Rebuilding the same set keeps the prompt
+	// prefix identical. The remembered set is this activation's scope's
+	// `lazy-tool-memory` store, which the hand-off restored (#3604).
+	//
+	// #3653: every start runs it, a concurrent secondary's included. pi binds
+	// `pi.setActiveTools` to this activation's own session, so the plan never
+	// touches another session's set; #473 only keeps a secondary out of
+	// handleSessionStart.
+	//
+	// Feature-detected: `pi.getActiveTools`/`setActiveTools` aren't guaranteed
+	// present on every host the broad `@duckmind/dm-coding-agent` peer
+	// dependency allows. Under `--no-lazy-tools` nothing is touched at all:
+	// all-active IS the requested posture.
+	const applyToolSetPlan = (ctx: unknown, reason: string | undefined): void => {
+		try {
+			const piWithActiveTools = pi as unknown as {
+				getActiveTools?: () => string[];
+				setActiveTools?: (names: string[]) => void;
+			};
+			if (
+				getLensFlag("no-lazy-tools") === true ||
+				typeof piWithActiveTools.getActiveTools !== "function" ||
+				typeof piWithActiveTools.setActiveTools !== "function"
+			)
+				return;
+			const lazyNames = new Set(enabledLazyTools);
+			const plan = planToolSet(
+				piWithActiveTools.getActiveTools(),
+				lazyNames,
+				getRememberedLazyTools(scope),
+			);
+			if (!plan.changed) return;
+			piWithActiveTools.setActiveTools(plan.desired);
+			recordToolSetMutation({
+				addedCount: plan.addedCount,
+				removedCount: plan.removedCount,
+				reason: isFreshSessionStart(reason)
+					? "fresh_session_lazy_deactivation"
+					: "session_rebuild_restore",
+				deferralApplies: supportsDeferredTools(
+					(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })
+						?.model,
+				),
+			});
+		} catch (toolSetErr) {
+			dbg(
+				`dynamic tool set restore failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
+			);
+		}
+	};
 
 	// #1929: wrapped like the other reachable handlers. The ctx delivered here
 	// is USUALLY the announced session's own, built moments earlier, so the
@@ -1827,6 +2237,60 @@ function activateExtension(hostPi: ExtensionAPI) {
 		wrapSessionEventHandler(
 			"session_start",
 			async (event, ctx) => {
+				const sessionStartEvent = event as {
+					reason?: string;
+					previousSessionFile?: string;
+				};
+				// pi's RPC double may deliver the same event object to a replacement
+				// extension factory. Genuine starts are newly allocated objects, even
+				// when their fields match an earlier start (#2891).
+				const isNewSessionStartEvent = reserveSessionStart(
+					sessionStartEvent as Record<string, unknown>,
+				);
+				const sessionStartReason = sessionStartEvent.reason;
+				const sessionIdentityParts = (() => {
+					try {
+						const sessionManager = (
+							ctx as {
+								sessionManager?: {
+									getSessionId?: () => string | undefined;
+									getSessionFile?: () => string | undefined;
+								};
+							}
+						)?.sessionManager;
+						// #3506: the host's own instance, to tell its SDK copy apart.
+						noteHostSessionManager(sessionManager);
+						return {
+							sessionId: sessionManager?.getSessionId?.(),
+							sessionFile: getSessionFile(ctx),
+						};
+					} catch {
+						return { sessionId: undefined, sessionFile: undefined };
+					}
+				})();
+				if (!isNewSessionStartEvent) {
+					const duplicateSubject =
+						sessionIdentityParts.sessionId ??
+						sessionIdentityParts.sessionFile ??
+						"session_start";
+					emitBounded(
+						"session_start_duplicate_suppressed",
+						duplicateSubject,
+						{
+							durationMs: 0,
+							metadata: {
+								reason: "duplicate start suppressed",
+								eventIdentity: "same-event-object",
+							},
+						},
+						{
+							ledgerKind: "session-start-duplicate",
+							risingEdgePer: "identity",
+							reason: "duplicate start suppressed",
+						},
+					);
+					return;
+				}
 				const sessionStartMonotonicAt = performance.now();
 				warmDispatchAtSessionStart();
 				void warmLspService().catch((err) =>
@@ -1857,7 +2321,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// this line would be a no-op anyway.
 					const buildIdentity = getBuildIdentity(import.meta.url);
 					if (buildIdentity) dbg(formatBuildIdentity(buildIdentity));
-					const sessionReason = (event as { reason?: string }).reason;
+					const sessionReason = sessionStartReason;
+					if (disabledToolNames.length > 0) {
+						dbg(
+							`session_start: disabled tools = ${formatDisabledToolNames(disabledToolNames)}`,
+						);
+					}
 
 					// #1334 S5: adopt the HOST's project-trust decision before anything
 					// below can auto-install a tool or spawn an LSP server. dm-lens is a
@@ -1921,6 +2390,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 						ctx,
 						stableSessionId,
 						sessionStartCwd,
+						// #3662: a `startup` start in a replacement gap is not the
+						// successor, so it must not take the primary slot.
+						sessionStartReason,
+						// #3855: nor is any start whose reason and key differ from
+						// the successor the primary's shutdown named.
+						startKey(getSessionFile(ctx), getSessionManager(ctx)),
 					);
 					ownedSessionRole = sessionStartDecision.runFullSessionStart
 						? "primary"
@@ -1959,13 +2434,54 @@ function activateExtension(hostPi: ExtensionAPI) {
 							sessionStartDecision.sameRoot === false &&
 							typeof sessionStartCwd === "string"
 						) {
-							void registerInstanceRoot(sessionStartCwd).catch(() => {
+							ownedSecondaryRoot = sessionStartCwd;
+							void registerInstanceRoot(
+								sessionStartCwd,
+								secondaryRootHolder,
+							).catch(() => {
 								// best-effort observability — never fail session_start
 							});
 						}
+						// #3819 r2: a demoted real successor (a row-17 start holds the
+						// primary registration) discards the slot left for it, so the
+						// session cannot take it stale once it classifies primary again.
+						const discardedSlot = discardHandoff({
+							reason: sessionReason,
+							sessionFile: getSessionFile(ctx),
+							sessionManager: getSessionManager(ctx),
+						});
+						// #3611: a secondary's own scope. The coordinator, and so the
+						// primary's generation, stays untouched (#473).
+						scope = beginScope({ role: "secondary" });
+						logScopeTransition(scope, {
+							transition: "start",
+							reason: sessionReason,
+							sessionId: stableSessionId,
+							cwd: sessionStartCwd ?? runtime.projectRoot,
+						});
+						// #3873 O4: a start the replacement gap declined because it is
+						// not the successor the shutdown named (#3855) is a demotion; a
+						// plain concurrent subagent is not, and writes only its `start`.
+						if (sessionStartDecision.basis === "successor-pending")
+							logScopeTransition(scope, {
+								transition: "demote",
+								reason: sessionReason,
+								sessionId: stableSessionId,
+								cwd: sessionStartCwd ?? runtime.projectRoot,
+								detail: {
+									classification: sessionStartDecision.classification,
+									basis: sessionStartDecision.basis,
+									gapMs: sessionStartDecision.gapMs,
+									lineageMatch: sessionStartDecision.lineageMatch,
+									discardedSlot,
+								},
+							});
 						return;
 					}
 
+					// #3881: set before this path's first await; the finally clears it.
+					const inFlight = { reason: sessionReason, shutDown: false };
+					startInFlight = inFlight;
 					// #2319: this process-singleton tally belongs to the primary
 					// session that owns the session-end rollup. A concurrent secondary
 					// must not erase a live primary's count before this decision.
@@ -1983,6 +2499,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// accepted cost on the other side (a torn-down secondary's own
 					// bracket goes stale until the next full session start).
 					resetCurrentPhaseForSession();
+					resetCacheFindingIdentitiesSession(stableSessionId, ownedSessionRole);
 					// #2526 review round 2, F1: the once-per-session phase claims
 					// (`config_resolved`) and the session record identity they are
 					// stamped with are re-armed HERE, not inside handleSessionStart.
@@ -1995,6 +2512,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// reaches handleSessionStart and so never publishes an expectation
 					// line of its own — must not re-arm a live primary's claims.
 					resetOncePerSessionPhases();
+					// #2858: pi owns one observation set per session file. A replacement
+					// shutdown emits the ending file's row before the next set opens.
+					// Open this before the handler below can hang (#2859), so the
+					// session-end row does not depend on handleSessionStart returning.
+					startSituationalToolTelemetrySession("pi");
 					// #2249: same gate — a declined bind's own session_start must never
 					// reach here (it returned above), so this only fires for a genuine
 					// new primary. A crash or forced kill can skip session_shutdown's
@@ -2007,81 +2529,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// one summary row instead of losing it.
 					emitConcurrentSessionBindRollupAtSessionEnd(runtime.projectRoot);
 					resetConcurrentSessionBindRollupCounts();
-
-					// Dynamic tooling (#pi 0.80.x+): put the active tool set back to the
-					// posture this logical conversation had — the always-active baseline
-					// plus exactly the lazy tools (LAZY_TOOL_CATALOG) the model activated
-					// via dm_lens_activate_tools. session_start is the correct lifecycle
-					// point for this call (#643; see the comment left at the old call site
-					// above, right after tool registration, for why it can never succeed
-					// there).
-					//
-					// #1453: this RESTORES, it does not merely shrink. Every session_start
-					// reason arrives with all registered dm-lens tools active, because the
-					// host builds a fresh AgentSession with `includeAllExtensionTools: true`
-					// on fork/reload/resume just as it does on startup, and never persists
-					// an active-tool set per session. Skipping the call on those reasons
-					// would therefore leave every lazy tool active forever AND change the
-					// advertised tool list relative to the parent's cached prompt prefix.
-					// Rebuilding the same set instead keeps the prefix identical and
-					// genuinely preserves the model's activations, because dm-lens's own
-					// closure state (`rememberedLazyTools`) survives the rebuild.
-					//
-					// Deliberately BELOW the #473 concurrent-secondary guard: the active
-					// tool set is shared runtime state (one loader per process), so a
-					// secondary's session_start must never rewrite the still-live
-					// primary's set — last writer would win.
-					//
-					// Feature-detected the same way as elsewhere in this handler:
-					// `pi.getActiveTools`/`setActiveTools` aren't guaranteed present on
-					// every host the broad `@duckmind/dm-coding-agent` peer
-					// dependency allows, so probe with typeof rather than assuming the
-					// pinned devDependency version's API exists at runtime. Under
-					// `--no-lazy-tools` nothing is touched at all: all-active IS the
-					// requested posture.
-					try {
-						const piWithActiveTools = pi as unknown as {
-							getActiveTools?: () => string[];
-							setActiveTools?: (names: string[]) => void;
-						};
-						if (
-							getLensFlag("no-lazy-tools") !== true &&
-							typeof piWithActiveTools.getActiveTools === "function" &&
-							typeof piWithActiveTools.setActiveTools === "function"
-						) {
-							// A fresh conversation starts with no activation memory; a
-							// rebuild inherits the parent's.
-							if (isFreshSessionStart(sessionReason))
-								rememberedLazyTools.clear();
-							const lazyNames = new Set(LAZY_TOOL_CATALOG.map((t) => t.name));
-							const plan = planToolSet(
-								piWithActiveTools.getActiveTools(),
-								lazyNames,
-								rememberedLazyTools,
-							);
-							if (plan.changed) {
-								piWithActiveTools.setActiveTools(plan.desired);
-								recordToolSetMutation({
-									addedCount: plan.addedCount,
-									removedCount: plan.removedCount,
-									reason: isFreshSessionStart(sessionReason)
-										? "fresh_session_lazy_deactivation"
-										: "session_rebuild_restore",
-									deferralApplies: supportsDeferredTools(
-										(
-											ctx as {
-												model?: Parameters<typeof supportsDeferredTools>[0];
-											}
-										)?.model,
-									),
-								});
-							}
-						}
-					} catch (toolSetErr) {
-						dbg(
-							`dynamic tool set restore failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
-						);
-					}
 
 					// #449 slice 1 / #472: register this process in the cross-process
 					// instance registry and fire-and-forget an orphan-LSP sweep. Below the
@@ -2150,7 +2597,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 						.then((entries) => {
 							if (entries.length === 0) return;
 							recordCrossProcessTouches(
-								entries.map((e) => ({ path: e.path, reason: e.reason })),
+								entries.map((e) => ({
+									path: e.path,
+									reason: e.reason,
+									sessionId: e.sessionId,
+								})),
 							);
 							dbg(
 								`session_start: cross-process nudge — ${entries.length} file(s) from other instance(s)`,
@@ -2181,7 +2632,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// reset beside the primary session-start reset block so a tightened
 					// sampling window cannot leak across sessions.
 					resetMemorySamplerCadence();
-					await handleSessionStart({
+					// #2815 R7: reset before the handler can publish its
+					// session_start_prehandler row. Keep this inside the primary gate so
+					// a concurrent secondary cannot erase the primary's live counter.
+					resetTurnContext(stableSessionId);
+					const sessionStartWork = handleSessionStart({
 						ctxCwd: ctx.cwd,
 						sessionStartFiredAt,
 						sessionStartMonotonicAt,
@@ -2189,10 +2644,18 @@ function activateExtension(hostPi: ExtensionAPI) {
 						emitHostReadyDelay,
 						sessionReason,
 						handlerEnteredAt,
+						globalConfig,
+						projectConfig: loadDmLensProjectConfig(runtime.projectRoot),
+						// #2967: the session-start orientation renders from the set the
+						// registration predicate actually loaded, never a constant.
+						disabledToolNames,
 						// #2129: this call site is only reached for "primary"/
 						// "sequential-replacement" — a declined start returned above.
 						sessionStartClassification: sessionStartDecision.classification,
 						sessionStartSameRoot: sessionStartDecision.sameRoot,
+						sessionStartBasis: sessionStartDecision.basis,
+						sessionStartGapMs: sessionStartDecision.gapMs,
+						sessionStartLineageMatch: sessionStartDecision.lineageMatch,
 						getFlag: (name: string) => getLensFlag(name),
 						notify: (msg, level) => notifyUi(ctx, msg, level),
 						dbg,
@@ -2207,114 +2670,90 @@ function activateExtension(hostPi: ExtensionAPI) {
 						resetDispatchBaselines,
 						resetLSPService,
 					});
-					if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
-
-					// Pin the stable identity + reason AFTER handleSessionStart (which ran
-					// resetForSession → a fresh random id); the stable id now wins (#190).
+					// #3611: handleSessionStart's resetForSession began this session's
+					// scope before its first await. Take it now (#3612): a throw later
+					// in the handler must not leave this activation without its scope.
+					scope = runtime.sessionScope;
+					registerPrimaryBridges(scope);
+					_turnSummaryEmitCtxGetter = rebindableProcessBridgeDeps(
+						"turn-summary-emit-context",
+						1,
+						scope,
+						{
+							runtime,
+							pi,
+							getLensFlag: (name: string) => getLensFlag(name),
+							isLensEnabled: () => lensEnabled,
+						},
+					);
+					// Pin the stable identity + reason over the fresh random id that
+					// reset drew (#190). #3613 F1: before the await, for the same
+					// reason as the scope: a throw later in the handler must not leave
+					// the coordinator on the random id, or every turn of this primary
+					// would take `beginTurn`'s other-session path.
 					runtime.setSessionLifecycle({
 						sessionId: stableSessionId,
 						reason: sessionReason,
 					});
+					await bounded(sessionStartWork, {
+						ms: HOOK_WALL_BUDGET_MS.session_start,
+						signal: ctx.signal,
+						hook: "session_start",
+						label: "handleSessionStart",
+					});
+					if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+					// #3612: the coordinator's fresh guard is this scope's read-guard
+					// cell, which the read-guard stores snapshot and restore.
+					scopeCell(scope, READ_GUARD_CELL, () => runtime.readGuard);
 
-					// Lifecycle-aware widget state (#190). The "should I rehydrate" signal is
-					// NOT the reason — it's whether a persisted snapshot exists for this
-					// STABLE session id. A `pi --session <id>` launch fires reason="startup"
-					// (not "resume" — that's only an in-process switchSession), so gating on
-					// "resume" alone missed the common resume path. So: fork branches from
-					// the in-memory stash; reload keeps state; new starts clean; everything
-					// else (resume / startup / default) rehydrates IFF a snapshot exists —
-					// a brand-new session has a fresh id with no file (→ clean), a
-					// resumed/launched one has its prior file (→ rehydrate).
-					const reasonLabel = sessionReason ?? "startup";
-					const startMode = sessionStartMode(
-						sessionReason,
-						!!pendingForkSnapshot,
+					// #3612: every session store takes this start's hand-off (design
+					// §3.4): the slot the replaced activation left at its shutdown
+					// (`/reload`, `/fork`, `/clone`), else a sidecar: its own for a
+					// resume or a `pi --session` launch (a launch fires "startup", not
+					// "resume"), the parent's for `pi --fork` and a fork whose slot
+					// is gone. `/new` resets.
+					// #3881: this activation shut down while the start was in flight
+					// (another extension's shutdown handler kept pi from invalidating
+					// the ctx yet). That shutdown handed the slot on; adopt nothing.
+					if (inFlight.shutDown) return;
+					const stateCwd = ctx.cwd ?? process.cwd();
+					const handoffSource = await adoptHandoff(scope, {
+						reason: sessionReason,
+						sessionFile: getSessionFile(ctx),
+						sessionManager: ctx.sessionManager,
+						cwd: stateCwd,
+						dbg,
+						loadOwnSidecar: () => loadSessionState(stateCwd, stableSessionId),
+						loadParentSidecar: async () => {
+							const parentFile = (() => {
+								try {
+									return (
+										ctx as {
+											sessionManager?: {
+												getHeader?: () => { parentSession?: string } | null;
+											};
+										}
+									)?.sessionManager?.getHeader?.()?.parentSession;
+								} catch {
+									return undefined;
+								}
+							})();
+							const parentId = parentFile
+								? await readSessionHeaderId(parentFile)
+								: undefined;
+							return loadSessionState(stateCwd, parentId);
+						},
+					});
+					logScopeTransition(scope, {
+						transition: "start",
+						reason: sessionReason,
+						sessionId: stableSessionId,
+						cwd: stateCwd,
+						handoffSource,
+					});
+					dbg(
+						`session_start: ${sessionReason ?? "startup"} — session stores from ${handoffSource}`,
 					);
-					if (startMode === "fork" && pendingForkSnapshot) {
-						// Branch the forked session from the source's in-memory snapshot, then
-						// persist it under the new session id so the fork owns its own copy.
-						clearWidgetState();
-						importWidgetState(pendingForkSnapshot);
-						const forkedFileCount = pendingForkSnapshot.files.length;
-						pendingForkSnapshot = undefined;
-						// #1041: adopt the source session's read history (staleness-reconciled
-						// against current disk) so the fork isn't zero-read-blocked on files
-						// the parent already read.
-						let forkReadImport:
-							| { imported: number; dropped: number }
-							| undefined;
-						if (pendingForkReadGuard) {
-							forkReadImport =
-								runtime.readGuard.importState(pendingForkReadGuard);
-							pendingForkReadGuard = undefined;
-						}
-						if (stableSessionId) {
-							void saveSessionState(
-								ctx.cwd ?? process.cwd(),
-								stableSessionId,
-								exportWidgetState(),
-								runtime.readGuard.exportState(),
-							);
-						}
-						dbg(
-							`session_start: fork — branched ${forkedFileCount} file(s) from source` +
-								(forkReadImport
-									? `, read-guard +${forkReadImport.imported} (dropped ${forkReadImport.dropped})`
-									: ""),
-						);
-					} else if (startMode === "keep") {
-						dbg("session_start: reload — keeping widget state");
-					} else if (startMode === "clean") {
-						pendingForkSnapshot = undefined;
-						pendingForkReadGuard = undefined;
-						clearWidgetState();
-						dbg("session_start: new — clean widget");
-					} else {
-						// maybe-rehydrate: covers resume AND startup (e.g. `pi --session <id>`)
-						pendingForkSnapshot = undefined;
-						pendingForkReadGuard = undefined;
-						clearWidgetState();
-						if (stableSessionId) {
-							const persisted = await loadSessionState(
-								ctx.cwd ?? process.cwd(),
-								stableSessionId,
-							);
-							if (persisted?.widget) {
-								// #180/#190: drop files changed on disk since the snapshot so a
-								// resume never surfaces stale diagnostics; they re-scan on edit.
-								const fresh = await dropStaleFiles(
-									persisted.widget,
-									persisted.savedAt,
-								);
-								const dropped =
-									persisted.widget.files.length - fresh.files.length;
-								importWidgetState(fresh);
-								// #1041: rehydrate the read-before-edit guard's read-set on the
-								// SAME path so the first post-resume edit of a previously-read
-								// file isn't falsely zero-read-blocked. importState reconciles
-								// each read against current disk (drops changed/missing files),
-								// so a resume never masks a real staleness.
-								const readImport = runtime.readGuard.importState(
-									persisted.readGuard,
-								);
-								dbg(
-									`session_start: ${reasonLabel} ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
-										(dropped > 0 ? `, dropped ${dropped} stale` : "") +
-										(readImport.imported > 0 || readImport.dropped > 0
-											? `; read-guard +${readImport.imported} read(s) (dropped ${readImport.dropped} stale)`
-											: ""),
-								);
-							} else {
-								dbg(
-									`session_start: ${reasonLabel} ${stableSessionId} — no persisted state (clean)`,
-								);
-							}
-						} else {
-							dbg(
-								`session_start: ${reasonLabel} — no stable session id (clean)`,
-							);
-						}
-					}
 
 					if (lensWidgetVisible) {
 						mountLensWidget(ctx.ui, readExtensionMode(ctx));
@@ -2326,34 +2765,82 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// session swap as a dm-lens crash (#1929, same shape as the
 					// agent_end and turn_end catches).
 					if (isStaleExtensionCtxError(sessionErr)) throw sessionErr;
-					dbg(`session_start crashed: ${sessionErr}`);
-					dbg(`session_start crash stack: ${(sessionErr as Error).stack}`);
+					// #2859/#2884: `dbg` writes nothing in tests, so a crashed
+					// session_start was indistinguishable from a completed one —
+					// fourteen awaits in tests/index-integration.test.ts rejected into
+					// this catch (a leaked `vi.doMock` had dropped an installer
+					// export), every assertion after them was vacuous, and the whole
+					// file stayed green. A test budget cannot see this: the handler
+					// settles promptly, it just did nothing. `surfaceHandlerCrash`
+					// logs, records one bounded ledger row, and under the runner
+					// rethrows so the crash fails the test that caused it; production
+					// keeps the swallow, because a dm-lens session_start bug must
+					// never take down the host's session. #2866 wrote that guard
+					// inline here; #2884 folded it onto the shared helper so the nine
+					// sibling catches below cannot drift from it.
+					surfaceHandlerCrash("session_start", sessionErr, { dbg });
+				} finally {
+					startInFlight = undefined;
+					// #3653: primary and secondary alike, after the hand-off
+					// restored this scope's activations, and even when a step above
+					// threw, so a session never keeps every lazy tool active.
+					applyToolSetPlan(ctx, sessionStartReason);
 				}
 			},
 			{ dbg },
 		),
 	);
 
-	// #190 Phase 2: capture the source session's diagnostics just before a fork,
-	// so the forked session (its `session_start` fires with reason="fork") can
-	// branch from them instead of starting empty. In-memory hand-off within the
-	// same process; cleared once adopted (or on any non-fork start).
-	(pi as any).on("session_before_fork", () => {
-		try {
-			pendingForkSnapshot = exportWidgetState();
-			// #1041: the source guard is still live here (reset happens in the
-			// fork's own session_start, which fires later), so this captures the
-			// parent's read-set for the fork to adopt.
-			pendingForkReadGuard = runtime.readGuard.exportState();
-			dbg(
-				`session_before_fork: stashed ${pendingForkSnapshot.files.length} file(s) + ${pendingForkReadGuard.reads.length} read-guard file(s) for the fork`,
-			);
-		} catch (forkErr) {
-			dbg(`session_before_fork crashed: ${forkErr}`);
-		}
-	});
+	// #3521: `/tree` moves the conversation inside this activation. Keep only
+	// the reads whose tool result is on the new branch. A concurrent secondary
+	// shares the module-level runtime, so its tree moves never touch the
+	// primary's guard; the other direction is an accepted residual (#3521 F2):
+	// a primary /tree clears a live secondary's reads, costing it one re-read.
+	// `session_before_tree` can still be cancelled by a later handler, so
+	// nothing happens there.
+	(pi as any).on(
+		"session_tree",
+		wrapSessionEventHandler(
+			"session_tree",
+			(
+				_event: unknown,
+				ctx: { cwd?: string; sessionManager?: unknown } | undefined,
+			) => {
+				try {
+					if (ownedSessionRole !== "primary") return;
+					const branch = branchToolResultIds(ctx?.sessionManager);
+					const retained = runtime.readGuard.retainBranch(branch.ids);
+					logReadGuardBranchMove({
+						trigger: "tree",
+						source: "live",
+						kept: retained.kept,
+						dropped: retained.dropped,
+						branch,
+						cwd: ctx?.cwd ?? runtime.projectRoot ?? process.cwd(),
+					});
+					// #3611: retainBranch moved the scope's branch epoch.
+					logScopeTransition(runtime.sessionScope, {
+						transition: "tree",
+						reason: "tree",
+						sessionId: runtime.telemetrySessionId,
+						cwd: ctx?.cwd ?? runtime.projectRoot ?? process.cwd(),
+					});
+				} catch (treeErr) {
+					if (isStaleExtensionCtxError(treeErr)) throw treeErr;
+					surfaceHandlerCrash("session_tree", treeErr, { dbg });
+				}
+			},
+			{ dbg },
+		),
+	);
 
 	pi.on("tool_call", async (event, ctx) => {
+		const toolEntry = toolRegistryEntryForPi(
+			(event as { toolName?: string }).toolName ?? "",
+		);
+		if (toolEntry && "situational" in toolEntry && toolEntry.situational) {
+			observeSituationalToolCall(toolEntry.name);
+		}
 		return handleToolCall({
 			event: event as unknown as Parameters<typeof handleToolCall>[0]["event"],
 			ctx: ctx as unknown as Parameters<typeof handleToolCall>[0]["ctx"],
@@ -2365,6 +2852,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			ensureLSPConfigInitialized,
 			updateLspStatus,
 			resetLSPService,
+			sessionId: getStableSessionId(ctx),
 		});
 	});
 
@@ -2394,6 +2882,13 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// `index.ts` and `tools/` too.
 		const rtToolName = (event as { toolName?: string })?.toolName;
 		const rtMutation = classifyMutatingTool(event, { recognizeOnly: true });
+		// #2939 F3: one edit-class predicate, shared with the `budgetKey`
+		// callback below — the two copies used to disagree on third-party
+		// shell tools carrying `input.command`.
+		const editClass = isEditClassToolResult(
+			event as { toolName?: string; input?: { command?: unknown } },
+			ctx?.cwd ?? runtime.projectRoot ?? process.cwd(),
+		);
 		if (rtMutation) {
 			logLatency({
 				type: "phase",
@@ -2410,33 +2905,68 @@ function activateExtension(hostPi: ExtensionAPI) {
 				},
 			});
 		}
+		// Read/search results still need the complete handler for read registration,
+		// bash recovery, and observed third-party mutations. Use only resident
+		// clients on that path; the handler requests them lazily if mutation work
+		// actually reaches the pipeline.
 		try {
-			const { biomeClient, ruffClient, metricsClient, agentBehaviorClient } =
-				await loadBootstrapClients();
-			return await handleToolResult({
-				event: event as any,
-				getFlag: (name: string, filePath?: string) =>
-					getLensFlag(name, filePath),
-				getFlagSource: (name: string, filePath?: string) =>
-					getLensFlagSource(name, filePath),
-				dbg,
-				runtime,
-				cacheManager,
-				biomeClient,
-				ruffClient,
-				metricsClient,
-				resetLSPService,
-				readGuard: runtime.readGuard,
-				agentBehaviorRecord: (toolName, filePath) =>
-					agentBehaviorClient.recordToolCall(toolName, filePath),
-				formatBehaviorWarnings: (warnings) =>
-					agentBehaviorClient.formatWarnings(warnings as any),
-				// #791: tags any deferred-format record queued from this tool_result
-				// with the STABLE session id of the ctx that produced it, so a
-				// later agent_end can tell its own queued work apart from a
-				// concurrent in-process secondary session's.
-				sessionId: getStableSessionId(ctx),
-			});
+			const resident = editClass
+				? await bounded(loadBootstrapClients(), {
+						ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+						signal: ctx.signal,
+						hook: "tool_result_edit",
+						label: "tool-result-bootstrap",
+					})
+				: peekBootstrapClients();
+			// `return await`, not `return`: this `try` has a `finally` that clears
+			// the ambient abort signal. Without the await the `finally` runs the
+			// instant the promise is RETURNED, so the slot is empty for the whole
+			// pipeline and an Escape mid-edit no longer kills its child processes
+			// (#2897 round 2 V2; #2939 round 2 restored it after measuring the
+			// deletion observable).
+			return await bounded(
+				handleToolResult({
+					signal: ctx.signal,
+					event: event as any,
+					getFlag: (name: string, filePath?: string) =>
+						getLensFlag(name, filePath),
+					getFlagSource: (name: string, filePath?: string) =>
+						getLensFlagSource(name, filePath),
+					dbg,
+					runtime,
+					cacheManager,
+					biomeClient: resident?.biomeClient,
+					ruffClient: resident?.ruffClient,
+					metricsClient: resident?.metricsClient,
+					resetLSPService,
+					readGuard: runtime.readGuard,
+					agentBehaviorRecord: (toolName, filePath) =>
+						(
+							resident?.agentBehaviorClient ?? getAgentBehaviorClient()
+						).recordToolCall(toolName, filePath),
+					formatBehaviorWarnings: (warnings) =>
+						(
+							resident?.agentBehaviorClient ?? getAgentBehaviorClient()
+						).formatWarnings(warnings as any),
+					// #791: tags any deferred-format record queued from this tool_result
+					// with the STABLE session id of the ctx that produced it, so a
+					// later agent_end can tell its own queued work apart from a
+					// concurrent in-process secondary session's.
+					sessionId: getStableSessionId(ctx),
+					sessionRole:
+						ownedSessionRole === "concurrent-secondary"
+							? "secondary"
+							: "primary",
+				}),
+				{
+					ms: editClass
+						? HOOK_WALL_BUDGET_MS.tool_result_edit
+						: HOOK_WALL_BUDGET_MS.tool_result_read_only,
+					signal: ctx.signal,
+					hook: editClass ? "tool_result_edit" : "tool_result_read_only",
+					label: "handleToolResult",
+				},
+			);
 		} finally {
 			setAmbientAbortSignal(undefined);
 		}
@@ -2444,8 +2974,33 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
 	(pi as any).on(
 		"tool_result",
-		wrapSessionEventHandler("tool_result", onToolResult, { dbg }),
+		wrapSessionEventHandler("tool_result", onToolResult, {
+			dbg,
+			budgetKey: (event, _ctx) => {
+				try {
+					// #2939 F3: the same predicate as the handler body above.
+					return isEditClassToolResult(
+						event as { toolName?: string; input?: { command?: unknown } },
+						(_ctx as { cwd?: string })?.cwd ??
+							runtime.projectRoot ??
+							process.cwd(),
+					)
+						? "tool_result_edit"
+						: "tool_result_read_only";
+				} catch {
+					return "tool_result_read_only";
+				}
+			},
+		}),
 	);
+
+	// #4185 round 4: the call is over. A read that ended in error, failed by
+	// the host or blocked by a later extension after dm-lens captured it (pi
+	// then emits no tool_result), releases its capture here, before the next
+	// tool_call of the run can count it.
+	pi.on("tool_execution_end", (event) => {
+		handleToolExecutionEnd(event, runtime.readGuard);
+	});
 
 	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
 	// Clear cascade snapshot at start of each new turn so stale data never leaks
@@ -2462,7 +3017,24 @@ function activateExtension(hostPi: ExtensionAPI) {
 		) {
 			mountLensWidget(ctx.ui, readExtensionMode(ctx));
 		}
-		runtime.beginTurn();
+		// #3613 (S4, N2): the turn's own session. A concurrent secondary's turn
+		// advances only its own turn identity and per-turn records; the
+		// coordinator's turn state is the primary's.
+		runtime.beginTurn(getStableSessionId(ctx));
+		// Capture before any awaited turn-end work can let a sibling session start.
+		turnStartScope = scope ?? runtime.sessionScope;
+		if (
+			ownedSessionRole === "concurrent-secondary" &&
+			getStableSessionId(ctx) !== undefined
+		) {
+			cacheManager.ensureSecondaryTurnStatePartition(
+				(ctx as { cwd?: string })?.cwd ?? process.cwd(),
+				getStableSessionId(ctx)!,
+			);
+		}
+		// Every turn, a secondary's too: clearing only re-runs a duplicate
+		// same-state analysis, while keeping it would skip a secondary's next
+		// turn (the dedupe keys on the primary's turn index).
 		clearLastAnalyzedStateCache();
 
 		// #492: parent-at-turn_start cross-process nudge consumer — the "parent
@@ -2492,7 +3064,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 				// drop path — every entry that reaches this point is relevant by
 				// construction.
 				recordCrossProcessTouches(
-					entries.map((e) => ({ path: e.path, reason: e.reason })),
+					entries.map((e) => ({
+						path: e.path,
+						reason: e.reason,
+						sessionId: e.sessionId,
+					})),
 				);
 				dbg(
 					`turn_start: cross-process nudge — ${entries.length} file(s) from other instance(s)`,
@@ -2583,6 +3159,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 	 */
 	async function runObservedSettledSweepSafely(
 		ctx: DeferredDrainCtx,
+		readGuardBranchEpoch: number,
+		lineage: LineageHandle,
 	): Promise<void> {
 		const cwd = ctx.cwd ?? runtime.projectRoot;
 		try {
@@ -2594,7 +3172,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 						cwd,
 						limit: OBSERVED_TRACKED_MAX_FILES,
 					}),
-				record: replayThroughMutationBridge,
+				// #3521: a /tree can land while the sweep awaits; the replayed
+				// write then must not vouch for a file the new branch never showed.
+				// #3620: nor, after `/new`, for one the new session never read.
+				record: (entry) =>
+					replayThroughMutationBridge({
+						...entry,
+						readGuardBranchEpoch,
+						lineage,
+					}),
 				getStoredLineHashes: (candidate) =>
 					storedLineHashesFor(runtime.readGuard, candidate),
 				// Merge of #2449 into #2450: #2449 wrote this gate as the
@@ -2615,7 +3201,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 				);
 			}
 		} catch (sweepErr) {
-			dbg(`observed_settled_sweep crashed: ${sweepErr}`);
+			surfaceHandlerCrash("observed_settled_sweep", sweepErr, { dbg });
 		}
 	}
 
@@ -2635,6 +3221,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 	async function refreshObservedLedgerSafely(
 		ctx: DeferredDrainCtx,
 	): Promise<void> {
+		const signal = ctx?.signal;
 		try {
 			await refreshObservedMutationLedger({
 				turnIndex: runtime.turnIndex,
@@ -2643,10 +3230,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 				// rather than a read (#2449 review round 2, F3).
 				getStoredLineHashes: (candidate) =>
 					storedLineHashesFor(runtime.readGuard, candidate),
-				signal: ctx?.signal,
+				signal,
 			});
 		} catch (refreshErr) {
-			dbg(`observed_ledger_refresh crashed: ${refreshErr}`);
+			surfaceHandlerCrash("observed_ledger_refresh", refreshErr, { dbg });
 		}
 	}
 
@@ -2677,6 +3264,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			return;
 		}
 		await handleAgentEnd({
+			signal: ctx.signal,
 			ctxCwd: ctx.cwd,
 			getFlag: (name: string, filePath?: string) => getLensFlag(name, filePath),
 			getFlagSource: (name: string, filePath?: string) =>
@@ -2726,8 +3314,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// registration owns it, instead of a second copy here logging it as a
 			// crash (#1925).
 			if (isStaleExtensionCtxError(agentEndErr)) throw agentEndErr;
-			dbg(`agent_end crashed: ${agentEndErr}`);
-			dbg(`agent_end crash stack: ${(agentEndErr as Error).stack}`);
+			surfaceHandlerCrash("agent_end", agentEndErr, { dbg });
 		} finally {
 			setAmbientAbortSignal(undefined);
 		}
@@ -2866,7 +3453,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// (see clients/memory-sampler.ts). Session age + turn count ride along so
 			// growth-vs-age curves are plottable from logs alone. Still cheap:
 			// O(1)/O(bounded-cache-size) reads only, no extra throttling needed.
-			if (shouldEmitMemorySampleAdaptive(runtime.turnIndex)) {
+			// #3613 G1: process-level cadences pace on every session's turn
+			// starts. The primary's index stands still through a subagent's run
+			// (it would fire at every subagent turn end while on a sampling
+			// turn), and a subagent's fractional turn key never meets `% N`.
+			const cadenceTurn = runtime.turnStartCount;
+			if (shouldEmitMemorySampleAdaptive(cadenceTurn)) {
 				try {
 					const sample = buildMemorySample(
 						runtime.wordIndex,
@@ -2888,10 +3480,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 						durationMs: 0,
 						metadata: { turnIndex: runtime.turnIndex, ...sample },
 					});
-					recordMemorySampleOutcome(
-						sample.process.heapUsedBytes,
-						runtime.turnIndex,
-					);
+					recordMemorySampleOutcome(sample.process.heapUsedBytes, cadenceTurn);
 				} catch {
 					// best-effort observability — never fail turn_end over this
 				}
@@ -2901,7 +3490,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// sample above — at most once per SMELLS_TURN_CHECK_INTERVAL turns, and
 			// each smell notifies at most once per session (checkSmellsAndNoteOnce's
 			// gate). See clients/smells-rollup.ts for the tail-scan cost bound.
-			if (shouldCheckSmellsThisTurn(runtime.turnIndex)) {
+			if (shouldCheckSmellsThisTurn(cadenceTurn)) {
 				try {
 					// S3c (#1432 review): use the in-process session start instead of
 					// letting countRecentSmells() fall back to its 24h rolling
@@ -2934,12 +3523,17 @@ function activateExtension(hostPi: ExtensionAPI) {
 				depChecker,
 				testRunnerClient,
 				sessionId: getStableSessionId(ctx),
+				// #4154: this activation's own scope, so a concurrent secondary's
+				// late dead-code scan never lands in the primary's cell.
+				// Test/MCP hosts may emit turn_end without turn_start. Real pi turns
+				// use the captured snapshot; this fallback preserves that host contract.
+				sessionScope: turnStartScope ?? scope ?? runtime.sessionScope,
+				signal: ctx.signal,
 				onTestRunnerComplete: (delivery) =>
 					stageTestRunnerDelivery({
 						...delivery,
 						owner: {
 							ownerId: testRunnerDeliveryOwnerId,
-							pi,
 							cacheManager,
 							runtime,
 							getCtx: () => ownEventCtx ?? {},
@@ -2968,14 +3562,13 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// resume (`pi --session <id>`) can rehydrate them. Only when pi gave us
 			// a stable session id (else the file would be orphaned, never loaded).
 			// Fire-and-forget — persistence must never delay or break a turn.
+			// #3612: every session store rides this snapshot (the read-set for
+			// #1041, filtered to its branch on resume by #3521).
 			if (runtime.hasStableSessionId) {
-				void saveSessionState(
+				persistScope(
 					ctx.cwd ?? process.cwd(),
 					runtime.telemetrySessionId,
-					exportWidgetState(),
-					// #1041: persist the read-guard read-set on the same snapshot so a
-					// later resume can rehydrate it (reconciled against disk on load).
-					runtime.readGuard.exportState(),
+					runtime.sessionScope,
 				);
 			}
 
@@ -2989,8 +3582,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		} catch (turnEndErr) {
 			// One classifier for the stale-ctx class — see `agent_end` above.
 			if (isStaleExtensionCtxError(turnEndErr)) throw turnEndErr;
-			dbg(`turn_end crashed: ${turnEndErr}`);
-			dbg(`turn_end crash stack: ${(turnEndErr as Error).stack}`);
+			surfaceHandlerCrash("turn_end", turnEndErr, { dbg });
 		} finally {
 			setAmbientAbortSignal(undefined);
 		}
@@ -3028,10 +3620,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// next turn_end merges), reusing the existing neighbor→turn-end formatting —
 	// previously this outcome was logs-only, a silent under-report (#533).
 	registerCascadeTierReconcileTask(() => getLSPService(), {
-		onResolvedFound: ({ filePath, diagnostics }) => {
+		onResolvedFound: ({ filePath, diagnostics, publishedAt }) => {
 			const run = buildResolvedFoundCascadeRun(runtime.projectRoot, {
 				filePath,
 				diagnostics,
+				publishedAt,
 			});
 			// #1443: the appended run outlives this turn's consumption —
 			// `beginTurn` carries it into the next turn_end exactly once instead
@@ -3070,15 +3663,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// feature-detected + guarded so an older host degrades to a dbg line).
 	// Registration is once-per-process (the quiet-window registry outlives
 	// factory re-activation); the ctx holder keeps the closure current.
-	_turnSummaryEmitCtx = {
-		pi,
-		getLensFlag: (name: string) => getLensFlag(name),
-		isLensEnabled: () => lensEnabled,
-	};
 	if (!_turnSummaryEmitRegistered) {
 		_turnSummaryEmitRegistered = true;
 		registerQuietWindowTask("turn_summary_emit", () => {
-			const emitCtx = _turnSummaryEmitCtx;
+			const emitCtx = _turnSummaryEmitCtxGetter?.();
 			if (!emitCtx || !emitCtx.isLensEnabled()) return;
 			// The captured `pi` can go STALE between the activation that set this
 			// holder and this fire-and-forget quiet-window run: an interim
@@ -3105,11 +3693,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 				throw err;
 			}
 			if (!turnSummaryEnabled) return;
-			if (runtime.turnSummary.isEmpty()) return;
+			if (emitCtx.runtime.turnSummary.isEmpty()) return;
 			const summaryStart = Date.now();
-			const cwd = runtime.projectRoot || process.cwd();
-			const details = runtime.turnSummary.consume(runtime.turnIndex, (fp) =>
-				toRunnerDisplayPath(cwd, fp),
+			const cwd = emitCtx.runtime.projectRoot || process.cwd();
+			const details = emitCtx.runtime.turnSummary.consume(
+				emitCtx.runtime.turnIndex,
+				(fp) => toRunnerDisplayPath(cwd, fp),
 			);
 			const line = formatTurnSummaryLine(details);
 			const sendMessage = (
@@ -3123,6 +3712,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 						display: true,
 						details,
 					});
+					recordTurnEndAdvisoryBytes(
+						emitCtx.runtime.telemetrySessionId,
+						Buffer.byteLength(line, "utf8"),
+					);
 				} catch (sendErr) {
 					if (isStaleExtensionCtxError(sendErr)) {
 						dbg(
@@ -3154,6 +3747,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 	}
 	const onAgentSettled = async (_event: unknown, ctx: DeferredDrainCtx) => {
 		if (!lensEnabled) return;
+		// #3521: pi marks the run inactive before it awaits this handler, so a
+		// /tree can land while the sweep below awaits. Captured before the first
+		// await: its replayed writes from before the move are not credited. The
+		// drain carries its own epochs: a record's queue-time epoch, and the
+		// quick fix's report epoch (#3676).
+		const settleBranchEpoch = runtime.readGuard.currentBranchEpoch;
 		// Keep the activation-owned live ctx current for the detached delivery
 		// task. It must probe idleness and append through this run's host seam.
 		rememberOwnEventCtx(ctx);
@@ -3177,6 +3776,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// production-unreachable.
 		try {
 			setAmbientAbortSignal(ctx?.signal);
+			// #3576: the session this settle's drain runs in. `/new`, fork and
+			// resume can land while the drain awaits its formatter; the refresh
+			// below then belongs to a session that no longer exists.
+			const settleSession = runtime.captureSessionGeneration();
 			try {
 				// #2430 item 3: the turn-boundary net runs BEFORE the drain, so a
 				// file a path-less third-party tool changed is queued in time to be
@@ -3185,22 +3788,65 @@ function activateExtension(hostPi: ExtensionAPI) {
 				// widget diagnostic files, open LSP documents — and never walks the
 				// workspace. Bounded on both axes (timeout + this ctx's abort) and
 				// wrapped, because an advisory sweep must never cost the drain.
-				await runObservedSettledSweepSafely(ctx);
+				await runObservedSettledSweepSafely(
+					ctx,
+					settleBranchEpoch,
+					settleSession,
+				);
 				await runDeferredMutationDrain(ctx);
 				// The drain just wrote formatted/autofixed bytes to files dm-lens
 				// itself owns. Re-baseline them, or the NEXT settle reads our own
 				// formatter output as unexplained third-party drift and requeues the
-				// same files forever.
-				await refreshObservedLedgerSafely(ctx);
+				// same files forever. #3576: with this session's read guard and
+				// handled set only.
+				await settleSession.guardedWrite(
+					`observed-ledger-refresh:${ctx?.cwd ?? runtime.projectRoot}`,
+					() => refreshObservedLedgerSafely(ctx),
+				);
 			} catch (drainErr) {
 				// #1924 classified the stale-ctx case inline here. #1925 moved the
 				// classifier and its record to clients/session-event-guard.ts, so
 				// this site only declines to swallow it: rethrow, and the wrapper
 				// around the registration skips the run and counts it.
 				if (isStaleExtensionCtxError(drainErr)) throw drainErr;
-				dbg(`agent_settled deferred_mutation_drain crashed: ${drainErr}`);
+				// Under the runner the two `…Safely` helpers above rethrow their own
+				// crash into this catch, so ONE crash can leave two ledger subjects
+				// (the inner site and this one). That is a test-path artifact and
+				// deliberately not deduplicated: in production the inner catches
+				// swallow, so this catch only ever sees a crash the drain itself
+				// raised, and the record stays one row per real crash.
+				surfaceHandlerCrash("agent_settled deferred_mutation_drain", drainErr, {
+					dbg,
+				});
 			} finally {
 				setAmbientAbortSignal(undefined);
+				// #4124: the run is over, so the word index's incremental-serialize
+				// memo (a second copy of its postings) is released once per run. After
+				// the drain, whose formatted writes can still schedule a persist. This
+				// session's index only: a concurrent secondary's settle must not drop
+				// the primary's mid-run memo, and a session replaced while the drain
+				// awaited owns a different index. Lazy and unawaited: a session that
+				// never built an index never loads the module (the eager allowlist
+				// stays as is), and a settle handler must not wait on an import. The
+				// index is captured here, under the guards.
+				const settledIndex = runtime.wordIndex;
+				if (
+					settledIndex &&
+					settleSession.isCurrent() &&
+					classifyOwnedSessionEmission(ctx, getStableSessionId(ctx)) ===
+						"primary"
+				) {
+					void import("./clients/word-index.js")
+						.then(({ releaseWordIndexMemoAtSettle }) =>
+							releaseWordIndexMemoAtSettle(settledIndex),
+						)
+						.catch((err) =>
+							surfaceHandlerCrash("word_index_memo_release", err, {
+								dbg,
+								rethrow: false,
+							}),
+						);
+				}
 			}
 			const cwd = ctx?.cwd;
 			void runQuietWindow({
@@ -3210,7 +3856,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 				sessionId: getStableSessionId(ctx),
 				ownerId: testRunnerDeliveryOwnerId,
 			}).catch((err) => {
-				dbg(`quiet_window crashed: ${err}`);
+				// This is the only fire-and-forget site of the nine. Nothing awaits
+				// this promise, so rethrowing here creates an unhandled rejection
+				// that can terminate the pi host. The bounded row is the observable
+				// for this site; production and the test runner must keep the host alive.
+				surfaceHandlerCrash("quiet_window", err, { dbg, rethrow: false });
 			});
 			// #1123 item 4: dump active handles AFTER the quiet-window work is
 			// scheduled — the #1097-class leak (a stray ref'd timer surviving
@@ -3236,10 +3886,25 @@ function activateExtension(hostPi: ExtensionAPI) {
 		dbg(`agent_settled registration failed (older pi host?): ${registerErr}`);
 	}
 
+	// #3611: retire this activation's scope once, with pi's shutdown reason.
+	const retireOwnScope = (
+		reason: string | undefined,
+		sessionId: string | undefined,
+	): void => {
+		if (!scope) return;
+		retireScope(scope, reason);
+		logScopeTransition(scope, {
+			transition: "shutdown",
+			reason: scope.retiredBy(),
+			sessionId,
+			cwd: runtime.projectRoot,
+		});
+	};
+
 	// --- Session shutdown: release all handles so subagent processes exit cleanly ---
 	// The LSP idle-reset timer (240s) is unref'd but we cancel it explicitly here
 	// so it does not fire after shutdown. resetLSPService shuts down any live clients.
-	(pi as any).on("session_shutdown", (_event: unknown, ctx: unknown) => {
+	(pi as any).on("session_shutdown", (event: unknown, ctx: unknown) => {
 		// #473: a concurrently-live in-process subagent session shutting down
 		// (its sibling primary — the real parent — still active) must NOT run
 		// the shared-infra teardown below: no LSP fleet shutdown, no idle-timer
@@ -3272,106 +3937,208 @@ function activateExtension(hostPi: ExtensionAPI) {
 			shutdownCwd,
 		);
 		if (shutdownClassification === "secondary") {
+			if (stableSessionId !== undefined && shutdownCwd !== undefined) {
+				cacheManager.clearTurnState(
+					shutdownCwd,
+					{
+						kind: "pi",
+						id: stableSessionId,
+					},
+					stableSessionId,
+				);
+			}
 			emitCacheUsageSummaryAtSessionEnd(
 				stableSessionId,
 				"concurrent-secondary",
 			);
 			clearCachePrefixSession(stableSessionId, "concurrent-secondary");
+			// #3613: its per-turn records end with it.
+			runtime.forgetTurnSession(stableSessionId);
 			decrementSecondarySessionCount();
 			// #2130: scoped deregistration. A secondary's shutdown must never run
 			// `deregisterInstance()` — the process lives on and the primary still
-			// owns the entry. Drop only THIS session's own root, and only when it
-			// is positively a different root than the primary's, so a secondary
-			// that shares the primary's directory cannot deregister the root the
-			// host is still working in. A root this session never registered is a
-			// documented no-op inside `deregisterInstanceRoot`.
+			// owns the entry. End only THIS activation's own hold (#3849): the
+			// root leaves the entry only when no other holder, the host's
+			// primary record included, still lists it. A secondary in the
+			// primary's own directory added nothing and removes nothing, and a
+			// hold the registry already ended is a documented no-op inside
+			// `deregisterInstanceRoot`.
 			//
 			// #2130 round 2: the call is now QUEUED, so it lands behind this
 			// session's own `void registerInstanceRoot(cwd)` from the declined
 			// start above rather than racing ahead of it and leaving the temp
 			// root behind. Fire and forget is still correct — the tail owns the
 			// ordering, and teardown must not block on a registry write.
-			try {
-				const secondaryRoot = shutdownCwd;
-				const primaryRoot = getActivePrimaryRoot();
-				if (
-					typeof secondaryRoot === "string" &&
-					secondaryRoot.length > 0 &&
-					primaryRoot !== undefined &&
-					normalizeFilePath(secondaryRoot) !== primaryRoot
-				) {
-					void deregisterInstanceRoot(secondaryRoot).catch(() => {
-						// best-effort bookkeeping — never fail teardown
-					});
-				}
-			} catch {
-				// Best-effort observability bookkeeping — a stale ctx or an
-				// unresolvable path must never break teardown.
+			if (ownedSecondaryRoot !== undefined) {
+				void deregisterInstanceRoot(
+					ownedSecondaryRoot,
+					secondaryRootHolder,
+				).catch(() => {
+					// best-effort bookkeeping — never fail teardown
+				});
 			}
+			// #3611: only this secondary's own scope retires.
+			retireOwnScope(
+				(event as { reason?: string } | undefined)?.reason,
+				stableSessionId,
+			);
 			dbg(
 				"session_shutdown: concurrent secondary — skipping shared-infra teardown",
 			);
 			return;
 		}
-
-		// #1654: no drain runs here — see the module comment above
-		// `runDeferredMutationDrain` (review round 1, F2/F3/F4/F5) for why a
-		// session_shutdown-based safety net was deliberately dropped rather
-		// than kept.
-
-		// #1018/#1996: emit the bounded primary cache summary, then drop this
-		// session's prefix/attribution state. The secondary path did the same for
-		// its role-local bucket before returning above.
-		emitCacheUsageSummaryAtSessionEnd(stableSessionId, "primary");
-		clearCachePrefixSession(stableSessionId, "primary");
-
-		cancelLSPIdleReset();
-		// #449 slice 1: SYNC-only deregistration (no child spawns — see the
-		// processExiting note below); safe to call unconditionally here.
-		deregisterInstance();
-		// #2129 review F3: release the primary registration at the same boundary
-		// the registry entry is released. Root identity made a stale `activeRoot`
-		// decisive: without this, once root A's primary ended, every later start
-		// in root B would classify `secondary-root` forever — never primary,
-		// never a full start, no re-arm. This is the process-lifetime-latch shape
-		// the catalog names. Only the PRIMARY path reaches here; a secondary
-		// returned above precisely because the primary is still live.
-		releasePrimarySession();
-		// #2467: no analyzer bootstrap may START loading from here on. A demand
-		// already in flight keeps its promise and still settles — the gate is
-		// checked only when no flight exists. Nothing is spawned, which is what
-		// AGENTS.md's #234 teardown rule requires of a session_shutdown-time
-		// call; a replacement session re-arms the gate at its session_start.
-		markAnalyzerBootstrapShutdown();
-		// processExiting: the loop is closing here — killing LSP servers must NOT
-		// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
-		// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen
-		// on `pi update`. Direct handle-kill only. Grandchildren behind a
-		// shell/.cmd wrapper are NOT reaped by the OS (Windows does not kill
-		// children when a parent dies) — they rely on stdin EOF, LSP
-		// `initialize.processId` self-watchdog compliance, and the #449/#472
-		// cross-process instance registry's orphan reaper as the backstop (#472).
-		resetLSPService({
-			fast: true,
-			processExiting: true,
-			reason: "session_shutdown",
+		const shutdownEvent = event as
+			| { reason?: string; targetSessionFile?: string }
+			| undefined;
+		const shutdownReason = shutdownEvent?.reason;
+		const shutdownBudgetKey =
+			shutdownReason === "quit" ? "session_shutdown_quit" : "session_shutdown";
+		// Start this before synchronous teardown so writes emitted by the teardown
+		// itself join the same serialized writer drain. Returning the promise keeps
+		// pi's awaited shutdown boundary without delaying synchronous lifecycle work
+		// for existing embedders that call handlers directly.
+		const ndjsonDrain = bounded(flushAllNdjsonWriters(), {
+			ms: HOOK_WALL_BUDGET_MS[shutdownBudgetKey],
+			signal: undefined,
+			hook: "session_shutdown",
+			label: "ndjson-writers",
 		});
-		// S2d (gap 5, #1432 review): one session_end_bus_rollup row per event
-		// name with any activity this session — same primary-only placement as
-		// the shared-infra teardown above (a concurrent secondary already
-		// returned before reaching here), since the rollup counters are
-		// process-wide module state a live secondary would still need.
-		emitBusEventRollupAtSessionEnd(runtime.projectRoot);
-		emitVerifiedPathAttributionRollup(runtime.projectRoot);
-		// #2249: same primary-only placement — one concurrent_session_bind_rollup
-		// row summarizing this session's declined binds by classification, a
-		// no-op when none occurred.
-		emitConcurrentSessionBindRollupAtSessionEnd(runtime.projectRoot);
-		// #1123 item 4: dump active handles AFTER teardown — whatever is still
-		// alive at this point is exactly what would keep a --print/--no-session
-		// process from exiting (the #1097 lesson: what survives IS the leak).
-		// No-op unless DM_LENS_DEBUG_HANDLES=1.
-		dumpActiveHandles("session_shutdown");
+		// #3611 r2: the retire runs in `finally`. After a /reload that
+		// re-evaluated the entry nothing else ever ends this scope, so a throw
+		// from a teardown step below must not skip it.
+		try {
+			// Graceful quit or replacement is awaited by pi before it closes the
+			// process/stdin. The returned drain promise keeps the at-exit replay from
+			// seeing an in-flight batch (#935). Hard exits skip this hook.
+			// #3612 (D3): hand this scope's stores to the successor that
+			// continues its conversation (`/reload`, `/fork`, `/clone`), before
+			// any teardown below. This portion stays synchronous; the hook returns
+			// its bounded writer-drain promise after teardown. The
+			// slot's sidecar save is its fallback (a fork's parent sidecar).
+			// #3881: a start still in flight never adopted; the slot left for it
+			// is the conversation's state, so hand that on instead.
+			// #4113: a start interrupted before dm-lens's handler ran has no mark
+			// and no scope. Its shutdown is primary only with the gap's named key
+			// (#4106), so the gap's name is the start reason it never saw. A
+			// started activation holds its scope and stashes it, even in a gap
+			// it does not own (a same-file second primary, R2: verify X1).
+			const unstartedReason =
+				startInFlight || scope !== undefined
+					? undefined
+					: (namedSuccessorReason() ?? expiredSuccessorReason());
+			if (startInFlight || unstartedReason !== undefined) {
+				if (startInFlight) startInFlight.shutDown = true;
+				forwardHandoff({
+					startReason: startInFlight ? startInFlight.reason : unstartedReason,
+					reason: shutdownReason,
+					sessionFile: getSessionFile(ctx),
+					targetSessionFile: shutdownEvent?.targetSessionFile,
+					sessionManager: getSessionManager(ctx),
+				});
+			} else if (
+				scope &&
+				stashHandoff(scope, {
+					reason: shutdownReason,
+					sessionFile: getSessionFile(ctx),
+					targetSessionFile: shutdownEvent?.targetSessionFile,
+					// #3819: a file-less successor finds this slot's ticket through
+					// the session manager pi hands it.
+					sessionManager: getSessionManager(ctx),
+				}) &&
+				runtime.hasStableSessionId
+			) {
+				persistScope(
+					shutdownCwd ?? process.cwd(),
+					runtime.telemetrySessionId,
+					scope,
+				);
+			}
+			const switchesSessionFile =
+				typeof shutdownEvent?.targetSessionFile === "string" &&
+				shutdownEvent.targetSessionFile.length > 0;
+			if (
+				switchesSessionFile ||
+				shutdownReason === "quit" ||
+				shutdownReason === undefined
+			) {
+				endSituationalToolTelemetry();
+			}
+
+			// #1018/#1996: emit the bounded primary cache summary, then drop this
+			// session's prefix/attribution state. The secondary path did the same for
+			// its role-local bucket before returning above.
+			emitCacheUsageSummaryAtSessionEnd(stableSessionId, "primary");
+			clearCachePrefixSession(stableSessionId, "primary");
+
+			cancelLSPIdleReset();
+			// #449 slice 1: SYNC-only deregistration (no child spawns — see the
+			// processExiting note below); safe to call unconditionally here.
+			deregisterInstance();
+			// #2129 review F3: release the primary registration at the same boundary
+			// the registry entry is released. Root identity made a stale `activeRoot`
+			// decisive: without this, once root A's primary ended, every later start
+			// in root B would classify `secondary-root` forever — never primary,
+			// never a full start, no re-arm. This is the process-lifetime-latch shape
+			// the catalog names. Only the PRIMARY path reaches here; a secondary
+			// returned above precisely because the primary is still live.
+			// #3662: a replacement reason leaves the slot pending for its successor.
+			// #3855: and names it by the key its start will compute. Read after the
+			// stash or forward above, which bind a file-less successor's ticket.
+			releasePrimarySession(
+				shutdownReason,
+				successorStartKey({
+					reason: shutdownReason,
+					sessionFile: getSessionFile(ctx),
+					targetSessionFile: shutdownEvent?.targetSessionFile,
+					sessionManager: getSessionManager(ctx),
+				}),
+			);
+			// #2467: no analyzer bootstrap may START loading from here on. A demand
+			// already in flight keeps its promise and still settles — the gate is
+			// checked only when no flight exists. Nothing is spawned, which is what
+			// AGENTS.md's #234 teardown rule requires of a session_shutdown-time
+			// call; a replacement session re-arms the gate at its session_start.
+			markAnalyzerBootstrapShutdown();
+			// processExiting: the loop is closing here — killing LSP servers must NOT
+			// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
+			// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen
+			// on `pi update`. Direct handle-kill only. Grandchildren behind a
+			// shell/.cmd wrapper are NOT reaped by the OS (Windows does not kill
+			// children when a parent dies) — they rely on stdin EOF, LSP
+			// `initialize.processId` self-watchdog compliance, and the #449/#472
+			// cross-process instance registry's orphan reaper as the backstop (#472).
+			resetLSPService({
+				fast: true,
+				processExiting: true,
+				reason: "session_shutdown",
+			});
+			// S2d (gap 5, #1432 review): one session_end_bus_rollup row per event
+			// name with any activity this session — same primary-only placement as
+			// the shared-infra teardown above (a concurrent secondary already
+			// returned before reaching here), since the rollup counters are
+			// process-wide module state a live secondary would still need.
+			emitBusEventRollupAtSessionEnd(runtime.projectRoot);
+			// #3873 O5: the fence side of the same rollup. The bus row proves
+			// `skipped_stale_session`; this one gives each generation fence its
+			// guarded and dropped counts, so zero drops is distinguishable from
+			// a fence nothing exercised.
+			emitFenceRollupAtSessionEnd(runtime.projectRoot);
+			emitVerifiedPathAttributionRollup(runtime.projectRoot);
+			// #2249: same primary-only placement — one concurrent_session_bind_rollup
+			// row summarizing this session's declined binds by classification, a
+			// no-op when none occurred.
+			emitConcurrentSessionBindRollupAtSessionEnd(runtime.projectRoot);
+			// #1123 item 4: dump active handles AFTER teardown — whatever is still
+			// alive at this point is exactly what would keep a --print/--no-session
+			// process from exiting (the #1097 lesson: what survives IS the leak).
+			// No-op unless DM_LENS_DEBUG_HANDLES=1.
+			dumpActiveHandles("session_shutdown");
+		} finally {
+			// #3611: last, so nothing above runs under a retired scope. Every
+			// handle this session issued stops being current (design §3.4).
+			retireOwnScope(shutdownReason, stableSessionId);
+		}
+		return ndjsonDrain;
 	});
 
 	// --- Prompt-cache response-side usage observability (#1018) ---
@@ -3423,33 +4190,40 @@ function activateExtension(hostPi: ExtensionAPI) {
 					incrementDegradationCount(degradation);
 				}
 			} catch (err) {
-				dbg(`message_end handler error: ${err}`);
+				// #2884 class sweep: the ninth member. The issue's grep looked for
+				// `… crashed: ` and this one says `handler error`, so it was not in
+				// the table — same shape, same fix.
+				surfaceHandlerCrash("message_end", err, { dbg });
 			}
 		});
 	} catch (err) {
+		// NOT the same class: this catch guards the `pi.on` REGISTRATION against
+		// an older host that has no `message_end` event, so it must keep
+		// swallowing under the runner too — a host-capability probe is not a
+		// handler crash. Same for the `agent_settled` registration above.
 		dbg(`message_end subscribe failed (older pi host?): ${err}`);
 	}
 
 	// --- Inject turn-end findings into next agent turn ---
 	// jscpd, madge, and turn-end delta results are cached at turn_end and consumed here
 	// via the context event, which fires before each provider request.
-	// Placement (#1016): splice the ephemeral dm-lens findings in IMMEDIATELY BEFORE
-	// the final message rather than prepending at index 0. Prepending flipped
+	// Placement (#1016, #3693): never prepend at index 0. Prepending flipped
 	// messages[0] every turn, which invalidated the entire prompt-cache prefix on
 	// EVERY prefix-caching provider (Anthropic, Bedrock, AND OpenAI — all key the
-	// cache on the exact token prefix). Inserting before the last message keeps
-	// messages[0] (the real first user turn) byte-stable so the prior conversation
-	// stays cached, AND keeps the real user prompt as the trailing message —
-	// preserving the trailing-`user` cache breakpoint and the historical fe0ed5da
-	// guarantee that input is never empty (existingMessages are always preserved,
-	// never dropped).
+	// cache on the exact token prefix). When the last message is a plain user
+	// prompt, the findings are APPENDED to that prompt's own content (copy on
+	// write), so the prior conversation AND the prompt's text stay a byte-stable
+	// prefix and the transcript keeps a single trailing `user` message — the
+	// cache breakpoint and the historical fe0ed5da guarantee that input is never
+	// empty (existingMessages are always preserved, never dropped). #1016's
+	// earlier splice-before-final placement is retired (#3693).
 	//
 	// The `context` event fires before EVERY provider/LLM call, not just at turn
 	// boundaries (clients/agent-nudge.ts), so mid-agentic-loop the trailing message
 	// is often a `tool_result` — which MUST stay immediately adjacent to the
 	// assistant message carrying its matching `tool_use`/`tool_calls`, across all of
 	// Anthropic, Bedrock, and OpenAI (a 400 otherwise). The trailing-role guard
-	// (isPlainUserPrompt) therefore only splices before the last message when it is a
+	// (isPlainUserPrompt) therefore only appends to the last message when it is a
 	// plain user prompt; otherwise it APPENDS after the whole transcript, which both
 	// preserves that adjacency and is still fully cache-friendly (the entire prior
 	// transcript stays an untouched prefix).
@@ -3458,15 +4232,25 @@ function activateExtension(hostPi: ExtensionAPI) {
 		content: unknown;
 	}): boolean => {
 		if (msg.role !== "user") return false;
-		// String content is a plain prompt; only an array of content blocks can
-		// carry a tool_result, which must not be preceded by an injected message.
-		if (!Array.isArray(msg.content)) return true;
+		if (typeof msg.content === "string") return true;
+		if (!Array.isArray(msg.content)) return false;
 		return !msg.content.some(
 			(block) =>
 				typeof block === "object" &&
 				block !== null &&
 				(block as { type?: unknown }).type === "tool_result",
 		);
+	};
+	const appendToUserPromptContent = (
+		content: string | unknown[],
+		injectedText: string,
+	): unknown => {
+		if (typeof content === "string") {
+			return content.length > 0
+				? `${content}\n\n${injectedText}`
+				: injectedText;
+		}
+		return [...content, { type: "text", text: injectedText }];
 	};
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context") overload has TS resolution bug
 	(pi as any).on(
@@ -3509,7 +4293,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 				let telemetryLogged = false;
 				const logContextObservation = (
 					resultMessages: Array<{ role: string; content: unknown }>,
-					placement: "prepend" | "insert-before-final" | "append" | "none",
+					placement: CacheContextPlacement,
 					// #1071: the per-source slices ARE the telemetry input. The source
 					// name list and the flat message list are both derived from them
 					// inside observeCacheContext, so this call site cannot report a
@@ -3547,7 +4331,14 @@ function activateExtension(hostPi: ExtensionAPI) {
 						cacheManager,
 						cwd,
 					);
-					const agentNudge = consumeAgentNudge(dbg);
+					const testFindings = consumeStagedTestRunnerFindings({
+						cwd,
+						sessionId: runtime.telemetrySessionId,
+						ownerId: testRunnerDeliveryOwnerId,
+						cacheManager,
+						runtime,
+					});
+					const agentNudge = consumeAgentNudge(dbg, scope);
 					const sourceMessages = [
 						{
 							source: "session-guidance" as const,
@@ -3556,6 +4347,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 						{
 							source: "turn-findings" as const,
 							messages: turnEndFindings?.messages ?? [],
+						},
+						{
+							source: "test-findings" as const,
+							messages: testFindings?.messages ?? [],
 						},
 						{
 							source: "agent-nudge" as const,
@@ -3593,16 +4388,29 @@ function activateExtension(hostPi: ExtensionAPI) {
 						return { messages: resultMessages };
 					}
 
-					// Insert the injected block just before the final message so
-					// messages[0] stays stable and the real user prompt stays trailing.
+					const injectedText = injectedMessages
+						.map((m) => m.content)
+						.join("\n\n");
+					if (!injectedText) {
+						logContextObservation(existingMessages, "none", []);
+						return;
+					}
+
+					const updatedLastMessage = {
+						...lastMessage,
+						content: appendToUserPromptContent(
+							lastMessage.content as string | unknown[],
+							injectedText,
+						),
+					};
+
 					const resultMessages = [
 						...existingMessages.slice(0, -1),
-						...injectedMessages,
-						lastMessage,
+						updatedLastMessage,
 					];
 					logContextObservation(
 						resultMessages,
-						"insert-before-final",
+						"append-to-last-user",
 						sourceMessages,
 					);
 					return { messages: resultMessages };

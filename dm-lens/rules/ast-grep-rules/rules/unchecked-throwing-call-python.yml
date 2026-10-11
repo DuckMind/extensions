@@ -9,7 +9,11 @@ note: |
   json.loads(): raises json.JSONDecodeError on malformed JSON
   os.stat():    raises FileNotFoundError, PermissionError
   os.remove():  raises FileNotFoundError, PermissionError
-  int()/float():raises ValueError on non-numeric strings
+
+  `int()`/`float()` are a separate rule, `unchecked-numeric-parse-python`
+  (#3211): whether they can raise depends on the argument's runtime type,
+  which is often undecidable from syntax alone (a typed parameter, a prior
+  guard), so they ship at `warning` instead of `error` here.
 
   ✅ WRAP IN TRY/EXCEPT:
     try:
@@ -40,8 +44,6 @@ rule:
     - pattern: shutil.copy($$$)
     - pattern: shutil.move($$$)
     - pattern: shutil.rmtree($$$)
-    - pattern: int($EXPR)
-    - pattern: float($EXPR)
   not:
     inside:
       stopBy: end

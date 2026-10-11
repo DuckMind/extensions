@@ -36,6 +36,7 @@ export interface QueryResultData {
 	results: SearchResult[];
 	error: string | null;
 	provider?: string;
+	providers?: string[];
 }
 
 interface FetchCacheRef {
@@ -67,13 +68,17 @@ export interface StoredSearchData {
 }
 
 const storedResults = new Map<string, StoredSearchData>();
+/** How many live sessions hold each result. Sessions forked from one history hold the same ids. */
+const resultHolders = new Map<string, number>();
 
 export function generateId(): string {
 	return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
 export function getFetchCacheDir(): string {
-	return join(getWebSearchConfigDir(), FETCH_CACHE_DIR);
+	// Always append our own folder: pruning deletes stale *.json files, so the override must
+	// never point pruning at a directory that holds user files.
+	return join(process.env.PI_WEB_ACCESS_CACHE_ROOT || getWebSearchConfigDir(), FETCH_CACHE_DIR);
 }
 
 function fetchCachePath(key: string): string | null {
@@ -150,17 +155,9 @@ function cacheLimits(limits?: Partial<FetchCacheLimits>): FetchCacheLimits {
 	return resolved;
 }
 
-function enforceDirectoryMode(fd: number): void {
+function enforceMode(fd: number, mode: number): void {
 	try {
-		fchmodSync(fd, 0o700);
-	} catch (err) {
-		if (process.platform !== "win32") throw err;
-	}
-}
-
-function enforceFileMode(fd: number): void {
-	try {
-		fchmodSync(fd, 0o600);
+		fchmodSync(fd, mode);
 	} catch (err) {
 		if (process.platform !== "win32") throw err;
 	}
@@ -181,31 +178,23 @@ function safeFetchCacheDir(create: boolean): string | null {
 	if (before.isSymbolicLink() || !before.isDirectory()) {
 		throw new Error("Fetched content cache path is not a safe directory");
 	}
-	if (process.platform === "win32") {
-		const after = lstatSync(dir);
-		if (after.isSymbolicLink() || !after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
-			throw new Error("Fetched content cache directory changed while securing it");
+	if (process.platform !== "win32") {
+		const fd = openSync(dir, constants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+		try {
+			const opened = fstatSync(fd);
+			if (!opened.isDirectory() || opened.dev !== before.dev || opened.ino !== before.ino) {
+				throw new Error("Fetched content cache directory changed while opening");
+			}
+			enforceMode(fd, 0o700);
+		} finally {
+			closeSync(fd);
 		}
-		return dir;
 	}
-	let fd: number | null = null;
-	try {
-		fd = openSync(dir, constants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-		const opened = fstatSync(fd);
-		if (!opened.isDirectory() || opened.dev !== before.dev || opened.ino !== before.ino) {
-			throw new Error("Fetched content cache directory changed while opening");
-		}
-		enforceDirectoryMode(fd);
-		closeSync(fd);
-		fd = null;
-		const after = lstatSync(dir);
-		if (after.isSymbolicLink() || !after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
-			throw new Error("Fetched content cache directory changed while securing it");
-		}
-		return dir;
-	} finally {
-		if (fd !== null) try { closeSync(fd); } catch {}
+	const after = lstatSync(dir);
+	if (after.isSymbolicLink() || !after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
+		throw new Error("Fetched content cache directory changed while securing it");
 	}
+	return dir;
 }
 
 function openRegularFile(path: string): { fd: number; info: Stats } {
@@ -224,28 +213,22 @@ function openRegularFile(path: string): { fd: number; info: Stats } {
 	}
 }
 
-type CacheUnlinkResult = "removed" | "missing" | "changed" | "error";
-
-function unlinkCacheFile(dir: string, file: CacheFile): CacheUnlinkResult {
+// True once the entry is gone; false when the directory or entry changed underneath us or could not be removed.
+function unlinkCacheFile(dir: string, file: CacheFile): boolean {
 	try {
 		const root = lstatSync(dir);
-		if (root.isSymbolicLink() || !root.isDirectory()) return "changed";
-		const path = join(dir, file.name);
-		let current: Stats;
-		try {
-			current = lstatSync(path);
-		} catch (err) {
-			return (err as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "error";
-		}
-		if (current.isSymbolicLink() || !current.isFile() || current.dev !== file.dev || current.ino !== file.ino) return "changed";
-		try {
-			unlinkSync(path);
-			return "removed";
-		} catch (err) {
-			return (err as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "error";
-		}
+		if (root.isSymbolicLink() || !root.isDirectory()) return false;
 	} catch {
-		return "error";
+		return false;
+	}
+	try {
+		const path = join(dir, file.name);
+		const current = lstatSync(path);
+		if (current.isSymbolicLink() || !current.isFile() || current.dev !== file.dev || current.ino !== file.ino) return false;
+		unlinkSync(path);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "ENOENT";
 	}
 }
 
@@ -268,24 +251,21 @@ function pruneFetchCache(now: number, limits: FetchCacheLimits, preferredKey?: s
 	const files: CacheFile[] = [];
 	for (const entry of entries) {
 		if (!CACHE_KEY_PATTERN.test(entry) && !CACHE_TMP_PATTERN.test(entry)) continue;
-		const path = join(dir, entry);
-		let opened: ReturnType<typeof openRegularFile>;
+		let info: Stats;
 		try {
-			opened = openRegularFile(path);
+			const opened = openRegularFile(join(dir, entry));
+			info = opened.info;
+			try {
+				enforceMode(opened.fd, 0o600);
+			} finally {
+				closeSync(opened.fd);
+			}
 		} catch {
 			continue;
 		}
-		try {
-			enforceFileMode(opened.fd);
-		} catch {
-			closeSync(opened.fd);
-			continue;
-		}
-		closeSync(opened.fd);
-		const file = { name: entry, size: opened.info.size, mtimeMs: opened.info.mtimeMs, dev: opened.info.dev, ino: opened.info.ino };
+		const file = { name: entry, size: info.size, mtimeMs: info.mtimeMs, dev: info.dev, ino: info.ino };
 		if (now - file.mtimeMs >= CACHE_TTL_MS) {
-			const removed = unlinkCacheFile(dir, file);
-			if (removed !== "removed" && removed !== "missing") return false;
+			if (!unlinkCacheFile(dir, file)) return false;
 			continue;
 		}
 		if (CACHE_KEY_PATTERN.test(entry)) files.push(file);
@@ -306,8 +286,7 @@ function pruneFetchCache(now: number, limits: FetchCacheLimits, preferredKey?: s
 		if (index < 0) break;
 		const file = files[index];
 		attempted.add(file.name);
-		const removed = unlinkCacheFile(dir, file);
-		if (removed === "removed" || removed === "missing") files.splice(index, 1);
+		if (unlinkCacheFile(dir, file)) files.splice(index, 1);
 		usage = projectedUsage();
 	}
 	return usage.entries <= limits.maxEntries && usage.bytes <= limits.maxBytes;
@@ -334,7 +313,7 @@ function writeFetchCache(data: StoredSearchData & { urls: ExtractedContent[] }):
 		fd = openSync(tmpPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | O_NOFOLLOW, 0o600);
 		const tmpInfo = fstatSync(fd);
 		tmpFile = { name: tmpName, size: tmpInfo.size, mtimeMs: tmpInfo.mtimeMs, dev: tmpInfo.dev, ino: tmpInfo.ino };
-		enforceFileMode(fd);
+		enforceMode(fd, 0o600);
 		writeFileSync(fd, serialized, "utf8");
 		fsyncSync(fd);
 		closeSync(fd);
@@ -355,11 +334,6 @@ function writeFetchCache(data: StoredSearchData & { urls: ExtractedContent[] }):
 		throw err;
 	}
 	return { version: FETCH_CACHE_VERSION, key, storedAt: Date.now() };
-}
-
-function cacheWriteError(err: unknown): string {
-	const message = err instanceof Error ? err.message : String(err);
-	return `Failed to write fetched content cache: ${message}`;
 }
 
 function createFetchSessionData(data: StoredSearchData & { urls: ExtractedContent[] }, ref: FetchCacheRef | null, cacheError?: string): StoredSearchData {
@@ -393,9 +367,9 @@ function unavailableFetchData(data: StoredSearchData, reason: string): StoredSea
 	};
 }
 
-function readCachedFetchData(data: StoredSearchData, now = Date.now()): StoredSearchData {
+function readCachedFetchData(data: StoredSearchData): StoredSearchData {
 	if (data.type !== "fetch") return data;
-	if (now - data.timestamp >= CACHE_TTL_MS) {
+	if (Date.now() - data.timestamp >= CACHE_TTL_MS) {
 		return unavailableFetchData(data, "Cached fetched content is missing or expired");
 	}
 	if (isInlineFetchData(data)) return data;
@@ -409,7 +383,7 @@ function readCachedFetchData(data: StoredSearchData, now = Date.now()): StoredSe
 		if (!safeFetchCacheDir(false)) return unavailableFetchData(data, "Cached fetched content is missing or expired");
 		const opened = openRegularFile(path);
 		fd = opened.fd;
-		enforceFileMode(fd);
+		enforceMode(fd, 0o600);
 		const parsed: unknown = JSON.parse(readFileSync(fd, "utf8"));
 		if (!isValidStoredData(parsed) || parsed.type !== "fetch" || parsed.id !== data.id || !isInlineFetchData(parsed)) {
 			return unavailableFetchData(data, "Cached fetched content is invalid");
@@ -426,8 +400,17 @@ function readCachedFetchData(data: StoredSearchData, now = Date.now()): StoredSe
 	}
 }
 
+function pruneExpiredFetchedResults(now: number): void {
+	for (const [id, data] of storedResults) {
+		if (data.type === "fetch" && now - data.timestamp >= CACHE_TTL_MS) {
+			storedResults.set(id, unavailableFetchData(data, "Cached fetched content is missing or expired"));
+		}
+	}
+}
+
 export function pruneExpiredFetchCache(now = Date.now(), requestedLimits?: Partial<FetchCacheLimits>): void {
 	const limits = cacheLimits(requestedLimits);
+	pruneExpiredFetchedResults(now);
 	try { pruneFetchCache(now, limits); } catch {}
 }
 
@@ -436,12 +419,13 @@ export function storeResult(id: string, data: StoredSearchData): void {
 }
 
 export function storeFetchedContentResult(id: string, data: StoredSearchData & { type: "fetch"; urls: ExtractedContent[] }): StoredSearchData {
+	pruneExpiredFetchedResults(Date.now());
 	let ref: FetchCacheRef | null = null;
 	let cacheError: string | undefined;
 	try {
 		ref = writeFetchCache(data);
 	} catch (err) {
-		cacheError = cacheWriteError(err);
+		cacheError = `Failed to write fetched content cache: ${err instanceof Error ? err.message : String(err)}`;
 	}
 	storedResults.set(id, ref ? { ...data, fetchCache: ref, urlMetadata: metadataForUrls(data.urls) } : { ...data, fetchCacheError: cacheError });
 	return createFetchSessionData(data, ref, cacheError);
@@ -473,11 +457,40 @@ export function deleteResult(id: string): boolean {
 			}
 		} catch {}
 	}
+	resultHolders.delete(id);
 	return storedResults.delete(id);
 }
 
 export function clearResults(): void {
 	storedResults.clear();
+	resultHolders.clear();
+}
+
+/** Record that one more live session holds each of these results. */
+export function holdResults(ids: Iterable<string>): void {
+	for (const id of ids) resultHolders.set(id, (resultHolders.get(id) ?? 0) + 1);
+}
+
+/** Release one session's hold on each result, and drop a result from memory once no live
+ * session holds it. Unlike deleteResult, the fetch cache files stay: the session journal
+ * still references them, and a later restore reads them back. */
+export function releaseResults(ids: Iterable<string>): void {
+	for (const id of ids) {
+		const holders = (resultHolders.get(id) ?? 0) - 1;
+		if (holders > 0) {
+			resultHolders.set(id, holders);
+			continue;
+		}
+		resultHolders.delete(id);
+		storedResults.delete(id);
+	}
+}
+
+/** Delete a result for one session that holds it. Other live sessions holding the same
+ * result keep it and its fetch cache file; the last holder deletes both. */
+export function deleteHeldResult(id: string): void {
+	if ((resultHolders.get(id) ?? 0) > 1) releaseResults([id]);
+	else deleteResult(id);
 }
 
 function isValidStoredData(data: unknown): data is StoredSearchData {
@@ -498,15 +511,33 @@ function isValidStoredData(data: unknown): data is StoredSearchData {
 
 export function restoreFromSession(ctx: ExtensionContext): void {
 	storedResults.clear();
+	loadSessionResults(ctx);
+}
+
+/** Add one session's stored results to memory, leaving other sessions' results in place,
+ * and return the results it loaded. A host that runs several sessions at once (one extension
+ * instance per session) restores each with this, holds their ids with holdResults, and
+ * releases them with releaseResults. */
+export function loadSessionResults(ctx: ExtensionContext): StoredSearchData[] {
 	const now = Date.now();
 	pruneExpiredFetchCache(now);
 
+	const loaded: StoredSearchData[] = [];
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type === "custom" && entry.customType === "web-search-results") {
 			const data = entry.data;
 			if (isValidStoredData(data) && now - data.timestamp < CACHE_TTL_MS) {
+				// Another live session may hold this result with its fetched content in memory;
+				// the journal copy only points at the disk cache, which can be pruned.
+				const live = storedResults.get(data.id);
+				if (live) {
+					loaded.push(live);
+					continue;
+				}
 				storedResults.set(data.id, data);
+				loaded.push(data);
 			}
 		}
 	}
+	return loaded;
 }

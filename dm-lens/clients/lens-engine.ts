@@ -27,12 +27,13 @@ import {
 } from "./instance-registry.js";
 import { extensionsForLanguageToken } from "./language-registry.js";
 import { initLSPConfig } from "./lsp/config.js";
-import { getLSPService } from "./lsp/index.js";
+import { getLSPService } from "./lsp/capabilities.js";
 import { acquireWarmWordIndex } from "./mcp/analyze.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { scanProjectDiagnostics } from "./project-diagnostics/scanner.js";
 import type { ProjectDiagnosticsSnapshot } from "./project-diagnostics/types.js";
 import { loadProjectSnapshotWithoutWordIndex } from "./project-snapshot.js";
+import { resolveLensToolName, type LensToolHost } from "./tool-config.js";
 import type { ReviewGraph } from "./review-graph/types.js";
 import {
 	getTreeSitterRuntimeStatus,
@@ -48,19 +49,13 @@ import {
 
 // --- Facades (re-exported so adapters import only this module) ---------------
 
-export {
-	type AnalyzeFileOptions,
-	analyzeFile,
-	type McpAnalyzeResult,
-} from "./mcp/analyze.js";
+export { analyzeFile, type McpAnalyzeResult } from "./mcp/analyze.js";
 export { createMcpHost } from "./mcp/host-shim.js";
 export {
 	createWarmIpcLineReader,
 	createWarmIpcRequestQueue,
 	ipcPathForCwd,
 	readTurnEndStatus,
-	requestWarmAnalyze,
-	type TurnEndStatus,
 	WARM_TURN_END_SCHEMA_VERSION,
 	type WarmAnalyzeRequest,
 	type WarmTurnEndRequest,
@@ -69,10 +64,8 @@ export {
 export {
 	analyzeFileFresh,
 	canRebuildDmLens,
-	REBUILD_UNAVAILABLE_MESSAGE,
 	resolveRebuildScript,
 	runRebuild,
-	type ScanDiagnostic,
 	summarizeScan,
 } from "./mcp/review.js";
 export {
@@ -80,35 +73,18 @@ export {
 	runSessionStart,
 	runTurnEnd,
 	runTurnEndForIpc,
-	type SessionStartOutcome,
-	type TurnEndDelivery,
-	type TurnEndOutcome,
 } from "./mcp/session.js";
 export {
-	type ModuleReport,
-	type ModuleReportOptions,
-	type ModuleSymbolEntry,
 	moduleReport,
-	type ReadEnclosingOptions,
-	type ReadEnclosingResult,
-	type ReadSymbolResult,
-	type RecommendedRead,
 	readEnclosing,
 	readSymbol,
 	renderCompactModuleReport,
 } from "./module-report.js";
 export {
 	type ProjectReport,
-	type ProjectReportOptions,
 	projectReport,
 	renderCompactProjectReport,
 } from "./project-report.js";
-export {
-	createDefaultHostPorts,
-	type HostLogSink,
-	type HostPorts,
-	type HostPortsOverrides,
-} from "./host-ports.js";
 // Effective-config introspection (#2427). A facade rather than a wrapper for
 // the same reason the others are: the computation reaches into the config
 // resolution, the LSP registry and the dispatch plan at once, and putting that
@@ -116,16 +92,10 @@ export {
 // server is selected. Adapters route to it; nobody re-derives it.
 export {
 	effectiveConfig,
-	type EffectiveConfigDocument,
-	type EffectiveConfigOptions,
 	type EffectiveConfigView,
 	type EffectiveFileView,
-	type EffectiveFileViewError,
 	type EffectiveServerDecision,
-	type EffectiveToolDecision,
 	isEffectiveFileViewError,
-	type RedactedServerSpec,
-	type ToolSelectionReason,
 } from "./effective-config.js";
 
 // --- Query wrappers (own the remaining internal reach-ins) -------------------
@@ -229,6 +199,7 @@ export function generatedSkipNotice(
 		ProjectDiagnosticsSnapshot,
 		"generatedNameOnlySkips" | "generatedDirSkips"
 	>,
+	host: LensToolHost = "pi",
 ): string | undefined {
 	const files = snapshot.generatedNameOnlySkips ?? 0;
 	const dirs = snapshot.generatedDirSkips ?? 0;
@@ -236,12 +207,20 @@ export function generatedSkipNotice(
 	const parts: string[] = [];
 	if (files > 0) parts.push(`${files} file(s)`);
 	if (dirs > 0) parts.push(`${dirs} director${dirs === 1 ? "y" : "ies"}`);
+	// #2535 F1: name the tools THIS host can call. pi has no project-scan
+	// surface, so it names only its diagnostics tool; MCP names both. A
+	// known-but-unmapped host resolves to undefined and is left out, never
+	// printed as a name the host cannot resolve.
+	const targets = [
+		resolveLensToolName("project_scan", host),
+		resolveLensToolName("lens_diagnostics", host),
+	].filter((tool): tool is string => tool !== undefined);
+	const scanRef = targets.length > 0 ? ` to ${targets.join(" / ")}` : "";
 	return (
 		`ℹ ${parts.join(" and ")} excluded by generated-name heuristics with no ` +
 		"confirming evidence — a real hand-written file/directory whose name " +
 		"looks generated (e.g. `gen.ts`, `generated/`) can be excluded too; " +
-		"pass includeGenerated: true to dmlens_project_scan / lens_diagnostics " +
-		"to scan without this filter if you suspect a false skip."
+		`pass includeGenerated: true${scanRef} to scan without this filter if you suspect a false skip.`
 	);
 }
 
@@ -321,7 +300,7 @@ export function resourceFootprint(): Promise<ResourceFootprint> {
  * offset=startLine, limit=endLine-startLine+1 for a one-line peek — prefer
  * module_report on `file` for the real outline. No per-hit `read` block, no
  * repeated raw `lines[]` array on the wire. */
-export interface SymbolSearchHit {
+interface SymbolSearchHit {
 	file: string;
 	score: number;
 	hits: number;

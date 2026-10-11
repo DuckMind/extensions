@@ -1,3 +1,4 @@
+import { withHandoffWriteLock, withRepositoryWorktreeLock } from "./worktree-lock.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
@@ -17,9 +18,10 @@ import type {
 	WorktreeCleanupReport,
 	WorktreeDiff,
 	WorktreeSetup,
+	WorktreeSetupProgress,
 	WorktreeCleanupIntent,
 } from "./worktree.ts";
-import { cleanupWorktrees } from "./worktree.ts";
+import { cleanupWorktrees, withWorktreeTransaction } from "./worktree.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "./lane-metadata.ts";
 
 export interface ParallelHandoffResult {
@@ -156,6 +158,26 @@ function resolveExistingPath(candidate: string): string {
 function pathInside(root: string, candidate: string): boolean {
 	const relative = path.relative(root, candidate);
 	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+export async function protectRetainedWorktreeForResume(manifestPath: string, runId: string, childIndex: number, signal?: AbortSignal): Promise<string> {
+	const original = readParallelHandoffManifest(manifestPath);
+	const group = original?.groups.find((item) => item.children.some((child) => child.index === childIndex));
+	if (!group) throw new Error("Retained worktree handoff disappeared before resume admission.");
+	return withWorktreeTransaction(() => withRepositoryWorktreeLock(group.repoRoot, () => withHandoffWriteLock(manifestPath, () => {
+		signal?.throwIfAborted();
+		const cwd = resolveRetainedWorktreeCwd(manifestPath, runId, childIndex);
+		if (!cwd) throw new Error("Retained worktree ownership disappeared before resume admission.");
+		const manifest = readParallelHandoffManifest(manifestPath)!;
+		const currentGroup = manifest.groups.find((item) => item.children.some((child) => child.index === childIndex))!;
+		const child = currentGroup.children.find((item) => item.index === childIndex)!;
+		const task = currentGroup.cleanup.tasks.find((item) => item.index === child.taskIndex)!;
+		task.preserved = true;
+		task.reason = "retained child resume requires managed worktree cwd";
+		manifest.updatedAt = Date.now();
+		writeAtomicJson(manifestPath, manifest);
+		return cwd;
+	}), { signal }));
 }
 
 export function resolveRetainedWorktreeCwd(manifestPath: string, runId: string, childIndex: number): string | undefined {
@@ -404,7 +426,7 @@ function firstRepositoryRoot(manifest: ParallelHandoffManifest): string | undefi
 
 function formatCleanupCommand(manifestPath: string, manifest: ParallelHandoffManifest): string | undefined {
 	const repoRoot = firstRepositoryRoot(manifest);
-	return repoRoot ? `subagent({ action: "worktree.cleanup", repo: ${JSON.stringify(repoRoot)}, handoffPath: ${JSON.stringify(manifestPath)}, mode: "plan" })` : undefined;
+	return repoRoot ? `subagent({ action: "worktree.cleanup", options: { repo: ${JSON.stringify(repoRoot)}, handoffPath: ${JSON.stringify(manifestPath)}, mode: "plan" } })` : undefined;
 }
 
 export function formatStoredParallelHandoffCleanup(manifestPath: string, manifest?: ParallelHandoffManifest): string {
@@ -416,7 +438,7 @@ export function formatStoredParallelHandoffCleanup(manifestPath: string, manifes
 			stored = undefined;
 		}
 	}
-	if (!stored) return ["Cleanup eligibility: unknown", "Reason: lane manifest is missing or invalid; removal is not safe.", `Plan command: subagent({ action: "worktree.cleanup", handoffPath: ${JSON.stringify(manifestPath)}, mode: "plan" })`].join("\n");
+	if (!stored) return ["Cleanup eligibility: unknown", "Reason: lane manifest is missing or invalid; removal is not safe.", `Plan command: subagent({ action: "worktree.cleanup", options: { handoffPath: ${JSON.stringify(manifestPath)}, mode: "plan" } })`].join("\n");
 	const eligibility = trustedStoredCleanupEligibility(stored);
 	const lines = [`Cleanup eligibility: ${eligibility.state}`];
 	if (eligibility.state === "terminal-blocked") lines.push(`Reason: ${eligibility.reason}`);
@@ -433,7 +455,11 @@ export interface ParallelHandoffEvidenceResult {
 	text: string;
 }
 
-export function recordParallelHandoffMerge(input: { manifestPath: string; laneId: string; merge: unknown; now?: number }): ParallelHandoffEvidenceResult {
+export function recordParallelHandoffMerge(...args: Parameters<typeof recordParallelHandoffMergeUnlocked>): ReturnType<typeof recordParallelHandoffMergeUnlocked> {
+	return withHandoffWriteLock(args[0].manifestPath, () => recordParallelHandoffMergeUnlocked(...args));
+}
+
+function recordParallelHandoffMergeUnlocked(input: { manifestPath: string; laneId: string; merge: unknown; now?: number }): ParallelHandoffEvidenceResult {
 	const manifest = readParallelHandoffManifest(input.manifestPath);
 	if (!manifest) throw new Error(`Parallel handoff manifest not found: ${input.manifestPath}`);
 	validateManifestForLaneEvidence(manifest, boundedString(input.laneId, "laneId", MAX_SUPERSESSION_ID_LENGTH));
@@ -451,7 +477,11 @@ export function recordParallelHandoffMerge(input: { manifestPath: string; laneId
 	return { manifest: updated, reference: referenceFor(input.manifestPath, updated), text: formatStoredParallelHandoffCleanup(input.manifestPath, updated) };
 }
 
-export function recordParallelHandoffSupersession(input: { manifestPath: string; laneId: string; supersession: unknown; now?: number }): ParallelHandoffEvidenceResult {
+export function recordParallelHandoffSupersession(...args: Parameters<typeof recordParallelHandoffSupersessionUnlocked>): ReturnType<typeof recordParallelHandoffSupersessionUnlocked> {
+	return withHandoffWriteLock(args[0].manifestPath, () => recordParallelHandoffSupersessionUnlocked(...args));
+}
+
+function recordParallelHandoffSupersessionUnlocked(input: { manifestPath: string; laneId: string; supersession: unknown; now?: number }): ParallelHandoffEvidenceResult {
 	const manifest = readParallelHandoffManifest(input.manifestPath);
 	if (!manifest) throw new Error(`Parallel handoff manifest not found: ${input.manifestPath}`);
 	const laneId = boundedString(input.laneId, "laneId", MAX_SUPERSESSION_ID_LENGTH);
@@ -493,7 +523,11 @@ function missingDiff(input: { manifestPath: string; stepIndex: number; taskIndex
 	};
 }
 
-export function writeParallelHandoffGroup(input: {
+export function writeParallelHandoffGroup(...args: Parameters<typeof writeParallelHandoffGroupUnlocked>): ReturnType<typeof writeParallelHandoffGroupUnlocked> {
+	return withHandoffWriteLock(args[0].manifestPath, () => writeParallelHandoffGroupUnlocked(...args));
+}
+
+function writeParallelHandoffGroupUnlocked(input: {
 	manifestPath: string;
 	runId: string;
 	mode: "single" | "parallel" | "chain";
@@ -574,6 +608,9 @@ export function writeParallelHandoffGroup(input: {
 				index: worktree.index,
 				path: worktree.path,
 				branch: worktree.branch,
+				...(worktree.provider ? { provider: worktree.provider } : {}),
+				...(worktree.naming ? { naming: worktree.naming } : {}),
+				...(worktree.recordedBaseDir ? { recordedBaseDir: worktree.recordedBaseDir } : {}),
 				worktreeRemoved: false,
 				branchRemoved: false,
 				preserved: true,
@@ -581,6 +618,15 @@ export function writeParallelHandoffGroup(input: {
 			})),
 		},
 	};
+	for (const task of group.cleanup.tasks) {
+		const previous = existing?.groups.flatMap((item) => item.cleanup.tasks).find((item) => item.path === task.path && item.branch === task.branch);
+		if (previous?.worktreeRemoved) task.worktreeRemoved = true;
+		if (previous?.branchRemoved) task.branchRemoved = true;
+		if (!task.worktreeRemoved && previous?.reason?.includes("retained child resume")) {
+			task.preserved = true;
+			task.reason = previous.reason;
+		}
+	}
 	const groups = existing?.groups.filter((candidate) => candidate.stepIndex !== input.stepIndex) ?? [];
 	groups.push(group);
 	groups.sort((left, right) => left.stepIndex - right.stepIndex);
@@ -612,18 +658,62 @@ export function parallelHandoffPath(baseDir: string, runId?: string): string {
 	return runId ? path.join(baseDir, "handoffs", `${runId}.json`) : path.join(baseDir, "handoff.json");
 }
 
-export function writePendingParallelHandoff(input: {
-	manifestPath: string;
-	runId: string;
-	mode: "single" | "parallel" | "chain";
-	source: "foreground" | "async";
-	cwd: string;
-	stepIndex: number;
-	flatStartIndex: number;
-	setup: WorktreeSetup;
-	laneBindings?: ParallelHandoffLaneBinding[];
-}): ParallelHandoffReference {
-	return writeParallelHandoffGroup({ ...input, diffs: [], results: [] });
+/** Synchronous onProgress projection shared by setup owners; snapshots are cumulative. */
+export function writeWorktreeSetupHandoff(input: Omit<Parameters<typeof writeParallelHandoffGroup>[0], "setup" | "diffs" | "results" | "cleanup" | "now"> & {
+	progress: WorktreeSetupProgress;
+}): ParallelHandoffReference | undefined {
+	const { progress, ...handoff } = input;
+	const { setup, attempts, cleanup } = progress;
+	// Preflight has no allocation identity yet. Its original error belongs to the caller.
+	if (attempts.length === 0 && setup.worktrees.length === 0) return undefined;
+	if (!setup.cwd || !setup.baseCommit) throw new Error("Cannot publish worktree allocation evidence without repository and base commit.");
+	const diagnostic = (text: string): string => text.slice(0, 512);
+	// Never copy argv, environment, Error objects or captured stdout/stderr into artifacts.
+	const commandEvidence = (command: WorktreeSetupProgress["command"]) => command && ({
+		pid: command.pid,
+		processGroupId: command.processGroupId,
+		...(command.result ? {
+			status: command.result.status,
+			signal: command.result.signal,
+			failed: Boolean(command.result.error),
+			outputIncomplete: command.result.outputIncomplete,
+			processTree: command.result.processTree?.state,
+		} : {}),
+	});
+	const errors = [
+		`Worktree setup ${JSON.stringify({ runId: input.runId, stepIndex: input.stepIndex, phase: progress.phase,
+			unknown: Boolean(progress.unknown), command: commandEvidence(progress.command) })}`,
+		...attempts.map((attempt) => {
+			const task = cleanup?.tasks.find((candidate) => candidate.index === attempt.index);
+			return `Allocation attempt ${JSON.stringify({ index: attempt.index, branch: attempt.branch,
+				path: attempt.path ?? null, validated: attempt.validated,
+				command: commandEvidence(attempt.command), hookCommand: commandEvidence(attempt.hookCommand),
+				...(task ? { worktreeRemoved: task.worktreeRemoved, branchRemoved: task.branchRemoved,
+					preserved: task.preserved, reason: task.reason && diagnostic(task.reason), errors: task.errors?.map(diagnostic) } : {}),
+			})}`;
+		}),
+		...(cleanup?.errors?.map(diagnostic) ?? []),
+		...(progress.unknown ? ["Setup settlement unknown; manual reconciliation required."] : []),
+	];
+	return writeParallelHandoffGroup({
+		...handoff, setup, diffs: [], results: [],
+		laneBindings: input.laneBindings?.filter((binding) => setup.worktrees.some((worktree) => worktree.index === binding.taskIndex)),
+		cleanup: {
+			state: cleanup?.state ?? "partial",
+			pruned: cleanup?.pruned ?? false,
+			errors,
+			// An attempted native path is not a validated recovery task, even during rollback.
+			tasks: setup.worktrees.map((worktree) => {
+				const task = cleanup?.tasks.find((candidate) => candidate.index === worktree.index);
+				return task ? { ...task, reason: task.reason && diagnostic(task.reason), errors: task.errors?.map(diagnostic) } : {
+					index: worktree.index, path: worktree.path, branch: worktree.branch,
+					provider: worktree.provider, naming: worktree.naming, recordedBaseDir: worktree.recordedBaseDir,
+					worktreeRemoved: false, branchRemoved: false, preserved: true,
+					reason: "setup pending durable handoff capture",
+				};
+			}),
+		},
+	});
 }
 
 export function formatParallelHandoffReference(reference: ParallelHandoffReference): string {
@@ -634,7 +724,11 @@ export function formatParallelHandoffError(error: unknown): string {
 	return `Worktree handoff unavailable: ${error instanceof Error ? error.message : String(error)}`;
 }
 
-export function discardPreservedWorktrees(
+export function discardPreservedWorktrees(...args: Parameters<typeof discardPreservedWorktreesUnlocked>): ReturnType<typeof discardPreservedWorktreesUnlocked> {
+	return withHandoffWriteLock(args[0], () => discardPreservedWorktreesUnlocked(...args));
+}
+
+function discardPreservedWorktreesUnlocked(
 	manifestPath: string,
 	authorization: Extract<WorktreeCleanupIntent, { kind: "discard" }>["authorization"],
 ): { manifest: ParallelHandoffManifest; text: string } {
@@ -653,6 +747,9 @@ export function discardPreservedWorktrees(
 				path: task.path,
 				agentCwd: task.path,
 				branch: task.branch,
+				...(task.provider ? { provider: task.provider } : {}),
+				...(task.naming ? { naming: task.naming } : {}),
+				...(task.recordedBaseDir ? { recordedBaseDir: task.recordedBaseDir } : {}),
 				index: task.index,
 				nodeModulesLinked: false,
 				syntheticPaths: [],

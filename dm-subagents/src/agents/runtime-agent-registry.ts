@@ -5,7 +5,7 @@ import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { validatePermissionRules, type PermissionRules } from "../runs/shared/permissions.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { BUILTIN_AGENT_NAMES } from "./builtin-names.ts";
-import type { AgentConfig, AgentDefaultContext, AgentDiscoveryDiagnostic } from "./agents.ts";
+import { applyRuntimeAgentSettings, type AgentConfig, type AgentDefaultContext, type AgentDiscoveryDiagnostic, type RuntimeAgentSettingsContext } from "./agents.ts";
 
 export const RUNTIME_AGENT_REGISTRY_KEY = "dm-subagents.runtime-agents.v1";
 
@@ -20,10 +20,10 @@ export interface RuntimeAgentDefinition {
 	systemPrompt: string;
 	aliases?: readonly string[];
 	tools?: readonly string[];
+	excludeTools?: readonly string[];
 	allowNestedSubagents?: boolean;
 	mcpDirectTools?: readonly string[];
 	model?: string;
-	fallbackModels?: readonly string[];
 	thinking?: string | false;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext?: boolean;
@@ -36,6 +36,7 @@ export interface RuntimeAgentDefinition {
 	defaultAcceptance?: AcceptanceInput;
 	acceptanceRole?: AcceptanceRole;
 	runner?: AgentRunnerConfig;
+	machine?: string;
 	skills?: readonly string[];
 	skillPath?: readonly string[];
 	extensions?: readonly string[];
@@ -47,7 +48,6 @@ export interface RuntimeAgentDefinition {
 	defaultProgress?: boolean;
 	interactive?: boolean;
 	maxSubagentDepth?: number;
-	completionGuard?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	permissions?: PermissionRules;
 }
@@ -198,11 +198,11 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Runtime agent definition must be an object.");
 	const definition = value as Record<string, unknown>;
 	const supported = new Set([
-		"description", "systemPrompt", "aliases", "tools", "allowNestedSubagents", "mcpDirectTools", "model", "fallbackModels", "thinking",
+		"description", "systemPrompt", "aliases", "tools", "excludeTools", "allowNestedSubagents", "mcpDirectTools", "model", "thinking",
 		"systemPromptMode", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "defaultContext", "defaultAsync", "defaultTimeoutMs",
-		"defaultToolTimeoutMs", "defaultAcceptance", "acceptanceRole", "runner", "skills", "skillPath",
+		"defaultToolTimeoutMs", "defaultAcceptance", "acceptanceRole", "runner", "machine", "skills", "skillPath",
 		"extensions", "subagentOnlyExtensions", "mutationTools", "output", "outputMode", "defaultReads", "defaultProgress", "interactive",
-		"maxSubagentDepth", "completionGuard", "toolBudget", "permissions",
+		"maxSubagentDepth", "toolBudget", "permissions",
 	]);
 	const unknown = Object.keys(definition).filter((key) => !supported.has(key));
 	if (unknown.length > 0) throw new Error(`Runtime agent definition has unknown fields: ${unknown.join(", ")}.`);
@@ -218,10 +218,11 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 	if (outputMode !== undefined && outputMode !== "inline" && outputMode !== "file-only") throw new Error("Runtime agent definition outputMode must be 'inline' or 'file-only'.");
 	const aliases = validateStringList(definition.aliases, "Runtime agent definition aliases");
 	const tools = validateStringList(definition.tools, "Runtime agent definition tools");
+	const excludeTools = validateStringList(definition.excludeTools, "Runtime agent definition excludeTools");
 	const allowNestedSubagents = validateBoolean(definition.allowNestedSubagents, "Runtime agent definition allowNestedSubagents");
 	const mcpDirectTools = validateStringList(definition.mcpDirectTools, "Runtime agent definition mcpDirectTools");
 	const model = validateOptionalString(definition.model, "Runtime agent definition model");
-	const fallbackModels = validateStringList(definition.fallbackModels, "Runtime agent definition fallbackModels");
+	if ((definition as Record<string, unknown>).fallbackModels !== undefined) throw new Error("Runtime agent definition fallbackModels was removed; configure one model instead.");
 	const inheritProjectContext = validateBoolean(definition.inheritProjectContext, "Runtime agent definition inheritProjectContext");
 	const inheritGlobalContext = validateBoolean(definition.inheritGlobalContext, "Runtime agent definition inheritGlobalContext");
 	const inheritSkills = validateBoolean(definition.inheritSkills, "Runtime agent definition inheritSkills");
@@ -235,12 +236,12 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 	const extensions = validateStringList(definition.extensions, "Runtime agent definition extensions");
 	const subagentOnlyExtensions = validateStringList(definition.subagentOnlyExtensions, "Runtime agent definition subagentOnlyExtensions");
 	const mutationTools = validateStringList(definition.mutationTools, "Runtime agent definition mutationTools");
+	const machine = validateOptionalString(definition.machine, "Runtime agent definition machine");
 	const output = validateOptionalString(definition.output, "Runtime agent definition output");
 	const defaultReads = validateStringList(definition.defaultReads, "Runtime agent definition defaultReads");
 	const defaultProgress = validateBoolean(definition.defaultProgress, "Runtime agent definition defaultProgress");
 	const interactive = validateBoolean(definition.interactive, "Runtime agent definition interactive");
 	const maxSubagentDepth = validatePositiveInteger(definition.maxSubagentDepth, "Runtime agent definition maxSubagentDepth");
-	const completionGuard = validateBoolean(definition.completionGuard, "Runtime agent definition completionGuard");
 	const toolBudget = validateToolBudget(definition.toolBudget);
 	const permissions = validatePermissionRules(definition.permissions, "Runtime agent definition permissions");
 	return {
@@ -248,10 +249,10 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 		systemPrompt: validateString(definition.systemPrompt, "Runtime agent definition systemPrompt", MAX_SYSTEM_PROMPT_LENGTH),
 		...(aliases ? { aliases } : {}),
 		...(tools ? { tools } : {}),
+		...(excludeTools ? { excludeTools } : {}),
 		...(allowNestedSubagents !== undefined ? { allowNestedSubagents } : {}),
 		...(mcpDirectTools ? { mcpDirectTools } : {}),
 		...(model ? { model } : {}),
-		...(fallbackModels ? { fallbackModels } : {}),
 		...(thinking !== undefined ? { thinking: thinking as string | false } : {}),
 		...(systemPromptMode !== undefined ? { systemPromptMode: systemPromptMode as "append" | "replace" } : {}),
 		...(inheritProjectContext !== undefined ? { inheritProjectContext } : {}),
@@ -269,13 +270,13 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 		...(extensions ? { extensions } : {}),
 		...(subagentOnlyExtensions ? { subagentOnlyExtensions } : {}),
 		...(mutationTools ? { mutationTools } : {}),
+		...(machine ? { machine } : {}),
 		...(output ? { output } : {}),
 		...(outputMode !== undefined ? { outputMode: outputMode as OutputMode } : {}),
 		...(defaultReads ? { defaultReads } : {}),
 		...(defaultProgress !== undefined ? { defaultProgress } : {}),
 		...(interactive !== undefined ? { interactive } : {}),
 		...(maxSubagentDepth !== undefined ? { maxSubagentDepth } : {}),
-		...(completionGuard !== undefined ? { completionGuard } : {}),
 		...(toolBudget !== undefined ? { toolBudget } : {}),
 		...(permissions !== undefined ? { permissions } : {}),
 	};
@@ -327,10 +328,10 @@ function toAgentConfig(name: string, definition: RuntimeAgentDefinition): AgentC
 		...(aliases ? { aliases } : {}),
 		...(definition.runner !== undefined ? { runner: definition.runner } : {}),
 		...(definition.tools !== undefined ? { tools: [...definition.tools] } : {}),
+		...(definition.excludeTools !== undefined ? { excludeTools: [...definition.excludeTools] } : {}),
 		...(definition.allowNestedSubagents !== undefined ? { allowNestedSubagents: definition.allowNestedSubagents } : {}),
 		...(definition.mcpDirectTools !== undefined ? { mcpDirectTools: [...definition.mcpDirectTools] } : {}),
 		...(definition.model !== undefined ? { model: definition.model } : {}),
-		...(definition.fallbackModels !== undefined ? { fallbackModels: [...definition.fallbackModels] } : {}),
 		...(definition.thinking !== undefined ? { thinking: definition.thinking } : {}),
 		systemPromptMode: definition.systemPromptMode ?? defaultSystemPromptMode(name),
 		inheritProjectContext: definition.inheritProjectContext ?? defaultInheritProjectContext(name),
@@ -350,13 +351,13 @@ function toAgentConfig(name: string, definition: RuntimeAgentDefinition): AgentC
 		...(definition.extensions !== undefined ? { extensions: [...definition.extensions] } : {}),
 		...(definition.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: [...definition.subagentOnlyExtensions] } : {}),
 		...(definition.mutationTools !== undefined ? { mutationTools: [...definition.mutationTools] } : {}),
+		...(definition.machine !== undefined ? { machine: definition.machine } : {}),
 		...(definition.output !== undefined ? { output: definition.output } : {}),
 		...(definition.outputMode !== undefined ? { outputMode: definition.outputMode } : {}),
 		...(definition.defaultReads !== undefined ? { defaultReads: [...definition.defaultReads] } : {}),
 		...(definition.defaultProgress !== undefined ? { defaultProgress: definition.defaultProgress } : {}),
 		...(definition.interactive !== undefined ? { interactive: definition.interactive } : {}),
 		...(definition.maxSubagentDepth !== undefined ? { maxSubagentDepth: definition.maxSubagentDepth } : {}),
-		...(definition.completionGuard !== undefined ? { completionGuard: definition.completionGuard } : {}),
 		...(definition.toolBudget !== undefined ? { toolBudget: definition.toolBudget } : {}),
 		...(definition.permissions !== undefined ? { permissions: definition.permissions } : {}),
 	};
@@ -416,10 +417,17 @@ function assertNoConfiguredCollision(configuredAgents: readonly AgentConfig[], r
 	}
 }
 
-export function mergeRuntimeAgents<T extends { agents: AgentConfig[]; agentDiagnostics?: AgentDiscoveryDiagnostic[] }>(dm: RuntimeAgentOwner, discovered: T, configuredAgents: readonly AgentConfig[] = discovered.agents): T {
-	const runtimeAgents = listRuntimeAgentConfigs(dm).filter((agent) => agent.disabled !== true);
-	if (runtimeAgents.length === 0) return discovered;
-	assertNoIdentityCollisions(runtimeAgents, "Runtime agent registration");
-	assertNoConfiguredCollision(configuredAgents, runtimeAgents);
+/**
+ * Append registered runtime agents to a discovery result. With `settings`, the
+ * runtime agents also receive the subagent model-tier settings that apply in
+ * that discovery context (see `applyRuntimeAgentSettings`); without it they
+ * carry only their registered definition.
+ */
+export function mergeRuntimeAgents<T extends { agents: AgentConfig[]; agentDiagnostics?: AgentDiscoveryDiagnostic[] }>(dm: RuntimeAgentOwner, discovered: T, configuredAgents: readonly AgentConfig[] = discovered.agents, settings?: RuntimeAgentSettingsContext): T {
+	const registered = listRuntimeAgentConfigs(dm).filter((agent) => agent.disabled !== true);
+	if (registered.length === 0) return discovered;
+	assertNoIdentityCollisions(registered, "Runtime agent registration");
+	assertNoConfiguredCollision(configuredAgents, registered);
+	const runtimeAgents = settings ? applyRuntimeAgentSettings(registered, settings) : registered;
 	return { ...discovered, agents: [...discovered.agents, ...runtimeAgents] };
 }

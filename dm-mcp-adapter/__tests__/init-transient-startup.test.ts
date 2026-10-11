@@ -15,11 +15,6 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../metadata-cache.ts", () => ({
   computeServerHash: vi.fn(() => "hash"),
   createCachedToolSelectorCandidateIndex: vi.fn(() => undefined),
-  getMetadataCachePath: vi.fn(() => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-mcp-transient-cache-"));
-    mocks.tempDirs.push(dir);
-    return join(dir, "cache.json");
-  }),
   getMissingConfiguredDirectToolServers: vi.fn(() => [] as string[]),
   isServerCacheValid: vi.fn(() => false),
   loadMetadataCache: vi.fn(() => mocks.cache),
@@ -130,20 +125,6 @@ describe("startup transient-503 handling", () => {
 
     expect(notify).toHaveBeenCalledWith("MCP: Failed to connect to firecrawl: connection refused", "error");
     expect(notify).not.toHaveBeenCalledWith(expect.stringContaining("temporarily unavailable"), "warning");
-  });
-
-  it("collapses an unauthenticated probe into one actionable TUI notification", async () => {
-    const rawDiagnostic = "Error POSTing to endpoint: — probe: endpoint returned an untyped response (401) — authentication may be required; MCP endpoint shape could not be determined";
-    vi.spyOn(McpServerManager.prototype, "connect").mockRejectedValue(new Error(rawDiagnostic));
-
-    const state = await boot(notify);
-
-    const message = "Authentication may be required (HTTP 401). Check the server credentials or OAuth sign-in, then reconnect.";
-    expect(state.failureMessages?.get("firecrawl")).toBe(message);
-    expect(notify).toHaveBeenCalledWith(`MCP: Failed to connect to firecrawl: ${message}`, "error");
-    expect(notify).toHaveBeenCalledTimes(1);
-    expect(consoleError).not.toHaveBeenCalled();
-    expect([...notify.mock.calls].flat().join("\n")).not.toContain(rawDiagnostic);
   });
 
   it("self-heals only keep-alive after startup failure", async () => {

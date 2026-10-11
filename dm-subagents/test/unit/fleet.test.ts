@@ -1,16 +1,22 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fsDefault, * as fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { visibleWidth, type MarkdownTheme } from "@duckmind/dm-tui";
+import { createEventBus } from "@duckmind/dm-coding-agent";
+import { registerInspector } from "../../src/api/inspectors.ts";
+import { getInspectorPlugins, registerInspectorEventListener } from "../../src/inspectors/plugins.ts";
 import { EXTERNAL_RUN_REGISTRY_KEY, EXTERNAL_RUN_REGISTRY_VERSION, registerExternalRun } from "../../src/api/external-runs.ts";
 import { collectFleetSnapshot, openSubagentFleet, SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { persistForegroundRunHistory, restoreForegroundRunHistory } from "../../src/runs/foreground/foreground-history.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "../../src/tui/fleet-status.ts";
+import { setMainThinkingLevelSource } from "../../src/tui/running-tone.ts";
 import { registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
 import { getArtifactPaths, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
 import type { HerdrClient } from "../../src/inspectors/herdr/client.ts";
+import { createHerdrInspectorPlugin } from "../../src/inspectors/herdr/plugin.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
 import { fauxAssistantMessage } from "@duckmind/dm-ai/providers/faux";
 import { createAssistantMessageEventStream } from "@duckmind/dm-ai";
@@ -44,6 +50,7 @@ function writeAsyncRun(root: string, input: {
 	state?: "running" | "complete" | "failed";
 	mode?: "single" | "parallel" | "workflow";
 	lastUpdate?: number;
+	startedAt?: number;
 	agents?: string[];
 	contexts?: Array<"fresh" | "fork">;
 	models?: string[];
@@ -63,7 +70,7 @@ function writeAsyncRun(root: string, input: {
 		sessionId: input.sessionId ?? "session-current",
 		mode: input.mode ?? (agents.length > 1 ? "parallel" : "single"),
 		state,
-		startedAt: 100,
+		startedAt: input.startedAt ?? 100,
 		lastUpdate: input.lastUpdate ?? 200,
 		currentStep: 0,
 		steps: agents.map((agent, index) => ({
@@ -84,6 +91,7 @@ function writeAsyncRun(root: string, input: {
 const theme = {
 	fg: (_name: string, text: string) => text,
 	bold: (text: string) => text,
+	getThinkingBorderColor: (_level: string) => (text: string) => text,
 };
 
 const markdownTheme: MarkdownTheme = {
@@ -116,9 +124,10 @@ describe("native subagent fleet", () => {
 		const ctx = {
 			model,
 			signal: undefined,
+			sessionManager: { getSessionId: () => "fleet-rewrite-session" },
 			modelRegistry: {
 				async getApiKeyAndHeaders() { return { ok: true as const, apiKey: "test" }; },
-				getRegisteredProviderConfig() { return { api: "faux", streamSimple: streamFn }; },
+				streamSimple: streamFn,
 			},
 		} as never;
 		const rewritten = await rewritePromptWithGuidance({
@@ -230,7 +239,7 @@ describe("native subagent fleet", () => {
 			assert.match(initial, /Transcript path: \/outside\/trusted\/roots\/transcript\.jsonl/);
 			assert.doesNotMatch(initial, /Herdr ·|steer ·|stop ·/);
 			component.handleInput("H");
-			assert.match(component.render(120).join("\n"), /display-only and have no Herdr controls/);
+			assert.match(component.render(120).join("\n"), /display-only and have no inspector controls/);
 			component.handleInput("s");
 			assert.match(component.render(120).join("\n"), /display-only and remain controlled/);
 			component.handleInput("D");
@@ -446,6 +455,29 @@ describe("native subagent fleet", () => {
 		}
 	});
 
+	it("keeps tracked missing-start rows stable across opposing heartbeat updates", () => {
+		const state = stateForTest();
+		state.fleetJobs = new Map();
+		for (const [id, startedAt, status] of [
+			["known", 100, "running"], ["unknown-b", undefined, "running"], ["unknown-a", undefined, "queued"],
+		] as const) {
+			state.fleetJobs.set(id, {
+				asyncId: id, asyncDir: `/tmp/${id}`, sessionId: "session-current", status, startedAt,
+			});
+		}
+		for (const direction of [1, -1]) {
+			let heartbeat = 500;
+			for (const job of state.fleetJobs.values()) job.updatedAt = heartbeat += direction * 10;
+			const snapshot = collectFleetSnapshot(state);
+			assert.equal(snapshot.error, undefined);
+			assert.deepEqual(snapshot.items.map((item) => item.key), ["async:unknown-a", "async:unknown-b", "async:known"]);
+			for (const item of snapshot.items) {
+				const job = state.fleetJobs.get(item.runId)!;
+				assert.equal(item.run?.startedAt, job.startedAt ?? job.updatedAt);
+			}
+		}
+	});
+
 	it("keeps tracked active workflows ahead of older failed terminal history", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-history-"));
 		try {
@@ -507,11 +539,58 @@ describe("native subagent fleet", () => {
 				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme },
 			);
 			try {
-				assert.ok(component.render(100).some((line) => line.includes("gpt-5.5 · thinking high")));
+				// The provider-qualified label wraps across rows in the 61-column detail pane, so
+				// reassemble the detail column before asserting the model and thinking metadata.
+				const detail = component.render(100)
+					.map((line) => line.split("│")[2] ?? "")
+					.join(" ")
+					.replace(/\s+/g, " ");
+				assert.ok(detail.includes("openai-codex/gpt-5.5 · thinking high"));
 			} finally {
 				component.dispose();
 			}
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("colors running Fleet rows by their child's recorded level, and whole runs by the main session's", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-levels-"));
+		setMainThinkingLevelSource(() => "xhigh");
+		try {
+			writeAsyncRun(root, { id: "level-steps", state: "running", agents: ["scout", "reviewer"], thinking: ["high", "medium"], lastUpdate: 300 });
+			writeAsyncRun(root, { id: "level-workflow", state: "running", mode: "workflow", agents: ["worker"], lastUpdate: 200 });
+			const state = stateForTest();
+			state.foregroundControls.set("level-foreground", { runId: "level-foreground", mode: "single", startedAt: 10, updatedAt: 400, currentAgent: "planner", currentIndex: 0, thinking: "max" });
+			const tones = ["accent", ...["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => `thinking:${level}`)];
+			const colored = (tone: string, text: string) => `\x1b[38;5;${Math.max(0, tones.indexOf(tone)) + 100}m${text}\x1b[39m`;
+			const ansiTheme = {
+				fg: (name: string, text: string) => colored(name, text),
+				bold: (text: string) => text,
+				getThinkingBorderColor: (level: string) => (text: string) => colored(`thinking:${level}`, text),
+			};
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 40, columns: 140 }, requestRender() {} } as never,
+				ansiTheme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme },
+			);
+			try {
+				const lines = component.render(140);
+				const plain = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+				const glyphTone = (label: string) => {
+					const code = lines.find((line) => plain(line).includes(`\u25cf ${label}`))?.match(/\x1b\[38;5;(\d+)m\u25cf/)?.[1];
+					return code === undefined ? undefined : tones[Number(code) - 100];
+				};
+				assert.equal(glyphTone("scout"), "thinking:high", "async step uses its recorded level");
+				assert.equal(glyphTone("planner"), "thinking:max", "foreground child uses its recorded level");
+				assert.equal(glyphTone("workflow"), "thinking:xhigh", "a whole workflow run uses the main level");
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			setMainThinkingLevelSource(() => undefined);
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -627,8 +706,8 @@ describe("native subagent fleet", () => {
 		});
 		const snapshot = collectFleetSnapshot(state);
 		assert.deepEqual(snapshot.items.map((item) => item.key), [
-			"foreground-active:child-2:0",
 			"foreground-active:child-1:0",
+			"foreground-active:child-2:0",
 			"async:unrelated",
 			"async:workflow-1",
 		]);
@@ -697,6 +776,26 @@ describe("native subagent fleet", () => {
 		assert.ok(!snapshot.items.some((item) => item.runId === "terminal-0"));
 	});
 
+	it("orders active runs by start time so the roster stays stable while they emit", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-active-order-"));
+		try {
+			writeAsyncRun(root, { id: "worker-b", startedAt: 200, lastUpdate: 900 });
+			writeAsyncRun(root, { id: "worker-a", startedAt: 100, lastUpdate: 500 });
+			const state = stateForTest();
+			const keys = () => collectFleetSnapshot(state, { asyncDirRoot: root, resultsDir: path.join(root, "results") }).items.map((item) => item.key);
+			// First refresh: the run created first stays on top, even though worker-b emitted most recently.
+			assert.deepEqual(keys(), ["async:worker-a:0", "async:worker-b:0"]);
+			// Later activity on worker-b must not reorder the roster.
+			writeAsyncRun(root, { id: "worker-b", startedAt: 200, lastUpdate: 1500 });
+			assert.deepEqual(keys(), ["async:worker-a:0", "async:worker-b:0"]);
+			// A run started later still lands after the earlier ones.
+			writeAsyncRun(root, { id: "worker-c", startedAt: 300, lastUpdate: 300 });
+			assert.deepEqual(keys(), ["async:worker-a:0", "async:worker-b:0", "async:worker-c:0"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts default Fleet navigation from Kitty CSI-u input", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-kitty-default-"));
 		try {
@@ -729,6 +828,7 @@ describe("native subagent fleet", () => {
 			writeAsyncRun(root, { id: "older", lastUpdate: 200 });
 			const state = stateForTest();
 			let closed = false;
+			let inspectCalls = 0;
 			const component = new SubagentFleetComponent(
 				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
 				theme as never,
@@ -739,7 +839,7 @@ describe("native subagent fleet", () => {
 					resultsDir: path.join(root, "results"),
 					refreshMs: 60_000,
 					fleetKeybindings: {
-						selectDown: ["n"],
+						selectDown: ["return"],
 						selectUp: ["p"],
 						steer: ["m"],
 						close: ["z"],
@@ -747,6 +847,7 @@ describe("native subagent fleet", () => {
 					actions: {
 						async steer() { return { text: "unused" }; },
 						stop() { return { text: "unused" }; },
+						async inspect() { inspectCalls++; return { text: "unexpected" }; },
 					},
 				},
 			);
@@ -755,8 +856,9 @@ describe("native subagent fleet", () => {
 				assert.match(selectedLine(), /newer/);
 				component.handleInput("j");
 				assert.match(selectedLine(), /newer/, "default j should not move when selectDown is overridden");
-				component.handleInput("\x1b[110;1u");
-				assert.match(selectedLine(), /older/, "custom selectDown should accept Kitty CSI-u input");
+				component.handleInput("\r");
+				assert.match(selectedLine(), /older/, "custom Enter binding should move instead of opening Herdr");
+				assert.equal(inspectCalls, 0);
 				component.handleInput("p");
 				assert.match(selectedLine(), /newer/);
 				component.handleInput("m");
@@ -1003,9 +1105,16 @@ describe("native subagent fleet", () => {
 			try {
 				const lines = component.render(100);
 				assert.ok(lines.some((line) => line.includes("FINAL ASYNC OUTPUT")));
-				assert.ok(lines.some((line) => line.includes("output-0.log")));
+				const detailText = (rendered: string[]) => rendered.map((line) => line.split("│").at(-2)?.trim() ?? "").join("");
+				const artifactIn = (rendered: string[]) => detailText(rendered).includes("output-0.log");
+				let artifactVisible = artifactIn(lines);
+				for (let page = 0; !artifactVisible && page < 8; page++) {
+					component.handleInput("\x1b[5~"); // page up through the detail viewport
+					artifactVisible = artifactIn(component.render(100));
+				}
+				assert.ok(artifactVisible, "artifact path remains reachable by scrolling");
 				assert.ok(lines.some((line) => line.includes("worker") && line.includes("[fork]")));
-				assert.ok(lines.some((line) => line.includes("worker.jsonl")));
+				assert.ok(detailText(lines).includes("worker.jsonl"));
 				for (const line of lines) assert.ok(visibleWidth(line) <= 100, `line exceeded width: ${line}`);
 				tui.terminal.rows = 10;
 				assert.ok(component.render(100).length <= 8, "short-terminal render should fit the overlay's 85% height cap");
@@ -1278,7 +1387,7 @@ describe("native subagent fleet", () => {
 				assert.ok(lines.some((line) => line.includes("worker")));
 				assert.ok(lines.some((line) => line.includes("reviewer")));
 				assert.ok(lines.some((line) => line.includes("foreground · live")));
-				assert.ok(lines.some((line) => line.includes("live-model · thinking high")));
+				assert.ok(lines.some((line) => line.includes("provider/live-model · thinking high")));
 				assert.ok(lines.every((line) => !line.includes("Implement the active task") && !line.includes("Review the active task")));
 				assert.ok(lines.some((line) => line.includes("Conversation") && line.includes("assistant response")));
 				assert.ok(lines.some((line) => line.includes("Worker live result")));
@@ -1363,7 +1472,7 @@ describe("native subagent fleet", () => {
 						const lines = component.render(100);
 						assert.ok(lines.some((line) => line.includes(expected)), `missing ${expected}`);
 						if (initialKey.startsWith("foreground-recent:")) {
-							assert.ok(lines.some((line) => line.includes("recent-model · thinking xhigh")));
+							assert.ok(lines.some((line) => line.includes("provider/recent-model · thinking xhigh")));
 						}
 					} finally {
 						component.dispose();
@@ -1404,7 +1513,9 @@ describe("native subagent fleet", () => {
 		}
 	});
 
-	it("focuses the Herdr pane the operator opens with the inspect key", async () => {
+	it("focuses an external inspector registered after Fleet opens", async (t) => {
+		const owner = { events: createEventBus() };
+		t.after(registerInspectorEventListener(owner));
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-inspect-focus-"));
 		try {
 			const asyncDir = writeAsyncRun(root, { id: "run-focus", agents: ["worker"] });
@@ -1419,7 +1530,7 @@ describe("native subagent fleet", () => {
 				updatedAt: 200,
 			});
 			const calls: string[][] = [];
-			const herdrClient: HerdrClient = {
+			const client: HerdrClient = {
 				run: async <T>(args: string[]) => {
 					calls.push(args);
 					if (args[0] === "--version") return { ok: true, data: "herdr 0.7.5" as T };
@@ -1435,6 +1546,7 @@ describe("native subagent fleet", () => {
 						const component = factory({ terminal: { rows: 32, columns: 100 }, requestRender() {} }, theme, undefined, () => {});
 						try {
 							component.render(100);
+							registerInspector(owner, { ...createHerdrInspectorPlugin({ client }), name: "test-host", available: () => true });
 							component.handleInput("H");
 							for (let attempt = 0; attempt < 500 && !calls.some((args) => args[0] === "pane" && args[1] === "split"); attempt++) {
 								await new Promise((resolve) => setImmediate(resolve));
@@ -1446,7 +1558,7 @@ describe("native subagent fleet", () => {
 				},
 			};
 
-			await openSubagentFleet(ctx as never, state, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, herdrClient });
+			await openSubagentFleet(ctx as never, state, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, inspectorPlugins: () => getInspectorPlugins(owner), inspectorEnv: {} });
 			const split = calls.find((args) => args[0] === "pane" && args[1] === "split");
 			assert.ok(split, `no pane split call: ${JSON.stringify(calls)}`);
 			assert.deepEqual(split.slice(-1), ["--focus"]);
@@ -1519,7 +1631,7 @@ describe("native subagent fleet", () => {
 			const lines = component.render(90);
 			const selectedLine = lines.find((line) => line.includes("›"));
 			assert.ok(selectedLine?.includes("run-work"), `unexpected selected row: ${selectedLine}`);
-			assert.ok(lines.some((line) => line.includes("Model: raw-model · thinking medium")));
+			assert.ok(lines.some((line) => line.includes("Model: provider/raw-model · thinking medium")));
 		} finally {
 			component.dispose();
 		}
@@ -1532,7 +1644,7 @@ describe("native subagent fleet", () => {
 			{ initialKey: "foreground-recent:run-recent:0", refreshMs: 60_000 },
 		);
 		try {
-			assert.ok(recentComponent.render(90).some((line) => line.includes("Model: recent-raw-model · thinking xhigh")));
+			assert.ok(recentComponent.render(90).some((line) => line.includes("Model: provider/recent-raw-model · thinking xhigh")));
 		} finally {
 			recentComponent.dispose();
 		}
@@ -1583,8 +1695,8 @@ describe("native subagent fleet", () => {
 		}
 	});
 
-	it("opens the selected async child in a Herdr inspector", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-herdr-"));
+	it("opens the selected async child in an inspector", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-inspector-"));
 		try {
 			const asyncDir = writeAsyncRun(root, { id: "async-herdr" });
 			const calls: Array<{ runId: string; asyncDir: string; index?: number }> = [];
@@ -1605,9 +1717,15 @@ describe("native subagent fleet", () => {
 				},
 			);
 			try {
-				component.handleInput("H");
+				component.handleInput("\r");
 				await new Promise((resolve) => setImmediate(resolve));
 				assert.deepEqual(calls, [{ runId: "async-herdr", asyncDir, index: 0 }]);
+				component.handleInput("H");
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.deepEqual(calls, [
+					{ runId: "async-herdr", asyncDir, index: 0 },
+					{ runId: "async-herdr", asyncDir, index: 0 },
+				]);
 				assert.ok(component.render(100).some((line) => line.includes("Inspector opened.")));
 			} finally {
 				component.dispose();
@@ -1623,6 +1741,7 @@ describe("native subagent fleet", () => {
 			const asyncDir = writeAsyncRun(root, { id: "async-stop" });
 			const state = stateForTest();
 			const calls: Array<{ runId: string; asyncDir: string; index?: number }> = [];
+			let inspectCalls = 0;
 			const component = new SubagentFleetComponent(
 				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
 				theme as never,
@@ -1632,6 +1751,7 @@ describe("native subagent fleet", () => {
 					asyncDirRoot: root,
 					resultsDir: path.join(root, "results"),
 					refreshMs: 60_000,
+					fleetKeybindings: { stop: ["return"] },
 					actions: {
 						async steer() {
 							return { text: "unused" };
@@ -1640,15 +1760,17 @@ describe("native subagent fleet", () => {
 							calls.push(input);
 							return { text: "Stop requested." };
 						},
+						async inspect() { inspectCalls++; return { text: "unexpected" }; },
 					},
 				},
 			);
 			try {
-				component.handleInput("D");
+				component.handleInput("\r");
 				assert.ok(component.render(100).some((line) => line.includes("Confirm stop for async run async-stop")));
+				assert.equal(inspectCalls, 0);
 				component.handleInput("n");
 				assert.deepEqual(calls, []);
-				component.handleInput("D");
+				component.handleInput("\r");
 				component.handleInput("y");
 				await new Promise((resolve) => setImmediate(resolve));
 				assert.deepEqual(calls, [{ runId: "async-stop", asyncDir, index: 0 }]);
@@ -1730,6 +1852,117 @@ describe("native subagent fleet", () => {
 		assert.equal(renderRequests, 1, "disposing cancels periodic redraws");
 	});
 
+	it("reuses an unchanged transcript across refresh ticks and rereads it when it changes", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-transcript-reuse-"));
+		let transcriptOpens = 0;
+		let failNextOpen = true;
+		const openSync = fsDefault.openSync;
+		t.mock.method(fsDefault, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+			if (path.basename(String(args[0])) === "transcript-0.jsonl") {
+				transcriptOpens++;
+				if (failNextOpen) {
+					failNextOpen = false;
+					throw Object.assign(new Error("too many open files"), { code: "EMFILE" });
+				}
+			}
+			return openSync(...args);
+		});
+		syncBuiltinESMExports();
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const asyncDir = writeAsyncRun(root, {
+			id: "reuse-running",
+			state: "running",
+			transcript: [{ recordType: "message", role: "assistant", text: "first alpha answer" }],
+		});
+		const transcriptPath = path.join(asyncDir, "transcript-0.jsonl");
+		const state = stateForTest();
+		state.baseCwd = root;
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+			theme as never,
+			state,
+			() => {},
+			{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 250, markdownTheme },
+		);
+		const tickAndRender = () => {
+			t.mock.timers.tick(250);
+			return component.render(100);
+		};
+		try {
+			assert.ok(!component.render(100).some((line) => line.includes("first alpha answer")), "the first read fails");
+			assert.ok(tickAndRender().some((line) => line.includes("first alpha answer")), "a failed read recovers on the next tick");
+			for (let tick = 0; tick < 3; tick++) assert.ok(tickAndRender().some((line) => line.includes("first alpha answer")));
+			assert.equal(transcriptOpens, 2, "an unchanged transcript is read once across refresh ticks");
+
+			fs.appendFileSync(transcriptPath, `${JSON.stringify({ recordType: "message", role: "assistant", text: "second appended answer" })}\n`);
+			assert.ok(tickAndRender().some((line) => line.includes("second appended answer")), "an append shows on the next tick");
+
+			const fixedTime = new Date(1_700_000_000_000);
+			fs.utimesSync(transcriptPath, fixedTime, fixedTime);
+			tickAndRender();
+			const before = fs.statSync(transcriptPath, { bigint: true });
+			fs.writeFileSync(transcriptPath, fs.readFileSync(transcriptPath, "utf-8").replace("second appended answer", "second replaced answer"));
+			fs.utimesSync(transcriptPath, fixedTime, fixedTime);
+			const after = fs.statSync(transcriptPath, { bigint: true });
+			assert.deepEqual([after.size, after.mtimeNs], [before.size, before.mtimeNs]);
+			assert.ok(tickAndRender().some((line) => line.includes("second replaced answer")), "a same-size, same-mtime rewrite shows on the next tick");
+
+			const opens = transcriptOpens;
+			component.invalidate();
+			component.render(100);
+			component.handleInput("r");
+			component.render(100);
+			assert.equal(transcriptOpens, opens + 2, "host invalidation and the refresh key reread the transcript");
+		} finally {
+			component.dispose();
+			t.mock.timers.reset();
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const malformedOnly of [false, true]) it(`reuses a readable transcript with no displayable events (${malformedOnly ? "only malformed records" : "user records only"})`, (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-transcript-empty-"));
+		let transcriptOpens = 0;
+		const openSync = fsDefault.openSync;
+		t.mock.method(fsDefault, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+			if (path.basename(String(args[0])) === "transcript-0.jsonl") transcriptOpens++;
+			return openSync(...args);
+		});
+		syncBuiltinESMExports();
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		writeAsyncRun(root, {
+			id: "user-only",
+			state: "complete",
+			transcript: Array.from({ length: 3 }, (_, index) => ({ recordType: "message", role: "user", text: `queued prompt ${index}` })),
+		});
+		if (malformedOnly) fs.writeFileSync(path.join(root, "user-only", "transcript-0.jsonl"), "not json\n[1]\n", "utf-8");
+		const state = stateForTest();
+		state.baseCwd = root;
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+			theme as never,
+			state,
+			() => {},
+			{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 250, markdownTheme },
+		);
+		try {
+			component.render(100);
+			for (let tick = 0; tick < 3; tick++) {
+				t.mock.timers.tick(250);
+				component.render(100);
+			}
+			assert.equal(transcriptOpens, 1);
+		} finally {
+			component.dispose();
+			t.mock.timers.reset();
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("refreshes the roster while the overlay remains open", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-refresh-"));
 		try {
@@ -1743,12 +1976,6 @@ describe("native subagent fleet", () => {
 				() => {},
 				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 250 },
 			);
-			let invalidations = 0;
-			const originalInvalidate = component.invalidate.bind(component);
-			component.invalidate = () => {
-				invalidations++;
-				originalInvalidate();
-			};
 			try {
 				assert.ok(component.render(90).some((line) => line.includes("No tracked children")));
 				const initialOutput = Array.from({ length: 40 }, (_, index) => `output line ${index}`).join("\n");
@@ -1762,7 +1989,6 @@ describe("native subagent fleet", () => {
 				lines = component.render(90);
 				assert.ok(lines.some((line) => line.includes("LATEST LIVE OUTPUT")), "live transcript should keep following new output");
 				assert.ok(renderRequests > 0);
-				assert.ok(invalidations > 0, "live refresh must invalidate cached TUI frames before rendering");
 			} finally {
 				component.dispose();
 			}

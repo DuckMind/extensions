@@ -8,28 +8,32 @@ import test from "node:test";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-const sourceImportPattern = /from\s+["'](@earendil-works\/[^"']+)["']|import\s+["'](@earendil-works\/[^"']+)["']/g;
+const sourceImportPattern = /from\s+["'](@duckmind\/[^"']+)["']|import\s+["'](@duckmind\/[^"']+)["']/g;
 const oldPiScopePattern = /@mariozechner\/dm-/;
-const piPackageJsonSubpathPattern = /@earendil-works\/dm-[^"']+\/package\.json/;
-const cjsPiPackageResolutionPattern = /require(?:\.resolve)?\(\s*["']@earendil-works\/dm-/;
+const piPackageJsonSubpathPattern = /@duckmind\/dm-[^"']+\/package\.json/;
+const cjsPiPackageResolutionPattern = /require(?:\.resolve)?\(\s*["']@duckmind\/dm-/;
 const exactVersionPattern = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const hostPeerPackages = [
 	"@duckmind/dm-agent-core",
 	"@duckmind/dm-ai",
 	"@duckmind/dm-coding-agent",
 	"@duckmind/dm-tui",
+	"typebox",
 ] as const;
 const expectedHostPeerRanges = {
-	"@duckmind/dm-agent-core": "*",
-	"@duckmind/dm-ai": ">=0.80.0",
-	"@duckmind/dm-coding-agent": "*",
-	"@duckmind/dm-tui": "*",
+	"@duckmind/dm-agent-core": ">=0.80.2",
+	"@duckmind/dm-ai": ">=0.80.2",
+	"@duckmind/dm-coding-agent": ">=0.80.2",
+	"@duckmind/dm-tui": ">=0.80.2",
+	typebox: "*",
 } satisfies Record<(typeof hostPeerPackages)[number], string>;
 const expectedHostDevVersions = {
-	"@duckmind/dm-agent-core": "0.81.0",
-	"@duckmind/dm-ai": "0.81.0",
-	"@duckmind/dm-tui": "0.81.0",
-} satisfies Record<Exclude<(typeof hostPeerPackages)[number], "@duckmind/dm-coding-agent">, string>;
+	"@duckmind/dm-agent-core": "file:../../dm-mono/packages/agent",
+	"@duckmind/dm-ai": "file:../../dm-mono/packages/ai",
+	"@duckmind/dm-coding-agent": "file:../../dm-mono/packages/coding-agent",
+	"@duckmind/dm-tui": "file:../../dm-mono/packages/tui",
+	typebox: "1.3.27",
+} satisfies Record<(typeof hostPeerPackages)[number], string>;
 
 test("the root entrypoint exposes the runtime error flag to TypeScript consumers", () => {
 	const consumerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-types-"));
@@ -37,6 +41,17 @@ test("the root entrypoint exposes the runtime error flag to TypeScript consumers
 		fs.writeFileSync(path.join(consumerRoot, "consumer.ts"), `
 import "dm-subagents";
 import type { AgentToolResult } from "@duckmind/dm-agent-core";
+import { registerWorkflowResource, type RegisterWorkflowResourceInput, type WorkflowResourceDefinition, type WorkflowResourceRegistration } from "dm-subagents/workflow-resources";
+
+const definition: WorkflowResourceDefinition = {
+	name: "consumer.check", version: 1,
+	resolve: (args) => typeof args.task === "string"
+		? { script: "return 1;", hostCommands: [{ key: "check", command: "node --version" }] }
+		: { error: "task required" },
+};
+const input: RegisterWorkflowResourceInput = { sessionId: "consumer", definition };
+const registration: WorkflowResourceRegistration = registerWorkflowResource(input);
+registration.dispose();
 
 const result: AgentToolResult<undefined> = {
 	content: [],
@@ -60,7 +75,8 @@ void result.isError;
 				baseUrl: consumerRoot,
 				paths: {
 					"dm-subagents": [path.join(projectRoot, "index.ts")],
-				"@duckmind/dm-agent-core": [path.join(projectRoot, "node_modules", "@earendil-works", "dm-agent-core", "dist", "index.d.ts")],
+					"dm-subagents/workflow-resources": [path.join(projectRoot, "src/api/workflow-resources.ts")],
+				"@duckmind/dm-agent-core": [path.join(projectRoot, "node_modules", "@duckmind", "dm-agent-core", "dist", "index.d.ts")],
 				},
 			},
 			files: [path.join(consumerRoot, "consumer.ts")],
@@ -91,6 +107,7 @@ function collectSourceFiles(dir: string): string[] {
 test("published extension APIs use supported package entrypoints", async () => {
 	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
 
+	assert.equal(packageJson.private, undefined, "the bundled package preserves upstream publish metadata");
 	assert.deepEqual(packageJson.dm?.extensions, ["./index.ts"]);
 	assert.equal(packageJson.files?.includes("index.ts"), true);
 	assert.equal(packageJson.files?.includes("*.mjs"), true);
@@ -104,15 +121,18 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.deepEqual(packageJson.exports, {
 		".": "./index.ts",
 		"./agents": "./src/api/agents.ts",
+		"./inspectors": "./src/api/inspectors.ts",
 		"./background-work": "./src/api/background-work.ts",
 		"./external-job-provider": "./src/api/external-job-provider.ts",
 		"./external-runs": "./src/api/external-runs.ts",
 		"./capability-ceiling": "./src/api/capability-ceiling.ts",
+		"./workflow-resources": "./src/api/workflow-resources.ts",
+		"./required-child-extensions": "./src/api/required-child-extensions.ts",
 		"./delegation": "./src/api/delegation.ts",
 		"./preflight": "./src/api/preflight.ts",
 		"./control-channel": "./src/api/control-channel.ts",
 		"./intercom-bridge": "./src/api/intercom-bridge.ts",
-		"./dm-args": "./src/api/dm-args.ts",
+		"./child-tool-plan": "./src/api/child-tool-plan.ts",
 		"./shared-types": "./src/api/shared-types.ts",
 		"./project-panes": "./src/api/project-panes.ts",
 	});
@@ -120,6 +140,9 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_EVENT, "dm-subagents:runtime-agent-register:v1");
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_VERSION, 1);
 	assert.equal(typeof agents.registerAgentViaEvents, "function");
+	const inspectors = await import("dm-subagents/inspectors");
+	assert.equal(inspectors.INSPECTOR_REGISTER_EVENT, "dm-subagents:inspector-register:v1");
+	assert.deepEqual(Object.keys(inspectors).sort(), ["INSPECTOR_REGISTER_EVENT", "registerInspector"]);
 	const backgroundWork = await import("dm-subagents/background-work");
 	assert.equal(backgroundWork.BACKGROUND_WORK_PROTOCOL_VERSION, 1);
 	assert.equal(backgroundWork.BACKGROUND_WORK_REGISTRY_KEY, "dm-subagents.background-work.v1");
@@ -134,20 +157,23 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(typeof externalRuns.snapshotExternalRuns, "function");
 	assert.equal(typeof externalRuns.unregisterExternalRun, "function");
 	const capability = await import("dm-subagents/capability-ceiling");
+	const workflowResources = await import("dm-subagents/workflow-resources");
+	assert.deepEqual(Object.keys(workflowResources), ["registerWorkflowResource"]);
+	assert.equal(typeof workflowResources.registerWorkflowResource, "function");
 	assert.equal(capability.SUBAGENT_CAPABILITY_CEILING_VERSION, 1);
 	assert.equal(capability.SUBAGENT_CAPABILITY_CEILING_REGISTRY_KEY, "dm-subagents.capability-ceiling.v1");
 	const delegation = await import("dm-subagents/delegation");
 	assert.equal(delegation.SUBAGENT_DELEGATION_REQUEST_EVENT, "prompt-template:subagent:request");
 	const preflight = await import("dm-subagents/preflight");
-	assert.equal(preflight.SUBAGENT_LAUNCH_CONTRACT_VERSION, 2);
+	assert.equal(preflight.SUBAGENT_LAUNCH_CONTRACT_VERSION, 3);
 	assert.equal(typeof preflight.resolveSubagentLaunchContract, "function");
 	const controlChannel = await import("dm-subagents/control-channel");
 	assert.equal(typeof controlChannel.requestAsyncStop, "function");
 	const intercomBridge = await import("dm-subagents/intercom-bridge");
 	assert.equal(typeof intercomBridge.resolveIntercomSessionTarget, "function");
-	const piArgs = await import("dm-subagents/dm-args");
-	assert.equal(typeof piArgs.resolvePiLaunchToolPlan, "function");
-	assert.equal("buildPiArgs" in piArgs, false);
+	const childToolPlan = await import("dm-subagents/child-tool-plan");
+	assert.equal(typeof childToolPlan.resolvePiLaunchToolPlan, "function");
+	assert.deepEqual(Object.keys(childToolPlan).sort(), ["resolvePiLaunchToolPlan"]);
 	const sharedTypes = await import("dm-subagents/shared-types");
 	assert.equal(typeof sharedTypes.wrapForkTask, "function");
 	assert.equal(typeof sharedTypes.DEFAULT_FORK_PREAMBLE, "string");
@@ -185,11 +211,7 @@ test("direct dependency declarations are exact version pins", () => {
 
 	for (const section of ["dependencies", "devDependencies"] as const) {
 		for (const [name, version] of Object.entries<string>(packageJson[section] ?? {})) {
-			if (name === "@duckmind/dm-coding-agent") {
-				assert.equal(version, "file:./test/fixtures/dm-coding-agent-shim");
-				continue;
-			}
-			assert.match(version, exactVersionPattern, `${section}.${name} should use an exact version`);
+			assert.match(version, section === "devDependencies" && name.startsWith("@duckmind/") ? /^file:\.\.\/\.\.\/dm-mono\/packages\// : exactVersionPattern, `${section}.${name} should use a pinned or local version`);
 		}
 	}
 });
@@ -203,26 +225,12 @@ test("host-owned packages are optional peers with supported ranges, not producti
 		assert.deepEqual(packageJson.peerDependenciesMeta?.[name], { optional: true }, `${name} should be an optional peer`);
 	}
 });
-test("typebox is a bundled runtime dependency", () => {
-	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
-
-	assert.equal(packageJson.dependencies?.typebox, "1.1.38");
-	assert.equal(packageJson.peerDependencies?.typebox, undefined);
-	assert.equal(packageJson.peerDependenciesMeta?.typebox, undefined);
-	assert.equal(packageJson.devDependencies?.typebox, undefined);
-});
-
 test("host-owned development packages use the supported SDK baseline", () => {
 	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
 
 	for (const [name, version] of Object.entries(expectedHostDevVersions)) {
 		assert.equal(packageJson.devDependencies?.[name], version, `${name} should use ${version}`);
 	}
-	assert.equal(
-		packageJson.devDependencies?.["@duckmind/dm-coding-agent"],
-		"file:./test/fixtures/dm-coding-agent-shim",
-		"dm-coding-agent should use the local type/runtime shim until upstream DM no longer pins vulnerable Undici",
-	);
 });
 
 test("old dm package scope is not used by source or tests", () => {

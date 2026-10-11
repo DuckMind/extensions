@@ -26,8 +26,8 @@ constraints:
 ignores:
   - "**/*_test.go"
   - "**/examples/**"
-  - "tests/fixtures/**"
-  - "cases/**"
+  - "**/tests/fixtures/**"
+  - "**/cases/**"
 tags:
   - go
   - idiom

@@ -21,7 +21,7 @@ import { getPackageRoot } from "./package-root.js";
 export const TREE_SITTER_WASMS_VERSION = "0.1.13";
 
 /** unpkg mirror of the tree-sitter-wasms artifacts. */
-export const GRAMMAR_CDN_BASE = `https://unpkg.com/tree-sitter-wasms@${TREE_SITTER_WASMS_VERSION}/out`;
+const GRAMMAR_CDN_BASE = `https://unpkg.com/tree-sitter-wasms@${TREE_SITTER_WASMS_VERSION}/out`;
 
 /**
  * Per-grammar source overrides — grammars we pull from a DIFFERENT package than the
@@ -33,8 +33,12 @@ export const GRAMMAR_CDN_BASE = `https://unpkg.com/tree-sitter-wasms@${TREE_SITT
  * grammar loads into web-tree-sitter's shared WASM Module (#255) — the maintained
  * 0.4.1 build parses cleanly in a multi-grammar process. tree-sitter-yaml: the
  * aggregator's yaml wasm is ABI-incompatible with web-tree-sitter 0.25 and fails to
- * load at all (#427); the maintained 0.7.1 build loads + parses. Mirrored by
- * `SOURCE_OVERRIDES` in scripts/download-grammars.
+ * load at all (#427); the maintained 0.7.1 build loads + parses. tree-sitter-bash:
+ * the aggregator's bash wasm imports `isalpha`, which web-tree-sitter 0.25's main
+ * module does not export, so `parse()` throws `resolved is not a function` on every
+ * `[ a == b ]` / `[[ a != b ]]` and the parser stays dead (#3996); the maintained
+ * 0.25.1 build imports only exported symbols. Mirrored by `SOURCE_OVERRIDES` in
+ * scripts/download-grammars.
  */
 export interface GrammarSourceOverride {
 	/** npm package the wasm actually comes from (for the provenance sidecar). */
@@ -54,6 +58,11 @@ export const GRAMMAR_SOURCE_OVERRIDES: Record<string, GrammarSourceOverride> = {
 		package: "@tree-sitter-grammars/tree-sitter-yaml",
 		version: "0.7.1",
 		url: "https://unpkg.com/@tree-sitter-grammars/tree-sitter-yaml@0.7.1/tree-sitter-yaml.wasm",
+	},
+	"tree-sitter-bash.wasm": {
+		package: "tree-sitter-bash",
+		version: "0.25.1",
+		url: "https://unpkg.com/tree-sitter-bash@0.25.1/tree-sitter-bash.wasm",
 	},
 };
 
@@ -225,7 +234,7 @@ export const BLOCKED_GRAMMARS: Record<string, GrammarBlock> = {
 };
 
 /** Runtime signals for the currently-running process. */
-export function currentGrammarRuntime(): GrammarRuntime {
+function currentGrammarRuntime(): GrammarRuntime {
 	const m = /^v?(\d+)/.exec(process.versions?.node ?? "");
 	return {
 		nodeMajor: m ? Number(m[1]) : 0,
@@ -277,7 +286,7 @@ export interface GrammarDownloadResult {
  * both the download path (validate before writing) and the on-disk path
  * (`fileHasWasmMagic`, for a file poisoned before this shipped) key off it.
  */
-export const WASM_MAGIC: readonly number[] = [0x00, 0x61, 0x73, 0x6d];
+const WASM_MAGIC: readonly number[] = [0x00, 0x61, 0x73, 0x6d];
 
 /** Do `bytes` start with the wasm magic number? */
 export function hasWasmMagic(bytes: Uint8Array): boolean {

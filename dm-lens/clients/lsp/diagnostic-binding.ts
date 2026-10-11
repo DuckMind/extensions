@@ -120,6 +120,8 @@ export interface DiagnosticBinding extends StoredDiagnosticBinding {
  */
 export interface TouchFileResult {
 	diags: import("./client.js").LSPDiagnostic[];
+	/** Primary/custom servers with no pull or observed push diagnostics. */
+	diagnosticsUnsupportedServerIds?: string[];
 	/** The file was declined because its nearest root is outside the session. */
 	skipReason?: "outside-project-root";
 	confirmation?: "confirmed" | "partial";
@@ -166,6 +168,23 @@ export interface TouchFileResult {
 	 * it covered — the same exemption `cut_off` and `silent` get.
 	 */
 	unconfirmedServerIds?: string[];
+	/**
+	 * #2810: the subset of {@link TouchDiagnosticsResult.unconfirmedServerIds}
+	 * this touch handed to the collect-later store, i.e. the only scanners a
+	 * turn-end drain can still deliver findings for (`cut_off`, `silent` or
+	 * `demoted`, each with no publication for these bytes). Deliberately NOT the
+	 * #1459 resync deferrals: those never received the content, are never marked
+	 * collect-later, and nothing arrives for them — they stay in the silent half
+	 * of the coverage notice, which is what says the result is incomplete.
+	 */
+	deferredServerIds?: string[];
+	/**
+	 * #3528 r2: servers whose notify queue did not send this touch's content (a
+	 * later read was sent instead, the path was closing or renamed away, or the
+	 * client was dead): the same set as the `lsp_touch_file` row's
+	 * `supersededServerIds`. Absent when every server got it.
+	 */
+	supersededServerIds?: string[];
 	binding?: DiagnosticBinding;
 }
 
@@ -173,10 +192,7 @@ export interface TouchFileResult {
  * #1549: which deadline made a touch inconclusive. `"mixed"` means both a
  * primary's notify write and the diagnostics wait lapsed on this touch.
  */
-export type TouchInconclusiveReason =
-	| "notify-write"
-	| "diagnostics-wait"
-	| "mixed";
+type TouchInconclusiveReason = "notify-write" | "diagnostics-wait" | "mixed";
 
 /** The inputs {@link resolveTouchVerdict} decides a touch's honesty verdict from. */
 export interface TouchVerdictInput {
@@ -309,24 +325,63 @@ export function touchCompletedConfirmationPolicy(
  *     scanner that HAD the content and published nothing, which is the whole
  *     subject of #1493 — recording a deferral there would corrupt it.
  */
-export type AuxiliaryWaitOutcome =
+type AuxiliaryWaitOutcome =
 	| "answered"
 	| "silent"
 	| "cut_off"
-	| "deferred";
+	| "deferred"
+	| "demoted";
 
 /** One auxiliary's contribution to a touch, as {@link auxiliaryCoverageGap} reads it. */
 export interface AuxiliaryWaitEvidence {
 	serverId: string;
 	outcome: AuxiliaryWaitOutcome;
 	/**
-	 * #1493: independent proof this auxiliary already published for EXACTLY the
-	 * content this touch carries — a stored binding whose `contentHash` equals
-	 * the touch's content hash. Such an auxiliary has reported on this file's
-	 * current bytes, so a wait that produced nothing new withholds nothing.
+	 * #1493/#2810: evidence this auxiliary already published for this touch —
+	 * either a stored binding whose `contentHash` equals the touch's content
+	 * hash, or (version-less publishers) a per-path publication stamp that
+	 * advanced past the touch's pre-notify baseline. The stamp form cannot prove
+	 * the bytes matched (a late publication of the previous revision also
+	 * advances it); only the demoted outcome row admits that form. The other
+	 * rows retain binding-only master semantics.
 	 * Absent/false → this touch has no publication of its own to point at.
 	 */
 	publishedThisContent?: boolean;
+}
+
+/**
+ * #2878: one publication-evidence predicate for auxiliary coverage. A
+ * content-hash binding proves that the stored publication describes these
+ * bytes. For a version-less publisher, an advanced per-path publication stamp
+ * proves that the auxiliary published after this touch's pre-notify baseline;
+ * the stamp alone cannot prove that the bytes matched. The pre-notify boolean
+ * passed as `bindingMatchesContent` preserves a binding that the notify
+ * cleared, while the live stamp covers a publication that landed after the
+ * wait began. This predicate is the union. Four callers use it; only the
+ * demoted row's `publishedThisContent` takes the union — the sibling and
+ * aggregate rows compute that field from `auxCoversThisContent` directly
+ * (#2914), while their `outcome` field still reads the stamp through this
+ * predicate. Absent evidence fails closed.
+ */
+export function auxiliaryPublicationEvidence({
+	bindingMatchesContent,
+	baseline,
+	currentPathVersion,
+	raced = true,
+}: {
+	bindingMatchesContent: boolean;
+	baseline: number | undefined;
+	currentPathVersion: number | undefined;
+	/** Whether the raced wait established the stamp evidence for this row. */
+	raced?: boolean;
+}): boolean {
+	return (
+		bindingMatchesContent ||
+		(raced &&
+			Number.isFinite(baseline) &&
+			currentPathVersion !== undefined &&
+			currentPathVersion > (baseline as number))
+	);
 }
 
 /**
@@ -362,7 +417,9 @@ export interface AuxiliaryWaitEvidence {
  * irrelevant once a verified publication for them exists. Exempting `silent` but
  * not `cut_off` on identical evidence would report the same coverage two ways
  * depending on which timer happened to win. This stays fail-closed — it
- * un-narrows only against a content-hash match, never against a timer.
+ * un-narrows only against publication evidence (content-hash match, or an
+ * advanced per-path publication stamp for version-less publishers), never
+ * against a timer.
  */
 export function auxiliaryCoverageGap(
 	evidence: readonly AuxiliaryWaitEvidence[],

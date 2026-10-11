@@ -2,18 +2,24 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { load as loadYaml } from "./deps/js-yaml.js";
 import { resolvePackagePath } from "./package-root.js";
 import { findLocalToolConfig } from "./path-utils.js";
+import {
+	getUserRuleRoot,
+	ruleCorpusFingerprintForCycle,
+	_resetRuleCorpusCycleFingerprintsForTests,
+} from "./custom-rule-locations.js";
 
 // ast-grep's root config marker. The `ast-grep lsp` server is workspace-gated:
 // it only operates in a project that has an `sgconfig.y[a]ml` at (or above) the
 // file. These are the names ast-grep itself looks for as root markers.
-export const SGCONFIG_NAMES = ["sgconfig.yml", "sgconfig.yaml"] as const;
+const SGCONFIG_NAMES = ["sgconfig.yml", "sgconfig.yaml"] as const;
 
 export interface AstGrepRuleSource {
 	dir: string;
-	origin: "project" | "bundled";
+	origin: "project" | "user" | "bundled";
 	tier: "primary" | "secondary";
 }
 
@@ -59,7 +65,8 @@ function canonicalDir(dir: string): string {
 
 /**
  * Rule sources in the precedence order shared by raw ast-grep/LSP and NAPI:
- * project primary, project secondary, bundled primary, bundled secondary.
+ * project primary, project secondary, user primary, user secondary, bundled
+ * primary, bundled secondary.
  */
 export function getAstGrepRuleSources(
 	projectRoot = process.cwd(),
@@ -78,6 +85,21 @@ export function getAstGrepRuleSources(
 			{
 				dir: path.join(root, "rules", "ast-grep-rules", "coderabbit", "rules"),
 				origin: "project",
+				tier: "secondary",
+			},
+		);
+	}
+	const userRoot = getUserRuleRoot();
+	if (canonicalDir(userRoot) !== canonicalDir(root)) {
+		candidates.push(
+			{
+				dir: path.join(userRoot, "ast-grep-rules", "rules"),
+				origin: "user",
+				tier: "primary",
+			},
+			{
+				dir: path.join(userRoot, "ast-grep-rules", "coderabbit", "rules"),
+				origin: "user",
 				tier: "secondary",
 			},
 		);
@@ -110,13 +132,6 @@ export function getAstGrepRuleSources(
 		seen.add(key);
 		return true;
 	});
-}
-
-/** Compatibility export retained for callers that only need ordered dirs. */
-export function shippedRuleDirsInPrecedenceOrder(
-	projectRoot = process.cwd(),
-): string[] {
-	return getAstGrepRuleSources(projectRoot).map((source) => source.dir);
 }
 
 function findYamlFiles(dir: string): string[] {
@@ -201,7 +216,18 @@ function snapshotRuleSource(source: AstGrepRuleSource): RuleSourceSnapshot {
 		}
 		hash.update(content);
 		hash.update("\0");
-		files.push({ file, relativePath, documents: parseRuleDocuments(content) });
+		const documents = parseRuleDocuments(content);
+		if (
+			source.origin === "user" &&
+			documents.some((document) => !document.id)
+		) {
+			recordDegradationOnce({
+				kind: "ast-grep-rule-invalid",
+				subject: file,
+				reason: "user ast-grep rule has no valid rule id",
+			});
+		}
+		files.push({ file, relativePath, documents });
 	}
 	const snapshot = { ...source, files, digest: hash.digest("hex") };
 	if (source.origin === "bundled") bundledSnapshots.set(cacheKey, snapshot);
@@ -221,6 +247,36 @@ function sourceFingerprint(sources: RuleSourceSnapshot[]): string {
 		hash.update("\0");
 	}
 	return hash.digest("hex");
+}
+
+/**
+ * Fingerprint shared by ast-grep execution and description metadata.
+ *
+ * Computed at most once per dispatch cycle and reused by every later call in
+ * it (#4212 round 4), through the same seam the tree-sitter loader memo uses so
+ * both rule families agree on when a corpus is re-read. Without it, every
+ * `AstGrepRuleManager.loadRuleDescriptions()` re-walked and re-content-hashed
+ * the project and user rule trees — the per-call cost the round-2 verify
+ * measured on the tree-sitter side of the same class.
+ *
+ * `force` recomputes and republishes into the current cycle. Only
+ * `resolveBaselineSgconfig` passes it; see there for why that path opts out of
+ * the cycle memo.
+ */
+export function getAstGrepRuleFingerprint(
+	projectRoot = process.cwd(),
+	options: { force?: boolean } = {},
+): string {
+	const root = path.resolve(projectRoot || process.cwd());
+	return ruleCorpusFingerprintForCycle(
+		"ast-grep",
+		root,
+		(fingerprintRoot) =>
+			sourceFingerprint(
+				getAstGrepRuleSources(fingerprintRoot).map(snapshotRuleSource),
+			),
+		options.force,
+	);
 }
 
 function materializeMergedRuleDir(
@@ -277,9 +333,17 @@ export function resolveBaselineSgconfig(
 	projectRoot = process.cwd(),
 ): string | undefined {
 	const root = canonicalDir(path.resolve(projectRoot || process.cwd()));
-	const sources = getAstGrepRuleSources(root).map(snapshotRuleSource);
-	if (sources.length === 0) return undefined;
-	const fingerprint = sourceFingerprint(sources);
+	// FORCED, so this path opts out of the cycle memo. It runs once per
+	// ast-grep LSP spawn (`clients/lsp/server.ts`, `spawn(root, options)`),
+	// never on a per-file or per-call path, and #497's point-7 contract —
+	// pinned by `tests/clients/sgconfig.test.ts` — is that a project rule added
+	// mid-session wins on the very next resolve, inside the same cycle. Serving
+	// a cycle-memoized fingerprint here would hand the spawned server a merged
+	// rule directory built before that rule existed. Forcing also republishes
+	// the fresh value into the cycle, so a later description read agrees with
+	// the config this just materialized. The snapshot below stays on the miss
+	// path: a hit returns before any rule file is read.
+	const fingerprint = getAstGrepRuleFingerprint(root, { force: true });
 	const cached = cachedBaselines.get(root);
 	if (
 		cached?.fingerprint === fingerprint &&
@@ -288,6 +352,9 @@ export function resolveBaselineSgconfig(
 	) {
 		return cached.path;
 	}
+
+	const sources = getAstGrepRuleSources(root).map(snapshotRuleSource);
+	if (sources.length === 0) return undefined;
 
 	const dir = path.join(os.tmpdir(), "dm-lens-ast-grep");
 	fs.mkdirSync(dir, { recursive: true });
@@ -311,7 +378,83 @@ export function resolveBaselineSgconfig(
 	const ruleDirForYaml = mergedDir.split(path.sep).join("/");
 	fs.writeFileSync(file, `ruleDirs:\n  - ${JSON.stringify(ruleDirForYaml)}\n`);
 	cachedBaselines.set(root, { fingerprint, path: file, mergedDir });
+	// Only the current pair is protected: every other baseline this process
+	// resolved is an eviction candidate too, or the keep-set would grow with
+	// the root count and the cap could never fire. An evicted sibling
+	// re-materializes on its next resolve through the existsSync check above.
+	enforceBaselineEntryCap(dir, new Set([file, mergedDir]));
 	return file;
+}
+
+/**
+ * Hard bound on the shared scratch dir (#2912: it held ~703,000 entries after
+ * one merge train). An entry cap, not a per-session subdirectory: no
+ * session-end seam owns this module, and a cap is race-safe across concurrent
+ * processes — a sibling whose baseline is evicted re-materializes on its next
+ * resolve (the existsSync check above self-heals). Each root baseline is two
+ * entries (config + merged rules dir); 24 entries ≈ 12 live roots, ample for
+ * concurrent agents times worktrees. Eviction is oldest-mtime-first and emits
+ * one bounded record per session.
+ */
+const SG_BASELINE_RETAINED_ENTRIES = 24;
+
+function enforceBaselineEntryCap(dir: string, keep: Set<string>): void {
+	let names: string[];
+	try {
+		names = fs.readdirSync(dir);
+	} catch {
+		return;
+	}
+	const candidates: { full: string; mtimeMs: number; recursive: boolean }[] =
+		[];
+	for (const name of names) {
+		const isConfig = /^baseline(?:-\d+(?:-[a-f0-9]+)?)?\.sgconfig\.yml$/.test(
+			name,
+		);
+		const isMergedDir = /^baseline-\d+(?:-[a-f0-9]+)?\.rules$/.test(name);
+		if (!isConfig && !isMergedDir) continue;
+		const full = path.join(dir, name);
+		if (keep.has(full)) continue;
+		try {
+			candidates.push({
+				full,
+				mtimeMs: fs.statSync(full).mtimeMs,
+				recursive: isMergedDir,
+			});
+		} catch {
+			// Racing another session; leave its artifact alone.
+		}
+	}
+	const over = candidates.length + keep.size - SG_BASELINE_RETAINED_ENTRIES;
+	if (over <= 0) return;
+	candidates.sort((a, b) => a.mtimeMs - b.mtimeMs);
+	let evicted = 0;
+	for (const candidate of candidates.slice(0, over)) {
+		try {
+			fs.rmSync(candidate.full, {
+				recursive: candidate.recursive,
+				force: true,
+			});
+			evicted += 1;
+			for (const [root, baseline] of cachedBaselines) {
+				if (
+					baseline.path === candidate.full ||
+					baseline.mergedDir === candidate.full
+				) {
+					cachedBaselines.delete(root);
+				}
+			}
+		} catch {
+			// Racing another session; leave its artifact alone.
+		}
+	}
+	if (evicted > 0) {
+		recordDegradationOnce({
+			kind: "sgconfig-baseline-cap-evict",
+			subject: dir,
+			reason: `evicted ${evicted} oldest baseline entries over the ${SG_BASELINE_RETAINED_ENTRIES}-entry cap`,
+		});
+	}
 }
 
 function cleanupStaleBaselines(dir: string, keep: Set<string>): void {
@@ -326,8 +469,9 @@ function cleanupStaleBaselines(dir: string, keep: Set<string>): void {
 			const full = path.join(dir, name);
 			if (keep.has(full)) continue;
 			try {
-				if (fs.statSync(full).mtimeMs < cutoff) {
-					fs.rmSync(full, { recursive: isMergedDir, force: true });
+				const stat = fs.statSync(full);
+				if (stat.mtimeMs < cutoff) {
+					fs.rmSync(full, { recursive: stat.isDirectory(), force: true });
 				}
 			} catch {
 				// Racing another session; leave its artifact alone.
@@ -342,4 +486,8 @@ function cleanupStaleBaselines(dir: string, keep: Set<string>): void {
 export function _resetBaselineSgconfigForTests(): void {
 	cachedBaselines.clear();
 	bundledSnapshots.clear();
+	// The baseline cache is keyed on a fingerprint this module no longer
+	// recomputes per call, so a test that clears one must clear the other or
+	// the next resolve in the same cycle reuses a stale corpus identity.
+	_resetRuleCorpusCycleFingerprintsForTests();
 }

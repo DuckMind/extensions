@@ -22,6 +22,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { normalizeFilePath } from "./path-utils.js";
+import { isTestProcessTargetingRealHome } from "./probe-home-state.js";
 import { redactSecrets } from "./redact/secrets.js";
 
 /** A queued write ("line") or an in-band truncate op (latency clear). */
@@ -148,6 +149,19 @@ interface NdjsonWriterState {
 	 * ledger instead of failing silently.
 	 */
 	rotationRetryAfterMs: number;
+	/** Whether this shared writer has seen a rotation-policy conflict this session. */
+	optionConflictRecorded: boolean;
+	/**
+	 * `truncate()` calls refused this session because a test process aimed them
+	 * at the real machine-global home (#3721, see `isTestProcessTargetingRealHome`).
+	 * In-memory, pulled at READ time by `getSinkTruncateRefusals()` for the same
+	 * import-cycle reason as `writeFailures`: this module may not call
+	 * `recordDegradationOnce`, and a record WRITTEN through the very sink whose
+	 * truncation was refused would be a write into the real log from a test
+	 * process, the harm the refusal prevents. Reset at session_start via
+	 * `resetSinkRotations()` (catalog shape 17).
+	 */
+	truncateRefusals: number;
 }
 
 const NDJSON_GLOBAL_STATE_SCHEMA = "dm-lens.ndjson-logger.state";
@@ -275,9 +289,12 @@ export function getRegisteredLogFiles(): ReadonlySet<string> {
 	return registeredLogFiles;
 }
 
-/** Test-only reset — each test file gets a clean registry (see ndjson-logger.test.ts). */
-export function _resetRegisteredLogFilesForTest(): void {
-	registeredLogFiles.clear();
+/** Resolve every registered NDJSON writer before a graceful lifecycle boundary. */
+export function flushAllNdjsonWriters(): Promise<void> {
+	if (!ndjsonGlobalState) return Promise.resolve();
+	return Promise.all(
+		[...ndjsonGlobalState.writers.values()].map((state) => drain(state)),
+	).then(() => undefined);
 }
 
 export interface SinkWriteFailureSummary {
@@ -361,7 +378,46 @@ export function resetSinkRotations(): void {
 		state.rotationCount = 0;
 		state.rotationFailures = 0;
 		state.rotationRetryAfterMs = 0;
+		state.optionConflictRecorded = false;
+		state.truncateRefusals = 0;
 	}
+}
+
+export interface SinkOptionConflictSummary {
+	/** Canonicalized absolute path whose rotation policy differed across graphs. */
+	file: string;
+}
+
+export interface SinkTruncateRefusalSummary {
+	/** Canonicalized absolute path of the sink whose truncation was refused. */
+	file: string;
+	/** `truncate()` calls refused this session (#3721). */
+	refusedCount: number;
+}
+
+/**
+ * Snapshot of refused truncations, one entry per sink that has any (#3721).
+ * Pure in-memory read, folded into `getDegradationSummary()` as
+ * `log-sink-truncate-refused`; one row per sink however many calls were
+ * refused, so a `beforeEach` that clears a log never fans out per call.
+ */
+export function getSinkTruncateRefusals(): SinkTruncateRefusalSummary[] {
+	if (!ndjsonGlobalState) return [];
+	const result: SinkTruncateRefusalSummary[] = [];
+	for (const state of ndjsonGlobalState.writers.values()) {
+		if (state.truncateRefusals > 0) {
+			result.push({ file: state.file, refusedCount: state.truncateRefusals });
+		}
+	}
+	return result;
+}
+
+/** Pure read-time view for the degradation ledger; never logs through this sink. */
+export function getSinkOptionConflicts(): SinkOptionConflictSummary[] {
+	if (!ndjsonGlobalState) return [];
+	return [...ndjsonGlobalState.writers.values()]
+		.filter((state) => state.optionConflictRecorded)
+		.map((state) => ({ file: state.file }));
 }
 
 function requireCurrentGlobalState(): NdjsonGlobalState {
@@ -386,19 +442,6 @@ function registerWriter(state: NdjsonWriterState): void {
 
 function normalizeLogPath(file: string): string {
 	return normalizeFilePath(path.resolve(file));
-}
-
-function assertCompatibleWriterOptions(
-	existing: NdjsonWriterState,
-	maxBytes?: number,
-	backupPath?: string,
-): void {
-	if (existing.maxBytes === maxBytes && existing.backupPath === backupPath)
-		return;
-	throw new Error(
-		`createNdjsonLogger: incompatible options for shared path ${existing.file}; ` +
-			`the first writer's maxBytes/backupPath must be reused`,
-	);
 }
 
 function writeQueueItemSync(state: NdjsonWriterState, item: QueueItem): void {
@@ -485,7 +528,6 @@ function createWriterState(
 	if (existing) {
 		// A partially initialized global state from another graph still needs to
 		// be enrolled, but it must never get a second queue or exit flusher.
-		assertCompatibleWriterOptions(existing, maxBytes, backupPath);
 		if (!exitFlushers.has(existing.exitFlusher)) registerWriter(existing);
 		// A state adopted from a pre-#1970 module graph predates this field.
 		if (typeof existing.writeFailures !== "number") existing.writeFailures = 0;
@@ -502,6 +544,24 @@ function createWriterState(
 			existing.rotationFailures = 0;
 		if (typeof existing.rotationRetryAfterMs !== "number")
 			existing.rotationRetryAfterMs = 0;
+		if (typeof existing.optionConflictRecorded !== "boolean")
+			existing.optionConflictRecorded = false;
+		// A state adopted from a pre-#3721 module graph predates this field.
+		if (typeof existing.truncateRefusals !== "number")
+			existing.truncateRefusals = 0;
+		const optionsDiffer =
+			existing.maxBytes !== maxBytes || existing.backupPath !== backupPath;
+		if (optionsDiffer) {
+			// A pre-#2505 graph can leave this writer unbounded. Adopt the incoming
+			// bound so reload restores rotation instead of preserving an unsafe gap.
+			if (existing.maxBytes === undefined && maxBytes !== undefined)
+				existing.maxBytes = maxBytes;
+			if (existing.backupPath === undefined && backupPath !== undefined)
+				existing.backupPath = backupPath;
+			// A rotation-policy disagreement must never abort extension loading.
+			// The ledger folds this bounded, per-path fact into health at read time.
+			existing.optionConflictRecorded = true;
+		}
 		return existing;
 	}
 
@@ -522,6 +582,8 @@ function createWriterState(
 	state.rotationCount = 0;
 	state.rotationFailures = 0;
 	state.rotationRetryAfterMs = 0;
+	state.optionConflictRecorded = false;
+	state.truncateRefusals = 0;
 	globalState.writers.set(file, state);
 	registerWriter(state);
 	return state;
@@ -921,6 +983,29 @@ export function createNdjsonLogger(options: NdjsonLoggerOptions): NdjsonLogger {
 			enqueue({ kind: "line", line: `${redactSecrets(line)}\n` });
 		},
 		truncate(): void {
+			// #3721: the one rule, asked of its owner. A test process never cuts a
+			// log out of the real home; the refusal is counted, not written into the
+			// sink. One warning on the 0 -> 1 edge, so the vitest process that
+			// triggers it sees the refusal (#3892 review F1). `emitWarning` is the
+			// only terminal channel a `clients/` module may use (#1333; a raw
+			// `process.stderr.write` reds `extension-terminal-silence.test.ts`).
+			const state = stateForCall();
+			if (isTestProcessTargetingRealHome(state.file)) {
+				if (state.truncateRefusals === 0) {
+					try {
+						process.emitWarning(
+							`dm-lens refused to truncate the real-home log ${state.file} ` +
+								"from a test process (pin DM_LENS_HOME for this file)",
+							{ code: "DM_LENS_LOG_SINK_TRUNCATE_REFUSED" },
+						);
+					} catch {
+						// The refusal is already counted; a warning that cannot be
+						// emitted must not propagate into a test's clear helper.
+					}
+				}
+				state.truncateRefusals += 1;
+				return;
+			}
 			enqueue({ kind: "truncate" });
 		},
 		async flush(): Promise<void> {

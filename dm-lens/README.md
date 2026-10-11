@@ -19,14 +19,11 @@ not query a third-party product registry.
 - Configuration and environment variables use the `DM_LENS_` / `.dm-lens`
   namespace.
 
-## DM compatibility fallback
+## Test-runner delivery
 
-DM's public renderer API is message-based rather than the upstream
-non-context-entry renderer API. Test-runner findings are therefore delivered
-with `triggerTurn: false`, an empty message `content`, and the findings in
-renderer-only `details`. This preserves visible diagnostics without injecting
-the findings into an LLM turn; the empty envelope is retained as a documented
-DM compatibility fallback.
+Lens 4.3 stages test-runner findings at the idle boundary and consumes them
+at the next turn's event handler. This no longer needs the legacy non-context
+entry renderer or the old empty-message compatibility fallback.
 
 The upstream source revision is recorded as technical provenance in the managed
 extension catalog. It is not a runtime lookup endpoint.

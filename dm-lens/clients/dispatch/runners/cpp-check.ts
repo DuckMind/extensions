@@ -1,6 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { probeToolAsync } from "../../tool-probe.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -9,6 +12,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 type CompilerSpec =
 	| { command: string; args: string[]; flavor: "gcc" | "msvc" }
@@ -125,7 +129,10 @@ async function resolveCompiler(
 			flavor: "msvc",
 		};
 	}
-	const clProbe = await safeSpawnAsync("cl", [], { timeout: 5000 });
+	// Mirrors the deliberate global-PATH probes in utils/runner-helpers.ts:
+	// this never resolves a config file or a target path, so there is no cwd
+	// for it to get wrong.
+	const clProbe = await probeToolAsync("cl", [], { timeout: 5000 });
 	if (!clProbe.error && clProbe.status !== null) {
 		return {
 			command: "cl",
@@ -137,17 +144,21 @@ async function resolveCompiler(
 	return undefined;
 }
 
-function parseGccLikeOutput(raw: string, filePath: string): Diagnostic[] {
+function parseGccLikeOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const line of raw.split(/\r?\n/)) {
 		const match = line.match(
 			/^(.*?):(\d+):(?:(\d+):)?\s*(fatal error|error|warning|note):\s+(.+)$/i,
 		);
 		if (!match) continue;
 		const [, sourcePath, lineStr, colStr, severityLabel, message] = match;
-		const resolvedSource = path.resolve(sourcePath.trim());
-		const resolvedTarget = path.resolve(filePath);
-		if (resolvedSource !== resolvedTarget) continue;
+		// #3278: one seam for reported-path attribution — see javac.ts.
+		if (!pathsEqual(path.resolve(cwd, sourcePath.trim()), absTarget)) continue;
 
 		const severity = severityLabel.toLowerCase().includes("error")
 			? "error"
@@ -170,17 +181,21 @@ function parseGccLikeOutput(raw: string, filePath: string): Diagnostic[] {
 	return diagnostics;
 }
 
-function parseMsvcOutput(raw: string, filePath: string): Diagnostic[] {
+function parseMsvcOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const line of raw.split(/\r?\n/)) {
 		const match = line.match(
 			/^(.*)\((\d+)(?:,(\d+))?\):\s*(fatal error|error|warning)\s+([A-Z]+\d+):\s+(.+)$/i,
 		);
 		if (!match) continue;
 		const [, sourcePath, lineStr, colStr, severityLabel, rule, message] = match;
-		const resolvedSource = path.resolve(sourcePath.trim());
-		const resolvedTarget = path.resolve(filePath);
-		if (resolvedSource !== resolvedTarget) continue;
+		// #3278: one seam for reported-path attribution — see javac.ts.
+		if (!pathsEqual(path.resolve(cwd, sourcePath.trim()), absTarget)) continue;
 
 		const severity = severityLabel.toLowerCase().includes("error")
 			? "error"
@@ -202,10 +217,6 @@ function parseMsvcOutput(raw: string, filePath: string): Diagnostic[] {
 	return diagnostics;
 }
 
-function firstOutputLine(raw: string): string {
-	return raw.trim().split(/\r?\n/, 1)[0]?.slice(0, 200) ?? "";
-}
-
 const cppCheckRunner: RunnerDefinition = {
 	id: "cpp-check",
 	appliesTo: ["cxx"],
@@ -213,7 +224,7 @@ const cppCheckRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "cpp-check");
 		const absPath = path.resolve(cwd, ctx.filePath);
 		const compiler = await resolveCompiler(absPath, cwd);
 		if (!compiler) {
@@ -225,48 +236,32 @@ const cppCheckRunner: RunnerDefinition = {
 			timeout: 30000,
 		});
 		const raw = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
-		const diagnostics =
-			compiler.flavor === "msvc"
-				? parseMsvcOutput(raw, ctx.filePath)
-				: parseGccLikeOutput(raw, ctx.filePath);
-
-		if (diagnostics.length === 0) {
-			if (result.status && result.status !== 0) {
-				return {
-					status: "failed",
-					diagnostics: [
-						{
-							id: "cpp-check-nonzero-no-diagnostics",
-							message:
-								firstOutputLine(raw) ||
-								`${compiler.command} exited non-zero without structured diagnostics`,
-							filePath: ctx.filePath,
-							severity: "warning",
-							semantic: "warning",
-							tool: "cpp-check",
-							rule: compiler.command,
-							fixable: false,
-						},
-					],
-					semantic: "warning",
-					rawOutput: raw,
-				};
-			}
-			return {
-				status: "succeeded",
-				diagnostics: [],
-				semantic: "none",
-				rawOutput: raw,
-			};
-		}
-
-		const hasErrors = diagnostics.some((d) => d.severity === "error");
-		return {
-			status: hasErrors ? "failed" : "succeeded",
-			diagnostics,
-			semantic: "warning",
-			rawOutput: raw,
-		};
+		const parsed = parseToolRun(
+			"cpp-check",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (gcc/clang 13 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(output) =>
+				compiler.flavor === "msvc"
+					? parseMsvcOutput(output, ctx.filePath, cwd)
+					: parseGccLikeOutput(output, ctx.filePath, cwd),
+		);
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "cpp-check",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+			classify: (diagnostics) => ({
+				status: diagnostics.some((d) => d.severity === "error")
+					? "failed"
+					: "succeeded",
+				semantic: "warning",
+			}),
+		});
 	},
 };
 

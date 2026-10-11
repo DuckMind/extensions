@@ -29,6 +29,10 @@ const writer = createNdjsonLogger({
 
 export interface DeadCodeScanEvent {
 	language: string;
+	/** #4117: the project root the scan ran over. */
+	root?: string;
+	/** #4117: linked worktrees under the root the scan was told to leave out. */
+	excludedWorktrees?: number;
 	sessionId?: string;
 	success: boolean;
 	cached: boolean;
@@ -38,6 +42,8 @@ export interface DeadCodeScanEvent {
 	unlistedDeps: number;
 	durationMs?: number;
 	reason?: string;
+	/** #4154: a failed scan left the good row on disk in place instead of replacing it. */
+	cacheKept?: boolean;
 }
 
 /**
@@ -48,9 +54,4 @@ export interface DeadCodeScanEvent {
 export function logDeadCodeScan(event: DeadCodeScanEvent): void {
 	if (isTestMode()) return;
 	writer.log({ ts: new Date().toISOString(), ...event });
-}
-
-/** Resolve once all enqueued dead-code writes are on disk (tests/shutdown). */
-export function flushDeadCodeLog(): Promise<void> {
-	return writer.flush();
 }

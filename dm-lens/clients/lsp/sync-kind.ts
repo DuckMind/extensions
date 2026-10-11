@@ -19,7 +19,6 @@
 
 export type TextDocumentSyncKind = 0 | 1 | 2;
 
-export const TEXT_DOCUMENT_SYNC_KIND_NONE: TextDocumentSyncKind = 0;
 export const TEXT_DOCUMENT_SYNC_KIND_FULL: TextDocumentSyncKind = 1;
 export const TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL: TextDocumentSyncKind = 2;
 
@@ -47,4 +46,44 @@ export function negotiateSyncKind(
 		if (isSyncKind(change)) return change;
 	}
 	return TEXT_DOCUMENT_SYNC_KIND_FULL;
+}
+
+/**
+ * #3405: the `save` half of the same `TextDocumentSyncOptions` object.
+ *
+ * `ServerCapabilities.textDocumentSync.save` is `boolean | SaveOptions`, and
+ * upstream states the rule this module has to encode: "If present save
+ * notifications are sent to the server. If omitted the notification should not
+ * be sent." (`microsoft/vscode-languageserver-node@4f782ce`
+ * `protocol/src/common/protocol.ts:1751-1755`). `SaveOptions.includeText` — "The
+ * client is supposed to include the content on save." (`:1038-1043`) — decides
+ * whether the notification carries the document text.
+ *
+ * `undefined` therefore means "this server did not ask for didSave", and is
+ * returned for the legacy bare-number `textDocumentSync` shape too: that shape
+ * carries a change kind and nothing else, so it declares no save. Fail-closed is
+ * the safe default here for the same reason #278 made the client capability set
+ * complete: a notification a server never advertised is one it may not have a
+ * handler for.
+ */
+export interface TextDocumentSaveOptions {
+	/** Send the document text with `textDocument/didSave`. */
+	includeText: boolean;
+}
+
+export function negotiateSaveOptions(
+	serverCapabilities: unknown,
+): TextDocumentSaveOptions | undefined {
+	const sync = (
+		serverCapabilities as { textDocumentSync?: unknown } | null | undefined
+	)?.textDocumentSync;
+	if (!sync || typeof sync !== "object") return undefined;
+	const save = (sync as { save?: unknown }).save;
+	if (save === true) return { includeText: false };
+	if (save && typeof save === "object") {
+		return {
+			includeText: (save as { includeText?: unknown }).includeText === true,
+		};
+	}
+	return undefined;
 }

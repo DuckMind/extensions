@@ -20,7 +20,7 @@
 
 import { DEPRECATED_CONFIG_SURFACES } from "./config-diagnostic-codes.js";
 
-export type LensFlagScope = "global" | "project";
+type LensFlagScope = "global" | "project";
 
 export interface LensFlagSpec {
 	/** CLI flag name (`--<name>`) and the key callers pass to `getFlag`. */
@@ -51,6 +51,27 @@ export interface LensFlagSpec {
 	 * (`format.mode`). Returns undefined when the key is absent.
 	 */
 	readGlobal?: (config: Record<string, unknown>) => boolean | undefined;
+}
+
+/**
+ * The `ui.*` opt-in family shares these three invariants — `negated: false`,
+ * `default: false`, `scope: "global"` — so declare them once here instead of
+ * restating a six-field object literal per entry (Sonar CPD's duplicate-block
+ * source: it normalizes string literals, so per-entry rewording cannot help).
+ */
+function globalOptInFlag(
+	name: string,
+	description: string,
+	configKey: string,
+): LensFlagSpec {
+	return {
+		name,
+		description,
+		configKey,
+		negated: false,
+		default: false,
+		scope: "global",
+	};
 }
 
 export const LENS_FLAGS: readonly LensFlagSpec[] = [
@@ -215,15 +236,26 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 		default: false,
 		scope: "global",
 	},
-	{
-		name: "lens-compact-tool-line",
-		description:
-			"Opt-in (#1327): collapse a dm-lens tool's call+result rows into ONE theme-aware line (status glyph + name + summary) instead of two. Preserves expand-to-view-full-output. Default off. Also via ui.compactToolLine=true in ~/.dm-lens/config.json.",
-		configKey: "ui.compactToolLine",
-		negated: false,
-		default: false,
-		scope: "global",
-	},
+	globalOptInFlag(
+		"lens-compact-tool-line",
+		"Opt-in (#1327): collapse a dm-lens tool's call+result rows into ONE theme-aware line (status glyph + name + summary) instead of two. Preserves expand-to-view-full-output. Default off. Also via ui.compactToolLine=true in ~/.dm-lens/config.json.",
+		"ui.compactToolLine",
+	),
+	globalOptInFlag(
+		"lens-compact-lsp-status",
+		"Opt-in (#3099): collapse the footer LSP status to one state glyph per group (LSP ✓ green, LSP ✗ red, dim LSP ✗ when nothing is warm) instead of listing the active server names. Default off. Also via ui.compactLspStatus=true in ~/.dm-lens/config.json.",
+		"ui.compactLspStatus",
+	),
+	globalOptInFlag(
+		"lens-hide-lsp-status",
+		"Opt-in (#3099): publish no dm-lens-lsp footer status at all, so a host that renders extension statuses stops showing the key. Outranks lens-compact-lsp-status when both are set. Default off. Also via ui.hideLspStatus=true in ~/.dm-lens/config.json.",
+		"ui.hideLspStatus",
+	),
+	globalOptInFlag(
+		"lens-compact-widget",
+		"Opt-in (#3959): render the dm-lens widget as ONE summary line (languages + error/warning totals) instead of also stacking file rows, the suppressed count and blocker details below it. Default off. Also via ui.compactWidget=true in ~/.dm-lens/config.json.",
+		"ui.compactWidget",
+	),
 	{
 		name: "no-lazy-tools",
 		description:
@@ -242,6 +274,24 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 		default: false,
 		scope: "global",
 	},
+	...(
+		[
+			"knip",
+			"jscpd",
+			"madge",
+			"gitleaks",
+			"govulncheck",
+			"deadCode",
+			"complexity",
+		] as const
+	).map((analyzer) => ({
+		name: `no-${analyzer.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`,
+		description: `Disable the ${analyzer} session-start analyzer. Also via ${analyzer}.enabled=false in config.`,
+		configKey: `${analyzer}.enabled`,
+		negated: true,
+		default: false,
+		scope: "project" as const,
+	})),
 ];
 
 const byName = new Map(LENS_FLAGS.map((spec) => [spec.name, spec]));
@@ -274,7 +324,43 @@ export const GLOBAL_NON_FLAG_CONFIG_SECTIONS: readonly string[] = [
 	"ignore",
 	"dispatch",
 	"widget",
+	"startup",
 	"$schema",
+];
+
+/**
+ * Dotted GLOBAL-only config keys that are NOT `LENS_FLAGS` entries — no CLI
+ * flag, not a boolean — but still sit inside a section a project
+ * `.dm-lens.json` is otherwise recognized to touch (#3131). The project
+ * loader's mixed-scope sub-key scan (`project-lens-config.ts`) already derives
+ * its FLAG population from `LENS_FLAGS`; that derivation structurally cannot
+ * see a key like `actionableWarnings.autoFix.maxFixes` — a numeric cap with no
+ * `--flag` counterpart, documented global-only (`docs/settings.md`), read only
+ * through `getGlobalActionableWarningMaxFixes()` (`clients/lens-config.ts`) —
+ * because it was never a `LensFlagSpec` to begin with. `actionableWarnings` is
+ * itself recognized at project scope only because its SIBLING
+ * `actionableWarnings.autoFix.enabled` is a `scope: "project"` flag, so before
+ * this registry existed the loader parsed `maxFixes` away with no signal at
+ * all — the same silent-drop shape #2426 review round 2 (F3) fixed for
+ * `lsp.enabled` and #3112 fixed for `tools.lazy`.
+ *
+ * This is the single source that population is derived from: the mixed-scope
+ * scan reads `LENS_FLAGS` for flag keys and this list for everything else, so
+ * a future non-flag global-only key needs one line HERE, never a second
+ * hand-typed list inside the loader.
+ *
+ * A key belongs here ONLY when all three hold: (a) it is global-only — read
+ * solely off `~/.dm-lens/config.json`, never honored from a project document;
+ * (b) it is not a `LENS_FLAGS` entry; (c) its SECTION is recognized at project
+ * scope for some OTHER reason. A key whose whole section is unrecognized at
+ * project scope needs no entry — the top-level unknown-key scan already
+ * reports the section. Swept at #3131: every other non-flag dotted key either
+ * loader parses (`dispatch.runnerTimeoutFloorMs`, `widget.visible`,
+ * `startup.mode`, `startup.scans.enabled`) fails (a) or (c) — see that PR's
+ * body for the per-member table — so this is currently the only member.
+ */
+export const GLOBAL_ONLY_NON_FLAG_KEYS: readonly string[] = [
+	"actionableWarnings.autoFix.maxFixes",
 ];
 
 /**
@@ -297,6 +383,20 @@ export const PROJECT_NON_FLAG_CONFIG_SECTIONS: readonly string[] = [
 	"reviewGraph",
 	"trivy",
 	"helm",
+	"startup",
+	// `tools` is MIXED-SCOPE, and belongs here for the project-scoped half
+	// (#3112). `tools.<name>.enabled` is not a registry flag at all: it is
+	// hand-parsed by `readToolConfig` against `TOOL_REGISTRY` in BOTH loaders,
+	// and `resolveLensToolEnabled` reads the project document's value ahead of
+	// the global one — which is what `docs/settings.md` and
+	// `docs/globalconfig.md` document. Deriving the project-accepted sections
+	// from the flag registry alone therefore put the whole section in
+	// `globalScopeOnlyKeys` (its only registry flag, `tools.lazy`, IS global)
+	// and told every user of a documented per-tool override that it was being
+	// ignored. The global-only half is not lost: `tools.lazy` is still reported
+	// at project scope by the project loader's mixed-scope sub-key scan, which
+	// derives WHICH sub-keys those are from this same registry.
+	"tools",
 ];
 
 /**
@@ -407,6 +507,25 @@ function resolveFlagConfigPath(
 	const finalSource = asConfigObject(source);
 	if (!finalSource) return undefined;
 	return { source: finalSource, segments };
+}
+
+/**
+ * Whether a parsed config document actually SETS the dotted `configKey` —
+ * presence, not validity (#3112). The project loader's mixed-scope scan must
+ * report `tools: { lazy: "yes" }` exactly as it reports `tools: { lazy: false }`:
+ * the user wrote a global-only setting in a project file either way, and
+ * {@link readFlagConfigValue} would return `undefined` for the malformed one and
+ * silently skip it. Shares {@link resolveFlagConfigPath} with every other reader
+ * so "which segments does this key name" is answered in exactly one place.
+ */
+export function hasFlagConfigPath(
+	raw: Record<string, unknown>,
+	configKey: string,
+): boolean {
+	const resolved = resolveFlagConfigPath(raw, configKey);
+	if (!resolved) return false;
+	const leaf = resolved.segments.at(-1);
+	return leaf !== undefined && leaf in resolved.source;
 }
 
 /**

@@ -2,42 +2,46 @@
  * Async execution logic for subagent tool
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
+import * as nodeModule from "node:module";
 import type { ExtensionAPI } from "@duckmind/dm-coding-agent";
 import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig, type UnknownAgentDiagnosticContext } from "../../agents/agents.ts";
-import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts";
-import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
+import { createAtomicJsonWriter, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
+import { childCacheRetentionEnv } from "../../shared/child-cache-retention.ts";
+import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
-import { planChildLaunch, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
-import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/dm-args.ts";
-import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveExistingReadPaths, writeInitialProgressFile, type ChainStep, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
-import type { RunnerStep } from "../shared/parallel-utils.ts";
+import { planChildLaunch, projectChainOutputSchemas, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
+import { formatHerdrMachineRunnerUnsupported, resolveHerdrMachinePlacement } from "../shared/herdr-machine.ts";
+import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
+import { assertClaudeCodeModelScope, isClaudeCodeAdapterId, resolveClaudeCodeOverride, type ClaudeCodeOverride } from "../shared/claude-code-adapter.ts";
+import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
+import { applyWatchdogLaunchRules, sendRuleViolationWarning } from "../../watchdog/rules.ts";
+import { buildChainInstructions, getStepAgents, isDynamicParallelStep, isParallelStep, resolveExistingReadInstructionPaths, resolveExistingReadPaths, writeInitialProgressFile, type ChainStep, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
+import { isDynamicRunnerGroup, isParallelGroup, type RunnerStep } from "../shared/parallel-utils.ts";
 import type { ContextMode } from "../shared/context-mode.ts";
-import { resolvePiPackageRoot } from "../shared/dm-spawn.ts";
+import { DM_CODING_AGENT_PACKAGE, resolveBunPiExecutable, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../shared/dm-spawn.ts";
+import { JITI_ALIAS_ENV, resolveHostPeerAliases } from "./runner-aliases.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
+import { resolveRuntimeModulePath } from "../../shared/runtime-module-path.ts";
 import { backgroundProcessOptions } from "../shared/background-process-options.ts";
-import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
-import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
+import { normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { DM_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
-import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, resolveSubagentModelOverride, type AvailableModelInfo, type ParentModel } from "../shared/model-fallback.ts";
+import { resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
 import { findModelInfo, resolveEffectiveThinking } from "../../shared/model-info.ts";
-import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV, type ThinkingLevel } from "../../shared/thinking-ceiling.ts";
-import { resolveExpectedWorktreeAgentCwd } from "../shared/worktree.ts";
+import { assertThinkingWithinCeiling, intersectThinkingCeilings, type ThinkingLevel } from "../../shared/thinking-ceiling.ts";
+import { resolveExpectedWorktreeAgentCwd, resolveWorktreeProvider, shouldDeferWorktreeCwd, WORKTREE_AGENT_CWD_PLACEHOLDER } from "../shared/worktree.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime } from "../shared/structured-output.ts";
-import { resolveEffectiveAcceptance, validateAcceptanceInput, validateExecutionAcceptance } from "../shared/acceptance.ts";
+import { resolveAcceptanceReportMode, resolveEffectiveAcceptance, validateAcceptanceInput, validateExecutionAcceptance } from "../shared/acceptance.ts";
 import { createRunFanoutBudget, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
-import { validateImplementationToolContract } from "../shared/completion-guard.ts";
 import {
 	type AcceptanceInput,
 	type AgentContract,
@@ -46,6 +50,7 @@ import {
 	type ArtifactConfig,
 	type Details,
 	type IntercomBridgeConfig,
+	type HerdrMachineReference,
 	type JsonSchemaObject,
 	type MaxOutputConfig,
 	type NestedRouteInfo,
@@ -64,24 +69,49 @@ import {
 	getAsyncConfigPath,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
-import { nestedResultsPath, nestedSummaryFromAsyncStatus, resolveInheritedNestedRouteFromEnv, resolveNestedParentAddressFromEnv, writeNestedEvent } from "../shared/nested-events.ts";
+import { inheritedNestedParentAddressOf, inheritedNestedRouteOf, nestedResultsPath, nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
+import { SUBAGENT_PARENT_SESSION_ENV, type ChildRuntimeConfig } from "../shared/child-runtime-config.ts";
+import { childSessionFactoryModule } from "../shared/child-session.ts";
+import { inheritedChildRuntime } from "../shared/child-launch.ts";
 import { resultFilePath } from "./result-files.ts";
+import { updateActiveRunIndex } from "./active-run-index.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetState } from "../shared/usage-budget.ts";
 import type { ImportedAsyncRoot } from "./chain-root-attachment.ts";
 import type { SessionLeaseRequest } from "../shared/session-lease.ts";
-import { finalizeProcessTerminal, readProcessTerminal } from "./process-terminal.ts";
+import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal } from "./process-terminal.ts";
+import { persistRunnerStartupFailure } from "./runner-startup-failure.ts";
 import type { ActiveAsyncCapacityHandle } from "./active-async-capacity.ts";
 import { statusStepDescription } from "./chain-append.ts";
-import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../shared/types.ts";
-import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
-import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
+import { currentPidNamespaceScope } from "./pid-namespace.ts";
+import { checkPidLiveness } from "./stale-run-reconciler.ts";
+import { lookupRunnerLauncher, resolveAgentRunnerLauncher, runnerLauncherPlacementError } from "../shared/runner-launcher.ts";
+import { SUBAGENT_PROCESS_TERMINAL_EVENT, type RunnerLauncher } from "../../shared/types.ts";
+import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
+import { resolveLaunchBinding } from "../../shared/launch-contract.ts";
 import { resolvePermissionRules, type PermissionConfig } from "../shared/permissions.ts";
 import { normalizeExtensionBindings, omitExtensionBindingsEnv, type ExtensionBindings } from "../shared/extension-bindings.ts";
+import { omitGitRoutingEnv } from "../shared/git-environment.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
+import { assertRequiredChildExtensionsAdmitted, resolveRequiredChildExtensions, writeRetainedRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
-const require = createRequire(import.meta.url);
-const piPackageRoot = resolvePiPackageRoot();
+const require = nodeModule.createRequire(import.meta.url);
+const piPackageRoot = resolveAsyncPiPackageRoot();
+
+/**
+ * The detached runner resolves the same host package the foreground
+ * `resolvePiCliScript` path resolves, so an explicit
+ * `DM_SUBAGENTS_DM_CODING_AGENT_PACKAGE_ROOT` override must be honored here
+ * too. Precedence mirrors the foreground resolver: argv-based discovery wins
+ * first (the foreground returns the argv script before any candidate), the
+ * environment override is consulted when that discovery cannot identify the
+ * host (wrapper installs, non-standard layouts), and the
+ * package-manager entry is last. Without the override, such hosts fail
+ * closed with "neither is available" while foreground children launch fine.
+ */
+function resolveAsyncPiPackageRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	return resolvePiPackageRoot() || env[DM_CODING_AGENT_PACKAGE_ROOT_ENV]?.trim() || resolveInstalledPiPackageRoot();
+}
 
 function resolveJitiCliFromPackageJson(packageJsonPath: string): string | undefined {
 	if (!fs.existsSync(packageJsonPath)) return undefined;
@@ -105,12 +135,12 @@ function resolveJitiCliPath(): string | undefined {
 	const candidates: Array<() => string | undefined> = [
 		() => require.resolve("jiti/package.json"),
 		() => piPackageRoot
-			? createRequire(path.join(piPackageRoot, "package.json")).resolve("jiti/package.json")
+			? nodeModule.createRequire(path.join(piPackageRoot, "package.json")).resolve("jiti/package.json")
 			: undefined,
 		() => {
 			if (!process.argv[1]) return undefined;
 			const piEntry = fs.realpathSync(process.argv[1]);
-			return createRequire(piEntry).resolve("jiti/package.json");
+			return nodeModule.createRequire(piEntry).resolve("jiti/package.json");
 		},
 		() => piPackageRoot ? path.join(piPackageRoot, "node_modules", "jiti", "package.json") : undefined,
 	];
@@ -128,6 +158,20 @@ function resolveJitiCliPath(): string | undefined {
 }
 
 const jitiCliPath = resolveJitiCliPath();
+const asyncRunnerModuleDir = path.dirname(fileURLToPath(import.meta.url));
+// Resolved per launch: an in-place package update can swap a sibling's .ts for .js.
+function asyncRunnerSourcePath(): string {
+	return resolveRuntimeModulePath(asyncRunnerModuleDir, "subagent-runner-bootstrap");
+}
+function sourceUnderNodeModules(): boolean {
+	return asyncRunnerSourcePath().split(path.sep).some((segment) => segment.toLowerCase() === "node_modules");
+}
+function supportsNativeRunner(nodeExecutable: string): boolean {
+	return Boolean(process.features.typescript)
+	&& typeof nodeModule.registerHooks === "function"
+	&& nodeExecutable === process.execPath
+	&& !sourceUnderNodeModules();
+}
 
 interface AsyncExecutionContext {
 	dm: ExtensionAPI;
@@ -136,13 +180,23 @@ interface AsyncExecutionContext {
 	completionOwnerId?: string;
 	/** Parent session id used by permission-system ask forwarding. */
 	parentSessionId?: string;
+	/** Parent session file, recorded as each new child session's `parentSession` header. */
+	parentSessionFile?: string;
 	permissions?: PermissionConfig;
 	currentModelProvider?: string;
 	currentModel?: ParentModel;
+	scopedModelIds?: string[];
 	/** Optional model-scope enforcement resolved from subagent settings. */
 	modelScope?: ModelScopeConfig;
+	modelResponseAliases?: Record<string, string[]>;
 	/** Whether the parent session has an interactive UI. */
 	interactive?: boolean;
+	/** User-configured runner launchers; an agent's `launcher` must name one of them. */
+	runnerLaunchers?: Record<string, string[]>;
+	/** The executor's own child runtime when the launch comes from an in-process child. */
+	childRuntime?: ChildRuntimeConfig;
+	/** The launching session's project trust; undefined when the host has no trust concept. */
+	projectTrusted?: boolean;
 }
 
 export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
@@ -161,6 +215,9 @@ interface AsyncChainParams {
 	availableModels?: AvailableModelInfo[];
 	cwd?: string;
 	maxOutput?: MaxOutputConfig;
+	machine?: string;
+	/** Launch cwd as typed when a machine is set: a path on that machine, never resolved locally. */
+	machineCwd?: string;
 	artifactsDir?: string;
 	artifactConfig: ArtifactConfig;
 	shareEnabled: boolean;
@@ -178,6 +235,9 @@ interface AsyncChainParams {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
+	baseRef?: string;
+	worktreeProvider?: import("../../shared/types.ts").WorktreeProvider;
+	worktreeBranchPrefix?: string;
 	controlConfig?: ResolvedControlConfig;
 	controlIntercomTarget?: string;
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
@@ -197,6 +257,7 @@ interface AsyncChainParams {
 	/** Global cap on simultaneously-running subagent tasks within the async run. */
 	globalConcurrencyLimit?: number;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	thinkingCeiling?: ThinkingLevel;
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	parentWorkflowRunId?: string;
@@ -206,6 +267,8 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
+	/** Originating executor invocation, distinct from the async run id. */
+	toolCallId?: string;
 	agent: string;
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -213,9 +276,13 @@ interface AsyncSingleParams {
 	agentConfig: AgentConfig;
 	/** Agent contract before per-run bridge injection, used only for recovery persistence. */
 	recoveryAgentConfig?: AgentConfig;
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	ctx: AsyncExecutionContext;
 	cwd?: string;
 	requestedCwd?: string;
+	machine?: string;
+	/** Launch cwd as typed when a machine is set: a path on that machine, never resolved locally. */
+	machineCwd?: string;
 	maxOutput?: MaxOutputConfig;
 	artifactsDir?: string;
 	artifactConfig: ArtifactConfig;
@@ -235,6 +302,7 @@ interface AsyncSingleParams {
 	structuredOutputSchema?: JsonSchemaObject;
 	modelOverride?: string;
 	modelOverrideFromParent?: boolean;
+	modelOrigin?: ModelOrigin;
 	fast?: boolean;
 	thinkingOverride?: AgentConfig["thinking"];
 	availableModels?: AvailableModelInfo[];
@@ -244,6 +312,9 @@ interface AsyncSingleParams {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
+	baseRef?: string;
+	worktreeProvider?: import("../../shared/types.ts").WorktreeProvider;
+	worktreeBranchPrefix?: string;
 	worktree?: boolean;
 	controlConfig?: ResolvedControlConfig;
 	intercomBridge?: IntercomBridgeConfig;
@@ -255,6 +326,8 @@ interface AsyncSingleParams {
 	absoluteDeadlineAt?: number;
 	/** Optional per-call hard toolTimeoutMs override (highest precedence). */
 	toolTimeoutMs?: number;
+	/** Steer the child to checkpoint and stop this many ms before the run deadline (resolved call param ?? config). */
+	checkpointBeforeDeadlineMs?: number;
 	toolBudget?: ResolvedToolBudget | ToolBudgetConfig;
 	usageBudget?: UsageBudgetConfig;
 	configToolBudget?: ResolvedToolBudget;
@@ -298,6 +371,8 @@ export interface AsyncRunnerStepBuildParams {
 	ctx: AsyncExecutionContext;
 	availableModels?: AvailableModelInfo[];
 	cwd?: string;
+	machine?: string;
+	machineCwd?: string;
 	chainSkills?: string[];
 	sessionFilesByFlatIndex?: (string | undefined)[];
 	thinkingOverridesByFlatIndex?: (AgentConfig["thinking"] | undefined)[];
@@ -309,6 +384,8 @@ export interface AsyncRunnerStepBuildParams {
 	waitToolEnabled?: boolean;
 	waitToolDefaultTimeoutMs?: number;
 	worktreeBaseDir?: string;
+	worktreeProvider?: import("../../shared/types.ts").WorktreeProvider;
+	worktreeBranchPrefix?: string;
 	asyncDir: string;
 	outputBaseDir?: string;
 	validateOutputBindings?: boolean;
@@ -322,6 +399,8 @@ export interface AsyncRunnerStepBuildParams {
 	/** DM_SUBAGENT_TOOL_TIMEOUT_MS override (lowest precedence). */
 	toolTimeoutMsEnv?: string | undefined;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Retained snapshot from the launch being continued; takes precedence over the live registry, as in single launches. */
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	thinkingCeiling?: ThinkingLevel;
 }
 
@@ -332,31 +411,26 @@ export type AsyncRunnerStepBuildResult =
 		workflowGraph: ReturnType<typeof buildWorkflowGraphSnapshot>;
 		eventChain: ChainStep[];
 		originalTask?: string;
+		/** Launcher name shared by every new step; absent when they run unwrapped. */
+		launcher?: string;
 	}
 	| { error: string };
 
 export function formatAsyncStartedMessage(headline: string, interactive: boolean): string {
 	const guidance = interactive
 		? [
-			"The async run is detached and running in the background.",
-			"You are in an interactive session. Return control to the user now; DM will wake you through the native completion notification when this subagent completes or needs attention. Do not run sleep/polling loops to wait for this async subagent; it does not need a wait call.",
-			"Use bg_wait only for provider, detached, or other background work that lacks a native completion notification.",
-			"If the current turn must receive results from work without a native notification before it ends, call blocking bg_wait(); ordinary async subagent runs do not need a wait call because their completion is delivered natively.",
-			"Otherwise, continue any independent work or return control to the user. Use subagent({ action: \"status\", id: \"...\" }) for a one-shot status/result or to inspect a blocked/stale run, never as a wait loop.",
+			"Detached. Return control now: native completion wakes you, so do not sleep, poll, or call bg_wait for it.",
+			"One-shot check: subagent({ action: \"status\", id: \"...\" }).",
 		]
 		: [
-			"The async run is detached. Do not run sleep timers or polling loops just to wait for it.",
-			"This is a non-interactive run: DM auto-drains current-session subagent work at agent_end so detached children are not abandoned. Use bg_wait only when this turn must receive provider, detached, or other background-work results that have no native completion notification.",
-			"Use subagent({ action: \"status\", id: \"...\" }) when you need a one-shot status/result or to inspect a blocked/stale run; do not poll in a loop.",
+			"Detached non-interactive run: DM auto-drains current-session subagent work at agent_end. Do not run sleep timers or polling loops. Use bg_wait only for results this turn needs from work without native notification, and subagent({ action: \"status\", id: \"...\" }) for a one-shot check.",
 		];
 	return [headline, "", ...guidance].join("\n");
 }
 
-/**
- * Check if jiti is available for async execution
- */
+/** Check whether detached async execution has a supported runtime. */
 export function isAsyncAvailable(): boolean {
-	return jitiCliPath !== undefined;
+	return resolveBunPiExecutable() !== undefined || supportsNativeRunner(resolveNodeExecutable()) || jitiCliPath !== undefined;
 }
 
 export function resolveAsyncRunnerLogPaths(cfg: object): { stdoutPath: string; stderrPath: string } | undefined {
@@ -383,61 +457,72 @@ function closeFd(fd: number | undefined): void {
  * Spawn the async runner process
  */
 const RUNNER_STARTUP_TIMEOUT_MS = 10_000;
-const RUNNER_STARTUP_WAIT_BUFFER = typeof SharedArrayBuffer !== "undefined" ? new SharedArrayBuffer(4) : undefined;
-const RUNNER_STARTUP_WAIT_VIEW = RUNNER_STARTUP_WAIT_BUFFER ? new Int32Array(RUNNER_STARTUP_WAIT_BUFFER) : undefined;
-
-type RunnerStartupState = "ready" | "acknowledged";
+type RunnerStartupState = "ready" | "acknowledged" | "confirmed" | "identified";
 
 type RunnerStartupWaitResult =
-	| { ok: true; token: string }
+	| { ok: true; token: string; pid?: unknown; pidNamespaceScope?: unknown }
 	| { ok: false; error: string; startupDidNotProceed?: boolean };
 
-function waitForStartupInterval(delayMs = 20): void {
-	if (RUNNER_STARTUP_WAIT_VIEW) {
-		Atomics.wait(RUNNER_STARTUP_WAIT_VIEW, 0, 0, delayMs);
-		return;
-	}
-	const waitUntil = Date.now() + delayMs;
-	while (Date.now() < waitUntil) {
-		// Startup handshakes are synchronous so resume rejects before reporting a run as started.
-	}
+function waitForStartupInterval(delayMs = 20): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function readRunnerStartup(startupPath: string, expectedState: RunnerStartupState, expectedToken?: string): RunnerStartupWaitResult | undefined {
 	if (!fs.existsSync(startupPath)) return undefined;
 	try {
-		const payload = JSON.parse(fs.readFileSync(startupPath, "utf-8")) as { state?: unknown; token?: unknown; error?: unknown };
+		const payload = JSON.parse(fs.readFileSync(startupPath, "utf-8")) as { state?: unknown; token?: unknown; error?: unknown; pid?: unknown; pidNamespaceScope?: unknown };
 		if (payload.state === "error" && typeof payload.error === "string") return { ok: false, error: payload.error, startupDidNotProceed: true };
 		if (payload.state !== expectedState) return undefined;
 		if (typeof payload.token !== "string" || (expectedToken !== undefined && payload.token !== expectedToken)) {
 			return { ok: false, error: `Async runner wrote an invalid ${expectedState} startup handshake: ${startupPath}`, startupDidNotProceed: true };
 		}
-		return { ok: true, token: payload.token };
+		return { ok: true, token: payload.token, pid: payload.pid, pidNamespaceScope: payload.pidNamespaceScope };
 	} catch (error) {
 		return { ok: false, error: `Failed to read async runner startup handshake '${startupPath}': ${error instanceof Error ? error.message : String(error)}`, startupDidNotProceed: true };
 	}
 }
 
-function waitForRunnerStartup(startupPath: string, expectedState: RunnerStartupState, timeoutMs: number, expectedToken?: string): RunnerStartupWaitResult {
+async function waitForRunnerStartup(startupPath: string, expectedState: RunnerStartupState, timeoutMs: number, expectedToken?: string, processClosed?: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>): Promise<RunnerStartupWaitResult> {
+	const confirmOpen = async (result: RunnerStartupWaitResult): Promise<RunnerStartupWaitResult> => {
+		if (!processClosed || result.ok === false) return result;
+		const outcome = await Promise.race([processClosed.then((exit) => ({ exit })), new Promise<undefined>((resolve) => setImmediate(() => resolve(undefined)))]);
+		if (!outcome) return result;
+		const finalResult = readRunnerStartup(startupPath, expectedState, expectedToken);
+		if (finalResult?.ok === false) return finalResult;
+		const { exitCode, signal } = outcome.exit;
+		return { ok: false, error: `Async runner exited before startup state '${expectedState}' (exit code ${exitCode ?? "unknown"}, signal ${signal ?? "none"}).`, startupDidNotProceed: true };
+	};
 	const deadline = Date.now() + timeoutMs;
-	for (;;) {
+	while (Date.now() <= deadline) {
 		const result = readRunnerStartup(startupPath, expectedState, expectedToken);
-		if (result) return result;
-		if (Date.now() >= deadline) break;
-		waitForStartupInterval(Math.min(20, Math.max(1, deadline - Date.now())));
+		if (result) return await confirmOpen(result);
+		const delay = waitForStartupInterval(Math.min(20, Math.max(1, deadline - Date.now())));
+		if (processClosed) {
+			const outcome = await Promise.race([delay.then(() => undefined), processClosed.then((exit) => ({ exit }))]);
+			if (outcome) {
+				const finalResult = readRunnerStartup(startupPath, expectedState, expectedToken);
+				if (finalResult?.ok === false) return finalResult;
+				const { exitCode, signal } = outcome.exit;
+				return { ok: false, error: `Async runner exited before startup state '${expectedState}' (exit code ${exitCode ?? "unknown"}, signal ${signal ?? "none"}).`, startupDidNotProceed: true };
+			}
+		} else {
+			await delay;
+		}
 	}
 	const finalResult = readRunnerStartup(startupPath, expectedState, expectedToken);
 	if (finalResult) return finalResult;
 	return { ok: false, error: `Timed out after ${timeoutMs}ms waiting for the async runner startup state '${expectedState}'.`, startupDidNotProceed: true };
 }
 
-function writeRunnerStartupControl(filePath: string, payload: { action: "ack" | "proceed"; token: string }): void {
+const writePrivateStartupControlJson = createAtomicJsonWriter({ mode: 0o600, ignoreCleanupErrorAfterSuccess: true });
+
+function writeRunnerStartupControl(filePath: string, payload: { action: "ack" | "confirm" | "proceed"; token: string }): void {
 	// Delegate to the shared atomic JSON writer (temp file + rename, retrying
 	// transient Windows EPERM/EBUSY/EACCES locks and cleaning up the temp file
 	// on failure), so the startup handshake gets the same locking resilience as
 	// every other async control/result file. This is exercised by
 	// test/unit/atomic-json.test.ts.
-	writePrivateAtomicJson(filePath, payload);
+	writePrivateStartupControlJson(filePath, payload);
 }
 
 function runnerIsAlive(pid: number): boolean {
@@ -446,6 +531,13 @@ function runnerIsAlive(pid: number): boolean {
 		return true;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function waitForStartupIntervalSync(delayMs = 20): void {
+	const waitUntil = Date.now() + delayMs;
+	while (Date.now() < waitUntil) {
+		// Pre-handshake failures happen before the runner can be observed asynchronously.
 	}
 }
 
@@ -458,41 +550,100 @@ function terminateRunnerBeforeProceed(pid: number): boolean {
 			if (!runnerIsAlive(pid)) return true;
 		}
 		const deadline = Date.now() + 1000;
-		while (runnerIsAlive(pid) && Date.now() < deadline) waitForStartupInterval();
+		while (runnerIsAlive(pid) && Date.now() < deadline) waitForStartupIntervalSync();
 	}
 	return !runnerIsAlive(pid);
 }
 
-function persistPreProceedStartupFailure(asyncDir: string, runId: string, runnerProcessInstanceId: string, sessionId: string | undefined, completionOwnerId: string | undefined, message: string): void {
-	const now = Date.now();
+async function terminateRunnerBeforeProceedAsyncDefault(proc: ChildProcess, processClosed: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>): Promise<boolean> {
+	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+		if (proc.pid === undefined || !runnerIsAlive(proc.pid)) return true;
+		try { process.kill(proc.pid, signal); } catch {
+			if (proc.pid === undefined || !runnerIsAlive(proc.pid)) return true;
+		}
+		const exited = await Promise.race([processClosed.then(() => true), waitForStartupInterval(1000).then(() => false)]);
+		if (exited || proc.pid === undefined || !runnerIsAlive(proc.pid)) return true;
+	}
+	return proc.pid === undefined || !runnerIsAlive(proc.pid);
+}
+
+async function completeRunnerStartupHandshake(
+	startupPath: string,
+	startupAckPath: string,
+	startupConfirmPath: string,
+	startupProceedPath: string,
+	proc: ChildProcess,
+	processClosed: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>,
+	getObservedProcessExit: () => { exitCode: number | null; signal: NodeJS.Signals | null } | undefined,
+	runnerProcessInstanceId: string,
+	persistStartupFailure: (message: string) => void,
+	// Behind a launcher the spawned pid is only the wrapper's: adopt the runner-reported pid and never signal the wrapper.
+	launcherIdentity?: { adopt: (pid: unknown, pidNamespaceScope: unknown) => string | undefined; terminate: () => boolean },
+): Promise<SpawnRunnerResult> {
+	const terminateRunnerBeforeProceedAsync = async (proc: ChildProcess, processClosed: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>) => launcherIdentity ? launcherIdentity.terminate() : terminateRunnerBeforeProceedAsyncDefault(proc, processClosed);
 	try {
-		const statusPath = path.join(asyncDir, "status.json");
-		let status: Partial<AsyncStatus> = {};
-		try {
-			status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as Partial<AsyncStatus>;
-		} catch {}
-		writePrivateAtomicJson(statusPath, {
-			...status,
-			runId,
-			...(sessionId ? { sessionId } : {}),
-			...(completionOwnerId ? { completionOwnerId } : {}),
-			state: "failed",
-			lastUpdate: now,
-			error: message,
-			processTerminal: {
-				version: 1,
-				state: "not-started",
-				runId,
-				runnerProcessInstanceId,
-			},
-		});
-		writePrivateAtomicJson(path.join(asyncDir, "process-terminal-candidate.json"), {
-			version: 1,
-			runId,
-			runnerProcessInstanceId,
-			writers: {},
-			expectedWriters: { 0: 0 },
-		});
+		const ready = await waitForRunnerStartup(startupPath, "ready", RUNNER_STARTUP_TIMEOUT_MS, undefined, processClosed);
+	const identityError = ready.ok && launcherIdentity ? launcherIdentity.adopt(ready.pid, ready.pidNamespaceScope) : undefined;
+	if (identityError) {
+		persistStartupFailure(identityError);
+		return { runnerProcessInstanceId, error: identityError, terminationObserved: await terminateRunnerBeforeProceedAsync(proc, processClosed), startupDidNotProceed: true };
+	}
+	if (ready.ok === false) {
+		persistStartupFailure(ready.error);
+		const terminationObserved = await terminateRunnerBeforeProceedAsync(proc, processClosed);
+		return { pid: proc.pid, runnerProcessInstanceId, error: ready.error, terminationObserved, startupDidNotProceed: true };
+	}
+	try { writeRunnerStartupControl(startupAckPath, { action: "ack", token: ready.token }); } catch (error) {
+		const message = `Failed to acknowledge async runner startup: ${error instanceof Error ? error.message : String(error)}`;
+		persistStartupFailure(message);
+		const terminationObserved = await terminateRunnerBeforeProceedAsync(proc, processClosed);
+		return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+	}
+	const acknowledged = await waitForRunnerStartup(startupPath, "acknowledged", RUNNER_STARTUP_TIMEOUT_MS, ready.token, processClosed);
+	if (acknowledged.ok === false) {
+		persistStartupFailure(acknowledged.error);
+		const terminationObserved = await terminateRunnerBeforeProceedAsync(proc, processClosed);
+		return { pid: proc.pid, runnerProcessInstanceId, error: acknowledged.error, terminationObserved, startupDidNotProceed: true };
+	}
+	try { writeRunnerStartupControl(startupConfirmPath, { action: "confirm", token: ready.token }); } catch (error) {
+		const message = `Failed to confirm async runner startup: ${error instanceof Error ? error.message : String(error)}`;
+		persistStartupFailure(message);
+		const terminationObserved = await terminateRunnerBeforeProceedAsync(proc, processClosed);
+		return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+	}
+	const confirmed = await waitForRunnerStartup(startupPath, "confirmed", RUNNER_STARTUP_TIMEOUT_MS, ready.token, processClosed);
+	if (confirmed.ok === false) {
+		persistStartupFailure(confirmed.error);
+		const terminationObserved = await terminateRunnerBeforeProceedAsync(proc, processClosed);
+		return { pid: proc.pid, runnerProcessInstanceId, error: confirmed.error, terminationObserved, startupDidNotProceed: true };
+	}
+	const closedAtCommit = await Promise.race([
+		processClosed.then((exit) => exit),
+		new Promise<undefined>((resolve) => setImmediate(() => resolve(undefined))),
+	]);
+	const observedExit = closedAtCommit ?? getObservedProcessExit();
+	if (observedExit) {
+		const message = `Async runner exited after startup state 'acknowledged' before proceed (exit code ${observedExit.exitCode ?? "unknown"}, signal ${observedExit.signal ?? "none"}).`;
+		persistStartupFailure(message);
+		const terminationObserved = await terminateRunnerBeforeProceedAsync(proc, processClosed);
+		return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+	}
+	try { writeRunnerStartupControl(startupProceedPath, { action: "proceed", token: ready.token }); } catch (error) {
+		const message = `Failed to authorize async runner startup: ${error instanceof Error ? error.message : String(error)}`;
+		persistStartupFailure(message);
+		const terminationObserved = await terminateRunnerBeforeProceedAsync(proc, processClosed);
+		return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+	}
+	try { fs.rmSync(startupPath, { force: true }); } catch {}
+	return { pid: proc.pid, runnerProcessInstanceId };
+	} finally {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+}
+
+function persistPreProceedStartupFailure(asyncDir: string, runId: string, runnerProcessInstanceId: string, sessionId: string | undefined, completionOwnerId: string | undefined, message: string): void {
+	try {
+		persistRunnerStartupFailure({ asyncDir, runId, runnerProcessInstanceId, sessionId, completionOwnerId, message });
 	} catch {
 		// Startup failures must still return the original launch error.
 	}
@@ -519,12 +670,38 @@ export function emitProcessTerminalEvent(ctx: AsyncExecutionContext, proof: unkn
 	}
 }
 
-function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">, initialStatusPath: string, onProcessTerminal?: (proof: unknown) => void, requestedCwd = cwd): SpawnRunnerResult {
+function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">, initialStatusPath: string, launchParentSessionId: string | undefined, onProcessTerminal?: (proof: unknown) => void, onBeforeProceed?: (runnerProcessInstanceId: string) => void, requestedCwd = cwd): SpawnRunnerResult | Promise<SpawnRunnerResult> {
 	const cwdError = preflightLaunchCwd(requestedCwd, cwd);
 	if (cwdError) return { error: cwdError };
+	if (launchParentSessionId !== undefined && (!launchParentSessionId || launchParentSessionId.trim() !== launchParentSessionId)) {
+		return { error: "Background runner parent session identity is invalid." };
+	}
+	const steps = (cfg as { steps?: unknown }).steps;
+	if (!Array.isArray(steps)) return { error: "Background runner launch is missing its steps." };
+	const inconsistentParent = (steps as RunnerStep[]).some((step) => isParallelGroup(step)
+		? step.parallel.some((child) => child.parentSessionId !== launchParentSessionId)
+		: (isDynamicRunnerGroup(step) ? step.parallel.parentSessionId : step.parentSessionId) !== launchParentSessionId);
+	if (inconsistentParent) return { error: "Background runner steps have inconsistent parent session identities." };
 
-	if (!jitiCliPath) {
-		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
+	// The compiled host exposes its SDK only through DM's extension loader.
+	const binaryHost = resolveBunPiExecutable();
+	const nodeExecutable = resolveNodeExecutable();
+	const nativeRunnerSupported = supportsNativeRunner(nodeExecutable);
+	const runner = asyncRunnerSourcePath();
+	const runnerIsJavaScript = path.extname(runner) === ".js";
+	const bootstrap = resolveRuntimeModulePath(path.dirname(runner), "binary-bootstrap");
+	if (binaryHost && !fs.existsSync(bootstrap)) return { error: `Background runner bootstrap not found: ${bootstrap}` };
+	if (!binaryHost && !runnerIsJavaScript && !nativeRunnerSupported && !jitiCliPath) {
+		return { error: sourceUnderNodeModules()
+			? "Background runner source is installed under node_modules, so upstream jiti is required for TypeScript execution."
+			: "Background runner requires enabled native TypeScript with synchronous module hooks, or installed upstream jiti for TypeScript execution." };
+	}
+	if (!binaryHost && !piPackageRoot) {
+		return { error: `Background children require a supported standalone DM host or the installed npm package (${DM_CODING_AGENT_PACKAGE}); neither is available.` };
+	}
+	const hostPeerAliases = !binaryHost && piPackageRoot ? resolveHostPeerAliases(piPackageRoot) : { aliases: {}, missing: [] };
+	if (hostPeerAliases.missing.length > 0) {
+		return { error: `Background children require the host npm package (${DM_CODING_AGENT_PACKAGE}) with its dependencies; ${piPackageRoot} does not provide ${hostPeerAliases.missing.join(", ")}.` };
 	}
 
 	fs.mkdirSync(TEMP_ROOT_DIR, { recursive: true });
@@ -534,8 +711,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const launchBarrierToken = hasRevivalLease ? undefined : runnerProcessInstanceId;
 	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
 	writePrivateAtomicJson(cfgPath, launchConfig);
-	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
-	const nodeCommand = resolveNodeExecutable();
+	const command = binaryHost ?? nodeExecutable;
 	const launchForStartup = launchConfig as typeof launchConfig & { asyncDir?: unknown; id?: unknown; sessionId?: unknown; completionOwnerId?: unknown; revivalLease?: unknown };
 	const launchAsyncDir = typeof launchForStartup.asyncDir === "string" ? launchForStartup.asyncDir : undefined;
 	const launchRunId = typeof launchForStartup.id === "string" ? launchForStartup.id : suffix;
@@ -545,12 +721,35 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		? path.join(launchAsyncDir, "runner-startup.json")
 		: undefined;
 	const startupAckPath = startupPath ? path.join(path.dirname(startupPath), "runner-startup-ack.json") : undefined;
+	const startupConfirmPath = startupPath ? path.join(path.dirname(startupPath), "runner-startup-confirm.json") : undefined;
 	const startupProceedPath = launchAsyncDir && (startupPath || launchBarrierToken)
 		? path.join(launchAsyncDir, "runner-startup-proceed.json")
 		: undefined;
 	if (startupPath) fs.rmSync(startupPath, { force: true });
 	if (startupAckPath) fs.rmSync(startupAckPath, { force: true });
+	if (startupConfirmPath) fs.rmSync(startupConfirmPath, { force: true });
 	if (startupProceedPath) fs.rmSync(startupProceedPath, { force: true });
+	// A broker launcher may start the runner outside its own process, so the spawned pid is only the
+	// wrapper's. The runner reports its own identity before it is allowed to proceed.
+	const launcher = (launchConfig as { launcher?: RunnerLauncher }).launcher;
+	const identityPath = launcher && launchBarrierToken && launchAsyncDir ? path.join(launchAsyncDir, "runner-startup.json") : undefined;
+	if (identityPath) fs.rmSync(identityPath, { force: true });
+	let runnerIdentity: { pid: number; pidNamespaceScope?: string } | undefined;
+	// Wrapper exit is not runner exit, so only a reported runner in this namespace may be signalled.
+	const terminateBeforeProceed = (pid: number): boolean => !launcher
+		? terminateRunnerBeforeProceed(pid)
+		: runnerIdentity !== undefined && runnerIdentity.pidNamespaceScope === currentPidNamespaceScope() && terminateRunnerBeforeProceed(runnerIdentity.pid);
+	const adoptRunnerIdentity = (pid: unknown, pidNamespaceScope: unknown): string | undefined => {
+		if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1) return `Async runner reported an invalid process identity in '${launchAsyncDir}'.`;
+		runnerIdentity = { pid, ...(typeof pidNamespaceScope === "string" ? { pidNamespaceScope } : {}) };
+		try {
+			const status = JSON.parse(fs.readFileSync(initialStatusPath, "utf-8")) as AsyncStatus;
+			writePrivateAtomicJson(initialStatusPath, { ...status, pid, ...(runnerIdentity.pidNamespaceScope !== undefined ? { pidNamespaceScope: runnerIdentity.pidNamespaceScope } : {}) });
+			return undefined;
+		} catch (error) {
+			return `Failed to record async runner identity: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	};
 
 	const logPaths = resolveAsyncRunnerLogPaths(launchConfig);
 	let stdoutFd: number | undefined;
@@ -561,14 +760,43 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			stdoutFd = fs.openSync(logPaths.stdoutPath, "a");
 			stderrFd = fs.openSync(logPaths.stderrPath, "a");
 		}
-		const proc = spawn(nodeCommand, [jitiCliPath, runner, cfgPath], {
+		// Short-circuit native peer aliases so DM's loader and generated factories preserve filesystem resolution semantics.
+		const preload = Object.keys(hostPeerAliases.aliases).length > 0
+			? ["--import", new URL("../../../runner-peer-preload.mjs", import.meta.url).href]
+			: [];
+		const args = binaryHost
+			? ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--mode", "rpc", "--extension", bootstrap]
+			: runnerIsJavaScript
+				? [...preload, runner, cfgPath]
+				: nativeRunnerSupported
+				? [...preload, "--experimental-strip-types", runner, cfgPath]
+				: [...preload, jitiCliPath!, runner, cfgPath];
+		const runnerEnv: NodeJS.ProcessEnv = {
+			...omitGitRoutingEnv(omitExtensionBindingsEnv(process.env)),
+			...childCacheRetentionEnv(),
+			[DM_CODING_AGENT_PACKAGE_ROOT_ENV]: binaryHost ? undefined : piPackageRoot,
+			// npm must override inherited bundled layouts (#2071); binaries retain release assets.
+			PI_PACKAGE_DIR: binaryHost ? process.env.PI_PACKAGE_DIR : piPackageRoot,
+			[JITI_ALIAS_ENV]: binaryHost ? undefined : JSON.stringify(hostPeerAliases.aliases),
+			PI_ASYNC_NATIVE_RUNNER: !binaryHost && (runnerIsJavaScript || nativeRunnerSupported) ? "1" : "0",
+			DM_SUBAGENT_RUNNER_CONFIG: binaryHost ? cfgPath : undefined,
+		};
+		if (launchParentSessionId === undefined) delete runnerEnv[SUBAGENT_PARENT_SESSION_ENV];
+		else runnerEnv[SUBAGENT_PARENT_SESSION_ENV] = launchParentSessionId;
+		const [spawnCommand, ...spawnArgs] = launcher ? [...launcher.argv, command, ...args] : [command, ...args];
+		const proc = spawn(spawnCommand!, spawnArgs, {
 			cwd,
 			...backgroundProcessOptions(),
 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],
-			env: {
-				...omitExtensionBindingsEnv(process.env),
-				...(piPackageRoot ? { [DM_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot } : {}),
-			},
+			env: runnerEnv,
+		});
+		let observedProcessExit: { exitCode: number | null; signal: NodeJS.Signals | null } | undefined;
+		proc.once("exit", (exitCode, signal) => { observedProcessExit = { exitCode, signal }; });
+		const processClosed = new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+			proc.once("close", (exitCode, signal) => {
+				observedProcessExit ??= { exitCode, signal };
+				resolve({ exitCode, signal });
+			});
 		});
 		closeFd(stdoutFd);
 		closeFd(stderrFd);
@@ -576,10 +804,21 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			console.error(`[dm-subagents] async spawn failed: ${error.message}`);
 		});
 		proc.once("close", (exitCode, signal) => {
-			const launch = launchConfig as { asyncDir?: unknown; id?: unknown; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
+			const finalize = () => {
+				const launch = launchConfig as { asyncDir?: unknown; id?: unknown; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
 			const asyncDir = launch.asyncDir;
 			const runId = launch.id;
 			if (typeof asyncDir !== "string" || typeof runId !== "string") return;
+			if (launcher) {
+				try {
+					writePrivateAtomicJson(path.join(asyncDir, "launcher-close.json"), { version: 1, runId, runnerProcessInstanceId, closeObservedAt: Date.now(), exitCode, signal, ...(runnerIdentity ? { runnerPid: runnerIdentity.pid } : {}) });
+				} catch {
+					// Diagnostic only; process-terminal proof stays authoritative.
+				}
+				// The runner may outlive its wrapper; only a confirmed-dead runner in this pid namespace finalizes here,
+				// otherwise status-pid reconciliation does it later.
+				if (!runnerIdentity || runnerIdentity.pidNamespaceScope !== currentPidNamespaceScope() || checkPidLiveness(runnerIdentity.pid, process.kill, runnerIdentity.pidNamespaceScope !== undefined) !== "dead") return;
+			}
 			finalizeProcessTerminal(asyncDir, runId, {
 				processInstanceId: runnerProcessInstanceId,
 				closeObservedAt: Date.now(),
@@ -624,6 +863,9 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 				}
 			}
 			onProcessTerminal?.(persisted);
+			};
+			if (startupPath) setImmediate(finalize);
+			else finalize();
 		});
 		if (typeof proc.pid !== "number") {
 			return { error: `async runner did not produce a pid for cwd: ${cwd}` };
@@ -631,13 +873,51 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		try {
 			writePrivateAtomicJson(initialStatusPath, {
 				...initialStatus,
-				pid: proc.pid,
+				...(launcher ? {} : { pid: proc.pid, pidNamespaceScope: currentPidNamespaceScope() }),
 				processTerminal: { version: 1, state: "pending", runId: initialStatus.runId, runnerProcessInstanceId },
 			});
+			// Aggregate waits must see the launch before the runner's first status update.
+			updateActiveRunIndex(path.dirname(initialStatusPath), initialStatus.state, initialStatus.toolCallId);
 		} catch (error) {
 			const message = `Failed to persist initial async status: ${error instanceof Error ? error.message : String(error)}`;
-			const terminationObserved = terminateRunnerBeforeProceed(proc.pid);
+			if (launchAsyncDir) persistPreProceedStartupFailure(launchAsyncDir, launchRunId, runnerProcessInstanceId, launchSessionId, launchCompletionOwnerId, message);
+			const terminationObserved = terminateBeforeProceed(proc.pid);
 			return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+		}
+		try {
+			if (!launchAsyncDir) throw new Error("Async runner is missing its lifecycle directory.");
+			initializeProcessTerminal(launchAsyncDir, launchRunId, runnerProcessInstanceId);
+		} catch (error) {
+			const message = `Failed to establish async runner lifecycle sidecar: ${error instanceof Error ? error.message : String(error)}`;
+			if (launchAsyncDir) persistPreProceedStartupFailure(launchAsyncDir, launchRunId, runnerProcessInstanceId, launchSessionId, launchCompletionOwnerId, message);
+			const terminationObserved = terminateBeforeProceed(proc.pid);
+			return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+		}
+		try {
+			onBeforeProceed?.(runnerProcessInstanceId);
+		} catch (error) {
+			const message = `Failed to establish async runner capacity ownership: ${error instanceof Error ? error.message : String(error)}`;
+			if (launchAsyncDir) persistPreProceedStartupFailure(launchAsyncDir, launchRunId, runnerProcessInstanceId, launchSessionId, launchCompletionOwnerId, message);
+			const terminationObserved = terminateBeforeProceed(proc.pid);
+			return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
+		}
+		if (identityPath && launchBarrierToken && startupProceedPath) {
+			proc.unref();
+			const fail = (message: string): SpawnRunnerResult => {
+				if (launchAsyncDir) persistPreProceedStartupFailure(launchAsyncDir, launchRunId, runnerProcessInstanceId, launchSessionId, launchCompletionOwnerId, message);
+				return { ...(runnerIdentity ? { pid: runnerIdentity.pid } : {}), runnerProcessInstanceId, error: message, terminationObserved: terminateBeforeProceed(proc.pid!), startupDidNotProceed: true };
+			};
+			return waitForRunnerStartup(identityPath, "identified", RUNNER_STARTUP_TIMEOUT_MS, launchBarrierToken, processClosed).then((identified) => {
+				if (identified.ok === false) return fail(identified.error);
+				const identityError = adoptRunnerIdentity(identified.pid, identified.pidNamespaceScope);
+				if (identityError) return fail(identityError);
+				try {
+					writeRunnerStartupControl(startupProceedPath, { action: "proceed", token: launchBarrierToken });
+				} catch (error) {
+					return fail(`Failed to authorize async runner startup: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return { pid: identified.pid as number, runnerProcessInstanceId };
+			});
 		}
 		if (launchBarrierToken && startupProceedPath) {
 			try {
@@ -645,48 +925,18 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			} catch (error) {
 				const message = `Failed to authorize async runner startup: ${error instanceof Error ? error.message : String(error)}`;
 				if (launchAsyncDir) persistPreProceedStartupFailure(launchAsyncDir, launchRunId, runnerProcessInstanceId, launchSessionId, launchCompletionOwnerId, message);
-				const terminationObserved = terminateRunnerBeforeProceed(proc.pid);
+				const terminationObserved = terminateBeforeProceed(proc.pid);
 				return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
 			}
 		}
 		proc.unref();
-		if (startupPath && startupAckPath && startupProceedPath) {
+		if (startupPath && startupAckPath && startupConfirmPath && startupProceedPath) {
 			const persistStartupFailure = (message: string) => {
 				if (launchAsyncDir) persistPreProceedStartupFailure(launchAsyncDir, launchRunId, runnerProcessInstanceId, launchSessionId, launchCompletionOwnerId, message);
 			};
-			const ready = waitForRunnerStartup(startupPath, "ready", RUNNER_STARTUP_TIMEOUT_MS);
-			if (ready.ok === false) {
-				persistStartupFailure(ready.error);
-				const terminationObserved = terminateRunnerBeforeProceed(proc.pid);
-				return { pid: proc.pid, runnerProcessInstanceId, error: ready.error, terminationObserved, startupDidNotProceed: ready.startupDidNotProceed };
-			}
-			try {
-				writeRunnerStartupControl(startupAckPath, { action: "ack", token: ready.token });
-			} catch (error) {
-				const message = `Failed to acknowledge async runner startup: ${error instanceof Error ? error.message : String(error)}`;
-				persistStartupFailure(message);
-				const terminationObserved = terminateRunnerBeforeProceed(proc.pid);
-				return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
-			}
-			const acknowledged = waitForRunnerStartup(startupPath, "acknowledged", RUNNER_STARTUP_TIMEOUT_MS, ready.token);
-			if (acknowledged.ok === false) {
-				persistStartupFailure(acknowledged.error);
-				const terminationObserved = terminateRunnerBeforeProceed(proc.pid);
-				return { pid: proc.pid, runnerProcessInstanceId, error: acknowledged.error, terminationObserved, startupDidNotProceed: acknowledged.startupDidNotProceed };
-			}
-			try {
-				writeRunnerStartupControl(startupProceedPath, { action: "proceed", token: ready.token });
-			} catch (error) {
-				const message = `Failed to authorize async runner startup: ${error instanceof Error ? error.message : String(error)}`;
-				persistStartupFailure(message);
-				const terminationObserved = terminateRunnerBeforeProceed(proc.pid);
-				return { pid: proc.pid, runnerProcessInstanceId, error: message, terminationObserved, startupDidNotProceed: true };
-			}
-			try {
-				fs.rmSync(startupPath, { force: true });
-			} catch {
-				// Proceed is the commit point; handshake cleanup cannot turn a running revival into a start error.
-			}
+			const handshake = completeRunnerStartupHandshake(startupPath, startupAckPath, startupConfirmPath, startupProceedPath, proc, processClosed, () => observedProcessExit ?? (proc.exitCode !== null || proc.signalCode !== null ? { exitCode: proc.exitCode, signal: proc.signalCode } : undefined), runnerProcessInstanceId, persistStartupFailure, launcher ? { adopt: adoptRunnerIdentity, terminate: () => terminateBeforeProceed(proc.pid!) } : undefined);
+			if (!launcher) return handshake;
+			return handshake.then(({ pid: _wrapperPid, ...result }) => ({ ...result, ...(runnerIdentity ? { pid: runnerIdentity.pid } : {}) }));
 		}
 		return { pid: proc.pid, runnerProcessInstanceId };
 	} catch (error) {
@@ -694,6 +944,23 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		closeFd(stderrFd);
 		return { error: error instanceof Error ? error.message : String(error) };
 	}
+}
+
+/**
+ * An explicit `thinking: false` clears the level, so only `undefined` falls
+ * through to the agent's own value. Treating `false` as absent would silently
+ * apply the agent default the caller just cleared.
+ */
+export function resolveClaudeCodeThinking(source: string | false | undefined, fallback: string | false | undefined): string | undefined {
+	const value = source === undefined ? fallback : source;
+	return typeof value === "string" ? value : undefined;
+}
+
+/** A pinned Claude Code model cannot survive pane-native saved-machine placement, which
+ * owns the remote model registry, so the combination fails instead of losing both flags. */
+export function assertClaudeCodeOverrideIsLocal(agent: string, machine: string | undefined, override: ClaudeCodeOverride | undefined): void {
+	if (!machine || !override) return;
+	throw new Error(`Agent '${agent}' requested machine '${machine}', but a Claude Code model or thinking level cannot be honored on a saved machine. Remove the model or thinking request, or run the agent locally.`);
 }
 
 function formatAsyncStartError(mode: SubagentRunMode, message: string): AsyncExecutionResult {
@@ -719,13 +986,34 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		thinkingOverridesByFlatIndex,
 		maxSubagentDepth,
 		worktreeBaseDir,
+		worktreeProvider,
+		worktreeBranchPrefix,
 		asyncDir,
 	} = params;
+	// One runner hosts every new step, so they share one launcher or none. Covers initial chains and
+	// appends to a running runner; the attached root runs in its own runner.
+	const stepLaunchers = [...new Set(chain.flatMap(getStepAgents))].map((name) => ({ name, launcher: agents.find((agent) => agent.name === name)?.launcher }));
+	const launcherNames = new Set(stepLaunchers.map(({ launcher }) => launcher));
+	if (launcherNames.size > 1) {
+		return { error: `Every agent in one background runner must use the same launcher or none: ${stepLaunchers.map(({ name, launcher }) => `${name} (${launcher ?? "none"})`).join(", ")}.` };
+	}
+	const launcher = [...launcherNames][0];
+	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
 	const outputBaseDir = params.outputBaseDir;
 	const resultMode = params.resultMode ?? "chain";
 	const chainSkills = params.chainSkills ?? [];
 	const availableModels = params.availableModels;
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
+	const launchMachine = params.machine;
+	let managedWorktreeProvider: "native" | "worktrunk" | undefined;
+	try {
+		if (chain.some((step) => "worktree" in step && step.worktree === true)) {
+			const resolved = resolveWorktreeProvider(worktreeProvider, worktreeBaseDir);
+			managedWorktreeProvider = shouldDeferWorktreeCwd(worktreeProvider, worktreeBaseDir) ? "worktrunk" : resolved;
+		}
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : String(error) };
+	}
 	const progressDir = params.progressDir ?? runnerCwd;
 	const graphChain: ChainStep[] = params.attachRoot
 		? [{
@@ -751,8 +1039,6 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		if (error instanceof ChainOutputValidationError) return { error: error.message };
 		throw error;
 	}
-	const workflowGraph = buildWorkflowGraphSnapshot({ runId: id, mode: resultMode, steps: graphChain });
-
 	const diagnosticContext = params.unknownAgentDiagnosticContext
 		?? unknownAgentDiagnosticContext(discoverAgents(path.resolve(runnerCwd), "both"));
 	for (const s of chain) {
@@ -765,6 +1051,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			if (!agents.find((x) => x.name === agentName)) return { error: formatUnknownAgentError(agentName, diagnosticContext) };
 		}
 	}
+	const graphSteps = projectChainOutputSchemas(graphChain, agents) as ChainStep[];
+	const workflowGraph = buildWorkflowGraphSnapshot({ runId: id, mode: resultMode, steps: graphSteps });
 
 	let progressInstructionCreated = false;
 	const buildStepOverrides = (s: SequentialStep): StepOverrides => {
@@ -777,16 +1065,43 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			...(stepSkillInput !== undefined ? { skills: stepSkillInput } : {}),
 			...(s.model !== undefined ? { model: s.model } : {}),
 			...(s.fast !== undefined ? { fast: s.fast } : {}),
+			...(s.outputSchema !== undefined ? { outputSchema: s.outputSchema } : {}),
 		};
 	};
 	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior, flatIndex?: number, parallelOutputNamespace?: { stepIndex: number; taskIndex?: number }, runFanoutPath?: string) => {
 		const a = agents.find((x) => x.name === s.agent)!;
+		const effectiveBehavior = resolvedBehavior ?? suppressProgressForReadOnlyTask(resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
+		const requestedMachine = s.machine ?? launchMachine ?? a.machine;
 		const externalRunner = a.runner?.type === "external-cli" || a.runner?.type === "external-job";
 		const externalRunnerType = a.runner?.type;
+		const machineUnsupported = formatHerdrMachineRunnerUnsupported({ machine: requestedMachine, agentName: a.name, runnerType: a.runner?.type, adapter: a.runner?.type === "external-cli" ? a.runner.adapter : undefined, worktree: s.worktree });
+		if (machineUnsupported) throw new AsyncStartValidationError(machineUnsupported);
+		const launcherError = runnerLauncherPlacementError(a, requestedMachine);
+		if (launcherError) throw new AsyncStartValidationError(launcherError);
+		const registeredExtensions = resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
+		try {
+			assertRequiredChildExtensionsAdmitted([params.requiredExtensions, ctx.childRuntime?.requiredExtensions, registeredExtensions], { agent: a.name, runnerType: a.runner?.type, machine: requestedMachine });
+		} catch (error) {
+			throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
+		}
+		let machine: HerdrMachineReference | undefined;
+		let machineEnv: Record<string, string> | undefined;
+		if (requestedMachine) {
+			try {
+				const placement = resolveHerdrMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: s.cwd ?? params.machineCwd });
+				machine = placement.machine;
+				machineEnv = placement.env;
+			} catch (error) {
+				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
+			}
+		}
+		// A code-owned Claude Code adapter owns its argv, but it does accept an explicit
+		// model/thinking request; those become --model/--effort on the launch below.
+		const claudeCodeAdapter = a.runner?.type === "external-cli" && isClaudeCodeAdapterId(a.runner.adapter);
 		if (externalRunner) {
 			const unsupported: string[] = [];
-			if (s.model !== undefined) unsupported.push("model override");
-			if (s.outputSchema !== undefined) unsupported.push("structured output");
+			if (s.model !== undefined && !claudeCodeAdapter) unsupported.push("model override");
+			if (effectiveBehavior.outputSchema !== undefined) unsupported.push("structured output");
 			if (s.acceptance !== undefined || params.agentContract !== undefined || s.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 			if (s.toolBudget !== undefined || params.toolBudget !== undefined || a.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
 			if ((s.fast ?? params.fast ?? a.fast) === true) unsupported.push("fast mode");
@@ -794,7 +1109,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			if (unsupported.length > 0) throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 		}
 		try {
-			assertAgentAllowedByCapabilityCeiling(a.name, intersectSubagentCapabilityCeilings(params.capabilityCeiling, decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV])));
+			assertAgentAllowedByCapabilityCeiling(a.name, intersectSubagentCapabilityCeilings(params.capabilityCeiling, ctx.childRuntime?.capabilityCeiling));
 		} catch (error) {
 			throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 		}
@@ -817,10 +1132,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			runtimeCwd: ctx.cwd,
 			stepCwdInput: s.cwd,
 			behaviorCwd,
+			...(machine ? { machineCwd: machine.cwd } : {}),
 			chainSkills,
 			outputBaseDir,
 			parallelOutputNamespace,
-			resolvedBehavior,
+			resolvedBehavior: effectiveBehavior,
 		});
 		const { stepCwd, instructionCwd, readExistenceCwd, behavior, namespaceOutputPath, outputPath, skillNames } = launchPlan;
 		const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
@@ -832,48 +1148,57 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		);
 		if (missingSkills.includes("dm-subagents")) throw new UnavailableSubagentSkillError(UNAVAILABLE_SUBAGENT_SKILL_ERROR);
 
-		let systemPrompt = a.systemPrompt?.trim() ?? "";
-		if (resolvedSkills.length > 0) {
-			const injection = buildSkillInjection(resolvedSkills);
-			systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
-		}
-		const memoryInjection = buildAgentMemoryInjection(a, stepCwd);
-		if (memoryInjection) {
-			systemPrompt = systemPrompt ? `${systemPrompt}\n\n${memoryInjection}` : memoryInjection;
-		}
-		systemPrompt = appendAgentRefinementOverlay(systemPrompt, { cwd: stepCwd, agentName: a.name });
+		const systemPrompt = buildEffectiveSystemPrompt({ agent: a, resolvedSkills, cwd: stepCwd });
 
 		const readInstructions = buildChainInstructions({ ...behavior, output: false, progress: false }, instructionCwd, false, undefined, readExistenceCwd);
 		const isFirstProgressAgent = behavior.progress && !progressPrecreated && !progressInstructionCreated;
 		if (behavior.progress) progressInstructionCreated = true;
 		const progressInstructions = buildChainInstructions({ ...behavior, output: false, reads: false }, progressDir, isFirstProgressAgent);
-		if (!namespaceOutputPath) systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath, a);
 		const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath, `Async step (${s.agent})`);
 		if (validationError) throw new AsyncStartValidationError(validationError);
 		let taskTemplate = s.task ?? "{previous}";
 		taskTemplate = taskTemplate.replace(/\{task\}/g, originalTask ?? "");
-		taskTemplate = taskTemplate.replace(/\{chain_dir\}/g, runnerCwd);
+		taskTemplate = taskTemplate.replace(/\{chain_dir\}/g, behaviorCwd ?? runnerCwd);
 		const taskText = `${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`;
+		// A namespaced parallel output path is added to each child's task by the runner.
 		const task = namespaceOutputPath ? taskText : injectSingleOutputInstruction(taskText, outputPath, a);
 
-		const modelScopes = resolveModelScopesForAgent(ctx.modelScope, a.name, ctx.currentModel);
-		const primaryModelFromParent = inheritsParentModel(s.model, a.model, ctx.currentModel);
+		const modelScopes = resolveModelScopesForAgent(ctx.modelScope, a.name, ctx.currentModel, ctx.scopedModelIds);
+		const modelOrigin = resolveModelOrigin({ explicitModel: s.model, agentModel: a.model, parentModel: ctx.currentModel });
+		const primaryModelFromParent = modelOrigin === "inherited";
 		const primaryModel = externalRunner ? undefined : resolveEffectiveSubagentModel(
 			s.model,
 			a.model,
 			ctx.currentModel,
 			availableModels,
 			a.modelProvider ?? ctx.currentModelProvider,
-			{ scope: modelScopes },
+			{ scope: modelScopes, source: modelOrigin === "explicit" ? "explicit" : "inherited" },
 		);
 		const thinkingOverride = flatIndex === undefined ? undefined : thinkingOverridesByFlatIndex?.[flatIndex];
+		let claudeCodeOverride: ClaudeCodeOverride | undefined;
+		if (claudeCodeAdapter) {
+			try {
+				claudeCodeOverride = resolveClaudeCodeOverride({
+					model: typeof s.model === "string" ? s.model : undefined,
+					agent: a,
+					thinking: resolveClaudeCodeThinking(thinkingOverride, a.thinking),
+					thinkingCeiling: intersectThinkingCeilings(params.thinkingCeiling, a.maxThinking, ctx.childRuntime?.thinkingCeiling),
+					agentName: a.name,
+					runId: id,
+				});
+				assertClaudeCodeModelScope({ scopes: modelScopes, model: claudeCodeOverride?.model, agent: a.name, runId: id });
+				assertClaudeCodeOverrideIsLocal(a.name, machine ? requestedMachine : undefined, claudeCodeOverride);
+			} catch (error) {
+				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
+			}
+		}
 		const effectiveThinking = externalRunner ? undefined : thinkingOverride ?? a.thinking;
 		const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, thinkingOverride !== undefined);
 		const contextLimit = model ? findModelInfo(model, availableModels, a.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
 		const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 			params.thinkingCeiling,
 			a.maxThinking,
-			decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
+			ctx.childRuntime?.thinkingCeiling,
 		);
 		if (!externalRunner) {
 			try {
@@ -884,35 +1209,41 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		}
 		const agentContract = s.agentContract ?? params.agentContract;
 		const permissionRules = resolvePermissionRules(ctx.permissions, a.permissions);
-		const modelCandidates = externalRunner ? [] : buildModelCandidates(primaryModel, a.fallbackModels, availableModels, a.modelProvider ?? ctx.currentModelProvider, {
-			scope: modelScopes,
-			primaryModelFromParent,
-		}).flatMap((candidate) => {
-			const resolved = applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined);
-			return resolved ? [resolved] : [];
-		});
+		let selectedModel = model;
+		let requestedModel: string | undefined;
 		if (!externalRunner) {
 			try {
-				for (const candidate of modelCandidates) assertThinkingWithinCeiling({ model: candidate, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: a.name, runId: id });
+				const modelEvidence = resolveModelSelection(primaryModel, availableModels, a.modelProvider ?? ctx.currentModelProvider, {
+					scope: modelScopes,
+					primaryModelFromParent,
+					origin: modelOrigin,
+				});
+				requestedModel = modelEvidence.requestedModel;
+				selectedModel = applyThinkingSuffix(modelEvidence.model, effectiveThinking, thinkingOverride !== undefined);
+				assertThinkingWithinCeiling({ model: selectedModel, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: a.name, runId: id });
 			} catch (error) {
 				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 			}
 		}
+		const launchRuleError = applyWatchdogLaunchRules({ cwd: machine ? runnerCwd : stepCwd, agent: a.name, model: selectedModel, warn: (violation) => sendRuleViolationWarning(ctx.dm, violation) });
+		if (launchRuleError) throw new AsyncStartValidationError(launchRuleError);
 		const fast = s.fast ?? params.fast ?? a.fast;
+		const requiredExtensions = externalRunner ? [] : params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? registeredExtensions;
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: a.tools,
+			excludeTools: a.excludeTools,
 			allowNestedSubagents: a.allowNestedSubagents,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
+			requiredExtensions,
 			mcpDirectTools: a.mcpDirectTools,
 			cwd: stepCwd,
 			requireReadTool: Boolean(resolvedSkills.length),
-			structuredOutput: Boolean(s.outputSchema),
+			structuredOutput: Boolean(behavior.outputSchema),
 			fast,
-			model,
-			modelCandidates,
+			model: selectedModel,
 			capabilityCeiling: params.capabilityCeiling,
-			inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
+			inheritedCapabilityCeiling: ctx.childRuntime?.capabilityCeiling,
 			agentName: a.name,
 			permissionRules,
 			runtimeSnapshotHost: ctx.dm,
@@ -921,54 +1252,46 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		if (externalRunner && permissionRules) {
 			throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}', which cannot enforce native DM child permission rules.`);
 		}
-		if (!externalRunner) {
-			const contractTools = toolPlan.explicitToolAllowlist ? toolPlan.effectiveToolAllowlist : undefined;
-			const contractError = validateImplementationToolContract({
-				agent: a.name,
-				task,
-				tools: contractTools,
-				mcpDirectTools: toolPlan.effectiveMcpTools,
-				configuredExtensions: toolPlan.configuredExtensions,
-				requestedTools: toolPlan.requestedBuiltinTools,
-				acceptanceRole: a.acceptanceRole,
-				completionGuard: a.completionGuard,
-			});
-			if (contractError) throw new AsyncStartValidationError(contractError);
-		}
 		return {
-			parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
+			parentSessionId: launchParentSessionId,
+			...(ctx.parentSessionFile ? { parentSessionFile: ctx.parentSessionFile } : {}),
 			permissionRules,
 			...(params.capabilityCeiling ? { capabilityCeiling: params.capabilityCeiling } : {}),
 			...(runFanoutPath ? { runFanoutPath } : {}),
 			agent: s.agent,
 			task,
 			...(a.runner ? { runner: a.runner } : {}),
+			...(claudeCodeOverride ? { claudeCodeOverrideArgs: claudeCodeOverride.args } : {}),
+			...(machine ? { machine } : {}),
+			...(machineEnv ? { machineEnv } : {}),
 			...(params.contextForAgent ? { context: params.contextForAgent(s.agent) } : {}),
 			...(agentContract ? { agentContract } : {}),
 			phase: s.phase,
 			label: s.label,
 			outputName: s.as,
-			structured: Boolean(s.outputSchema),
+			structured: Boolean(behavior.outputSchema),
 			cwd: stepCwd,
-			requestedCwd: s.cwd ?? stepCwd,
-			model,
+			requestedCwd: machine ? machine.cwd : s.cwd ?? stepCwd,
+			model: selectedModel,
 			...(contextLimit !== undefined ? { contextLimit } : {}),
 			...(fast !== undefined ? { fast } : {}),
-			thinking: resolveEffectiveThinking(model, effectiveThinking),
+			thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),
 			...(thinkingCeiling ? { thinkingCeiling } : {}),
 			launchResolvedExtensions,
-			...(toolPlan.mcpConfig ? { mcpConfig: toolPlan.mcpConfig } : {}),
-			...(toolPlan.runtimeServerNames ? { runtimeServerNames: toolPlan.runtimeServerNames } : {}),
-			modelCandidates: externalRunner ? undefined : modelCandidates,
+			...(requestedModel ? { requestedModel } : {}),
 			...(primaryModelFromParent ? { skipPrimaryModelVerification: true } : {}),
 			...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
+			...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 			tools: a.tools,
+			excludeTools: a.excludeTools,
 			allowNestedSubagents: a.allowNestedSubagents,
+			allowedAgents: a.allowedAgents,
 			extensions: a.extensions,
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
+			...(!externalRunner ? { requiredExtensions } : {}),
 			mcpDirectTools: a.mcpDirectTools,
+			...(toolPlan.builtinMcpTools ? { builtinMcpTools: toolPlan.builtinMcpTools } : {}),
 			mutationTools: a.mutationTools,
-			completionGuard: a.completionGuard,
 			systemPrompt,
 			systemPromptMode: a.systemPromptMode,
 			inheritProjectContext: a.inheritProjectContext,
@@ -997,8 +1320,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			acceptanceInput: s.acceptance,
 			acceptanceRole: a.acceptanceRole,
 			...(s.gateOn ? { gateOn: s.gateOn } : {}),
-			...(s.outputSchema ? { structuredOutputSchema: s.outputSchema } : {}),
-			...(s.outputSchema ? { structuredOutput: createStructuredOutputRuntime(s.outputSchema, path.join(asyncDir, "structured-output"), { captureAcceptanceReport: s.acceptance !== false }) } : {}),
+			...(behavior.outputSchema ? { structuredOutputSchema: behavior.outputSchema } : {}),
+			...(behavior.outputSchema ? { structuredOutput: createStructuredOutputRuntime(behavior.outputSchema, path.join(asyncDir, "structured-output"), { acceptanceReport: resolveAcceptanceReportMode(s.acceptance) }) } : {}),
 			...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
 			...(s.worktree ? { worktree: true } : {}),
 		};
@@ -1032,7 +1355,9 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				return {
 					parallel: s.parallel.map((t, taskIndex) => {
 						let behaviorCwd: string | undefined;
-						if (s.worktree) {
+						if (s.worktree && managedWorktreeProvider === "worktrunk") {
+							behaviorCwd = WORKTREE_AGENT_CWD_PLACEHOLDER;
+						} else if (s.worktree && managedWorktreeProvider === "native") {
 							try {
 								behaviorCwd = resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s${stepIndex}`, taskIndex, worktreeBaseDir);
 							} catch {
@@ -1040,7 +1365,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 							}
 						}
 						const staticStep = nextFlatStep();
-						return buildSeqStep({ ...t, agentContract: t.agentContract ?? s.agentContract, gateOn: t.gateOn ?? s.gateOn }, staticStep.sessionFile, behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], staticStep.index, { stepIndex, taskIndex }, resultMode === "parallel" ? `tasks[${taskIndex}]` : `chain[${stepIndex}].parallel[${taskIndex}]`);
+						return buildSeqStep({ ...t, machine: t.machine ?? s.machine, worktree: s.worktree, agentContract: t.agentContract ?? s.agentContract, gateOn: t.gateOn ?? s.gateOn }, staticStep.sessionFile, behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], staticStep.index, { stepIndex, taskIndex }, resultMode === "parallel" ? `tasks[${taskIndex}]` : `chain[${stepIndex}].parallel[${taskIndex}]`);
 					}),
 					concurrency: s.concurrency,
 					failFast: s.failFast,
@@ -1087,7 +1412,9 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			}
 			const sequential = s as SequentialStep;
 			let behaviorCwd: string | undefined;
-			if (sequential.worktree) {
+			if (sequential.worktree && managedWorktreeProvider === "worktrunk") {
+				behaviorCwd = WORKTREE_AGENT_CWD_PLACEHOLDER;
+			} else if (sequential.worktree && managedWorktreeProvider === "native") {
 				try {
 					behaviorCwd = resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s${stepIndex}`, 0, worktreeBaseDir);
 				} catch {
@@ -1099,6 +1426,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		});
 		const steps = params.attachRoot
 			? [{
+					parentSessionId: launchParentSessionId,
+					...(ctx.parentSessionFile ? { parentSessionFile: ctx.parentSessionFile } : {}),
 					agent: params.attachRoot.agent,
 					task: "",
 					label: params.attachRoot.label ?? `Attached root ${params.attachRoot.runId}`,
@@ -1127,7 +1456,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				seen.set(task.outputPath, { index, agent: task.agent });
 			}
 		}
-		return { steps: steps as RunnerStep[], runnerCwd, workflowGraph, eventChain: graphChain, ...(originalTask !== undefined ? { originalTask } : {}) };
+		return { steps: steps as RunnerStep[], runnerCwd, workflowGraph, eventChain: graphChain, ...(originalTask !== undefined ? { originalTask } : {}), ...(launcher !== undefined ? { launcher } : {}) };
 	} catch (error) {
 		if (error instanceof UnavailableSubagentSkillError || error instanceof AsyncStartValidationError) return { error: error.message };
 		throw error;
@@ -1140,7 +1469,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 export function executeAsyncChain(
 	id: string,
 	params: AsyncChainParams,
-): AsyncExecutionResult {
+): AsyncExecutionResult | Promise<AsyncExecutionResult> {
 	const {
 		chain,
 		agents,
@@ -1157,6 +1486,9 @@ export function executeAsyncChain(
 		worktreeSetupHook,
 		worktreeSetupHookTimeoutMs,
 		worktreeBaseDir,
+		baseRef,
+		worktreeProvider,
+		worktreeBranchPrefix,
 		controlConfig,
 		controlIntercomTarget,
 		childIntercomTarget,
@@ -1164,16 +1496,18 @@ export function executeAsyncChain(
 	} = params;
 	const resultMode = params.resultMode ?? "chain";
 	const acceptanceErrors = validateExecutionAcceptance({
-		chain: chain.map((step) => {
-			if (isParallelStep(step)) return { parallel: step.parallel };
-			if (isDynamicParallelStep(step)) return { acceptance: step.acceptance, parallel: step.parallel };
-			return { acceptance: step.acceptance };
-		}),
+		chain: projectChainOutputSchemas(chain, agents,
+			(step, outputSchema) => ({ acceptance: step.acceptance, outputSchema }),
+			(step, parallel) => Array.isArray(step.parallel) ? { parallel } : { acceptance: "acceptance" in step ? step.acceptance : undefined, parallel }),
 	});
 	if (acceptanceErrors.length > 0) return formatAsyncStartError(resultMode, acceptanceErrors.join(" "));
+	// Refuse an undefined launcher before the run directory exists and before step building can write progress files.
+	const undefinedLauncher = chain.flatMap(getStepAgents).map((name) => agents.find((agent) => agent.name === name)?.launcher)
+		.find((name) => name !== undefined && !lookupRunnerLauncher(ctx.runnerLaunchers, name));
+	if (undefinedLauncher !== undefined) return formatAsyncStartError(resultMode, `Launcher '${undefinedLauncher}' used by this ${resultMode} is not defined in runnerLaunchers in the user subagent config.`);
 	const capabilityCeiling = params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
-	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
-	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+	const inheritedNestedRoute = inheritedNestedRouteOf(ctx.childRuntime);
+	const nestedAddress = inheritedNestedRoute ? inheritedNestedParentAddressOf(ctx.childRuntime) : undefined;
 	const asyncDir = inheritedNestedRoute
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
 		: path.join(DIRS.async, id);
@@ -1202,6 +1536,8 @@ export function executeAsyncChain(
 		availableModels: params.availableModels,
 		cwd,
 		chainSkills: params.chainSkills,
+		machine: params.machine,
+		machineCwd: params.machineCwd,
 		sessionFilesByFlatIndex,
 		thinkingOverridesByFlatIndex,
 		contextForAgent: params.contextForAgent,
@@ -1213,6 +1549,8 @@ export function executeAsyncChain(
 		waitToolEnabled: params.waitToolEnabled,
 		waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
 		worktreeBaseDir,
+		worktreeProvider,
+		worktreeBranchPrefix,
 		asyncDir,
 		fast: params.fast,
 		toolBudget: params.toolBudget,
@@ -1222,6 +1560,7 @@ export function executeAsyncChain(
 		toolTimeoutMsEnv: params.toolTimeoutMsEnv ?? toolTimeoutFromEnv(),
 		capabilityCeiling,
 		thinkingCeiling: params.thinkingCeiling,
+		requiredExtensions: params.requiredExtensions,
 	});
 	if ("error" in built) {
 		try {
@@ -1232,6 +1571,7 @@ export function executeAsyncChain(
 		return formatAsyncStartError(resultMode, built.error);
 	}
 	const { steps, runnerCwd, workflowGraph, eventChain } = built;
+	const launcher = built.launcher === undefined ? undefined : lookupRunnerLauncher(ctx.runnerLaunchers, built.launcher);
 	const deadlineAt = params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined;
 	const initialUsageBudget = usageBudgetState(params.usageBudget, undefined);
 	let childTargetIndex = 0;
@@ -1264,10 +1604,17 @@ export function executeAsyncChain(
 	}
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
-
-	let spawnResult: SpawnRunnerResult = {};
+	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
 	try {
-		spawnResult = spawnRunner(
+		writeRetainedRequiredChildExtensions(asyncDir, params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(launchParentSessionId ?? undefined));
+	} catch (error) {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		return formatAsyncStartError(resultMode, `Failed to record required child extensions: ${error instanceof Error ? error.message : String(error)}`);
+	}
+
+	let spawnResultOrPromise: SpawnRunnerResult | Promise<SpawnRunnerResult> = {};
+	try {
+		spawnResultOrPromise = spawnRunner(
 			{
 				id,
 				steps,
@@ -1284,10 +1631,15 @@ export function executeAsyncChain(
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
-				piArgv1: process.argv[1],
+				childSessionFactoryModule: childSessionFactoryModule(),
+				inheritedChildRuntime: inheritedChildRuntime(ctx.childRuntime),
+				projectTrusted: ctx.projectTrusted,
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
+				baseRef,
+				worktreeProvider,
+				worktreeBranchPrefix,
 				controlConfig,
 				toolBudget: params.toolBudget,
 				usageBudget: params.usageBudget,
@@ -1309,6 +1661,7 @@ export function executeAsyncChain(
 					depth: nestedAddress.depth,
 					path: nestedAddress.path,
 				} : undefined,
+				...(launcher ? { launcher } : {}),
 			},
 			id,
 			runnerCwd,
@@ -1324,10 +1677,13 @@ export function executeAsyncChain(
 				currentStep: 0,
 				chainStepCount: eventChain.length,
 				...(initialParallelGroups.length ? { parallelGroups: initialParallelGroups } : {}),
+				...(launcher ? { launcher } : {}),
 				steps: initialStatusSteps,
 			},
 			path.join(asyncDir, "status.json"),
+			launchParentSessionId,
 			(proof) => emitProcessTerminalEvent(ctx, proof),
+			(runnerProcessInstanceId) => params.activeAsyncCapacity?.markStarted(runnerProcessInstanceId),
 		);
 	} catch (error) {
 		params.activeAsyncCapacity?.rollback();
@@ -1335,8 +1691,13 @@ export function executeAsyncChain(
 		return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': ${message}`);
 	}
 
+	// A launcher run's spawn resolves once the runner reports its identity.
+	const finishSpawnResult = (spawnResult: SpawnRunnerResult): AsyncExecutionResult => {
 	if (spawnResult.error) {
-		if (!spawnResult.pid || !spawnResult.runnerProcessInstanceId || (spawnResult.startupDidNotProceed && spawnResult.terminationObserved)) params.activeAsyncCapacity?.rollback();
+		if (spawnResult.startupDidNotProceed) {
+			if (!spawnResult.runnerProcessInstanceId || params.activeAsyncCapacity?.rollbackBeforeRunnerProceed(spawnResult.runnerProcessInstanceId) !== true) params.activeAsyncCapacity?.rollback();
+		}
+		else if (!spawnResult.pid || !spawnResult.runnerProcessInstanceId) params.activeAsyncCapacity?.rollback();
 		else params.activeAsyncCapacity?.markStarted(spawnResult.runnerProcessInstanceId);
 		return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': ${spawnResult.error}`);
 	}
@@ -1344,8 +1705,6 @@ export function executeAsyncChain(
 		params.activeAsyncCapacity?.rollback();
 		return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': runner identity unavailable`);
 	}
-	params.activeAsyncCapacity?.markStarted(spawnResult.runnerProcessInstanceId);
-
 	if (spawnResult.pid) {
 		const eventFirstStep = eventChain[0];
 		if (!eventFirstStep) {
@@ -1396,7 +1755,7 @@ export function executeAsyncChain(
 						path: nestedAddress.path,
 						asyncDir,
 						pid: spawnResult.pid,
-						ownerIntercomTarget: process.env.DM_SUBAGENT_INTERCOM_SESSION_NAME,
+						ownerIntercomTarget: ctx.childRuntime?.intercomSessionName,
 						leafIntercomTarget: childIntercomTargets?.[0],
 						intercomTarget: childIntercomTargets?.[0],
 						ownerState: "live",
@@ -1455,6 +1814,8 @@ export function executeAsyncChain(
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`, ctx.interactive === true) }],
 		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
 	};
+	};
+	return spawnResultOrPromise instanceof Promise ? spawnResultOrPromise.then(finishSpawnResult) : finishSpawnResult(spawnResultOrPromise);
 }
 
 /**
@@ -1467,7 +1828,7 @@ export function workflowAwaitedAsyncResultPath(asyncDir: string): string {
 export function executeAsyncSingle(
 	id: string,
 	params: AsyncSingleParams,
-): AsyncExecutionResult {
+): AsyncExecutionResult | Promise<AsyncExecutionResult> {
 	const {
 		agent,
 		agentConfig,
@@ -1483,6 +1844,9 @@ export function executeAsyncSingle(
 		worktreeSetupHook,
 		worktreeSetupHookTimeoutMs,
 		worktreeBaseDir,
+		baseRef,
+		worktreeProvider,
+		worktreeBranchPrefix,
 		controlConfig,
 		controlIntercomTarget,
 		childIntercomTarget,
@@ -1507,11 +1871,14 @@ export function executeAsyncSingle(
 	const externalRunner = agentConfig.runner?.type === "external-cli" || agentConfig.runner?.type === "external-job";
 	const externalRunnerType = agentConfig.runner?.type;
 	const permissionRules = resolvePermissionRules(ctx.permissions, agentConfig.permissions);
+	// See the chain path: the Claude Code adapter accepts an explicit model/thinking
+	// request even though no other external runner does.
+	const claudeCodeAdapter = agentConfig.runner?.type === "external-cli" && isClaudeCodeAdapterId(agentConfig.runner.adapter);
 	if (externalRunner) {
 		const unsupported: string[] = [];
-		if (params.modelOverride !== undefined) unsupported.push("model override");
+		if (params.modelOverride !== undefined && !claudeCodeAdapter) unsupported.push("model override");
 		if ((params.fast ?? agentConfig.fast) === true) unsupported.push("fast mode");
-		if (params.thinkingOverride !== undefined) unsupported.push("thinking override");
+		if (params.thinkingOverride !== undefined && !claudeCodeAdapter) unsupported.push("thinking override");
 		if (params.structuredOutputSchema !== undefined) unsupported.push("structured output");
 		if (params.acceptance !== undefined || params.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 		if (params.toolBudget !== undefined || agentConfig.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
@@ -1521,16 +1888,50 @@ export function executeAsyncSingle(
 		if (extensionBindings !== undefined) unsupported.push("extension bindings");
 		if (unsupported.length > 0) return formatAsyncStartError("single", `Agent '${agentConfig.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 	}
-	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]));
+	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), ctx.childRuntime?.capabilityCeiling);
 	try {
 		assertAgentAllowedByCapabilityCeiling(agentConfig.name, capabilityCeiling);
 	} catch (error) {
 		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 	}
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
-	const instructionCwd = params.worktree === true
+	const requestedMachine = params.machine ?? agentConfig.machine;
+	const machineUnsupported = formatHerdrMachineRunnerUnsupported({ machine: requestedMachine, agentName: agentConfig.name, runnerType: agentConfig.runner?.type, adapter: agentConfig.runner?.type === "external-cli" ? agentConfig.runner.adapter : undefined, worktree: params.worktree });
+	if (machineUnsupported) return formatAsyncStartError("single", machineUnsupported);
+	const resolvedLauncher = resolveAgentRunnerLauncher(agentConfig, ctx.runnerLaunchers, requestedMachine);
+	if (resolvedLauncher.error) return formatAsyncStartError("single", resolvedLauncher.error);
+	const launcher = resolvedLauncher.launcher;
+	const registeredExtensions = resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
+	try {
+		assertRequiredChildExtensionsAdmitted([params.requiredExtensions, ctx.childRuntime?.requiredExtensions, registeredExtensions], { agent: agentConfig.name, runnerType: agentConfig.runner?.type, machine: requestedMachine });
+	} catch (error) {
+		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+	}
+	let machine: HerdrMachineReference | undefined;
+	let machineEnv: Record<string, string> | undefined;
+	if (requestedMachine) {
+		try {
+			const placement = resolveHerdrMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: params.machineCwd });
+			machine = placement.machine;
+			machineEnv = placement.env;
+		} catch (error) {
+			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+		}
+	}
+	let managedWorktreeProvider: "native" | "worktrunk" | undefined;
+	if (params.worktree === true) {
+		try {
+			const resolved = resolveWorktreeProvider(params.worktreeProvider, worktreeBaseDir);
+			managedWorktreeProvider = shouldDeferWorktreeCwd(params.worktreeProvider, worktreeBaseDir) ? "worktrunk" : resolved;
+		} catch (error) {
+			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+		}
+	}
+	const instructionCwd = params.worktree === true && managedWorktreeProvider === "worktrunk"
+		? WORKTREE_AGENT_CWD_PLACEHOLDER
+		: params.worktree === true && managedWorktreeProvider === "native"
 		? resolveExpectedWorktreeAgentCwd(runnerCwd, `${id}-s0`, 0, worktreeBaseDir)
-		: runnerCwd;
+		: machine?.cwd ?? runnerCwd;
 	const readExistenceCwd = params.worktree === true ? runnerCwd : instructionCwd;
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
@@ -1542,19 +1943,9 @@ export function executeAsyncSingle(
 		agentConfig.filePath ? path.dirname(agentConfig.filePath) : runnerCwd,
 	);
 	if (missingSkills.includes("dm-subagents")) return formatAsyncStartError("single", UNAVAILABLE_SUBAGENT_SKILL_ERROR);
-	let systemPrompt = agentConfig.systemPrompt?.trim() ?? "";
-	if (resolvedSkills.length > 0) {
-		const injection = buildSkillInjection(resolvedSkills);
-		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${injection}` : injection;
-	}
-	const memoryInjection = buildAgentMemoryInjection(agentConfig, runnerCwd);
-	if (memoryInjection) {
-		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${memoryInjection}` : memoryInjection;
-	}
-	systemPrompt = appendAgentRefinementOverlay(systemPrompt, { cwd: runnerCwd, agentName: agentConfig.name });
 
-	const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
-	const nestedAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
+	const inheritedNestedRoute = inheritedNestedRouteOf(ctx.childRuntime);
+	const nestedAddress = inheritedNestedRoute ? inheritedNestedParentAddressOf(ctx.childRuntime) : undefined;
 	const asyncDir = inheritedNestedRoute
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", inheritedNestedRoute.rootRunId, id)
 		: path.join(DIRS.async, id);
@@ -1574,7 +1965,7 @@ export function executeAsyncSingle(
 
 	const effectiveOutput = normalizeSingleOutputOverride(params.output, agentConfig.output);
 	const outputPath = resolveSingleOutputPath(effectiveOutput, ctx.cwd, instructionCwd, params.outputBaseDir ?? (artifactsDir ? path.join(artifactsDir, "outputs", id) : undefined));
-	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath, agentConfig);
+	const systemPrompt = buildEffectiveSystemPrompt({ agent: agentConfig, resolvedSkills, cwd: runnerCwd });
 	const outputMode = params.outputMode ?? agentConfig.outputMode ?? "inline";
 	const validationError = validateFileOnlyOutputMode(outputMode, outputPath, `Async single run (${agent})`);
 	if (validationError) return formatAsyncStartError("single", validationError);
@@ -1582,28 +1973,65 @@ export function executeAsyncSingle(
 	// Reads: caller override > agent defaultReads > none. `~`/`~/` expand to home;
 	// absolute paths pass through; relative paths resolve against the child cwd.
 	const reads = params.reads !== undefined ? params.reads : agentConfig.defaultReads ?? false;
-	const readPaths = Array.isArray(reads) ? resolveExistingReadPaths(reads, readExistenceCwd) : [];
+	const readPaths = Array.isArray(reads)
+		? machine
+			? externalRunner
+				? reads.map((read) => read === "~" || read.startsWith("~/") || path.posix.isAbsolute(read) ? read : path.posix.resolve(instructionCwd, read))
+				: []
+			: managedWorktreeProvider === "worktrunk"
+			? resolveExistingReadInstructionPaths(reads, instructionCwd, readExistenceCwd)
+			: resolveExistingReadPaths(reads, readExistenceCwd)
+		: [];
 	const readsInstruction = readPaths.length > 0
 		? `[Read from: ${readPaths.join(", ")}]\n\n`
 		: "";
 	const taskText = readsInstruction + taskWithOutputInstruction;
-	const modelScopes = resolveModelScopesForAgent(ctx.modelScope, agentConfig.name, ctx.currentModel);
-	const primaryModel = externalRunner ? undefined : params.modelOverrideFromParent
-		? params.modelOverride
-		: resolveSubagentModelOverride(
-			params.modelOverride ?? agentConfig.model,
-			ctx.currentModel,
-			availableModels,
-			ctx.currentModelProvider,
-			{ scope: modelScopes },
-		);
+	const modelScopes = resolveModelScopesForAgent(ctx.modelScope, agentConfig.name, ctx.currentModel, ctx.scopedModelIds);
+	const modelOrigin = resolveModelOrigin({
+		fromParent: params.modelOverrideFromParent,
+		storedOrigin: params.modelOrigin,
+		explicitModel: params.modelOverrideFromParent ? undefined : params.modelOverride,
+		agentModel: agentConfig.model,
+		parentModel: ctx.currentModel,
+	});
+	let primaryModel: string | undefined;
+	try {
+		primaryModel = externalRunner ? undefined : modelOrigin === "inherited"
+			? params.modelOverride ?? (ctx.currentModel ? `${ctx.currentModel.provider}/${ctx.currentModel.id}` : undefined)
+			: resolveSubagentModelOverride(
+				params.modelOverride ?? agentConfig.model,
+				ctx.currentModel,
+				availableModels,
+				ctx.currentModelProvider,
+				{ scope: modelScopes, source: modelOrigin === "explicit" ? "explicit" : "inherited" },
+			);
+	} catch (error) {
+		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+	}
+	let singleClaudeCodeOverride: ClaudeCodeOverride | undefined;
+	if (claudeCodeAdapter) {
+		try {
+			singleClaudeCodeOverride = resolveClaudeCodeOverride({
+				model: typeof params.modelOverride === "string" ? params.modelOverride : undefined,
+				agent: agentConfig,
+				thinking: resolveClaudeCodeThinking(params.thinkingOverride, agentConfig.thinking),
+				thinkingCeiling: intersectThinkingCeilings(params.thinkingCeiling, agentConfig.maxThinking, ctx.childRuntime?.thinkingCeiling),
+				agentName: agentConfig.name,
+				runId: id,
+			});
+			assertClaudeCodeModelScope({ scopes: modelScopes, model: singleClaudeCodeOverride?.model, agent: agentConfig.name, runId: id });
+			assertClaudeCodeOverrideIsLocal(agentConfig.name, machine ? requestedMachine : undefined, singleClaudeCodeOverride);
+		} catch (error) {
+			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+		}
+	}
 	const effectiveThinking = externalRunner ? undefined : params.thinkingOverride ?? agentConfig.thinking;
 	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, params.thinkingOverride !== undefined);
 	const contextLimit = model ? findModelInfo(model, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
 	const thinkingCeiling = externalRunner ? undefined : intersectThinkingCeilings(
 		params.thinkingCeiling,
 		agentConfig.maxThinking,
-		decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
+		ctx.childRuntime?.thinkingCeiling,
 	);
 	if (!externalRunner) {
 		try {
@@ -1631,75 +2059,56 @@ export function executeAsyncSingle(
 	const initialUsageBudget = usageBudgetState(params.usageBudget, undefined);
 	const resolvedSessionDir = params.sessionDir ?? (sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined);
 	const structuredOutput = params.structuredOutputSchema
-		? createStructuredOutputRuntime(params.structuredOutputSchema, path.join(asyncDir, "structured-output"), { captureAcceptanceReport: params.acceptance !== false })
+		? createStructuredOutputRuntime(params.structuredOutputSchema, path.join(asyncDir, "structured-output"), { acceptanceReport: resolveAcceptanceReportMode(params.acceptance) })
 		: undefined;
-	const modelCandidates = externalRunner
-		? []
-		: buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider, {
-			scope: modelScopes,
-			primaryModelFromParent: params.modelOverrideFromParent,
-		})
-			.flatMap((candidate) => {
-				const resolved = applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined);
-				return resolved ? [resolved] : [];
-			});
+	let selectedModel = model;
+	let requestedModel: string | undefined;
 	if (!externalRunner) {
 		try {
-			for (const candidate of modelCandidates) assertThinkingWithinCeiling({ model: candidate, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: agentConfig.name, runId: id });
+			const modelEvidence = resolveModelSelection(primaryModel, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider, {
+				scope: modelScopes,
+				primaryModelFromParent: modelOrigin === "inherited",
+				origin: modelOrigin,
+			});
+			requestedModel = modelEvidence.requestedModel;
+			selectedModel = applyThinkingSuffix(modelEvidence.model, effectiveThinking, params.thinkingOverride !== undefined);
+			assertThinkingWithinCeiling({ model: selectedModel, configThinking: effectiveThinking, ceiling: thinkingCeiling, agent: agentConfig.name, runId: id });
 		} catch (error) {
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 		}
 	}
+	const requiredExtensions = externalRunner ? [] : params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? registeredExtensions;
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
+		excludeTools: agentConfig.excludeTools,
 		allowNestedSubagents: agentConfig.allowNestedSubagents,
 		extensions: agentConfig.extensions,
 		subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
+		requiredExtensions,
 		mcpDirectTools: agentConfig.mcpDirectTools,
 		cwd: runnerCwd,
 		requireReadTool: Boolean(resolvedSkills.length),
 		structuredOutput: Boolean(params.structuredOutputSchema),
 		fast: params.fast ?? agentConfig.fast,
-		model,
-		modelCandidates,
+		model: selectedModel,
 		capabilityCeiling,
-		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
+		inheritedCapabilityCeiling: ctx.childRuntime?.capabilityCeiling,
 		agentName: agentConfig.name,
 		permissionRules: resolvePermissionRules(ctx.permissions, agentConfig.permissions),
 		runtimeSnapshotHost: ctx.dm,
 	});
 	const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);
-	if (!externalRunner) {
-		const contractTools = toolPlan.explicitToolAllowlist ? toolPlan.effectiveToolAllowlist : undefined;
-		const contractError = validateImplementationToolContract({
-			agent: agentConfig.name,
-			task: taskText,
-			tools: contractTools,
-			mcpDirectTools: toolPlan.effectiveMcpTools,
-			configuredExtensions: toolPlan.configuredExtensions,
-			requestedTools: toolPlan.requestedBuiltinTools,
-			acceptanceRole: agentConfig.acceptanceRole,
-			completionGuard: agentConfig.completionGuard,
-		});
-		if (contractError) return formatAsyncStartError("single", contractError);
-	}
-	const launchContractDigest = launchBindingDigest({
-		definitionDigest: agentDefinitionDigest(agentConfig),
+	const fast = params.fast ?? agentConfig.fast;
+	const launchThinking = resolveEffectiveThinking(selectedModel, effectiveThinking);
+	const { definitionDigest, launchContractDigest } = resolveLaunchBinding({
+		agent: agentConfig,
 		task,
-		...(model ? { model } : {}),
-		modelCandidates,
-		...((params.fast ?? agentConfig.fast) !== undefined ? { fast: params.fast ?? agentConfig.fast } : {}),
-		...(resolveEffectiveThinking(model, effectiveThinking) ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
-		...(thinkingCeiling ? { thinkingCeiling } : {}),
+		model: selectedModel,
+		...(fast !== undefined ? { fast } : {}),
+		...(launchThinking ? { thinking: launchThinking } : {}),
 		systemPrompt,
-		systemPromptMode: agentConfig.systemPromptMode,
-		inheritProjectContext: agentConfig.inheritProjectContext,
-		inheritGlobalContext: agentConfig.inheritGlobalContext,
-		inheritSkills: agentConfig.inheritSkills,
 		skills: resolvedSkills.map((skill) => skill.name),
-		tools: toolPlan.effectiveToolAllowlist,
-		extensions: toolPlan.extensionArgs,
-		mcpDirectTools: toolPlan.effectiveMcpTools,
+		toolPlan,
 		...(outputPath ? { outputPath } : {}),
 		outputMode,
 		...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
@@ -1716,10 +2125,12 @@ export function executeAsyncSingle(
 	});
 	const recoveryAgentConfig = params.recoveryAgentConfig ?? agentConfig;
 	const recoveryDescriptor: SteeringRecoveryDescriptor = {
+		...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 		version: 1,
 		...(lane ? { lane } : {}),
 		launchContractDigest,
 		...(extensionBindings ? { extensionBindings } : {}),
+		...(requiredExtensions.length > 0 ? { requiredExtensions } : {}),
 		runFanoutBudget,
 		sourceRunId: id,
 		...(params.agentContract ? { agentContract: params.agentContract } : {}),
@@ -1727,15 +2138,17 @@ export function executeAsyncSingle(
 		launchResolvedExtensions,
 		...(sessionFile ? { sessionFile } : {}),
 		cwd: runnerCwd,
-		...(model ? { model } : {}),
+		...(selectedModel ? { model: selectedModel } : {}),
 		...(params.fast ?? recoveryAgentConfig.fast ? { fast: params.fast ?? recoveryAgentConfig.fast } : {}),
 		...(recoveryAgentConfig.modelProvider ? { modelProvider: recoveryAgentConfig.modelProvider } : {}),
-		...(params.modelOverrideFromParent ? { modelOverrideFromParent: true } : {}),
-		...(recoveryAgentConfig.fallbackModels ? { fallbackModels: [...recoveryAgentConfig.fallbackModels] } : {}),
-		...(effectiveThinking ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
+		...(modelOrigin === "inherited" ? { modelOverrideFromParent: true } : {}),
+		modelOrigin,
+		...(effectiveThinking ? { thinking: resolveEffectiveThinking(selectedModel, effectiveThinking) } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
 		...(recoveryAgentConfig.tools ? { tools: [...recoveryAgentConfig.tools] } : {}),
+		...(recoveryAgentConfig.excludeTools ? { excludeTools: [...recoveryAgentConfig.excludeTools] } : {}),
 		...(recoveryAgentConfig.allowNestedSubagents !== undefined ? { allowNestedSubagents: recoveryAgentConfig.allowNestedSubagents } : {}),
+		...(recoveryAgentConfig.allowedAgents !== undefined ? { allowedAgents: [...recoveryAgentConfig.allowedAgents] } : {}),
 		...(recoveryAgentConfig.extensions ? { extensions: [...recoveryAgentConfig.extensions] } : {}),
 		...(recoveryAgentConfig.subagentOnlyExtensions ? { subagentOnlyExtensions: [...recoveryAgentConfig.subagentOnlyExtensions] } : {}),
 		...(recoveryAgentConfig.mcpDirectTools ? { mcpDirectTools: [...recoveryAgentConfig.mcpDirectTools] } : {}),
@@ -1748,7 +2161,6 @@ export function executeAsyncSingle(
 		...(resolvedSkills.length ? { skills: resolvedSkills.map((skill) => skill.name) } : {}),
 		...(recoveryAgentConfig.skillPath ? { skillPath: [...recoveryAgentConfig.skillPath] } : {}),
 		...(recoveryAgentConfig.filePath ? { agentFilePath: recoveryAgentConfig.filePath } : {}),
-		...(recoveryAgentConfig.completionGuard !== undefined ? { completionGuard: recoveryAgentConfig.completionGuard } : {}),
 		...(recoveryAgentConfig.memory ? { memory: { ...recoveryAgentConfig.memory } } : {}),
 		...(outputPath ? { outputPath } : {}),
 		outputMode,
@@ -1757,6 +2169,8 @@ export function executeAsyncSingle(
 		...(controlConfig ? { controlConfig } : {}),
 		...(params.context ? { context: params.context } : {}),
 		...(params.intercomBridge !== undefined ? { intercomBridge: params.intercomBridge } : {}),
+		...(params.baseRef !== undefined ? { baseRef: params.baseRef } : {}),
+		...(launcher ? { launcher: launcher.name } : {}),
 		...(deadlineAt !== undefined ? { absoluteDeadlineAt: deadlineAt } : {}),
 		...(resolvedToolBudget.budget ? { initialToolBudget: resolvedToolBudget.budget } : {}),
 		maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, recoveryAgentConfig.maxSubagentDepth),
@@ -1774,42 +2188,51 @@ export function executeAsyncSingle(
 			return formatAsyncStartError("single", `Failed to persist async recovery descriptor for '${id}': ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	let spawnResult: SpawnRunnerResult = {};
+	let spawnResultOrPromise: SpawnRunnerResult | Promise<SpawnRunnerResult> = {};
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
+	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
 	try {
-		spawnResult = spawnRunner(
+		spawnResultOrPromise = spawnRunner(
 			{
 				id,
+				...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 				steps: [
 					{
-						parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
+						parentSessionId: launchParentSessionId,
+						...(ctx.parentSessionFile ? { parentSessionFile: ctx.parentSessionFile } : {}),
 						permissionRules,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
 						agent,
 						task: taskText,
 						...(agentConfig.runner ? { runner: agentConfig.runner } : {}),
+						...(singleClaudeCodeOverride ? { claudeCodeOverrideArgs: singleClaudeCodeOverride.args } : {}),
+						...(machine ? { machine } : {}),
+						...(!externalRunner && machine && params.reads !== undefined ? { remoteReads: params.reads } : {}),
+						...(machineEnv ? { machineEnv } : {}),
 						...(params.externalJobFollowUp ? { externalJobFollowUp: params.externalJobFollowUp } : {}),
 						...(params.context ? { context: params.context } : {}),
-						cwd: runnerCwd,
-						requestedCwd: params.requestedCwd ?? runnerCwd,
-						model,
+						cwd: machine?.cwd ?? runnerCwd,
+						requestedCwd: machine?.cwd ?? params.requestedCwd ?? runnerCwd,
+						model: selectedModel,
 						...(contextLimit !== undefined ? { contextLimit } : {}),
 						...(params.fast ?? agentConfig.fast ? { fast: params.fast ?? agentConfig.fast } : {}),
-						thinking: resolveEffectiveThinking(model, effectiveThinking),
+						thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),
 						...(thinkingCeiling ? { thinkingCeiling } : {}),
-						modelCandidates,
-						...(params.modelOverrideFromParent ? { skipPrimaryModelVerification: true } : {}),
+						...(requestedModel ? { requestedModel } : {}),
+						...(modelOrigin === "inherited" ? { skipPrimaryModelVerification: true } : {}),
 						...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
+						...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 						tools: agentConfig.tools,
+						excludeTools: agentConfig.excludeTools,
 						allowNestedSubagents: agentConfig.allowNestedSubagents,
+						allowedAgents: agentConfig.allowedAgents,
 						extensions: agentConfig.extensions,
 						subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
+						...(!externalRunner ? { requiredExtensions } : {}),
 						mcpDirectTools: agentConfig.mcpDirectTools,
-						...(toolPlan.mcpConfig ? { mcpConfig: toolPlan.mcpConfig } : {}),
-						...(toolPlan.runtimeServerNames ? { runtimeServerNames: toolPlan.runtimeServerNames } : {}),
+						...(toolPlan.builtinMcpTools ? { builtinMcpTools: toolPlan.builtinMcpTools } : {}),
 						mutationTools: agentConfig.mutationTools,
-						completionGuard: agentConfig.completionGuard,
 						systemPrompt,
 						systemPromptMode: agentConfig.systemPromptMode,
 						inheritProjectContext: agentConfig.inheritProjectContext,
@@ -1824,12 +2247,13 @@ export function executeAsyncSingle(
 						waitToolEnabled: params.waitToolEnabled,
 						waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
 						...(params.agentContract ? { agentContract: params.agentContract } : {}),
-						definitionDigest: agentDefinitionDigest(agentConfig),
+						definitionDigest,
 						launchBindingTask: task,
 						launchContractDigest,
 						...(extensionBindings ? { extensionBindings } : {}),
 						launchResolvedExtensions,
 						effectiveAcceptance: resolvedAcceptance,
+						acceptanceInput: params.acceptance,
 						...(structuredOutput ? { structuredOutput } : {}),
 						...(params.structuredOutputSchema ? { structuredOutputSchema: params.structuredOutputSchema } : {}),
 						...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
@@ -1852,14 +2276,20 @@ export function executeAsyncSingle(
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
-				piArgv1: process.argv[1],
+				childSessionFactoryModule: childSessionFactoryModule(),
+				projectTrusted: ctx.projectTrusted,
+				inheritedChildRuntime: inheritedChildRuntime(ctx.childRuntime),
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
+				baseRef,
+				worktreeProvider,
+				worktreeBranchPrefix,
 				controlConfig,
 				timeoutMs,
 				deadlineAt,
 				toolTimeoutMs,
+				checkpointBeforeDeadlineMs: params.checkpointBeforeDeadlineMs,
 				toolBudget: params.toolBudget,
 				usageBudget: params.usageBudget,
 				controlIntercomTarget,
@@ -1873,6 +2303,7 @@ export function executeAsyncSingle(
 				...(lane ? { lane } : {}),
 				...(params.revivalLease ? { revivalLease: params.revivalLease } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
+				...(launcher ? { launcher } : {}),
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
 					parentStepIndex: nestedAddress.parentStepIndex,
@@ -1888,16 +2319,20 @@ export function executeAsyncSingle(
 				...(ctx.currentSessionId ? { sessionId: ctx.currentSessionId } : {}),
 				...(initialCompletionOwnerId ? { completionOwnerId: initialCompletionOwnerId } : {}),
 				mode: "single",
+				...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 				state: "running",
 				startedAt: initialStatusAt,
 				lastUpdate: initialStatusAt,
 				currentStep: 0,
 				chainStepCount: 1,
 				...(lane ? { lane } : {}),
+				...(launcher ? { launcher } : {}),
 				steps: [{ agent, status: "pending", ...(lane ? { lane } : {}), ...(model ? { model } : {}), ...(contextLimit !== undefined ? { contextLimit } : {}) }],
 			},
 			path.join(asyncDir, "status.json"),
+			launchParentSessionId,
 			(proof) => emitProcessTerminalEvent(ctx, proof),
+			(runnerProcessInstanceId) => params.activeAsyncCapacity?.markStarted(runnerProcessInstanceId),
 			params.requestedCwd ?? runnerCwd,
 		);
 	} catch (error) {
@@ -1905,9 +2340,12 @@ export function executeAsyncSingle(
 		const message = error instanceof Error ? error.message : String(error);
 		return formatAsyncStartError("single", `Failed to start async run '${id}': ${message}`);
 	}
-
+	const finishSpawnResult = (spawnResult: SpawnRunnerResult): AsyncExecutionResult => {
 	if (spawnResult.error) {
-		if (!spawnResult.pid || !spawnResult.runnerProcessInstanceId || (spawnResult.startupDidNotProceed && spawnResult.terminationObserved)) params.activeAsyncCapacity?.rollback();
+		if (spawnResult.startupDidNotProceed) {
+			if (!spawnResult.runnerProcessInstanceId || params.activeAsyncCapacity?.rollbackBeforeRunnerProceed(spawnResult.runnerProcessInstanceId) !== true) params.activeAsyncCapacity?.rollback();
+		}
+		else if (!spawnResult.pid || !spawnResult.runnerProcessInstanceId) params.activeAsyncCapacity?.rollback();
 		else params.activeAsyncCapacity?.markStarted(spawnResult.runnerProcessInstanceId);
 		return formatAsyncStartError("single", `Failed to start async run '${id}': ${spawnResult.error}`);
 	}
@@ -1915,8 +2353,6 @@ export function executeAsyncSingle(
 		params.activeAsyncCapacity?.rollback();
 		return formatAsyncStartError("single", `Failed to start async run '${id}': runner identity unavailable`);
 	}
-	params.activeAsyncCapacity?.markStarted(spawnResult.runnerProcessInstanceId);
-
 	if (spawnResult.pid) {
 		if (inheritedNestedRoute && nestedAddress) {
 			const now = Date.now();
@@ -1934,7 +2370,7 @@ export function executeAsyncSingle(
 						path: nestedAddress.path,
 						asyncDir,
 						pid: spawnResult.pid,
-						ownerIntercomTarget: process.env.DM_SUBAGENT_INTERCOM_SESSION_NAME,
+						ownerIntercomTarget: ctx.childRuntime?.intercomSessionName,
 						leafIntercomTarget: childIntercomTarget?.(agent, 0),
 						intercomTarget: childIntercomTarget?.(agent, 0),
 						ownerState: "live",
@@ -1960,6 +2396,7 @@ export function executeAsyncSingle(
 			sessionId: ctx.currentSessionId,
 			completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
 			mode: "single",
+			...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 			agent,
 			task: task?.trim() ? PROMPT_REDACTED : undefined,
 			goal: (params.goal ?? task).trim() ? PROMPT_REDACTED : undefined,
@@ -1979,6 +2416,8 @@ export function executeAsyncSingle(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`, ctx.interactive === true) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
+		details: { mode: "single", runId: id, ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}), results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
 	};
+	};
+	return spawnResultOrPromise instanceof Promise ? spawnResultOrPromise.then(finishSpawnResult) : finishSpawnResult(spawnResultOrPromise);
 }

@@ -25,7 +25,7 @@ import {
 // presence of one is the repo's deliberate opt-in: it carries the author's
 // chosen severities/ignores, so we let zizmor findings BLOCK in that workspace
 // (advisory-only otherwise, like Opengrep's local-rules gate).
-export const LOCAL_ZIZMOR_CONFIG_NAMES = [
+const LOCAL_ZIZMOR_CONFIG_NAMES = [
 	path.join(".github", "zizmor.yml"),
 	path.join(".github", "zizmor.yaml"),
 	"zizmor.yml",
@@ -190,10 +190,16 @@ function classifyGhTokenFailure(
 	};
 }
 
-async function deriveGhCliToken(): Promise<string | undefined> {
+type GitHubTokenConsumer = "zizmor" | "github-api";
+
+async function deriveGhCliToken(
+	consumer: GitHubTokenConsumer,
+): Promise<string | undefined> {
 	const sampler = startHostStallSampler();
 	const startedAt = Date.now();
-	// Best-effort: a missing/unauthenticated `gh` just leaves zizmor offline.
+	// Best-effort: a missing/unauthenticated `gh` leaves the requesting
+	// consumer without a derived token; only the zizmor wrapper turns that into
+	// an offline-mode degradation.
 	// ignoreAmbientSignal so a mid-turn Esc can't silently drop the server into
 	// offline mode; short timeout so a wedged `gh` never stalls the warm spawn.
 	// safeSpawnAsync never rejects (every failure resolves into `res`), so no
@@ -210,7 +216,7 @@ async function deriveGhCliToken(): Promise<string | undefined> {
 		if (token.length > 0) {
 			ghTokenLatch.noteAvailable();
 			logAvailabilityDecision({
-				tool: "zizmor-gh-token",
+				tool: consumer === "zizmor" ? "zizmor-gh-token" : "github-token",
 				verdict: "available",
 				outcome: "success",
 				cause: "ok",
@@ -230,6 +236,7 @@ async function deriveGhCliToken(): Promise<string | undefined> {
 		// online audits ran while zizmor was actually about to launch offline
 		// — the #1535 silence moved into the telemetry instead of being fixed.
 		return recordGhTokenUnavailable(
+			consumer,
 			{
 				outcome: "non-installable",
 				cause: "empty-result",
@@ -241,6 +248,7 @@ async function deriveGhCliToken(): Promise<string | undefined> {
 	}
 
 	return recordGhTokenUnavailable(
+		consumer,
 		classifyGhTokenFailure(res, hostStallMs),
 		elapsedMs,
 		hostStallMs,
@@ -254,18 +262,19 @@ async function deriveGhCliToken(): Promise<string | undefined> {
  * can't drift on which fields get set.
  */
 function recordGhTokenUnavailable(
+	consumer: GitHubTokenConsumer,
 	{ outcome, cause, classifiedBy }: GhTokenFailureVerdict,
 	elapsedMs: number,
 	hostStallMs: number,
 ): undefined {
 	const retryAfterMs = ghTokenLatch.noteUnavailable(outcome, cause);
-	if (outcome === "transient") {
+	if (consumer === "zizmor" && outcome === "transient") {
 		recordZizmorOfflineDegradation(
 			`gh auth token probe ${cause}; running offline until the next zizmor start (retry allowed in ${Math.round(retryAfterMs / 1000)}s)`,
 		);
 	}
 	logAvailabilityDecision({
-		tool: "zizmor-gh-token",
+		tool: consumer === "zizmor" ? "zizmor-gh-token" : "github-token",
 		verdict: "unavailable",
 		outcome,
 		cause,
@@ -329,14 +338,33 @@ function recordZizmorOfflineDegradation(reason: string): void {
 export async function resolveZizmorGitHubToken(): Promise<string | undefined> {
 	// Respect an explicit offline request — never derive a token then.
 	if (process.env.ZIZMOR_OFFLINE) return undefined;
-	const fromEnv =
-		process.env.ZIZMOR_GITHUB_TOKEN ||
-		process.env.GH_TOKEN ||
-		process.env.GITHUB_TOKEN;
+	return resolveGitHubToken(
+		["ZIZMOR_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+		{ consumer: "zizmor" },
+	);
+}
+
+/**
+ * Resolve a GitHub token for an API client. Explicit environment variables are
+ * checked in the caller's order; when none is present, reuse the bounded,
+ * session-reset `gh auth token` resolver above rather than spawning once per
+ * request. The returned token is ephemeral and callers must not persist or
+ * send it to non-API hosts.
+ */
+export async function resolveGitHubToken(
+	envKeys: readonly string[] = ["GITHUB_TOKEN", "GH_TOKEN"],
+	options: { consumer?: GitHubTokenConsumer } = {},
+): Promise<string | undefined> {
+	const consumer = options.consumer ?? "github-api";
+	const fromEnv = envKeys.map((key) => process.env[key]).find(Boolean);
 	if (fromEnv) return fromEnv;
 	const memo = ghTokenLatch.read();
 	if (memo !== null) {
-		if (memo === false && ghTokenLatch.getOutcome() === "transient") {
+		if (
+			consumer === "zizmor" &&
+			memo === false &&
+			ghTokenLatch.getOutcome() === "transient"
+		) {
 			// Served straight from the still-cooling latch: no new probe runs,
 			// so `deriveGhCliToken`'s own logging never fires. Without this, once
 			// the cooldown ladder crosses zizmor's own respawn cadence (bounded
@@ -380,6 +408,6 @@ export async function resolveZizmorGitHubToken(): Promise<string | undefined> {
 		}
 		return memo ? cachedToken : undefined;
 	}
-	cachedToken = await deriveGhCliToken();
+	cachedToken = await deriveGhCliToken(consumer);
 	return cachedToken;
 }

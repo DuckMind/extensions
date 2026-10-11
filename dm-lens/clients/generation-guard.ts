@@ -45,14 +45,16 @@
  * keyed map it is a compare while nothing has been invalidated, and a
  * normalize plus one `Map.get` once something has. The hand-rolled form it
  * replaces normalized on EVERY call, and this repo's normalizer runs
- * `realpathSync.native` on Windows, so an uninterrupted sweep pays that
- * syscall once rather than once per file. See
+ * `realpathSync.native` on Windows and, since #3098, on POSIX as well, so an
+ * uninterrupted sweep pays that syscall once rather than once per file. See
  * `GenerationMapOptions.normalizeKey` for the correctness reason the slow
  * path exists at all.
  */
 
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
+import { logLatency } from "./latency-logger.js";
+import { getProcessSingleton } from "./process-singletons.js";
 
 /**
  * Names of every generation-carrying store created through this module.
@@ -161,8 +163,89 @@ export interface GenerationMap {
 	 * primitive carries it now rather than growing an API under merge pressure.
 	 */
 	forget(key: string): void;
+	/**
+	 * Drop every key, invalidating all outstanding handles.
+	 *
+	 * Use this when the owning seam has a whole-store reset boundary rather
+	 * than a per-key invalidation.
+	 */
+	clear(): void;
 	/** Number of keys currently retained, for tests and bound assertions. */
 	size(): number;
+}
+
+/**
+ * #3873 O5: per-source denominator for the stale-write ledger. The ledger
+ * writes a row at the first drop and at power-of-two counts, so zero rows
+ * cannot tell zero drops from a guard nothing exercised. These counters give
+ * `guarded` (every write a fence admitted or dropped) and `dropped` per
+ * source, rolled up once per session by {@link emitFenceRollupAtSessionEnd}.
+ *
+ * Bounded by declared source names (`MAX_DECLARED_SOURCES`), with every
+ * undeclared name folded into one `(other)` entry; one cell per process, so a
+ * second module evaluation counts into the same tallies.
+ */
+interface FenceTally {
+	guarded: number;
+	dropped: number;
+}
+
+const FENCE_TALLY_FAMILY = "generation-guard.fence-tally";
+const FENCE_TALLY_VERSION = 1;
+const OTHER_SOURCES = "(other)";
+/** Sources named in one rollup row; the rest are counted in `sourcesOmitted`. */
+const MAX_ROLLUP_SOURCES = 16;
+
+function fenceTallies(): Map<string, FenceTally> {
+	return getProcessSingleton(
+		FENCE_TALLY_FAMILY,
+		FENCE_TALLY_VERSION,
+		() => new Map<string, FenceTally>(),
+	);
+}
+
+function tallyFence(sourceName: string, dropped: boolean): void {
+	const tallies = fenceTallies();
+	const key = declaredSources.has(sourceName) ? sourceName : OTHER_SOURCES;
+	let tally = tallies.get(key);
+	if (!tally) {
+		tally = { guarded: 0, dropped: 0 };
+		tallies.set(key, tally);
+	}
+	tally.guarded += 1;
+	if (dropped) tally.dropped += 1;
+}
+
+/**
+ * One `session_end_fence_rollup` row at a primary `session_shutdown`, next to
+ * `session_end_bus_rollup`: per generation source, the writes its fence
+ * admitted or dropped this session. Written even when empty, so a session
+ * that exercised no fence is distinguishable from a flush gap. About 350 B
+ * plus 60 B per source, 16 sources at most; clears the tallies.
+ */
+export function emitFenceRollupAtSessionEnd(cwd: string): void {
+	const tallies = fenceTallies();
+	const rows = [...tallies.entries()]
+		.map(([source, tally]) => ({ source, ...tally }))
+		.sort(
+			(a, b) =>
+				b.dropped - a.dropped ||
+				b.guarded - a.guarded ||
+				a.source.localeCompare(b.source),
+		);
+	tallies.clear();
+	logLatency({
+		type: "phase",
+		phase: "session_end_fence_rollup",
+		filePath: cwd,
+		durationMs: 0,
+		metadata: {
+			guardedTotal: rows.reduce((sum, row) => sum + row.guarded, 0),
+			droppedTotal: rows.reduce((sum, row) => sum + row.dropped, 0),
+			sources: rows.slice(0, MAX_ROLLUP_SOURCES),
+			sourcesOmitted: Math.max(0, rows.length - MAX_ROLLUP_SOURCES),
+		},
+	});
 }
 
 function recordStaleWrite(
@@ -182,6 +265,8 @@ function makeHandle(
 	sourceName: string,
 	generation: number,
 	read: () => number,
+	/** The declared source, without a map's `[key]` suffix: the tally's key. */
+	tallyName: string,
 ): GenerationHandle {
 	return {
 		generation,
@@ -191,9 +276,11 @@ function makeHandle(
 		guardedWrite<T>(subject: string, write: () => T): T | undefined {
 			const observed = read();
 			if (observed !== generation) {
+				tallyFence(tallyName, true);
 				recordStaleWrite(sourceName, subject, generation, observed);
 				return undefined;
 			}
+			tallyFence(tallyName, false);
 			return write();
 		},
 	};
@@ -205,19 +292,28 @@ function makeHandle(
  * `name` appears in the stale-write ledger subject and in the sweep's
  * declaration list, so it must name the STORE, not the module.
  */
-export function createGenerationSource(name: string): GenerationSource {
+export function createGenerationSource(
+	name: string,
+	store?: () => { generation: number },
+): GenerationSource {
 	declare(name);
-	let generation = 0;
-	const read = (): number => generation;
+	// `store` puts the counter in a process singleton for state that lives per
+	// process while its source is built per module evaluation (#3733; N4 of
+	// #3609): two evaluations then bump and read ONE counter. Called on every
+	// read, so a cell another build replaced is still the one read.
+	const local = { generation: 0 };
+	const cell = store ?? (() => local);
+	const read = (): number => cell().generation;
 	return {
 		name,
 		current: read,
 		bump(): number {
-			generation += 1;
-			return generation;
+			const held = cell();
+			held.generation += 1;
+			return held.generation;
 		},
 		capture(): GenerationHandle {
-			return makeHandle(name, generation, read);
+			return makeHandle(name, read(), read, name);
 		},
 	};
 }
@@ -230,8 +326,9 @@ export interface GenerationMapOptions {
 	 * uses for its own map, or two spellings of one cwd get two stamps.
 	 *
 	 * The normalizer MAY consult the filesystem, and the repo's does:
-	 * `normalizeMapKey` runs `realpathSync.native` on Windows, which answers
-	 * differently once a path that did not exist comes into existence. A
+	 * `normalizeMapKey` runs `realpathSync.native` on Windows and, since #3098,
+	 * on POSIX as well — on BOTH it answers differently once a path that did not
+	 * exist comes into existence (HISTORY.md defect shape 1). A
 	 * handle therefore re-runs the normalizer whenever the map has been
 	 * invalidated since that handle was captured, and skips it otherwise.
 	 *
@@ -302,20 +399,29 @@ export function createGenerationMap(
 			// forgotten or evicted, which is the fail-open hole this closes.
 			const stamp = read(normalized) || issue(normalized);
 			const capturedInvalidations = invalidations;
-			return makeHandle(`${name}[${normalized}]`, stamp, () => {
-				// Fast path: nothing has been invalidated since capture, so no key
-				// can have changed stamps and the normalizer need not run again.
-				if (invalidations === capturedInvalidations) return stamp;
-				// Something moved. Re-derive the key from the ORIGINAL string: a
-				// normalizer that consults the filesystem can resolve the same
-				// input to a different key once the path exists, and a stamp read
-				// under the stale spelling would falsely read current.
-				return read(normalize(key));
-			});
+			return makeHandle(
+				`${name}[${normalized}]`,
+				stamp,
+				() => {
+					// Fast path: nothing has been invalidated since capture, so no key
+					// can have changed stamps and the normalizer need not run again.
+					if (invalidations === capturedInvalidations) return stamp;
+					// Something moved. Re-derive the key from the ORIGINAL string: a
+					// normalizer that consults the filesystem can resolve the same
+					// input to a different key once the path exists, and a stamp read
+					// under the stale spelling would falsely read current.
+					return read(normalize(key));
+				},
+				name,
+			);
 		},
 		forget(key: string): void {
 			invalidations += 1;
 			stamps.delete(normalize(key));
+		},
+		clear(): void {
+			invalidations += 1;
+			stamps.clear();
 		},
 		size(): number {
 			return stamps.size;

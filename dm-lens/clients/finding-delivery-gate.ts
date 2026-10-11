@@ -30,7 +30,11 @@
  *     deliver unchanged. A missed demotion is noise; a wrong drop can hide a
  *     live credential or CVE.
  * The turn-end secrets (gitleaks/trivy-secrets) and govulncheck advisory both
- * route through this gate in `clients/runtime-turn.ts`.
+ * route through this gate in `clients/runtime-turn.ts`, in ONE shared call
+ * (#3264) whose arms the secrets LANE (`clients/turn-end/lanes/secrets.ts`,
+ * #1892) renders. A lane declares its sources and never gates itself: the
+ * pass, its stat budget and its bounded records are per DELIVERY, not per
+ * lane.
  *
  * The SAME freshness family, one level up, covers cross-file drift: a cached
  * inline blocker is a verdict about its file *and everything that file
@@ -141,6 +145,13 @@
 
 const MS_PER_MINUTE = 60_000;
 
+/** Mark retained findings whose replacement result could not be reconciled. */
+export function markUnreconciledFindings<T extends { stale?: boolean }>(
+	findings: readonly T[],
+): T[] {
+	return findings.map((finding) => ({ ...finding, stale: true }));
+}
+
 /**
  * Render a short, honest age suffix for a store that cannot be freshness-
  * gated per-path (see module doc). `undefined`/unparseable `scannedAt`
@@ -171,9 +182,6 @@ export function formatCacheAgeLabel(
 		? `scanned ${ageHours}h ago`
 		: `scanned ${ageHours}h ${remMinutes}m ago`;
 }
-
-/** How a delivery surface satisfies #1634's "gated or labeled" contract. */
-export type DeliveryMode = "gated" | "labeled";
 
 interface DeliverySurfaceBase {
 	/** Human-readable one-line description of what the surface renders. */
@@ -225,13 +233,13 @@ interface DeliverySurfaceBase {
 	evidenceMin?: number;
 }
 
-export interface GatedDeliverySurface extends DeliverySurfaceBase {
+interface GatedDeliverySurface extends DeliverySurfaceBase {
 	mode: "gated";
 	/** Named gate(s) this surface routes through before rendering. */
 	gates: string[];
 }
 
-export interface LabeledDeliverySurface extends DeliverySurfaceBase {
+interface LabeledDeliverySurface extends DeliverySurfaceBase {
 	mode: "labeled";
 	/** Why this surface cannot take the full gate stack. */
 	reason: string;
@@ -242,6 +250,13 @@ export interface LabeledDeliverySurface extends DeliverySurfaceBase {
 export type DeliverySurfaceEntry =
 	| GatedDeliverySurface
 	| LabeledDeliverySurface;
+
+/** Project-wide scanner output belongs to the primary session's turn_end. */
+export function admitsProjectWideFindings(
+	sessionRole: "primary" | "secondary",
+): boolean {
+	return sessionRole === "primary";
+}
 
 /**
  * The enumeration (#1634 criterion 1): every surface that renders findings to
@@ -294,7 +309,9 @@ function labeled(
 	reason: string,
 	ageSource: string,
 	evidence: string[] = [],
-	extra: Partial<Pick<LabeledDeliverySurface, "status" | "partialReason">> = {},
+	extra: Partial<
+		Pick<LabeledDeliverySurface, "status" | "partialReason" | "evidenceMin">
+	> = {},
 ): LabeledDeliverySurface {
 	return {
 		mode: "labeled",
@@ -311,23 +328,39 @@ const RUNTIME_TURN_FILE = "clients/runtime-turn.ts";
 const LENS_DIAGNOSTICS_FILE = "tools/lens-diagnostics.ts";
 
 export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
+	// #1892 (lane extraction): both secrets tiers are rendered by the secrets
+	// LANE (`clients/turn-end/lanes/secrets.ts`), so `clients/runtime-turn.ts`
+	// no longer reads `.live`/`.stale` itself — the arm it can still be pinned
+	// to is the whole gated store object it hands the lane. That is WEAKER than
+	// the previous `gitleaksGate.live,` pin (it no longer says which partition
+	// feeds which tier) and the loss is deliberate: the live/stale split is a
+	// lane rule now, pinned behaviourally instead, by
+	// `tests/clients/runtime-turn-finding-freshness.test.ts` ("keeps an
+	// unmodified file's finding as a full-severity blocker" / "DEMOTES a
+	// finding whose file was edited after the scan — kept, no line") and the
+	// committed witness goldens under `tests/fixtures/witness/`. What the pin
+	// still proves is what this registry exists for: the rows the tier renders
+	// came out of a real `gateFindingsByPathFreshness` call and not out of a
+	// hand-built object (the R2 binding chain in
+	// `tests/clients/finding-delivery-gate.test.ts` walks
+	// `gitleaksGate` → `scannerGates` → the call).
 	"runtime-turn:secrets-gitleaks": gated(
 		RUNTIME_TURN_FILE,
 		"Turn-end 🔴 secrets blocker, gitleaks cache.",
 		["gateFindingsByPathFreshness"],
-		['store: "gitleaks"'],
+		["gitleaksGate,"],
 	),
 	"runtime-turn:secrets-trivy": gated(
 		RUNTIME_TURN_FILE,
 		"Turn-end 🔴 secrets blocker, trivy secrets cache.",
 		["gateFindingsByPathFreshness"],
-		['store: "trivy-secrets"'],
+		["trivySecretsGate,"],
 	),
 	"runtime-turn:govulncheck-advisory": gated(
 		RUNTIME_TURN_FILE,
 		"Turn-end 🛡️ Go CVE advisory (call-site line only).",
 		["gateFindingsByPathFreshness"],
-		['store: "govulncheck"'],
+		["scannerGates.govulncheck"],
 	),
 	// Two tagged seams (the stale and live render branches below the same
 	// `sweepInlineBlockerFreshness` call) legitimately share one evidence
@@ -343,13 +376,15 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 		["sweepInlineBlockerFreshness(runtime, cwd, {"],
 		{ evidenceMin: 2 },
 	),
-	// Same two gate calls as the live secrets tier — this tier renders their
-	// `.stale` arm, so it has no OWN gate call to point at.
+	// The same shared gate call and the same two stores as the live secrets
+	// tier — one lane renders both tiers, so this surface has no gate call and
+	// no arm read of its own; see the note above the live tier for what the pin
+	// does and does not prove.
 	"runtime-turn:stale-secrets-tier": gated(
 		RUNTIME_TURN_FILE,
 		"Turn-end 🔑 demoted-secrets tier (drifted since scan).",
 		["gateFindingsByPathFreshness"],
-		['store: "gitleaks"', 'store: "trivy-secrets"'],
+		["gitleaksGate,", "trivySecretsGate,"],
 	),
 	// The evidence below is the literal header FRAGMENT including the
 	// interpolation — proves the label is actually rendered, not merely
@@ -432,18 +467,39 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 	// drifting edit already re-touched the file — a fresh pending pair
 	// supersedes this one), with both drop arms counted in the
 	// `late_auxiliary_findings` latency record rather than silenced.
+	//
+	// #3102: freshness is only half the gate. The survivors also take the shared
+	// `clients/dispatch/finding-policy.ts` stack (inline `dm-lens-ignore` →
+	// stored dispositions → `.dm-lens.json` rule policy) the per-edit dispatcher,
+	// `mode=full` and the `source=lsp` probe lane apply — without it a finding
+	// the agent marked `false-positive` re-reported on every drain. Per #3088
+	// round-2 F4, the evidence is the CALL TEXT of that filter, which exists
+	// nowhere else in this file: a bare `applyFindingPolicy` would also be
+	// satisfied by an import line or an unrelated caller.
 	"runtime-turn:late-auxiliary-findings": gated(
 		RUNTIME_TURN_FILE,
 		"Turn-end late-auxiliary LSP findings (collect-later probe of aux " +
 			"client caches whose grace window expired).",
-		["gateFindingsByPathFreshness"],
-		['store: "late-auxiliary-findings"'],
+		// #3248: the open-coded `applyFindingPolicy(...)` here and the identical
+		// one the late-RUNNER lane needed are now one `applyPushedFindingPolicy`
+		// call, so the gate and the evidence name that call. Same stack, same
+		// identities — only the spelling moved.
+		["gateFindingsByPathFreshness", "applyPushedFindingPolicy"],
+		['"late-auxiliary-findings": {', "applyPushedFindingPolicy(gate.live, {"],
 	),
 	"runtime-turn:late-runner-findings": gated(
 		RUNTIME_TURN_FILE,
 		"Turn-end CLI runner findings collected after the post-write path.",
-		["gateFindingsByPathFreshness"],
-		['store: "late-runner-findings"'],
+		// #3248: this lane was the last push surface with no disposition stage;
+		// it routes through the same shared policy call as its late-auxiliary
+		// twin. #3814: the freshness gate and that policy call now live in ONE
+		// verdict, `judgeDeferredRunnerFindings` (clients/deferred-runner-blockers.ts),
+		// which the commit gate calls too; this lane's proof is that it asks that
+		// verdict. That the verdict itself runs both seams is pinned by behaviour
+		// (`tests/index-3814-deferred-blocker-gate.test.ts`: a stale answer and a
+		// marked finding each stop blocking, one mutation each).
+		["judgeDeferredRunnerFindings"],
+		["judgeDeferredRunnerFindings("],
 		{ evidenceMin: 2 },
 	),
 	"runtime-turn:cascade-blocker": labeled(
@@ -451,32 +507,71 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 		"Turn-end 🧪 cascade neighbor blocker.",
 		"Cascade results settle synchronously this turn where possible " +
 			"(`settleCascadeRuns`), but an unsettled compute can carry over to a " +
-			"later turn (bounded by a carry cap) — this round does not freshness-" +
-			"gate that carry-over window.",
+			"later turn (bounded by a carry cap) — a carried-over result renders " +
+			"with an explicit `(carried N turns · scanned Xm ago)` label (#3167, " +
+			"#3168 F3), so the agent can tell it from a fresh observation.",
 		"live",
-		[],
-		{
-			status: "partial",
-			partialReason:
-				"A carried-over cascade result (run.carriedTurns > 0) is rendered " +
-				"without an age label. Follow-up: surface carriedTurns as an explicit " +
-				"label when > 0, or route through formatCacheAgeLabel using the run's " +
-				"own timestamp.",
-		},
+		["cascadeCarrySuffix("],
+		{ evidenceMin: 1 },
 	),
 	"runtime-turn:cascade-coverage-advisory": labeled(
 		RUNTIME_TURN_FILE,
 		"Turn-end cascade-coverage-gap advisories (graph/binding/budget).",
 		"Explains what the cascade check could NOT confirm this turn — not a " +
 			"finding with a cited path, an absence-of-coverage disclosure computed " +
-			"from this turn's own indeterminate-run list.",
+			"from this turn's own indeterminate-run list. An advisory computed from " +
+			"a carried indeterminate run is labeled `(carried N turns · <age>)` " +
+			"(#3167, #3168 F4 — dropped on mixed carried/fresh buckets). The age " +
+			"half reads `scan age unknown` on this surface today: no indeterminate-" +
+			"run producer stamps `observedAt` (only the resolved-found plumb does, " +
+			"`clients/cascade-format.ts`), and one unstamped carried run collapses " +
+			"the whole bucket's age rather than claiming the stamped runs' (#3168 " +
+			"F13). The carry COUNT is always real.",
 		"live",
-		[],
-		{
-			status: "partial",
-			partialReason:
-				"Same cascade carry-over caveat as runtime-turn:cascade-blocker.",
-		},
+		["withCarryLabel("],
+		{ evidenceMin: 3 },
+	),
+	// #3102: the cold-neighbour cascade run is BUILT here, in the quiet-window
+	// reconcile (`onResolvedFound` in index.ts), a turn earlier than the
+	// `runtime-turn:cascade-blocker` render that finally carries it — so it is
+	// its own delivery lane, and it was the one that rendered raw LSP findings
+	// with no policy filter at all. The evidence is the CALL TEXT of the shared
+	// filter (#3088 round-2 F4): a bare `applyFindingPolicy` would also be
+	// satisfied by the import line.
+	"cascade-format:resolved-found-run": gated(
+		"clients/cascade-format.ts",
+		"Cold-neighbour ERROR diagnostics formatted into the turn-end cascade " +
+			"run by `buildResolvedFoundCascadeRun` (quiet-window reconcile of a " +
+			"cascade touch that skipped its in-lane wait).",
+		["applyFindingPolicy"],
+		["applyFindingPolicy(retained, {"],
+	),
+	// #3157: the IN-LANE cascade — a different delivery lane from the
+	// quiet-window run above, and the one #3102's sweep cleared WRONGLY. Its four
+	// display sites (passive cold snapshot, fresh touch, touch-error fallback,
+	// degraded fallback) assemble `CascadeNeighborResult.diagnostics` and reach
+	// the agent through `formatCascadeNeighborDiagnostics` without ever entering
+	// the dispatcher's `applyOutputFilters` pipeline: the sweep's file-level
+	// verdict ("the per-edit dispatch path, which already filters in
+	// dispatcher.ts") was true only of the per-edit RUNNER output in
+	// `runners/lsp.ts`, which is a different call site in a different file.
+	//
+	// Evidence is the CALL TEXT (#3088 round-2 F4), counted: `cascadeDisplay(` is
+	// the one seam all four sites route through, so `evidenceMin: 4` is the count
+	// of display sites in the file and dropping ANY of them back to a raw
+	// `convertLspDiagnostics` reds this suite. Identity-stubbing the callee
+	// instead is caught behaviourally — it reds twelve cases in
+	// `tests/clients/inlane-cascade-finding-policy.test.ts`, which is a stronger
+	// signal than the R2 proximity heuristic. Residual, stated: a FIFTH display
+	// site that open-codes the conversion keeps the count at 4 and is caught by
+	// review, not by this row.
+	"dispatch-integration:in-lane-cascade": gated(
+		"clients/dispatch/integration.ts",
+		"In-lane per-edit cascade neighbour ERROR diagnostics, rendered into the " +
+			"turn-end cascade block by `computeCascadeForFile`.",
+		["applyCascadeDisplayPolicy"],
+		["cascadeDisplay("],
+		{ evidenceMin: 4 },
 	),
 	"runtime-turn:call-graph-advisory": labeled(
 		RUNTIME_TURN_FILE,
@@ -493,17 +588,19 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 				"tracked as a follow-up, not silently assumed fresh.",
 		},
 	),
+	// #3088 round 2 F4: this row used to name `applyDispositions`/`applyRulePolicy`
+	// with whole-file evidence literals. Once #3088 folded mode=full's stack onto
+	// `applyFindingPolicy`, those two literals survived only in UNRELATED
+	// mode=delta helpers in the same file, so deleting the entire policy stack out
+	// of `applyInlineSuppressionsToSummaries` left this gate — and the ratchet —
+	// green while five behaviour cases redded. The evidence is now the call text
+	// of the merge's own filter, which exists nowhere else in the file.
 	"lens-diagnostics:mode-full": gated(
 		LENS_DIAGNOSTICS_FILE,
 		"`lens_diagnostics mode=full` report.",
+		["applyFindingPolicy", "reconcileProjectDiagnosticsSnapshot"],
 		[
-			"applyDispositions",
-			"applyRulePolicy",
-			"reconcileProjectDiagnosticsSnapshot",
-		],
-		[
-			"applyDispositions(",
-			"applyRulePolicy(",
+			"applyFindingPolicy(summary.diagnostics, {",
 			"reconcileProjectDiagnosticsSnapshot(",
 		],
 	),
@@ -529,9 +626,9 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 			"the persisted project-diagnostics delta report.",
 		["gateFindingsByPathFreshness"],
 		[
-			'store: "lens-diagnostics-delta"',
+			'"lens-diagnostics-delta": {',
 			"applyDeltaFreshnessGate(",
-			'store: "lens-diagnostics-delta-project"',
+			'"lens-diagnostics-delta-project": {',
 		],
 	),
 	"widget-state:footer": gated(
@@ -582,23 +679,30 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 			"the shared workspace-diagnostics cache: createWorkspaceDiagnosticsCacheContext " +
 			"is the tool's entry, and its lookup() applies the #671/#672 freshness stack " +
 			"(own-file mtime + reverse-dependency mtimes via isEntryFresh) plus the " +
-			"#1095 content binding.",
+			"#1095 content binding. #3088: every route out of this tool — fresh, " +
+			"cache replay, single file, directory — also passes applyProbeFindingPolicy, " +
+			"the stored-disposition / .dm-lens.json rule-policy / inline dm-lens-ignore " +
+			"stack the per-edit dispatch path and mode=full apply.",
 		[
 			"createWorkspaceDiagnosticsCacheContext",
 			"isEntryFresh",
 			"cacheCtx.lookup",
+			"applyProbeFindingPolicy",
 		],
 		[
 			"createWorkspaceDiagnosticsCacheContext(resolvedCwd)",
 			"cacheCtx.lookup(file, scopeKey)",
+			"applyProbeFindingPolicy(",
 		],
 	),
 	"git-guard:commit-blocked": labeled(
 		"clients/git-guard.ts",
 		"Git-guard commit/push 🔴 COMMIT BLOCKED verdict (--lens-guard).",
 		"Synchronous preflight rejection returned inline with the failed git " +
-			"command — no stored state is delivered, so nothing can go stale between " +
-			"detection and delivery.",
+			"command. The blocker map it reads is refreshed at decision time: the " +
+			"gate first judges settled collect-later runner answers through the " +
+			"freshness gate and the finding policy (#3814), so a stale answer " +
+			"cannot block.",
 		"live",
 	),
 	"shared-checkout-guard:worktree-mutation-blocked": labeled(

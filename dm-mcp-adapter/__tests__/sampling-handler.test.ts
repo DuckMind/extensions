@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Api, Model } from "@duckmind/dm-ai";
+import type { Model } from "@duckmind/dm-ai";
 import type { CreateMessageRequest, ModelPreferences } from "@modelcontextprotocol/client";
 import type { SamplingHandlerOptions } from "../sampling-handler.ts";
 
@@ -7,9 +7,7 @@ const mocks = vi.hoisted(() => ({
   complete: vi.fn(),
 }));
 
-vi.mock("@duckmind/dm-ai/compat", () => ({
-  complete: mocks.complete,
-}));
+vi.mock("@duckmind/dm-ai/compat", () => ({ completeSimple: mocks.complete }));
 
 const usage = {
   input: 0,
@@ -60,7 +58,7 @@ function createOptions(overrides: Partial<SamplingHandlerOptions> = {}): Samplin
     autoApprove: true,
     modelRegistry: {
       getAvailable: vi.fn(() => [model]),
-      getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "key", headers: { "x-test": "1" } })),
+      getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
     },
     getCurrentModel: vi.fn(() => undefined),
     getSignal: vi.fn(() => undefined),
@@ -98,7 +96,7 @@ describe("sampling handler", () => {
     });
   });
 
-  it("converts approved MCP sampling requests into pi-ai completions", async () => {
+  it("converts approved MCP sampling requests using DM host credentials", async () => {
     const { handleSamplingRequest } = await import("../sampling-handler.ts");
     const result = await handleSamplingRequest(createOptions(), createSamplingRequest({
       systemPrompt: "Translate tersely.",
@@ -121,12 +119,11 @@ describe("sampling handler", () => {
         ],
       },
       {
-        apiKey: "key",
-        headers: { "x-test": "1" },
         maxTokens: 50,
         temperature: 0.2,
         metadata: { locale: "fr" },
         signal: undefined,
+        apiKey: "test-key",
       },
     );
     expect(result).toEqual({
@@ -135,6 +132,22 @@ describe("sampling handler", () => {
       model: "anthropic/claude-sonnet",
       stopReason: "endTurn",
     });
+  });
+
+  it("rejects failed host authorization without sampling or exposing credentials", async () => {
+    const { handleSamplingRequest } = await import("../sampling-handler.ts");
+    const options = createOptions({
+      modelRegistry: {
+        getAvailable: vi.fn(() => [model]),
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: false as const, error: "Model authentication unavailable" })),
+      },
+    });
+
+    await expect(handleSamplingRequest(options, createSamplingRequest({
+      messages: [{ role: "user", content: { type: "text", text: "Hello" } }],
+      maxTokens: 50,
+    }))).rejects.toThrow("Model authentication unavailable");
+    expect(mocks.complete).not.toHaveBeenCalled();
   });
 
   it("requires UI approval unless auto-approve is enabled", async () => {
@@ -169,7 +182,7 @@ describe("sampling handler", () => {
     await runBasicSampling({
       modelRegistry: {
         getAvailable: vi.fn(() => [haiku, opus]),
-        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "key" })),
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
       },
       getCurrentModel: vi.fn(() => opus),
     }, { hints: [{ name: "haiku" }] });
@@ -181,7 +194,7 @@ describe("sampling handler", () => {
     await runBasicSampling({
       modelRegistry: {
         getAvailable: vi.fn(() => [haiku, opus]),
-        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "key" })),
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
       },
       getCurrentModel: vi.fn(() => opus),
     }, { hints: [{ name: " HAIKU " }] });
@@ -193,7 +206,7 @@ describe("sampling handler", () => {
     await runBasicSampling({
       modelRegistry: {
         getAvailable: vi.fn(() => [geminiFlash, opus]),
-        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "key" })),
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
       },
       getCurrentModel: vi.fn(() => opus),
     }, { hints: [{ name: "2.5 Flash" }] });
@@ -205,7 +218,7 @@ describe("sampling handler", () => {
     await runBasicSampling({
       modelRegistry: {
         getAvailable: vi.fn(() => [geminiFlash, opus]),
-        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "key" })),
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
       },
       getCurrentModel: vi.fn(() => opus),
     }, { hints: [{ name: "google/gemini" }] });
@@ -217,7 +230,7 @@ describe("sampling handler", () => {
     await runBasicSampling({
       modelRegistry: {
         getAvailable: vi.fn(() => [haiku, geminiFlash, opus]),
-        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "key" })),
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
       },
       getCurrentModel: vi.fn(() => opus),
     }, { hints: [{ name: "gemini" }, { name: "haiku" }] });
@@ -225,30 +238,26 @@ describe("sampling handler", () => {
     expect(mocks.complete.mock.calls[0][0]).toBe(geminiFlash);
   });
 
-  it("falls back when hinted models do not have configured auth", async () => {
-    const getApiKeyAndHeaders = vi.fn(async (candidate: Model<Api>) => {
-      if (candidate.id === "claude-haiku") return { ok: false, error: "missing key" };
-      return { ok: true, apiKey: "key" };
-    });
+  it("propagates completion errors without falling back to another candidate", async () => {
+    mocks.complete.mockRejectedValueOnce(new Error("Provider is not configured: anthropic"));
 
-    await runBasicSampling({
+    await expect(runBasicSampling({
       modelRegistry: {
         getAvailable: vi.fn(() => [haiku, opus]),
-        getApiKeyAndHeaders,
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
       },
       getCurrentModel: vi.fn(() => opus),
-    }, { hints: [{ name: "haiku" }] });
+    }, { hints: [{ name: "haiku" }] })).rejects.toThrow("Provider is not configured: anthropic");
 
-    expect(getApiKeyAndHeaders).toHaveBeenNthCalledWith(1, haiku);
-    expect(getApiKeyAndHeaders).toHaveBeenNthCalledWith(2, opus);
-    expect(mocks.complete.mock.calls[0][0]).toBe(opus);
+    expect(mocks.complete).toHaveBeenCalledTimes(1);
+    expect(mocks.complete.mock.calls[0][0]).toBe(haiku);
   });
 
   it("preserves current-model-first selection when no hints are provided", async () => {
     await runBasicSampling({
       modelRegistry: {
         getAvailable: vi.fn(() => [haiku]),
-        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "key" })),
+        getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
       },
       getCurrentModel: vi.fn(() => opus),
     });

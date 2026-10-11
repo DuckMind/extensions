@@ -1,10 +1,10 @@
 import type { LSPSymbol } from "./lsp/client.js";
-import { getLSPService } from "./lsp/index.js";
+import { getLSPService } from "./lsp/capabilities.js";
 
 // Grounded against this repo's workspace-native TypeScript 7.0.2 server
 // (`tsc --lsp --stdio`) on 2026-07-30: 20 already-open documentSymbol calls
 // measured p50 3.70 ms / p95 5.28 ms. Keep generous headroom for slower hosts.
-export const LSP_DOCUMENT_SYMBOL_TIMEOUT_MS = 150;
+const LSP_DOCUMENT_SYMBOL_TIMEOUT_MS = 150;
 
 export const SYMBOL_KIND_NAMES: Record<number, string> = {
 	1: "file",

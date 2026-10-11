@@ -82,13 +82,20 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { BootstrapClients } from "../bootstrap.js";
 import type { CacheManager } from "../cache-manager.js";
 import type { RuntimeCoordinator } from "../runtime-coordinator.js";
 import { applyDispositionsMultiFile } from "../diagnostic-dispositions.js";
+import { parseScannedAtMs } from "../advisory-provenance.js";
 import { getKnipIgnorePatterns } from "../file-utils.js";
-import { isAtOrAboveHomeDir } from "../path-utils.js";
+import { isAtOrAboveHomeDir, realpathOrResolve } from "../path-utils.js";
+import { isSameOrWithin } from "../lsp/server.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import { GitleaksClient } from "../gitleaks-client.js";
 import { GovulncheckClient } from "../govulncheck-client.js";
 import {
@@ -111,9 +118,30 @@ import type { ProjectDiagnostic } from "./types.js";
 import type { FailedProjectAnalyzer } from "./extractors.js";
 
 export interface FreshProjectDiagnosticsResult {
+	/** The single validation result shared by all explicit-root consumers. */
+	analysisRootValidation?: AnalysisRootValidation;
 	diagnostics: ProjectDiagnostic[];
 	/** Extractor ids that actually contributed findings this run. */
 	runners: string[];
+	/**
+	 * Extractor ids whose result is the parsed output of a scan THIS call ran
+	 * over the analysis root — the opt-in `AnalysedRootSignal` each client
+	 * sets at its own parse site (#2154). `lens_diagnostics mode=full` retires
+	 * retained findings only for these ids, so a runner that reported
+	 * `success: true` without running (skipped, crashed before writing its
+	 * report, served from a memo) is deliberately absent.
+	 */
+	analyzed: string[];
+	/**
+	 * File-level authority established by this fetch: an entry covers exactly
+	 * the files it lists. An entry is present for every producer that DECLARED
+	 * its coverage this call, so an entry with an EMPTY set means "this producer
+	 * analysed the root and proved zero files" — file-level authority over
+	 * nothing, not absent authority (#2962). The legacy `analyzed` list remains
+	 * the conservative fallback only for runners that declare no coverage at all
+	 * (#2887).
+	 */
+	authoritativeCoverage?: ProjectRunnerCoverage[];
 	/** Extractor ids skipped this run (not applicable / tool unavailable, OR
 	 *  aborted before settling — see `abortedIds`). */
 	cold: string[];
@@ -130,6 +158,11 @@ export interface FreshProjectDiagnosticsResult {
 	 * their own distinct "stopped mid-scan" reason at the render layer.
 	 */
 	coldReasons?: Record<string, string>;
+	/** Extractor ids that ran but have incomplete coverage. Findings remain
+	 * visible, but their result must not be presented as a complete scan. */
+	partial?: string[];
+	/** Specific reason for each incomplete-coverage result. */
+	partialReasons?: Record<string, string>;
 	/**
 	 * #1623: ms-old each id's data was when this call read it, keyed by
 	 * extractor id — present only for lanes that are a cache-read BY DESIGN
@@ -156,6 +189,8 @@ export interface FreshProjectDiagnosticsResult {
 	 *  nothing was spawned. Kept separate from the per-analyzer skip reasons so
 	 *  a caller can render "unsafe root" instead of "not applicable". */
 	unsafeRoot?: boolean;
+	/** True when an explicit analysis root was missing or was not a directory. */
+	analysisRootError?: string;
 	/**
 	 * Count of findings dropped by an agent/user disposition (false-positive
 	 * or suppress mark — #1617) before landing in `diagnostics`. Every
@@ -175,6 +210,17 @@ export interface FreshProjectDiagnosticsResult {
 	 * "ran clean" — that gap is #1623's lane-status territory, not this one.
 	 */
 	dispositionSuppressedByLane?: Record<string, number>;
+}
+
+export type AnalysisRootValidation =
+	| { state: "safe"; root: string }
+	| { state: "unsafe"; root: string; reason: string }
+	| { state: "undecided"; root?: string; reason: string };
+
+export interface ProjectRunnerCoverage {
+	runnerId: string;
+	root: string;
+	files: ReadonlySet<string>;
 }
 
 /** The heavyweight analyzers surfaced in `lens_diagnostics mode=full` — this is
@@ -202,6 +248,23 @@ function pushUnique(list: string[], id: string): void {
 }
 
 /**
+ * #3600: the time a heavyweight lane observed the bytes its rows were computed
+ * from. Prefer the result's own `scannedAt`, stamped at the top of each
+ * client's run body BEFORE it reads anything: when this lane JOINS another
+ * caller's in-flight run, the initiator's stamp is the real read time, not
+ * this lane's later start. The lane start is only the fallback for a result
+ * that carries no stamp at all (a hand-rolled double, or an early shape that
+ * returned before its run body) — for a JOINED run that fallback would be
+ * LATER than the read, which is why every real client run body stamps.
+ */
+function laneObservedAtMs(
+	scannedAt: string | number | undefined,
+	startedAtMs: number,
+): number {
+	return parseScannedAtMs(scannedAt) ?? startedAtMs;
+}
+
+/**
  * Trigger (or join, via each client's in-flight de-dupe guard) a fresh run of
  * every heavyweight project analyzer and adapt the results to
  * `ProjectDiagnostic[]`. Runs all analyzers in parallel — total wall time is bounded by the
@@ -217,9 +280,53 @@ export async function fetchFreshProjectDiagnostics(
 	cwd: string,
 	clients: BootstrapClients,
 	signal?: AbortSignal,
-	options: { homeDir?: string; runtime?: RuntimeCoordinator } = {},
+	options: {
+		homeDir?: string;
+		runtime?: RuntimeCoordinator;
+		analysisRoot?: string;
+	} = {},
 ): Promise<FreshProjectDiagnosticsResult> {
-	const analysisRoot = path.resolve(cwd);
+	const requestedRoot =
+		options.analysisRoot === undefined
+			? cwd
+			: path.resolve(cwd, options.analysisRoot);
+	let analysisRoot: string;
+	let analysisRootValidation: AnalysisRootValidation;
+	if (options.analysisRoot !== undefined) {
+		try {
+			if (!fs.statSync(requestedRoot).isDirectory()) {
+				throw new Error("is not a directory");
+			}
+			analysisRoot = fs.realpathSync(requestedRoot);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			const reason = `the explicit analysis root ${requestedRoot} is unavailable or ${detail}`;
+			analysisRootValidation = {
+				state: "undecided",
+				root: requestedRoot,
+				reason,
+			};
+			incrementDegradationCount({
+				kind: "lens-diagnostics-analysis-root-rejected",
+				subject: requestedRoot,
+				reason,
+			});
+			return {
+				analysisRootValidation,
+				diagnostics: [],
+				runners: [],
+				analyzed: [],
+				authoritativeCoverage: [],
+				cold: [...ANALYZER_IDS],
+				coldReasons: Object.fromEntries(ANALYZER_IDS.map((id) => [id, reason])),
+				failed: [],
+				timings: {},
+				analysisRootError: reason,
+			};
+		}
+	} else {
+		analysisRoot = realpathOrResolve(cwd);
+	}
 	// #747: refuse to spawn any heavyweight analyzer when the analysis root is
 	// at — or above — the home directory (the #250/#253 escape class). Every
 	// analyzer here treats `analysisRoot` as a whole tree to walk; from $HOME
@@ -230,26 +337,60 @@ export async function fetchFreshProjectDiagnostics(
 	// substitute root to fall back to — the caller's `paths` scope only filters
 	// REPORTED results, it never narrows what these analyzers walk.
 	const unsafeRootReason =
-		"the working directory resolves at or above the home directory; heavyweight analyzers refuse to walk from there (#747)";
-	if (isAtOrAboveHomeDir(analysisRoot, options.homeDir)) {
+		"the analysis root resolves at or above the home directory; heavyweight analyzers refuse to walk from there (#747)";
+	const homeRoot = realpathOrResolve(options.homeDir ?? os.homedir());
+	if (options.analysisRoot !== undefined) {
+		const unsafeExplicitRoot =
+			!isSameOrWithin(homeRoot, analysisRoot) ||
+			isSameOrWithin(analysisRoot, homeRoot);
+		analysisRootValidation = unsafeExplicitRoot
+			? {
+					state: "unsafe",
+					root: analysisRoot,
+					reason:
+						"explicit analysis root must be strictly contained by the canonical home directory",
+				}
+			: { state: "safe", root: analysisRoot };
+	} else if (isAtOrAboveHomeDir(analysisRoot, options.homeDir)) {
+		analysisRootValidation = {
+			state: "unsafe",
+			root: analysisRoot,
+			reason: unsafeRootReason,
+		};
+	} else {
+		analysisRootValidation = { state: "safe", root: analysisRoot };
+	}
+	if (analysisRootValidation.state !== "safe") {
+		incrementDegradationCount({
+			kind: "lens-diagnostics-analysis-root-rejected",
+			subject: analysisRoot,
+			reason: analysisRootValidation.reason,
+		});
 		return {
+			analysisRootValidation,
 			diagnostics: [],
 			runners: [],
+			analyzed: [],
+			authoritativeCoverage: [],
 			cold: [...ANALYZER_IDS],
 			coldReasons: Object.fromEntries(
 				ANALYZER_IDS.map((id) => [id, unsafeRootReason]),
 			),
 			failed: [],
 			timings: {},
-			unsafeRoot: true,
+			unsafeRoot: analysisRootValidation.state === "unsafe",
 		};
 	}
 	const diagnostics: ProjectDiagnostic[] = [];
 	const runners: string[] = [];
+	const analyzed: string[] = [];
+	const authoritativeCoverage: ProjectRunnerCoverage[] = [];
 	const cold: string[] = [];
 	// #1623: the specific reason each `cold` id was skipped, captured at the
 	// gate that decided it — see FreshProjectDiagnosticsResult.coldReasons.
 	const coldReasons: Record<string, string> = {};
+	const partial: string[] = [];
+	const partialReasons: Record<string, string> = {};
 	const failed: FailedProjectAnalyzer[] = [];
 	const timings: Record<string, number> = {};
 	// #1623: ms-old each id's data was when this call read it, for lanes that
@@ -278,14 +419,71 @@ export async function fetchFreshProjectDiagnostics(
 		coldReasons[id] = reason;
 	}
 
+	function markPartial(id: string, reason: string): void {
+		pushUnique(partial, id);
+		partialReasons[id] = reason;
+	}
+
+	/**
+	 * `analysedRoot` is the client's own opt-in `AnalysedRootSignal` (#2154),
+	 * never a property of reaching this function: `success: true` is also what
+	 * a skipped, crashed-before-reporting or memoised run returns, and only the
+	 * client knows which of those it is. Findings are recorded either way — an
+	 * id that did not analyse the root simply carries no authority to retire a
+	 * retained finding.
+	 */
 	function record(
 		id: string,
 		adapted: ProjectDiagnostic[],
 		elapsedMs: number,
+		analysedRoot: boolean,
+		analysis?: { analyzedFiles?: string[] },
+		observedAt?: number,
 	): void {
+		if (analysedRoot) {
+			pushUnique(analyzed, id);
+			// #2962: the entry is pushed on the DECLARATION, not on its size. A
+			// coverage producer that analysed the root and proved zero files is a
+			// third state, distinct from both "covered, file absent from the set"
+			// and "this runner declares no coverage" — and it is the only one of
+			// the three that used to fall through to the whole-root id-only arm in
+			// `runnerRetirementDecision`, retiring findings for files nothing
+			// scanned. The eight non-producer runners pass no `analyzedFiles` at
+			// all and are untouched by this.
+			if (analysis?.analyzedFiles !== undefined) {
+				const root = realpathOrResolve(analysisRoot);
+				authoritativeCoverage.push({
+					runnerId: id,
+					root,
+					files: new Set(
+						analysis.analyzedFiles.map((file) => {
+							return realpathOrResolve(file);
+						}),
+					),
+				});
+				if (analysis.analyzedFiles.length === 0) {
+					// Bounded at one row per (producer, root) per session: the kept
+					// finding is otherwise indistinguishable from a healthy run, and
+					// "the only coverage producer proved nothing" is the fact an
+					// operator needs when mode=full keeps showing a stale finding.
+					recordDegradationOnce({
+						kind: "runner-coverage-empty",
+						subject: `${id}:${root}`,
+						reason: `${id} analysed this root but declared zero scanned files, so retained ${id} findings are kept rather than retired`,
+					});
+				}
+			}
+		}
 		timings[id] = (timings[id] ?? 0) + elapsedMs;
+		// #3600: the row carries the lane's own observation time through the
+		// #1888 fold, which otherwise stamps it with the project scan's time or
+		// the fold's `now`.
+		const stamped =
+			observedAt === undefined
+				? adapted
+				: adapted.map((diagnostic) => ({ ...diagnostic, observedAt }));
 		const kept = applyDispositionsMultiFile(
-			adapted,
+			stamped,
 			analysisRoot,
 			(d) => d.filePath,
 		);
@@ -303,10 +501,15 @@ export async function fetchFreshProjectDiagnostics(
 
 	function recordFailed(
 		id: string,
-		result: { summary?: string } | object,
+		result:
+			| { summary?: string; reason?: FailedProjectAnalyzer["reason"] }
+			| object,
 	): void {
 		failed.push({
 			id,
+			...("reason" in result && result.reason !== undefined
+				? { reason: result.reason }
+				: {}),
 			summary:
 				"summary" in result && typeof result.summary === "string"
 					? result.summary
@@ -331,6 +534,13 @@ export async function fetchFreshProjectDiagnostics(
 				recordFailed("knip", result);
 				return;
 			}
+			// knip reports `success: true` for a run that never happened (no
+			// project root, a memo hit, an unparseable exit-0). Those belong in
+			// the honest `cold` channel, not in "fetched fresh this call".
+			if (result.analyzed !== true) {
+				markCold("knip", result.summary ?? "knip did not analyse this root");
+				return;
+			}
 			cacheManager.writeCache("knip", result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -338,6 +548,9 @@ export async function fetchFreshProjectDiagnostics(
 				"knip",
 				knipIssuesToProjectDiagnostics(analysisRoot, result.issues ?? []),
 				Date.now() - startMs,
+				true,
+				result,
+				laneObservedAtMs(result.scannedAt, startMs),
 			);
 		}),
 
@@ -369,6 +582,13 @@ export async function fetchFreshProjectDiagnostics(
 				recordFailed("jscpd", result);
 				return;
 			}
+			if (result.analyzed !== true) {
+				markCold(
+					"jscpd",
+					"jscpd did not analyse this root (no source files, or the scan produced no report)",
+				);
+				return;
+			}
 			cacheManager.writeCache(scannerKey, result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -376,6 +596,9 @@ export async function fetchFreshProjectDiagnostics(
 				"jscpd",
 				jscpdResultToProjectDiagnostics(analysisRoot, result),
 				Date.now() - startMs,
+				true,
+				result,
+				laneObservedAtMs(result.scannedAt, startMs),
 			);
 		}),
 
@@ -400,6 +623,9 @@ export async function fetchFreshProjectDiagnostics(
 				"madge",
 				circularDepsToProjectDiagnostics(analysisRoot, result.circular ?? []),
 				Date.now() - startMs,
+				result.analyzed === true,
+				result,
+				laneObservedAtMs(result.scannedAt, startMs),
 			);
 		}),
 
@@ -442,6 +668,9 @@ export async function fetchFreshProjectDiagnostics(
 				"gitleaks",
 				gitleaksResultToProjectDiagnostics(analysisRoot, result),
 				Date.now() - startMs,
+				result.analyzed === true,
+				result,
+				laneObservedAtMs(result.scannedAt, startMs),
 			);
 		}),
 
@@ -485,6 +714,9 @@ export async function fetchFreshProjectDiagnostics(
 				"govulncheck",
 				govulncheckResultToProjectDiagnostics(analysisRoot, result),
 				Date.now() - startMs,
+				result.analyzed === true,
+				result,
+				laneObservedAtMs(result.scannedAt, startMs),
 			);
 		}),
 
@@ -519,6 +751,43 @@ export async function fetchFreshProjectDiagnostics(
 				recordFailed("opengrep", result);
 				return;
 			}
+			if (result.analyzed !== true) {
+				// A usable partial report with no scanned paths carries findings but
+				// no retirement authority. Keep those findings visible and mark the
+				// producer partial so the renderer does not call it cold/not-run.
+				const reason =
+					result.summary ??
+					result.reason ??
+					"opengrep did not analyse this root";
+				if (result.partial) markPartial("opengrep", reason);
+				else markCold("opengrep", reason);
+				record(
+					"opengrep",
+					opengrepResultToProjectDiagnostics(analysisRoot, result),
+					Date.now() - startMs,
+					false,
+					result,
+					laneObservedAtMs(result.scannedAt, startMs),
+				);
+				return;
+			}
+			if (result.partial) {
+				markPartial(
+					"opengrep",
+					result.summary ??
+						result.reason ??
+						"opengrep scan coverage is incomplete",
+				);
+				record(
+					"opengrep",
+					opengrepResultToProjectDiagnostics(analysisRoot, result),
+					Date.now() - startMs,
+					true,
+					result,
+					laneObservedAtMs(result.scannedAt, startMs),
+				);
+				return;
+			}
 			cacheManager.writeCache("opengrep", result, analysisRoot, {
 				scanDurationMs: Date.now() - startMs,
 			});
@@ -526,6 +795,9 @@ export async function fetchFreshProjectDiagnostics(
 				"opengrep",
 				opengrepResultToProjectDiagnostics(analysisRoot, result),
 				Date.now() - startMs,
+				result.analyzed === true,
+				result,
+				laneObservedAtMs(result.scannedAt, startMs),
 			);
 		}),
 
@@ -561,6 +833,9 @@ export async function fetchFreshProjectDiagnostics(
 				"trivy",
 				trivyResultToProjectDiagnostics(analysisRoot, result),
 				Date.now() - startMs,
+				result.analyzed === true,
+				result,
+				laneObservedAtMs(result.scannedAt, startMs),
 			);
 		}),
 
@@ -587,13 +862,22 @@ export async function fetchFreshProjectDiagnostics(
 						recordFailed("dead-code", result);
 						return;
 					}
-					cacheManager.writeCache(cacheKey, result, analysisRoot, {
-						scanDurationMs: Date.now() - startMs,
-					});
+					if (result.analyzed === true) {
+						cacheManager.writeCache(cacheKey, result, analysisRoot, {
+							scanDurationMs: Date.now() - startMs,
+						});
+					}
+					const adapted = deadCodeResultToProjectDiagnostics(
+						analysisRoot,
+						result,
+					);
 					record(
 						"dead-code",
-						deadCodeResultToProjectDiagnostics(analysisRoot, result),
+						adapted,
 						Date.now() - startMs,
+						result.analyzed === true,
+						result,
+						laneObservedAtMs(result.scannedAt, startMs),
 					);
 				}),
 			);
@@ -655,6 +939,22 @@ export async function fetchFreshProjectDiagnostics(
 					options.runtime,
 				),
 				Date.now() - startMs,
+				// Never authoritative: this lane reads the cache turn_end wrote,
+				// it never runs a suite over the root this call (#2154).
+				false,
+				undefined,
+				// #3600: the batch's own launch stamp (`launchedFrom`), taken at
+				// turn_end BEFORE the suite ran — the safe (at-or-before the read)
+				// direction. `meta.timestamp` is the cache WRITE time, i.e. AFTER
+				// the suite read its files, so an edit during the run would look
+				// older than the row and escape the widget gate. A legacy entry
+				// with no `launchedFrom` falls back to its write time, then to the
+				// lane start, rather than dropping the row.
+				laneObservedAtMs(
+					cached.data.launchedFrom?.revision.capturedAt ??
+						cached.meta.timestamp,
+					startMs,
+				),
 			);
 		}),
 	];
@@ -685,10 +985,15 @@ export async function fetchFreshProjectDiagnostics(
 		const abortedIds = ANALYZER_IDS.filter((id) => !settledIds.has(id));
 		for (const id of abortedIds) pushUnique(cold, id);
 		return {
+			analysisRootValidation,
 			diagnostics,
 			runners,
+			analyzed,
+			authoritativeCoverage,
 			cold,
 			coldReasons,
+			partial,
+			partialReasons,
 			failed,
 			timings,
 			cachedAgeMs,
@@ -700,10 +1005,15 @@ export async function fetchFreshProjectDiagnostics(
 	}
 
 	return {
+		analysisRootValidation,
 		diagnostics,
 		runners,
+		analyzed,
+		authoritativeCoverage,
 		cold,
 		coldReasons,
+		partial,
+		partialReasons,
 		failed,
 		timings,
 		cachedAgeMs,

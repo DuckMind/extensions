@@ -12,6 +12,8 @@
 
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { pathsEqual } from "../../path-utils.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd, hasGolangciConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -24,6 +26,7 @@ import {
 	createAvailabilityChecker,
 	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 const golangci = createAvailabilityChecker("golangci-lint", ".exe");
 
@@ -80,15 +83,27 @@ function describeReplacement(
 	return "Apply golangci-lint suggested fix";
 }
 
-function parseGolangciJson(raw: string, filePath: string): Diagnostic[] {
+function parseGolangciJson(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	try {
 		const output: GolangciOutput = JSON.parse(raw);
 		if (!output.Issues) return [];
 
-		const absFile = path.resolve(filePath);
+		const absFile = path.resolve(cwd, filePath);
 
-		return output.Issues.filter(
-			(issue) => path.resolve(issue.Pos.Filename) === absFile,
+		// #3278: one seam for reported-path attribution — see javac.ts. The base
+		// matters here more than anywhere else in the family: golangci-lint's
+		// `PathPrettifier` OVERWRITES `Pos.Filename` with `filepath.Rel(basePath,
+		// …)` before the JSON printer sees it (v1.64.8,
+		// `pkg/result/processors/path_prettifier.go:31` +
+		// `path_relativity.go:43`), so the spelling is relative to the child's
+		// base path — the `cwd` we spawned it in — and `path.resolve` with no
+		// base resolved it against the EXTENSION's cwd instead.
+		return output.Issues.filter((issue) =>
+			pathsEqual(path.resolve(cwd, issue.Pos.Filename), absFile),
 		).map((issue) => {
 			const severity = issue.Severity === "error" ? "error" : "warning";
 			// golangci-lint's --out-format=json emits a Replacement object per
@@ -127,7 +142,7 @@ const golangciRunner: RunnerDefinition = {
 	timeoutMs: 90_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "golangci-lint");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("golangci-lint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -148,28 +163,35 @@ const golangciRunner: RunnerDefinition = {
 			{ timeout: 60000, cwd },
 		);
 
-		if (result.status === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const diagnostics = parseGolangciJson(result.stdout, ctx.filePath);
-		let semantic: RunnerResult["semantic"] = "none";
-		if (diagnostics.some((d) => d.semantic === "blocking")) {
-			semantic = "blocking";
-		} else if (diagnostics.length > 0) {
-			semantic = "warning";
-		}
-
-		if (semantic === "none") {
-			// Non-zero exit but no parseable issues — likely a config/tool error
-			return { status: "skipped", diagnostics: [], semantic };
-		}
-
-		return {
-			status: semantic === "blocking" ? "failed" : "succeeded",
-			diagnostics,
-			semantic,
-		};
+		// Exit table: 0 is clean-or-findings; 1 means issues, 3 failure,
+		// 4 timeout, and 5 missing config. Every nonzero code is a ran outcome
+		// whose parser decides: JSON issues remain findings, while emitted
+		// non-JSON text becomes a parse-error diagnostic and no output stays
+		// skipped. Keep stderr as the parse input when stdout is absent so tool
+		// errors cannot be mistaken for a clean file.
+		const raw =
+			(result.stdout ?? "").length > 0
+				? (result.stdout ?? "")
+				: result.status !== 0
+					? result.stderr || ""
+					: "";
+		const parsed = parseToolRun(
+			"golangci-lint",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (golangci-lint 1.60 docs https://golangci-lint.run/docs/welcome/quick-start/): 0 clean; 1 findings; 2 error; 3 error; 4 error; 5 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2, 3, 4, 5] },
+			},
+			(raw) => parseGolangciJson(raw, ctx.filePath, cwd),
+		);
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "golangci-lint",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+		});
 	},
 };
 

@@ -13,6 +13,8 @@ export {
 	type ExecutionProjection,
 	type ExternalJobRunnerStatus,
 	type ExternalJobStatus,
+	type IntercomBridgeConfig,
+	type IntercomBridgeMode,
 	type JsonSchemaObject,
 	type OutputMode,
 	type ReviewProjection,
@@ -20,4 +22,8 @@ export {
 	type SubagentResultStatus,
 	type SubagentRunMode,
 	type Usage,
+	type ManagedWorktreeProvider,
+	type WorktreeNaming,
+	type WorktreeProvider,
+	type WorkflowResourceProvenance,
 } from "../shared/types.ts";

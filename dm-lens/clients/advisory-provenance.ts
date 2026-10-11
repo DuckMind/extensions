@@ -9,7 +9,7 @@ import { freshnessFromMtime } from "./freshness.js";
 
 export type AdvisoryFileRole = "source" | "test" | "affected";
 
-export interface AdvisoryFileProvenance {
+interface AdvisoryFileProvenance {
 	path: string;
 	role: AdvisoryFileRole;
 	mtimeMs: number;
@@ -284,7 +284,7 @@ export function validateAdvisoryProvenance(
 //     it.
 
 /** Stat budget: one per unique cited path, sharing the envelope's own cap. */
-export const MAX_FINDING_PATH_STATS = MAX_ADVISORY_AFFECTED_FILES;
+const MAX_FINDING_PATH_STATS = MAX_ADVISORY_AFFECTED_FILES;
 
 /** How many dead paths a single drop record names before it stops. */
 const MAX_LOGGED_DEAD_PATHS = 3;
@@ -363,22 +363,56 @@ export function findingPathFreshness(
 	resolvedPath: string,
 	scannedAtMs?: number,
 ): FindingPathFreshness {
+	return freshnessFromFacts(statFindingPath(resolvedPath), scannedAtMs);
+}
+
+/**
+ * What one `statSync` of a cited path says, with no store's scan timestamp
+ * mixed in yet. THIS — not the verdict — is what the per-delivery memo holds.
+ *
+ * #1892: the verdict depends on which store is asking (its own `scannedAt`,
+ * its own `onMissing`); the stat does not. Memoizing the verdict, as the
+ * pre-#1892 single-store gate did, is safe only while one store asks per call:
+ * share that memo across stores and the first store to ask decides for every
+ * later one — a govulncheck `demote` verdict for a deleted path would be
+ * re-served to gitleaks, which must `drop` it, and a gitleaks `stale` verdict
+ * (its scan is older) would demote a trivy secret its own newer scan covers.
+ */
+export type FindingPathFacts =
+	| { readonly state: "present"; readonly mtimeMs: number }
+	| { readonly state: "missing" }
+	| { readonly state: "unknown" };
+
+/** The one filesystem touch. Injectable via `probePath` so rules stay testable. */
+function statFindingPath(resolvedPath: string): FindingPathFacts {
 	try {
-		const stat = fs.statSync(resolvedPath);
-		// No scan timestamp recorded: the pre-kernel behavior treated the
-		// path as live (no reference to be stale against) - preserved.
-		if (scannedAtMs === undefined) return "live";
-		const verdict = freshnessFromMtime({
-			mtimeMs: stat.mtimeMs,
-			referenceMs: scannedAtMs,
-		});
-		return verdict.verdict === "stale" ? "stale" : "live";
+		return { state: "present", mtimeMs: fs.statSync(resolvedPath).mtimeMs };
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code ?? "unknown";
 		// ENOTDIR: an ancestor component is no longer a directory — the cited
 		// path cannot exist either, same as ENOENT.
-		return code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unknown";
+		return code === "ENOENT" || code === "ENOTDIR"
+			? { state: "missing" }
+			: { state: "unknown" };
 	}
+}
+
+/** Pure: one store's verdict for one path's facts. No filesystem, no policy. */
+function freshnessFromFacts(
+	facts: FindingPathFacts,
+	scannedAtMs?: number,
+): FindingPathFreshness {
+	if (facts.state === "missing") return "missing";
+	if (facts.state === "unknown") return "unknown";
+	// No scan timestamp recorded: the pre-kernel behavior treated the path as
+	// live (no reference to be stale against) - preserved.
+	if (scannedAtMs === undefined) return "live";
+	return freshnessFromMtime({
+		mtimeMs: facts.mtimeMs,
+		referenceMs: scannedAtMs,
+	}).verdict === "stale"
+		? "stale"
+		: "live";
 }
 
 /** Existence-only probe. Retained for callers that have no scan timestamp. */
@@ -431,6 +465,8 @@ export interface FindingPathPartition<T> {
  * every later turn, which is the very defect this gate exists to close.
  */
 export function partitionFindingsByCitedPath<T>(args: {
+	/** Cache/store name; the stat allowance is per store. */
+	store?: string;
 	findings: readonly T[];
 	cwd: string;
 	citedPath: (finding: T) => string | undefined;
@@ -439,13 +475,64 @@ export function partitionFindingsByCitedPath<T>(args: {
 	scannedAt?: string | number;
 	/** What a deleted cited path means for this store. See `FindingMissingPolicy`. */
 	onMissing?: FindingMissingPolicy;
-	existence?: (
-		resolvedPath: string,
-		scannedAtMs?: number,
-	) => FindingPathFreshness;
+	probePath?: (resolvedPath: string) => FindingPathFacts;
 }): FindingPathPartition<T> {
-	const limit = args.maxUniquePaths ?? MAX_FINDING_PATH_STATS;
-	const probe = args.existence ?? findingPathFreshness;
+	return partitionOneSource(
+		{ ...args, store: args.store ?? "" },
+		createPathFactsMemo(args),
+	);
+}
+
+/**
+ * One delivery's shared filesystem knowledge: at most one `statSync` per unique
+ * resolved path, and one stat budget, however many stores ask about it.
+ *
+ * Built fresh on every gate call — per delivery, never per process. A
+ * module-level cache here would be the process-lifetime latch shape: it would
+ * pin the first verdict for a path and re-serve it for every later turn, which
+ * is the very defect this gate exists to close.
+ */
+interface PathFactsMemo {
+	facts: Map<string, FindingPathFacts>;
+	probe: (resolvedPath: string) => FindingPathFacts;
+	/**
+	 * Stat allowance per SOURCE, not a shared pool (#3264 review F2). The facts
+	 * are shared; the budget is not. A shared pool would let the first source
+	 * spend it and leave a later one failing open as `live` — re-rendering an
+	 * edited cited line as current on a lane that never hit its own cap before
+	 * the fold. With a per-source allowance no lane can regress: a path an
+	 * earlier source already probed is a free memo hit for every later one, so
+	 * the folded delivery always probes FEWER paths than the pre-fold lanes did,
+	 * never more.
+	 */
+	limit: number;
+	/** Findings that failed open past the allowance, by source name. */
+	starved: Map<string, number>;
+}
+
+function createPathFactsMemo(args: {
+	maxUniquePaths?: number;
+	probePath?: (resolvedPath: string) => FindingPathFacts;
+}): PathFactsMemo {
+	return {
+		facts: new Map(),
+		probe: args.probePath ?? statFindingPath,
+		limit: args.maxUniquePaths ?? MAX_FINDING_PATH_STATS,
+		starved: new Map(),
+	};
+}
+
+function partitionOneSource<T>(
+	args: {
+		store: string;
+		findings: readonly T[];
+		cwd: string;
+		citedPath: (finding: T) => string | undefined;
+		scannedAt?: string | number;
+		onMissing?: FindingMissingPolicy;
+	},
+	memo: PathFactsMemo,
+): FindingPathPartition<T> {
 	const scannedAtMs = parseScannedAtMs(args.scannedAt);
 	const onMissing = args.onMissing ?? "drop";
 	// Two dedup layers, cheapest first. `rawVerdicts` collapses findings that
@@ -453,19 +540,24 @@ export function partitionFindingsByCitedPath<T>(args: {
 	// (#1460's live record: 126 findings over a handful of distinct `file`
 	// strings). Only a raw string not seen before pays for
 	// `resolveRunnerPath`/`advisoryPathKey`, which folds FS-confirmed spelling
-	// variants (case, separators, ancestor walk-up) into `verdicts`, the
+	// variants (case, separators, ancestor walk-up) into `memo.facts`, the
 	// canonical-key map that `statCount` reports. Keying the expensive work by
 	// the RESOLVED path instead of the raw one (the pre-#1461-HIGH-2 shape)
 	// still called it once per finding, since the dedup lookup came after the
 	// cost it was meant to dedupe.
+	//
+	// `rawVerdicts` is per SOURCE (the verdict is this store's), `memo.facts` is
+	// per DELIVERY (the stat is nobody's). #1892.
 	const rawVerdicts = new Map<string, FindingPathFreshness>();
-	const verdicts = new Map<string, FindingPathFreshness>();
 	const live: T[] = [];
 	const stale: T[] = [];
 	const dropped: T[] = [];
 	const deadPaths: string[] = [];
 	const stalePaths: string[] = [];
-	let truncated = false;
+	const seenPaths = new Set<string>();
+	// This SOURCE's own probes. A memo hit costs nothing, so an earlier source
+	// having paid for a path only ever helps this one (#3264 review F2).
+	let probed = 0;
 	for (const finding of args.findings) {
 		const cited = args.citedPath(finding);
 		if (!cited) {
@@ -482,26 +574,32 @@ export function partitionFindingsByCitedPath<T>(args: {
 			// `normalizeMapKey`, so the resolved path IS the canonical key — a
 			// second `advisoryPathKey` pass would re-pay the same realpath cost.
 			const resolved = resolveRunnerPath(args.cwd, cited);
-			const key = resolved;
-			verdict = verdicts.get(key);
-			if (verdict === undefined) {
-				if (verdicts.size >= limit) {
-					// Budget spent on paths we have not seen before — deliver rather
-					// than guess. Already-probed paths keep their cached verdict.
-					truncated = true;
-					verdict = "live";
+			let facts = memo.facts.get(resolved);
+			if (facts === undefined) {
+				if (probed >= memo.limit) {
+					// Allowance spent on paths nobody in this delivery has seen —
+					// deliver rather than guess, exactly as the pre-fold per-lane cap
+					// did. Guessing a verdict for a path nobody looked at is the worse
+					// error; what the fold adds is that the guess is now RECORDED.
+					memo.starved.set(args.store, (memo.starved.get(args.store) ?? 0) + 1);
+					facts = { state: "unknown" };
 				} else {
-					verdict = probe(resolved, scannedAtMs);
-					// A store that treats deletion as evidence-loss rather than
-					// remediation-loss folds `missing` into the demote arm here, so
-					// every downstream list and record sees one consistent verdict.
-					if (verdict === "missing" && onMissing === "demote") {
-						verdict = "stale";
-					}
-					verdicts.set(key, verdict);
-					if (verdict === "missing") deadPaths.push(resolved);
-					else if (verdict === "stale") stalePaths.push(resolved);
+					probed += 1;
+					facts = memo.probe(resolved);
+					memo.facts.set(resolved, facts);
 				}
+			}
+			verdict = freshnessFromFacts(facts, scannedAtMs);
+			// A store that treats deletion as evidence-loss rather than
+			// remediation-loss folds `missing` into the demote arm here, so
+			// every downstream list and record sees one consistent verdict. It is
+			// applied per SOURCE, after the shared lookup: `onMissing` is this
+			// store's policy and must never be cached into another store's answer.
+			if (verdict === "missing" && onMissing === "demote") verdict = "stale";
+			if (!seenPaths.has(resolved)) {
+				seenPaths.add(resolved);
+				if (verdict === "missing") deadPaths.push(resolved);
+				else if (verdict === "stale") stalePaths.push(resolved);
 			}
 			rawVerdicts.set(cited, verdict);
 		}
@@ -515,8 +613,8 @@ export function partitionFindingsByCitedPath<T>(args: {
 		dropped,
 		deadPaths,
 		stalePaths,
-		statCount: verdicts.size,
-		truncated,
+		statCount: memo.facts.size,
+		truncated: (memo.starved.get(args.store) ?? 0) > 0,
 	};
 }
 
@@ -535,14 +633,13 @@ export function dropFindingsForMissingPaths<T>(args: {
 	cwd: string;
 	citedPath: (finding: T) => string | undefined;
 	maxUniquePaths?: number;
-	existence?: (
-		resolvedPath: string,
-		scannedAtMs?: number,
-	) => FindingPathFreshness;
+	probePath?: (resolvedPath: string) => FindingPathFacts;
 }): T[] {
 	// No `scannedAt` — existence-only, so `partition.stale` is always empty.
 	const partition = partitionFindingsByCitedPath(args);
-	emitDeadPathDropRecord(args.store, args.cwd, partition);
+	emitDeadPathDropRecord(args.cwd, partition, {
+		[args.store]: partition.dropped.length,
+	});
 	return partition.live;
 }
 
@@ -558,48 +655,131 @@ export interface FindingFreshnessGate<T> {
 	stale: T[];
 }
 
+/** One cached store asking the gate about its own findings. */
+export interface FindingFreshnessSource<T> {
+	findings: readonly T[];
+	citedPath: (finding: T) => string | undefined;
+	/**
+	 * The store envelope's scan timestamp. Absent/unparseable disables demotion.
+	 * Explicitly `| undefined`: every caller reads it off an optional cache entry
+	 * (`entry?.data?.scannedAt`), and under `exactOptionalPropertyTypes` the bare
+	 * optional would reject that — degrading the source's inferred finding type
+	 * to `any` and taking the citedPath callbacks with it.
+	 */
+	scannedAt?: string | number | undefined;
+	/** Defaults to `"drop"`, matching #1460's secrets behaviour. */
+	onMissing?: FindingMissingPolicy | undefined;
+}
+
+/** The finding type one gate source carries, recovered per store key. */
+export type SourceFinding<X> =
+	X extends FindingFreshnessSource<infer T> ? T : never;
+
 /**
- * Delivery-seam wrapper with the #1622 freshness verdict. Emits at most one
- * `finding_dead_path_drop` and one `finding_stale_line_demote` record per store
- * per delivery, each with a capped path sample; never one per finding.
+ * Delivery-seam wrapper with the #1622 freshness verdict, over one or more
+ * stores at once. The store name is the KEY of `sources`, and it is also the
+ * finding's source identity inside the gate: every store's `scannedAt` and
+ * `onMissing` decide that store's findings and only that store's.
+ *
+ * #1892: the three turn-end scanner lanes used to call this once each, so one
+ * file cited by gitleaks AND trivy-secrets was stat'd twice, spent two separate
+ * stat budgets, and wrote two `finding_stale_line_demote` rows for ONE decision.
+ * Passing them together makes the filesystem pass shared and the record one per
+ * delivery, without letting one store's clean/stale/missing answer speak for
+ * another's — the two directions this seam has to keep apart.
  *
  * Callers that have no scan timestamp keep using `dropFindingsForMissingPaths`.
  */
-export function gateFindingsByPathFreshness<T>(args: {
-	/** Cache/store name as it appears in telemetry, e.g. `"gitleaks"`. */
-	store: string;
-	findings: readonly T[];
+export function gateFindingsByPathFreshness<
+	S extends Record<string, FindingFreshnessSource<any>>,
+>(args: {
 	cwd: string;
-	/** The store envelope's scan timestamp. Absent/unparseable disables demotion. */
-	scannedAt?: string | number;
-	citedPath: (finding: T) => string | undefined;
+	sources: S;
 	maxUniquePaths?: number;
-	/** Defaults to `"drop"`, matching #1460's secrets behaviour. */
-	onMissing?: FindingMissingPolicy;
-	existence?: (
-		resolvedPath: string,
-		scannedAtMs?: number,
-	) => FindingPathFreshness;
-}): FindingFreshnessGate<T> {
-	const partition = partitionFindingsByCitedPath(args);
-	emitDeadPathDropRecord(args.store, args.cwd, partition);
-	emitStaleLineDemoteRecord(args.store, args.cwd, args.scannedAt, partition);
-	return { live: partition.live, stale: partition.stale };
+	probePath?: (resolvedPath: string) => FindingPathFacts;
+	/**
+	 * Judge without writing the delivery records (`finding_dead_path_drop`,
+	 * `finding_stale_line_demote`, the stat-budget row). For a caller that only
+	 * PEEKS at an answer another surface will deliver and record: the commit gate
+	 * reading a settled collect-later answer before the turn end that owns it
+	 * (#3814 r1 L1: both sites wrote the row for one decision).
+	 */
+	quiet?: boolean;
+}): { [K in keyof S]: FindingFreshnessGate<SourceFinding<S[K]>> } {
+	const memo = createPathFactsMemo(args);
+	// Sorted, not literal order: which source pays for a shared path, and the
+	// order stores appear in the records, must not depend on how the CALLER
+	// happened to write the object (#3264 review F2).
+	const names = Object.keys(args.sources).sort((a, b) =>
+		a < b ? -1 : a > b ? 1 : 0,
+	);
+	const gates = {} as Record<string, FindingFreshnessGate<unknown>>;
+	const dropped: Record<string, number> = {};
+	const demoted: Record<string, number> = {};
+	const merged: FindingPathPartition<unknown> = {
+		live: [],
+		stale: [],
+		dropped: [],
+		deadPaths: [],
+		stalePaths: [],
+		statCount: 0,
+		truncated: false,
+	};
+	const scannedAtByStore: Record<string, string> = {};
+	for (const name of names) {
+		const source = args.sources[name] as FindingFreshnessSource<unknown>;
+		const partition = partitionOneSource(
+			{ ...source, store: name, cwd: args.cwd },
+			memo,
+		);
+		gates[name] = { live: partition.live, stale: partition.stale };
+		if (partition.dropped.length > 0) dropped[name] = partition.dropped.length;
+		if (partition.stale.length > 0) demoted[name] = partition.stale.length;
+		if (source.scannedAt !== undefined) {
+			scannedAtByStore[name] = String(source.scannedAt);
+		}
+		merged.live.push(...partition.live);
+		merged.stale.push(...partition.stale);
+		merged.dropped.push(...partition.dropped);
+		for (const deadPath of partition.deadPaths) {
+			if (!merged.deadPaths.includes(deadPath)) merged.deadPaths.push(deadPath);
+		}
+		for (const stalePath of partition.stalePaths) {
+			if (!merged.stalePaths.includes(stalePath)) {
+				merged.stalePaths.push(stalePath);
+			}
+		}
+	}
+	merged.statCount = memo.facts.size;
+	merged.truncated = memo.starved.size > 0;
+	if (args.quiet !== true) {
+		emitDeadPathDropRecord(args.cwd, merged, dropped);
+		emitStaleLineDemoteRecord(args.cwd, scannedAtByStore, merged, demoted);
+		emitStatBudgetRecord(args.cwd, memo);
+	}
+	return gates as { [K in keyof S]: FindingFreshnessGate<SourceFinding<S[K]>> };
 }
 
+/**
+ * `store` is the joined source names, so a single-source delivery still reads
+ * `store: "gitleaks"` exactly as it did pre-#1892; `byStore` is what makes the
+ * merged record discriminating — which store's findings this decision retired.
+ */
 function emitDeadPathDropRecord<T>(
-	store: string,
 	cwd: string,
 	partition: FindingPathPartition<T>,
+	byStore: Record<string, number>,
 ): void {
 	if (partition.dropped.length === 0) return;
+	const stores = Object.keys(byStore);
 	logLatency({
 		type: "phase",
 		phase: "finding_dead_path_drop",
 		filePath: cwd,
 		durationMs: 0,
 		metadata: {
-			store,
+			store: stores.join("+"),
+			byStore,
 			droppedDeadPaths: partition.dropped.length,
 			deadPathCount: partition.deadPaths.length,
 			deliveredCount: partition.live.length,
@@ -618,19 +798,25 @@ function emitDeadPathDropRecord<T>(
  * proxy — the blocker payload is written nowhere.
  */
 function emitStaleLineDemoteRecord<T>(
-	store: string,
 	cwd: string,
-	scannedAt: string | number | undefined,
+	scannedAtByStore: Record<string, string>,
 	partition: FindingPathPartition<T>,
+	byStore: Record<string, number>,
 ): void {
 	if (partition.stale.length === 0) return;
+	// Only the stores that actually contributed to THIS decision are named, so
+	// `store` still reads `gitleaks` for a gitleaks-only demotion whether the
+	// delivery gated one store or three.
+	const stores = Object.keys(byStore);
+	const single = stores.length === 1 ? scannedAtByStore[stores[0]!] : undefined;
 	logLatency({
 		type: "phase",
 		phase: "finding_stale_line_demote",
 		filePath: cwd,
 		durationMs: 0,
 		metadata: {
-			store,
+			store: stores.join("+"),
+			byStore,
 			demotedStalePaths: partition.stale.length,
 			stalePathCount: partition.stalePaths.length,
 			deliveredCount: partition.live.length,
@@ -638,8 +824,48 @@ function emitStaleLineDemoteRecord<T>(
 			samplePaths: partition.stalePaths
 				.slice(0, MAX_LOGGED_DEAD_PATHS)
 				.map((stalePath) => toProjectRelativePath(stalePath, cwd)),
-			...(scannedAt === undefined ? {} : { scannedAt: String(scannedAt) }),
+			// One store: the flat `scannedAt` field, unchanged. Several: the
+			// per-store map, because the whole point of the fold is that they
+			// differ — one flattened timestamp here would be the same authority
+			// collapse the gate refuses to make on the findings themselves.
+			...(single === undefined ? {} : { scannedAt: single }),
+			...(stores.length > 1
+				? {
+						scannedAtByStore: Object.fromEntries(
+							stores.map((name) => [name, scannedAtByStore[name] ?? ""]),
+						),
+					}
+				: {}),
 			...(partition.truncated ? { truncated: true } : {}),
+		},
+	});
+}
+
+/**
+ * #3264 review F2: the drop and demote records both return early when nothing
+ * was dropped or demoted, so a delivery whose only casualty was the stat
+ * allowance — every starved finding failing OPEN, delivered at full severity
+ * against a path nobody looked at — wrote no row at all. This is that row: one
+ * per delivery, naming the cap and every source that hit it, never one per
+ * finding.
+ */
+function emitStatBudgetRecord(cwd: string, memo: PathFactsMemo): void {
+	if (memo.starved.size === 0) return;
+	const stores = [...memo.starved.keys()].sort((a, b) =>
+		a < b ? -1 : a > b ? 1 : 0,
+	);
+	logLatency({
+		type: "phase",
+		phase: "finding_path_stat_budget_exhausted",
+		filePath: cwd,
+		durationMs: 0,
+		metadata: {
+			store: stores.join("+"),
+			byStore: Object.fromEntries(
+				stores.map((name) => [name, memo.starved.get(name) ?? 0]),
+			),
+			maxUniquePaths: memo.limit,
+			statCount: memo.facts.size,
 		},
 	});
 }

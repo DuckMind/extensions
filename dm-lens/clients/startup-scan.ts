@@ -29,7 +29,7 @@ import {
 	registerWorkspaceTopologyReset,
 } from "./workspace-topology.js";
 
-export const PROJECT_ROOT_MARKERS = [
+const PROJECT_ROOT_MARKERS = [
 	".git",
 	"package.json",
 	"pyproject.toml",
@@ -38,17 +38,8 @@ export const PROJECT_ROOT_MARKERS = [
 	"composer.json",
 ];
 
-// Deprecated (#776): no longer read directly below — `computeStartupScanContext`
-// / `resolveStartupScanContextAsync` now default `maxSourceFiles` to
-// `getStartupScanMaxSourceFilesDerived(cwd)` (project-scale.ts's
-// `maxProjectFiles` knob), which reproduces this same 2,000 value at the
-// default base. Kept exported for tests/callers that still reference the
-// literal.
-export const MAX_STARTUP_SOURCE_FILES = 2000;
-
 // #758: hard ceiling on the number of directory entries the startup source
 // count walk will visit before it gives up and declares the tree too big to
-// warm. The source-file early-exit (MAX_STARTUP_SOURCE_FILES) only fires when
 // a project has MANY source files — a repo with FEW source files but a huge
 // pile of non-source files (e.g. a game mod: 300 scripts among 84k data files)
 // never trips it, so the pre-#758 walk traversed the entire tree, dominated by
@@ -70,6 +61,17 @@ export interface StartupScanContext {
 		| "too-many-source-files"
 		| "too-many-entries";
 	sourceFileCount?: number;
+	/**
+	 * The two bounds that can produce a size skip, as they were in effect when
+	 * this verdict was computed (#4126). Both are set on every
+	 * `too-many-source-files` / `too-many-entries` verdict. A persisted size
+	 * verdict missing either, or carrying a value that differs from the bound
+	 * now in effect, is stale — see `isStartupScanVerdictFresh`. Records
+	 * written before #4126 (every release through v4.4.0) carry neither; the
+	 * corpus is `tests/fixtures/startup-scan/released-4.4.0/`.
+	 */
+	maxProjectFiles?: number;
+	maxScanEntries?: number;
 	/**
 	 * Wall-clock time (`Date.now()`) this verdict was computed. Stamped by
 	 * `resolveStartupScanContext`/`Async` right before it's cached, and carried
@@ -138,7 +140,7 @@ export const _resetStartupScanMaxEntriesForTests = _maxEntries._resetForTests;
  *
  * The content-derived reasons `too-many-source-files` and `too-many-entries`
  * (#758) are the ones that are TTL'd. They can go stale on their own: the repo
- * can shrink below `MAX_STARTUP_SOURCE_FILES` (or below the entry ceiling)
+ * can shrink below the source-file cap (or below the entry ceiling)
  * between sessions, and nothing else would notice
  * — the seq-based freshness check that guards every other
  * `project-snapshot.json` field never fires for them, because dm-lens never
@@ -155,9 +157,16 @@ export const _resetStartupScanMaxEntriesForTests = _maxEntries._resetForTests;
  * function either; a fresh snapshot's `seq` match already implies the
  * project state hasn't moved since it warmed successfully.
  *
- * Fails closed on a verdict with no `computedAt` (e.g. hand-written test
- * fixture, or a pre-#699 snapshot) — treated as stale so it gets refreshed
- * rather than trusted indefinitely.
+ * A size verdict is fresh only while every bound that produced it equals the
+ * bound now in effect (#4126): both `maxProjectFiles` (derived for the
+ * verdict's `cwd`, as the writer derived it) and `maxScanEntries`, whatever
+ * the reason. Both bounds apply during one walk (`count > maxSourceFiles` or
+ * `visited >= maxScanEntries`), so a changed bound can change the outcome or
+ * flip the reason; the re-walk decides, this function never predicts it.
+ * Fails closed on a verdict with no `computedAt`, and on one with a missing
+ * bound (a hand-written fixture, or a record from a release through v4.4.0):
+ * an absent bound never equals the bound in effect, so the same compares
+ * treat it as stale and it gets refreshed rather than trusted indefinitely.
  */
 export function isStartupScanVerdictFresh(
 	verdict: StartupScanContext,
@@ -169,6 +178,11 @@ export function isStartupScanVerdictFresh(
 	)
 		return true;
 	if (typeof verdict.computedAt !== "number") return false;
+	if (
+		verdict.maxProjectFiles !== getStartupScanMaxSourceFilesDerived(verdict.cwd)
+	)
+		return false;
+	if (verdict.maxScanEntries !== getStartupScanMaxEntries()) return false;
 	return now - verdict.computedAt < getStartupScanVerdictTtlMs();
 }
 
@@ -208,7 +222,7 @@ export function findNearestProjectRoot(startDir: string): string | null {
 	}
 }
 
-export interface SourceCountResult {
+interface SourceCountResult {
 	/** Source files found (capped at `limit + 1` once the early-exit fires). */
 	count: number;
 	/**
@@ -410,6 +424,8 @@ function computeStartupScanContext(
 				? "too-many-entries"
 				: "too-many-source-files",
 			sourceFileCount,
+			maxProjectFiles: maxSourceFiles,
+			maxScanEntries,
 		};
 	}
 
@@ -537,6 +553,8 @@ export async function resolveStartupScanContextAsync(
 					? "too-many-entries"
 					: "too-many-source-files",
 				sourceFileCount,
+				maxProjectFiles: maxSourceFiles,
+				maxScanEntries,
 			};
 		} else {
 			result = {

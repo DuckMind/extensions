@@ -1,4 +1,7 @@
+import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { logRunnerAdvisoryOnce } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd, hasYamllintConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -9,6 +12,7 @@ import type {
 } from "../types.js";
 import {
 	createAvailabilityChecker,
+	resolveRunnerCwd,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
 import { parseToolRun } from "./utils/tool-failure.js";
@@ -18,16 +22,22 @@ const yamllint = createAvailabilityChecker("yamllint", ".exe");
 
 export { hasYamllintConfig };
 
-function parseYamllintParsable(raw: string, filePath: string): Diagnostic[] {
+function parseYamllintParsable(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const line of raw.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		const match = line.match(
 			/^(.*?):(\d+):(\d+):\s*\[(error|warning)\]\s*(.*?)\s*\(([^)]+)\)\s*$/i,
 		);
 		if (!match) continue;
+		if (!pathsEqual(path.resolve(cwd, match[1]!), absTarget)) continue;
 
-		const severity = match[4].toLowerCase() === "error" ? "error" : "warning";
+		const severity = match[4]!.toLowerCase() === "error" ? "error" : "warning";
 		diagnostics.push({
 			id: `yamllint-${match[2]}-${match[3]}-${match[6]}`,
 			message: `[${match[6]}] ${match[5]}`,
@@ -50,14 +60,19 @@ const yamllintRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "yamllint");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("yamllint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 		const hasConfig = hasYamllintConfig(cwd);
 		if (!hasConfig) {
-			ctx.log("yamllint: no config detected, running with default rules");
+			logRunnerAdvisoryOnce(
+				ctx,
+				"yamllint",
+				cwd,
+				"yamllint: no config detected, running with default rules",
+			);
 		}
 
 		let cmd: string | null = null;
@@ -70,6 +85,7 @@ const yamllintRunner: RunnerDefinition = {
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
 		const result = await safeSpawnAsync(cmd, ["-f", "parsable", ctx.filePath], {
+			cwd,
 			timeout: 15000,
 		});
 
@@ -87,8 +103,13 @@ const yamllintRunner: RunnerDefinition = {
 		// record when a failing run yields nothing.
 		const run = parseToolRun(
 			"yamllint",
-			{ result, output: result.stdout },
-			(out) => parseYamllintParsable(out, ctx.filePath),
+			{
+				result,
+				output: result.stdout,
+				// EXIT TABLE (yamllint 1.35 docs https://yamllint.readthedocs.io/en/stable/): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(out) => parseYamllintParsable(out, ctx.filePath, cwd),
 			{ parseOutput: raw },
 		);
 		if (run.skipped) return run.skipped;

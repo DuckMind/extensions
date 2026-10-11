@@ -2,7 +2,7 @@
  * Shared plumbing for best-effort, fire-and-forget child-process spawns
  * (shape 4 of the recurring-defect catalog in AGENTS.md: "a timer / promise /
  * worker / child that outlives its one-shot settle"). Extracted from the
- * orphan reaper's `unrefReaperChild`/`spawnCollectStdout` (#1153/#1160) into a
+ * orphan reaper's `unrefReaperChild` (#1153/#1160) into a
  * shared, dependency-free module so every one-shot
  * `spawn(..., { stdio: ["ignore","pipe",...] })` call site in the codebase —
  * the reaper's enumeration/kill spawns AND the resource sampler's Windows
@@ -11,14 +11,18 @@
  * new-code-duplication finding: two near-identical spawn→collect-stdout
  * blocks in `clients/resource-sampler.ts` collapsed to one shared helper).
  *
- * Deliberately has NO imports beyond `node:child_process` types, so both
+ * Deliberately has NO imports beyond `node:child_process` types and
+ * `spawn-output-cap.ts` (itself import-free, #3383), so both
  * `clients/instance-reaper.ts` and `clients/resource-sampler.ts` (which
  * `clients/safe-spawn.ts` itself depends on) can import this without risking
- * a circular-import chain.
+ * a circular-import chain. That is also why the output bound below reports
+ * nothing to the degradation ledger: importing the ledger here would put
+ * `safe-spawn.ts`'s own dependency above it in the graph.
  */
 
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { spawn as nodeSpawn } from "node:child_process";
+import { createBoundedOutputSink } from "./spawn-output-cap.js";
 
 /**
  * Detach a best-effort, fire-and-forget child process from the event loop.
@@ -49,36 +53,11 @@ export function unrefChildAndPipes(child: ChildProcess): void {
 }
 
 /**
- * Spawn a best-effort, fire-and-forget child, accumulate its full stdout, and
- * resolve with the collected text (empty string on a synchronous spawn
- * failure or an `error` event). Consolidates the spawn → unref →
- * pipe-stdout → `close` plumbing shared by every one-shot OS-process-table
- * query in the codebase — each caller supplies only its command/args/options
- * and does its own output parse. The child + its stdio pipes are `unref`'d
- * here (via `unrefChildAndPipes`) so a settled one-shot `pi --print` process
- * can exit without waiting, and both the unref and the collect plumbing live
- * in exactly ONE place rather than being re-derived at each spawn site.
- * Never rejects — any failure resolves to `""`, which every caller's parse
- * turns into an empty/absent result (the best-effort contract every caller
- * here already has).
- */
-export function spawnCollectStdout(
-	command: string,
-	args: string[],
-	options: SpawnOptions,
-): Promise<string> {
-	return spawnCollectStdoutResult(command, args, options).then(
-		(result) => result.stdout,
-	);
-}
-
-/**
  * Why a spawn's stdout is what it is. `""` alone cannot tell "the query ran
  * and found nothing" from "the query never ran" — the availability invariant
  * in CLAUDE.md: an empty result must distinguish clean from errored. Callers
  * that must emit a distinguishable record use `spawnCollectStdoutResult`;
  * callers that genuinely only want best-effort text keep calling
- * `spawnCollectStdout`, which is now a thin projection of this same code path
  * (one implementation, not two).
  */
 export type SpawnCollectStatus =
@@ -143,7 +122,6 @@ export interface SpawnCollectOptions {
 export type SpawnTimeoutKill = "gone" | "alive" | "invalid" | "unverified";
 
 /**
- * `spawnCollectStdout` plus the reason the output is what it is. Same spawn,
  * unref, collect, settle plumbing; the only additions are an optional hard
  * timeout and a status discriminator. Never rejects.
  */
@@ -165,10 +143,15 @@ export function spawnCollectStdoutResult(
 		try {
 			const child = nodeSpawn(command, args, options);
 			unrefChildAndPipes(child);
-			let out = "";
-			child.stdout?.on("data", (chunk) => {
-				out += chunk.toString();
-			});
+			// #3383: bounded, not `out += chunk`. The producer is a process-table
+			// query (`ps`, `wmic`, `powershell`) whose output nothing else limits,
+			// and the concatenation runs inside a `data` handler where V8's
+			// `RangeError: Invalid string length` would be an uncaught exception
+			// rather than this promise's result. A truncated table is the ending
+			// this contract already documents for a timed-out child: whatever was
+			// kept is parsed, and the caller reads `status`.
+			const out = createBoundedOutputSink();
+			child.stdout?.on("data", (chunk) => out.append(chunk));
 			child.once("error", (error) =>
 				settle({ stdout: "", status: "spawn-error", error }),
 			);
@@ -177,7 +160,7 @@ export function spawnCollectStdoutResult(
 				(code: number | null, signal: NodeJS.Signals | null) =>
 					settle(
 						code === 0 && signal === null
-							? { stdout: out, status: "ok" }
+							? { stdout: out.text, status: "ok" }
 							: {
 									stdout: "",
 									status: "exit-error",
@@ -194,7 +177,7 @@ export function spawnCollectStdoutResult(
 					// child, which is the leak this timeout exists to prevent.
 					void terminateTimedOutChild(child, collectOptions.onTimeout).then(
 						(timeoutKill) =>
-							settle({ stdout: out, status: "timeout", timeoutKill }),
+							settle({ stdout: out.text, status: "timeout", timeoutKill }),
 					);
 				}, timeoutMs);
 				timer.unref();

@@ -64,9 +64,33 @@ export interface ProcessQuery {
 	tabSeparated: boolean;
 	fields: ProcessField[];
 	serverSideFiltered: boolean;
+	/** Set when the query needs a pinned locale and zone (a POSIX start time). */
+	env?: NodeJS.ProcessEnv;
 }
 
-export const DEFAULT_SNAPSHOT_TIMEOUT_MS: number;
+export function isoFromLstart(raw: string): string | undefined;
+
+export function readLinuxProcessStart(pid: number): string | undefined;
+
+export function parseLinuxStatStart(stat: string): string | undefined;
+
+export function readLinuxPidNamespace(pid: number): string | undefined;
+
+export function readLinuxProcessEnvironmentVariable(
+	pid: number,
+	name: string,
+): string | undefined;
+
+export function buildEnvironmentQuery(pids: readonly number[]): {
+	command: string;
+	args: string[];
+};
+
+export function parseEnvironmentVariable(
+	out: string,
+	name: string,
+): Map<number, string>;
+
 export const ALL_PROCESS_FIELDS: readonly ProcessField[];
 
 export function windowsExe(name: string): string;

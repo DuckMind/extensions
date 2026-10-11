@@ -4,7 +4,7 @@ import { test } from "node:test";
 
 const indexUrl = new URL("../index.ts", import.meta.url).href;
 
-test("registers eagerly and loads content extraction on first use", () => {
+test("registers tool definitions and loads content extraction on first use", () => {
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
 		input: buildChildScript(indexUrl),
 		encoding: "utf8",
@@ -65,7 +65,7 @@ function buildChildScript(moduleUrl) {
 				if (property === "registerTool") return (tool) => tools.push(tool);
 				if (property === "registerCommand") return (name) => commands.push(name);
 				if (property === "registerShortcut") return (name) => shortcuts.push(name);
-				if (property === "on") return (name) => events.push(name);
+				if (property === "on") return (name) => { events.push(name); return () => {}; };
 				return () => {};
 			},
 		});
@@ -73,7 +73,7 @@ function buildChildScript(moduleUrl) {
 		initializeExtension(pi);
 		assert.deepEqual(
 			tools.map((tool) => tool.name),
-			["web_search", "source_check", "fetch_content", "get_search_content"],
+			["web_search", "source_check", "fetch_content", "get_search_content", "web_enable"],
 		);
 		assert.ok(commands.includes("websearch"), "websearch command was not registered");
 		assert.ok(shortcuts.length > 0, "shortcuts were not registered");
@@ -106,7 +106,7 @@ function buildChildScript(moduleUrl) {
 
 			assert.equal(existsSync(markerPath), true, "extract.ts did not load on first use");
 			assert.equal(result.details.successful, 1);
-			assert.match(result.content.at(-1).text, /preserving first-use extraction/);
+			assert.match(result.content.find((item) => item.type === "text").text, /preserving first-use extraction/);
 		} finally {
 			await new Promise((resolve) => server.close(resolve));
 		}

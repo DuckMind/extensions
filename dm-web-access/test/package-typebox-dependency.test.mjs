@@ -8,7 +8,7 @@ import { test } from "node:test";
 
 const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 
-test("packed installs include typebox without peer dependencies", async () => {
+test("packed installs keep typebox as a peer dependency (hosted by pi at runtime)", async () => {
 	const tempDir = await mkdtemp(join(tmpdir(), "dm-web-access-pack-install-"));
 	try {
 		const packOutput = execFileSync("npm", ["pack", "--json", "--pack-destination", tempDir], {
@@ -23,18 +23,17 @@ test("packed installs include typebox without peer dependencies", async () => {
 		assert.ok(packedFiles.includes("SECURITY.md"));
 		assert.ok(!packedFiles.some((path) => path.startsWith("skills/")));
 		assert.ok(!packedFiles.some((path) => path.startsWith("test/")));
-		const tarball = join(tempDir, filename);
-
-		execFileSync("npm", ["install", "--omit=peer", "--ignore-scripts", "--no-audit", "--no-fund", tarball], {
+		// DM installs packages without peers and hosts typebox itself, so the package must not ship a private copy.
+		execFileSync("npm", ["install", "--omit=peer", "--ignore-scripts", "--no-audit", "--no-fund", join(tempDir, filename)], {
 			cwd: tempDir,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 
 		const packageRequire = createRequire(join(tempDir, "node_modules", "dm-web-access", "package.json"));
 		const installedManifest = packageRequire("dm-web-access/package.json");
-		assert.equal(installedManifest.peerDependencies?.typebox, undefined);
-		assert.match(installedManifest.dependencies?.typebox, /^\^1\./);
-		assert.match(packageRequire.resolve("typebox").replaceAll("\\", "/"), /node_modules\/typebox\//);
+		assert.equal(installedManifest.peerDependencies?.typebox, "*");
+		assert.equal(installedManifest.dependencies?.typebox, undefined);
+		assert.throws(() => packageRequire.resolve("typebox"), { code: "MODULE_NOT_FOUND" });
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
 	}

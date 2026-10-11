@@ -2,9 +2,9 @@
  * Persistent NDJSON trace of `pi.events` bus publish attempts
  * (`dmlens:files:touched` #482 / `dmlens:diagnostics` #502 /
  * `dmlens:diagnostic:disposition` / `dmlens:format:queued` +
- * `dmlens:format:start` + `dmlens:autofix:start` #673/#684 /
+ * `dmlens:format:start` + `dmlens:format:done` + `dmlens:autofix:start` #673/#684 /
  * `dm-lens/analysis-complete` + `dm-lens/findings` + `dm-lens/turn-findings`
- * #1415) — nine event names across five producers.
+ * #1415) — ten event names across five producers.
  *
  * All five producers (clients/bus-publish.ts, clients/diagnostics-publish.ts,
  * clients/disposition-publish.ts, clients/format-events-publish.ts,
@@ -22,8 +22,7 @@
  * This module gives bus events the same durable trace every other dm-lens
  * subsystem already has (latency.log, cascade.log, read-guard.log, ...) —
  * see clients/latency-logger.ts for the house pattern this mirrors exactly:
- * one shared `createNdjsonLogger` writer, `isTestMode()` no-op guard,
- * `getBusEventsLogPath()` for testability.
+ * one shared `createNdjsonLogger` writer, `isTestMode()` no-op guard.
  *
  * Logging volume: `emitted` and `emit_failed` are logged on every call —
  * they're the two outcomes an operator actually needs a per-event trace for.
@@ -59,18 +58,19 @@ const writer = createNdjsonLogger({
 	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
 });
 
-export type BusEventName =
+type BusEventName =
 	| "dmlens:files:touched"
 	| "dmlens:diagnostics"
 	| "dmlens:diagnostic:disposition"
 	| "dmlens:format:queued"
 	| "dmlens:format:start"
+	| "dmlens:format:done"
 	| "dmlens:autofix:start"
 	| "dm-lens/analysis-complete"
 	| "dm-lens/findings"
 	| "dm-lens/turn-findings";
 
-export type BusEventOutcome =
+type BusEventOutcome =
 	| "emitted"
 	| "skipped_unwired"
 	| "skipped_disabled"
@@ -176,13 +176,4 @@ export function emitBusEventRollupAtSessionEnd(cwd: string): void {
 		});
 	}
 	resetBusEventRollupCounts();
-}
-
-export function getBusEventsLogPath(): string {
-	return BUS_EVENTS_LOG_FILE;
-}
-
-/** Resolve once all enqueued bus-event writes are on disk (tests/shutdown). */
-export function flushBusEventsLog(): Promise<void> {
-	return writer.flush();
 }

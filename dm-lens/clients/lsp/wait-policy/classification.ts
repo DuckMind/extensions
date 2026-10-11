@@ -7,11 +7,16 @@
  */
 
 import { getServersForFileWithConfig } from "../config.js";
+import { isAuxiliary } from "../server-traits.js";
 import type { LSPService } from "../index.js";
 import { getStrategy } from "./strategies.js";
 import type { LSPCapabilitySnapshot } from "./capability-snapshot.js";
 
-export type CascadeWaitTier = "pull-capable" | "tier3-silent" | "waits";
+export type CascadeWaitTier =
+	| "pull-capable"
+	| "tier3-silent"
+	| "diagnostics-unsupported"
+	| "waits";
 
 /**
  * Classify a SINGLE server (by id, given its live capability snapshot — or
@@ -32,6 +37,14 @@ export function classifyServerWaitTier(
 
 	const mode = snapshot.workspaceDiagnosticsSupport?.mode;
 	if (mode === "pull") return "pull-capable";
+	if (
+		snapshot.customServer === true &&
+		mode === "push-only" &&
+		snapshot.diagnosticsUnsupported === true &&
+		snapshot.diagnosticsPublished !== true
+	) {
+		return "diagnostics-unsupported";
+	}
 	if (mode !== "push-only") return "waits";
 
 	const strategy = getStrategy(serverId, snapshot.launchVariant);
@@ -68,7 +81,7 @@ export function resolvePrimaryServerForWaitPolicy(
 	| { serverId: string; snapshot: LSPCapabilitySnapshot | undefined }
 	| undefined {
 	const servers = getServersForFileWithConfig(filePath).filter(
-		(s) => s.role !== "auxiliary",
+		(s) => !isAuxiliary(s),
 	);
 	const primary = servers[0];
 	if (!primary) return undefined;

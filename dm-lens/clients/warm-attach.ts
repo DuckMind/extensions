@@ -25,6 +25,10 @@ import {
 	WARM_CODE_ACTION_LOOKUP_LIMIT,
 	WARM_DIAGNOSTICS_SCHEMA_VERSION,
 } from "./mcp/ipc.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
 interface AttachState {
@@ -200,6 +204,33 @@ function startServer(cwd: string): void {
 	}
 	const server = net.createServer((socket) => {
 		socket.setEncoding("utf8");
+		// #3389: an ACCEPTED socket with no `error` listener rethrows, and
+		// `server.on("error")` below covers only the listener. A client that walks
+		// away while this incumbent is answering — every `requestWarmDiagnostics`
+		// timeout, schema refusal and validation refusal destroys its socket
+		// (`clients/mcp/ipc.ts:312`) — therefore turned a routine
+		// `read ECONNRESET` into an uncaught exception in THIS host, the same
+		// ending #3375 closed for an unbounded `data` handler. The handler does NOT
+		// tear the connection down: a real system failure has already destroyed the
+		// stream before this runs (measured: `destroyed` is true at entry), and an
+		// `error` emitted with no errno leaves a socket that is still answering
+		// (review round 1) — destroying that one would drop a live request. So the
+		// handler exists to keep the event catchable and to leave the peer's
+		// behavior visible in the ledger.
+		socket.on("error", (failure) => {
+			incrementDegradationCount({
+				// Subject is the errno, so one peer's repeated resets stay one row.
+				// No `?? "unknown"` fallback: `normalizeForLedger`
+				// (`clients/ledger-bounds.ts:29`) already maps a missing value to
+				// `"unknown"`, and a second copy of that rule here was a branch no
+				// mutation could red (#3389 review round 1, F3395-01) — an error
+				// emitted with no `code` is pinned end-to-end in
+				// `tests/clients/warm-attach-socket-error.test.ts`.
+				kind: "warm-attach-socket-error",
+				subject: (failure as NodeJS.ErrnoException).code,
+				reason: String(failure),
+			});
+		});
 		// One-shot per connection (#1219 family): the same defect shape as the
 		// MCP warm socket — clients write exactly one request and read one
 		// reply, so a handler that kept re-reading the same buffered line
@@ -207,18 +238,29 @@ function startServer(cwd: string): void {
 		// the line and ignores anything after it.
 		socket.on(
 			"data",
-			createWarmIpcLineReader((line) => {
-				void (async () => {
-					try {
-						const req = JSON.parse(line) as
-							| WarmDiagnosticsRequest
-							| WarmCodeActionsRequest;
-						socket.end(`${JSON.stringify(await serveRequest(req))}\n`);
-					} catch (error) {
-						socket.end(`${JSON.stringify({ error: String(error) })}\n`);
-					}
-				})();
-			}),
+			createWarmIpcLineReader(
+				(line) => {
+					void (async () => {
+						try {
+							const req = JSON.parse(line) as
+								| WarmDiagnosticsRequest
+								| WarmCodeActionsRequest;
+							socket.end(`${JSON.stringify(await serveRequest(req))}\n`);
+						} catch (error) {
+							socket.end(`${JSON.stringify({ error: String(error) })}\n`);
+						}
+					})();
+				},
+				{
+					label: "warm-attach-server",
+					// #3383: an unterminated request line is answered like any other
+					// unusable request rather than buffered without a ceiling.
+					onOverflow: () =>
+						socket.end(
+							`${JSON.stringify({ error: "warm request line exceeded the framing limit" })}\n`,
+						),
+				},
+			),
 		);
 	});
 	server.on("error", (error) => {
@@ -272,6 +314,21 @@ export async function tryWarmAttachedDiagnostics(
 		timeoutMs,
 	);
 	if (!result.available) {
+		// #3255 H1: a confirmed-alive incumbent whose endpoint has no listener is
+		// the upgrade-stranded shape — narrowing the workspace-id case fold
+		// renamed the socket, so a peer that registered before the upgrade is
+		// still serving the previous name. `promoteToLocal` alone left that in the
+		// latency log only; this is the entry `/lens-perf` renders. Bounded twice
+		// over: once per kind/subject by the ledger, and once per session by
+		// `promoteToLocal`'s latch, which returns early on every later call.
+		if (result.reason === "no-listener") {
+			recordDegradationOnce({
+				kind: "warm-ipc-endpoint-missing",
+				subject: diagnosticsIpcPathForCwd(state.cwd, state.incumbentPid),
+				reason:
+					"the registry confirms this incumbent is alive but nothing is listening on its derived endpoint — if dm-lens was upgraded while it was running, restart it",
+			});
+		}
 		promoteToLocal(result.reason);
 	} else {
 		record("diagnostics-served", file, undefined, state.incumbentPid, source);
@@ -323,6 +380,19 @@ export function _resetWarmAttachForTests(): void {
 	state.incumbentPid = undefined;
 	state.local = true;
 	state.servedDiagnosticHashes.clear();
+}
+
+/**
+ * The live diagnostics server, exposed for tests (#3389 review round 1,
+ * F3395-01). The `error` handler on an ACCEPTED socket has exactly one input
+ * channel — an `error` event on that socket — and a test cannot reach the
+ * socket any other way: it is created by `net.createServer` inside the closure
+ * above, and Node's ESM namespace for `node:net` is not configurable, so the
+ * factory cannot be wrapped from a test either. A test observes the server's
+ * own `connection` event through this accessor; nothing in production reads it.
+ */
+export function _warmAttachServerForTests(): net.Server | undefined {
+	return state.server;
 }
 
 export function _setWarmAttachForTests(

@@ -1,5 +1,7 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { logRunnerAdvisoryOnce, resolveRunnerCwd } from "../../tool-cwd.js";
 import {
 	getLinterPolicyForCwd,
 	hasStylelintConfig,
@@ -32,6 +34,7 @@ const stylelint = createAvailabilityChecker("stylelint", ".cmd");
 // exists to name.
 //
 // #1937 corrected the safety argument that used to sit here: it claimed a
+// EXIT TABLE (Stylelint 16 docs https://stylelint.io/user-guide/cli): 0 clean; 1 findings; 2 fatal/error; other nonzero rejected.
 // fatal stylelint "writes nothing to stdout", which is true but useless,
 // because a stylelint that DID find problems writes nothing to stdout either.
 // `stylelintReport` below is what now separates the two.
@@ -112,11 +115,23 @@ const STYLELINT_FIXABLE_RULES = new Set<string>([
 	"value-no-vendor-prefix",
 ]);
 
-function parseStylelintJson(raw: string, filePath: string): Diagnostic[] {
+function parseStylelintJson(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	try {
 		const results: StylelintResult[] = JSON.parse(raw);
 		const diagnostics: Diagnostic[] = [];
+		const absTarget = path.resolve(cwd, filePath);
 		for (const result of results) {
+			// #3295: stylelint keys each result by its own `source`; a config
+			// `files`/`overrides` entry or an `@import` makes that a DIFFERENT file.
+			if (
+				result.source &&
+				!pathsEqual(path.resolve(cwd, result.source), absTarget)
+			)
+				continue;
 			for (const w of result.warnings) {
 				const severity = w.severity === "error" ? "error" : "warning";
 				const fixable = STYLELINT_FIXABLE_RULES.has(w.rule);
@@ -150,7 +165,7 @@ const stylelintRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "stylelint");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("stylelint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -158,7 +173,12 @@ const stylelintRunner: RunnerDefinition = {
 		const fileDir = path.dirname(path.resolve(cwd, ctx.filePath));
 		const hasConfig = hasStylelintConfig(fileDir) || hasStylelintConfig(cwd);
 		if (!hasConfig) {
-			ctx.log("stylelint: no config detected, running with default rules");
+			logRunnerAdvisoryOnce(
+				ctx,
+				"stylelint",
+				cwd,
+				"stylelint: no config detected, running with default rules",
+			);
 		}
 
 		let cmd: string | null = null;
@@ -185,7 +205,7 @@ const stylelintRunner: RunnerDefinition = {
 		const run = parseToolRun(
 			"stylelint",
 			{ result, output: raw, exitCodes: STYLELINT_EXIT_CODES },
-			(out) => parseStylelintJson(out, ctx.filePath),
+			(out) => parseStylelintJson(out, ctx.filePath, cwd),
 		);
 		if (run.skipped) return run.skipped;
 

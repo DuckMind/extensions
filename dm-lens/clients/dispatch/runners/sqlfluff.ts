@@ -1,4 +1,7 @@
+import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { logRunnerAdvisoryOnce, resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd, hasSqlfluffConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -22,6 +25,7 @@ const sqlfluff = createAvailabilityChecker("sqlfluff", ".exe");
 // Only 2 is a rejected invocation.
 //
 // The exit TABLE is what protects this runner, not the nothing-to-parse rule:
+// EXIT TABLE (SQLFluff 3.1 docs https://docs.sqlfluff.com/en/stable/production.html): 0 clean; 1 findings/error; other nonzero rejected.
 // sqlfluff writes its user errors to STDOUT, not stderr (live: an unknown
 // dialect prints the error there), so stdout is non-empty and the fallback
 // rule would read the failed run as a run that found nothing.
@@ -97,14 +101,26 @@ const SQLFLUFF_FIXABLE_RULES = new Set<string>([
 	"ST02",
 ]);
 
-function parseSqlfluffOutput(raw: string, filePath: string): Diagnostic[] {
+function parseSqlfluffOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	if (!raw.trim()) return [];
 	try {
 		const parsed = JSON.parse(raw) as SqlfluffJson;
 		if (!Array.isArray(parsed)) return [];
 
 		const diagnostics: Diagnostic[] = [];
+		const absTarget = path.resolve(cwd, filePath);
 		for (const item of parsed) {
+			// #3295: sqlfluff's JSON is an array of FILES; a jinja `{% include %}`
+			// or a directory argv puts a second one in it.
+			if (
+				item.filepath &&
+				!pathsEqual(path.resolve(cwd, item.filepath), absTarget)
+			)
+				continue;
 			for (const v of item.violations ?? []) {
 				if (!v.description) continue;
 				const code = v.code ?? "SQL";
@@ -142,14 +158,19 @@ const sqlfluffRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "sqlfluff");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("sqlfluff")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 		const hasConfig = hasSqlfluffConfig(cwd);
 		if (!hasConfig) {
-			ctx.log("sqlfluff: no config detected, using ANSI dialect defaults");
+			logRunnerAdvisoryOnce(
+				ctx,
+				"sqlfluff",
+				cwd,
+				"sqlfluff: no config detected, using ANSI dialect defaults",
+			);
 		}
 
 		let cmd: string | null = null;
@@ -188,7 +209,7 @@ const sqlfluffRunner: RunnerDefinition = {
 		const run = parseToolRun(
 			"sqlfluff",
 			{ result, exitCodes: SQLFLUFF_EXIT_CODES },
-			(out) => parseSqlfluffOutput(out, ctx.filePath),
+			(out) => parseSqlfluffOutput(out, ctx.filePath, cwd),
 			{ parseOutput: result.stdout ?? "" },
 		);
 		if (run.skipped) return run.skipped;

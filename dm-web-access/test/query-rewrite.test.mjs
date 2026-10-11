@@ -39,8 +39,7 @@ test("rewriteSearchQuery uses the registered provider runtime", async () => {
 					};
 				},
 			},
-			cwd: process.cwd(),
-			isProjectTrusted: () => false,
+			scopedModels: [],
 		},
 		signal,
 	);
@@ -49,4 +48,53 @@ test("rewriteSearchQuery uses the registered provider runtime", async () => {
 	assert.equal(request.model, model);
 	assert.equal(request.options.signal, signal);
 	assert.match(request.context.messages[0].content[0].text, /Query: http status codes/);
+});
+
+test("rewriteSearchQuery skips models outside the host's resolved scope", async () => {
+	const haiku = { api: "custom-rewrite-api", provider: "anthropic", id: "claude-haiku-4-5", input: ["text"] };
+	const flash = { api: "custom-rewrite-api", provider: "google", id: "gemini-3.6-flash", input: ["text"] };
+	const used = [];
+	const result = await rewriteSearchQuery(
+		"http status codes",
+		{
+			modelRegistry: {
+				find: (provider, id) => [haiku, flash].find(model => model.provider === provider && model.id === id),
+				getAvailable: () => [haiku, flash],
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
+				complete: async (calledModel) => {
+					used.push(`${calledModel.provider}/${calledModel.id}`);
+					return { stopReason: "stop", content: [{ type: "text", text: "rewritten" }] };
+				},
+			},
+			scopedModels: [{ model: flash }],
+		},
+		new AbortController().signal,
+	);
+
+	assert.equal(result, "rewritten");
+	assert.deepEqual(used, ["google/gemini-3.6-flash"]);
+});
+
+test("rewriteSearchQuery uses a model whose provider authenticates without an API key", async () => {
+	const haiku = { api: "custom-rewrite-api", provider: "anthropic", id: "claude-haiku-4-5", input: ["text"] };
+	const used = [];
+	const result = await rewriteSearchQuery(
+		"http status codes",
+		{
+			modelRegistry: {
+				find: (provider, id) => (provider === haiku.provider && id === haiku.id ? haiku : undefined),
+				getAvailable: () => [haiku],
+				getApiKeyAndHeaders: async () => ({ ok: true }),
+				complete: async (calledModel) => {
+					used.push(`${calledModel.provider}/${calledModel.id}`);
+					return { stopReason: "stop", content: [{ type: "text", text: "rewritten" }] };
+				},
+			},
+			scopedModels: [],
+		},
+		new AbortController().signal,
+	);
+
+	assert.equal(result, "rewritten");
+	assert.deepEqual(used, ["anthropic/claude-haiku-4-5"]);
 });

@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { pathsEqual } from "../../path-utils.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -9,6 +11,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 const dotnet = createAvailabilityChecker("dotnet", ".exe");
 
@@ -102,17 +105,21 @@ function parseDotnetDiagnosticLine(line: string): DotnetDiagnosticLine | null {
 	return { reportedFile, lineStr, colStr, severityLabel, rule, message };
 }
 
-function parseDotnetBuildOutput(raw: string, filePath: string): Diagnostic[] {
+function parseDotnetBuildOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const line of raw.split(/\r?\n/)) {
 		const parsed = parseDotnetDiagnosticLine(line);
 		if (!parsed) continue;
 
 		const { reportedFile, lineStr, colStr, severityLabel, rule, message } =
 			parsed;
-		const resolvedReported = path.resolve(reportedFile);
-		const resolvedTarget = path.resolve(filePath);
-		if (resolvedReported !== resolvedTarget) continue;
+		// #3278: one seam for reported-path attribution — see javac.ts.
+		if (!pathsEqual(path.resolve(cwd, reportedFile), absTarget)) continue;
 
 		const severity =
 			severityLabel.toLowerCase() === "error" ? "error" : "warning";
@@ -143,7 +150,7 @@ const dotnetBuildRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "dotnet-build");
 		if (!(await dotnet.isAvailableAsync(cwd))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
@@ -168,26 +175,30 @@ const dotnetBuildRunner: RunnerDefinition = {
 		);
 		const raw = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
 
-		if (result.status === 0 && !raw) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const diagnostics = parseDotnetBuildOutput(raw, ctx.filePath);
-		if (diagnostics.length === 0) {
-			return {
-				status: result.status === 0 ? "succeeded" : "failed",
-				diagnostics: [],
-				semantic: "warning",
-				rawOutput: raw,
-			};
-		}
-
-		const hasErrors = diagnostics.some((d) => d.severity === "error");
-		return {
-			status: hasErrors ? "failed" : "succeeded",
-			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
-		};
+		const parsed = parseToolRun(
+			"dotnet-build",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (.NET SDK 8 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(output) => parseDotnetBuildOutput(output, ctx.filePath, cwd),
+		);
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "dotnet-build",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+			classify: (diagnostics) => {
+				const hasErrors = diagnostics.some((d) => d.severity === "error");
+				return {
+					status: hasErrors ? "failed" : "succeeded",
+					semantic: hasErrors ? "blocking" : "warning",
+				};
+			},
+		});
 	},
 };
 

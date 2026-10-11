@@ -1,6 +1,9 @@
+import { execFile } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { createRequestHeadersCommandFetch } from "../request-headers-command.ts";
 
@@ -53,6 +56,54 @@ process.stdin.on("end", () => {
 `;
 
 describe("per-request HTTP header commands", () => {
+  it.each(["init", "Request"])("aborts a streamed response after garbage collection using the %s signal", async mode => {
+    await promisify(execFile)(process.execPath, [
+      "--expose-gc",
+      "--import", "tsx",
+      fileURLToPath(new URL("./fixtures/request-headers-stream.ts", import.meta.url)),
+      mode,
+    ], { timeout: 10_000 });
+  }, 15_000);
+
+  it("uses the init signal override instead of the input Request signal", async () => {
+    const script = commandScript('process.stdout.write("{}");\n');
+    const inputController = new AbortController();
+    const overrideController = new AbortController();
+    const input = new Request("https://mcp.example.test/mcp", { signal: inputController.signal });
+    let forwardedSignal: AbortSignal | null | undefined;
+    const fetch = createRequestHeadersCommandFetch(
+      { command: process.execPath, args: [script] },
+      async (_input, init) => {
+        forwardedSignal = init?.signal;
+        return new Response("ok");
+      },
+    );
+
+    await fetch(input, { signal: overrideController.signal });
+    inputController.abort();
+    expect(forwardedSignal?.aborted).toBe(false);
+    overrideController.abort();
+    expect(forwardedSignal?.aborted).toBe(true);
+  });
+
+  it("detaches the input Request signal for an explicit null override", async () => {
+    const script = commandScript('process.stdout.write("{}");\n');
+    const controller = new AbortController();
+    const input = new Request("https://mcp.example.test/mcp", { signal: controller.signal });
+    let forwardedSignal: AbortSignal | null | undefined;
+    const fetch = createRequestHeadersCommandFetch(
+      { command: process.execPath, args: [script] },
+      async (_input, init) => {
+        forwardedSignal = init?.signal;
+        return new Response("ok");
+      },
+    );
+
+    controller.abort();
+    await fetch(input, { signal: null });
+    expect(forwardedSignal?.aborted).toBe(false);
+  });
+
   it("derives headers from the exact request and preserves existing headers", async () => {
     const script = commandScript(readEnvelope);
     let forwarded: Request | undefined;
@@ -196,25 +247,35 @@ setTimeout(() => {
     const marker = join(mkdtempSync(join(tmpdir(), "pi-mcp-request-headers-")), "marker");
     const helper = commandScript(`
 import { writeFileSync } from "node:fs";
-setTimeout(() => {
-  writeFileSync(${JSON.stringify(marker)}, "alive");
-}, 150);
+writeFileSync(${JSON.stringify(marker)}, String(process.pid));
 setInterval(() => {}, 1000);
 `);
     const script = commandScript(`
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 spawn(process.execPath, [${JSON.stringify(helper)}], { stdio: "ignore" }).unref();
-setTimeout(() => {
+const ready = setInterval(() => {
+  if (!existsSync(${JSON.stringify(marker)})) return;
+  clearInterval(ready);
   process.stdout.write("not-json");
-}, 75);
+}, 10);
 `);
     const fetch = createRequestHeadersCommandFetch({ command: process.execPath, args: [script] });
 
     await expect(fetch("https://mcp.example.test/mcp")).rejects.toThrow(
       "HTTP request headers command returned invalid JSON",
     );
-    await delay(220);
-    expect(existsSync(marker)).toBe(false);
+    // The helper wrote its marker before cleanup; its PID must not survive the request.
+    const pid = Number(readFileSync(marker, "utf8"));
+    await expect.poll(() => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+        throw error;
+      }
+    }, { interval: 25, timeout: 2000 }).toBe(false);
   });
 
   it("kills a command that keeps running after timeout", async () => {

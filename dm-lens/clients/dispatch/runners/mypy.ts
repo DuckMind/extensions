@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { hasMypyConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -25,7 +26,8 @@ const mypy = createAvailabilityChecker("mypy", "");
 // [syntax]`). A bad flag or unreadable config also exits 2, but writes its
 // message to STDERR and leaves stdout empty.
 //
-// So the exit code cannot separate the two, and the STREAM does: the gate below
+// EXIT TABLE (mypy 1.11 docs https://mypy.readthedocs.io/en/stable/command_line.html): 0 clean; 1 findings; 2 findings/error; other
+// nonzero rejected. The exit code cannot separate the two, and the STREAM does:
 // judges "nothing to parse" on stdout alone, while the parser still reads both.
 // The table's remaining job is to reject any OTHER nonzero status.
 const MYPY_EXIT_CODES: ToolExitCodes = { ran: [1, 2] };
@@ -80,7 +82,7 @@ const mypyRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "mypy");
 
 		// Only run if mypy config exists — avoids false positives in untyped projects
 		if (!hasMypyConfig(cwd)) {

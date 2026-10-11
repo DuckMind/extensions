@@ -3,12 +3,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { incrementDegradationCount } from "../../degradation-ledger.js";
 import { safeSpawnAsync, type SpawnResult } from "../../safe-spawn.js";
+import { probeToolAsync } from "../../tool-probe.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import type {
 	Diagnostic,
 	DispatchContext,
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 import { PRIORITY } from "../priorities.js";
 import {
 	type AvailabilityCause,
@@ -50,13 +53,20 @@ const PS_TIMEOUT_MS = 30000;
  * available". `safeSpawnAsync` carries the standard taxonomy — `failure`,
  * `spawnFailure.kind` and the errno on `error` — which is what lets the
  * availability policy tell a stall from an absence.
+ *
+ * The two presence probes that used to share this wrapper now go through
+ * `probeToolAsync` (#2894), so the only spawn left here is the ANALYSIS pass
+ * — which always has a project to resolve `PSScriptAnalyzerSettings.psd1`
+ * against. `cwd` is required to keep it that way.
  */
 function spawnPs(
 	cmd: string,
 	args: string[],
-	timeoutMs = PS_TIMEOUT_MS,
+	options: { timeoutMs?: number; cwd: string },
 ): Promise<SpawnResult> {
+	const { timeoutMs = PS_TIMEOUT_MS, cwd } = options;
 	return safeSpawnAsync(cmd, args, {
+		cwd,
 		timeout: timeoutMs,
 		resourceLabel: "psscriptanalyzer",
 	});
@@ -179,12 +189,11 @@ async function resolvePowerShellCmd(): Promise<string | null> {
 	for (const candidate of ["pwsh", "powershell"]) {
 		const sampler = startHostStallSampler();
 		const startedAt = Date.now();
-		const result = await spawnPs(candidate, [
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			"exit 0",
-		]);
+		const result = await probeToolAsync(
+			candidate,
+			["-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+			{ timeout: PS_TIMEOUT_MS, resourceLabel: "psscriptanalyzer" },
+		);
 		const hostStallMs = sampler.stop();
 		const elapsedMs = Date.now() - startedAt;
 		elapsedTotalMs += elapsedMs;
@@ -230,12 +239,16 @@ async function checkModuleAvailable(cmd: string): Promise<boolean> {
 
 	const sampler = startHostStallSampler();
 	const startedAt = Date.now();
-	const result = await spawnPs(cmd, [
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		"if (Get-Module -ListAvailable PSScriptAnalyzer) { exit 0 } else { exit 1 }",
-	]);
+	const result = await probeToolAsync(
+		cmd,
+		[
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			"if (Get-Module -ListAvailable PSScriptAnalyzer) { exit 0 } else { exit 1 }",
+		],
+		{ timeout: PS_TIMEOUT_MS, resourceLabel: "psscriptanalyzer" },
+	);
 	const hostStallMs = sampler.stop();
 	const elapsedMs = Date.now() - startedAt;
 	if (!result.error && result.status === 0) {
@@ -349,7 +362,7 @@ const psScriptAnalyzerRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "psscriptanalyzer");
 		const absPath = path.resolve(cwd, ctx.filePath);
 
 		// Write script to temp file so we avoid cmd.exe quoting entirely
@@ -359,14 +372,18 @@ const psScriptAnalyzerRunner: RunnerDefinition = {
 		try {
 			const sampler = startHostStallSampler();
 			const startedAt = Date.now();
-			const result = await spawnPs(cmd, [
-				"-NoProfile",
-				"-NonInteractive",
-				"-File",
-				tmpScript,
-				"-FilePath",
-				absPath,
-			]);
+			const result = await spawnPs(
+				cmd,
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-File",
+					tmpScript,
+					"-FilePath",
+					absPath,
+				],
+				{ timeoutMs: PS_TIMEOUT_MS, cwd },
+			);
 			const hostStallMs = sampler.stop();
 			const elapsedMs = Date.now() - startedAt;
 
@@ -497,11 +514,10 @@ const psScriptAnalyzerRunner: RunnerDefinition = {
 			}
 
 			const hasErrors = diagnostics.some((d) => d.severity === "error");
-			return {
+			return findingsResult(diagnostics, {
 				status: hasErrors ? "failed" : "succeeded",
-				diagnostics,
 				semantic: hasErrors ? "blocking" : "warning",
-			};
+			});
 		} finally {
 			await fs.unlink(tmpScript).catch(() => {});
 		}

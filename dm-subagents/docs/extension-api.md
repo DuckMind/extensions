@@ -2,6 +2,97 @@
 
 Public seams for other DM extensions and host integrations: the in-process RPC, the structured delegation API, launch preflight, capability ceilings, the background-work provider contract, and the Herdr integration.
 
+## Trusted workflow resources
+
+Loaded trusted TypeScript extensions can import `registerWorkflowResource` from `dm-subagents/workflow-resources`. This subpath does not load the main extension and exposes no resolver or permit constructor. Its exported types are `RegisterWorkflowResourceInput`, `WorkflowResourceDefinition`, and `WorkflowResourceRegistration`:
+
+```typescript
+registerWorkflowResource({
+  sessionId: string,
+  definition: {
+    name: string,
+    version: number,
+    resolve(args: Readonly<Record<string, unknown>>):
+      | { script: string; hostCommands?: readonly { key: string; command: string }[] }
+      | { error: string },
+  },
+}): { dispose(): void }
+```
+
+Names are case-sensitive, at most 128 characters, and match `[A-Za-z0-9][A-Za-z0-9._-]*`; use an extension prefix. Versions are positive safe integers. Registration throws for invalid input, protected builtins (`review`, `run-ci`, `parallel`, and `chain` and `tasks`, which back the tool's structured inputs), or duplicate names within the same session. Different sessions may register the same name. Dispose before replacement; there is no silent overwrite.
+
+Register in `session_start` using **`ctx.sessionManager.getSessionId()`**, not the session file path or a tool argument. Dispose in `session_shutdown`. New/resumed/forked sessions and reloads need registration from the replacement runtime's `session_start`; do not retain old `dm`/`ctx` references. The extension owns cleanup, not an automatic registration lifecycle manager. Disposal is idempotent and cannot remove a newer replacement. Missing cleanup can cause a duplicate-registration failure on reload.
+
+`resolve` must do synchronous, bounded validation and string construction, without I/O, SDK calls, timers or process work. Core deep-copies plain JSON args: at most 16 KiB encoded, nesting depth 8, 16 fields per object, 64 items per array, finite numbers, and nonempty strings of at most 16 KiB. The extension must additionally reject unsupported fields and validate resource-specific semantics. Throws, promises/thenables and malformed expansions fail before authority is issued; errors are bounded to 4096 characters.
+
+Host grants bind **exact key/trimmed-command pairs**, not independent sets of keys and commands. At most 32 grants are accepted, with unique safe workflow keys and nonempty commands bounded to 16 KiB without NUL. Omitted grants give no host authority. Core snapshots the expansion and grants at resolution. Disposing stops future lookup, but already-admitted workflows retain captured grants, even after replacement. Use existing stop/deadline controls for cancellation; this does not promise survival of host shutdown or durable named scheduling. Existing child admission and capability ceilings still apply.
+
+### Mixed child and finite host example
+
+This extension owns two fixed commands; `scripts/finite-check.mjs` must be an existing trusted finite helper in the workflow cwd. It runs a reviewer first, then a check. No command or flags come from free-form public args.
+
+```typescript
+import type { ExtensionAPI } from "@duckmind/dm-coding-agent";
+import { registerWorkflowResource } from "dm-subagents/workflow-resources";
+
+export default function (dm: ExtensionAPI) {
+  let registration: { dispose(): void } | undefined;
+  dm.on("session_start", (_event, ctx) => {
+    registration?.dispose();
+    registration = registerWorkflowResource({
+      sessionId: ctx.sessionManager.getSessionId(),
+      definition: {
+        name: "acme.review-check",
+        version: 1,
+        resolve(args) {
+          if (Object.keys(args).some(k => k !== "task" && k !== "check"))
+            return { error: "Only task and check are supported." };
+          if (typeof args.task !== "string" || !args.task.trim() || args.task.length > 4000)
+            return { error: "task must contain 1–4000 characters." };
+          if (args.check !== "quick" && args.check !== "full")
+            return { error: "check must be quick or full." };
+          const command = args.check === "quick"
+            ? "node ./scripts/finite-check.mjs --mode quick"
+            : "node ./scripts/finite-check.mjs --mode full";
+          const host = { kind: "command", command, timeoutMs: 120000 };
+          return {
+            hostCommands: [{ key: "check", command }],
+            script: `
+              const review = await runs.run("review", {
+                agent: "reviewer", task: ${JSON.stringify(args.task)}
+              });
+              if (!review.ok) throw new Error("Review child failed");
+              const check = await runs.host("check", ${JSON.stringify(host)});
+              return { review: review.output, check };
+            `,
+          };
+        },
+      },
+    });
+  });
+  dm.on("session_shutdown", () => {
+    registration?.dispose();
+    registration = undefined;
+  });
+}
+```
+
+Invoke through the public `subagent` tool (use `async: false` for foreground):
+
+```json
+{
+  "workflow": "acme.review-check",
+  "args": { "task": "Review the current change; return findings only.", "check": "quick" },
+  "async": true
+}
+```
+
+The parent evaluates child findings and ordinary command logs/status/terminal receipts; child success is not approval or proof of a clean review. The timeout above bounds the host command, not the whole workflow.
+
+**Trust boundary:** this API composes already-loaded trusted code; it is neither authentication nor a sandbox. Session IDs scope lookup, not authorization between malicious extensions. Core owns opaque permits and provenance; caller-supplied issuer/trust/permit metadata cannot grant authority. Raw public scripts and script paths do not gain host authority, and registration is not an arbitrary-command entry point for public args.
+
+The existing shell runner uses workflow cwd and inherited environment. Exact matching does not pin PATH resolution, executable bytes, repository helpers, or credentials. Those remain operator/extension trust responsibilities. `JSON.stringify` embeds data in JavaScript source; **it is not shell escaping**. Keep commands fixed as above, or validate strictly bounded numeric/hex tokens before binding known positions; never concatenate arbitrary task text or flags into shell commands. No new runner, cwd confinement, CI/merge policy, or SDK lifecycle framework is provided.
+
 ## In-process event-bus RPC
 
 Other DM extensions can use the in-process event-bus RPC instead of scraping slash output or calling internal modules. Listen for `subagents:rpc:v1:ready`, send requests on `subagents:rpc:v1:request`, and read replies from `subagents:rpc:v1:reply:<requestId>`.
@@ -17,21 +108,22 @@ dm.events.emit("subagents:rpc:v1:request", {
   requestId,
   method: "spawn",
   params: {
-    workflowScript: `return runs.run("main", { agent: "reviewer", task: "Review the current diff" })`,
+    script: `return runs.run("main", { agent: "reviewer", task: "Review the current diff" })`,
     context: "fresh"
   }
 });
 ```
 
-The RPC methods are `ping`, `status`, `manage`, `spawn`, `steer`, `interrupt`, `stop`, and `resume`. `status`, `manage`, `steer`, `interrupt`, and `resume` reuse normal package-owned actions.
+The RPC methods are `ping`, `status`, `manage`, `spawn`, `steer`, `interrupt`, `stop`, `resume`, and `cost`. `status`, `manage`, `steer`, `interrupt`, and `resume` reuse normal package-owned actions.
 
 Method notes:
 
 - `manage` exposes a narrow schedule-only allowlist: `schedule.list`, `schedule.show`, `schedule.history`, `schedule.pause`, `schedule.resume`, `schedule.run`, and `schedule.delete`. All actions except `schedule.list` require `id`. Mission, agent, config, worktree, and arbitrary management actions are rejected before executor dispatch. `ping.capabilities.managementActions` advertises the exact allowlist.
-- `spawn` accepts structured single-child execution (`agent`, `task?`), inline `workflowScript`, or `workflowScriptPath` and is async-only: omit `async` or set `async: true`, omit `clarify`, and do not pass management `action` values. Relative script paths resolve against the request `cwd`. It goes through the same executor as the `subagent` tool, so agent discovery, validation, session attribution, configured spawn caps, child-safety depth, artifacts, and async status all behave the same.
+- `spawn` accepts structured single-child execution (`agent`, `task?`), inline script text as `script`, or `workflow` with a script path (containing `/`, such as `"./ci/sweep.js"`) or a named workflow resource. `workflow: true` is rejected because RPC requests have no assistant reply to read a block from; the removed `workflowScript` and `workflowScriptPath` fields are rejected with errors naming `script` and `workflow`. Spawn is async-only: omit `async` or set `async: true`, omit `clarify`, and do not pass management `action` values. Relative script paths resolve against the request `cwd`. It goes through the same executor as the `subagent` tool, so agent discovery, validation, session attribution, configured spawn caps, child-safety depth, artifacts, and async status all behave the same.
 - `steer` requires an async run `id` (plus optional child `index`) and a non-empty `message`; its reply preserves the normal acknowledged-delivery result. Optional `mode` values are `steer` (default), `follow_up`, and `auto`, and receipts include `deliveryStatus: "delivered" | "queued"`. RPC steering disables the direct tool's pause-and-revive recovery in every mode so an extension keeps authority over the exact child it spawned; `ping.capabilities.nonRecoveringSteer` advertises this guarantee.
 - `resume` requires a run target and non-empty `message`. It delegates to the existing revival path, which validates current-session ownership, persisted session/recovery metadata, stopped/live state, capability ceilings, and the exclusive session lease before returning the new async run details. Callers may request a `file-only` output path for the revived result without overriding its model, tools, or budgets. `ping.capabilities.resume` advertises this seam.
-- `stop` targets current-session top-level async runs through the stop control channel and records a `stopped` lifecycle instead of reporting a timeout.
+- `cost` returns the same parent-plus-child accounting `/subagent-cost` renders, as data: `{ version: 1, parent, children, childTotal, total, unresolvedAsyncChildren }`, where each usage is `{ input, output, cacheRead, cacheWrite, cost, turns }` and each child carries `label`, `agent`, `runId`, `usage`, and `sessionFile` when known. It is read-only and walks the current session branch plus existing run artifacts, so request it on your own turn boundaries (for example after `agent_settled` or an async completion wake), not on a timer. `unresolvedAsyncChildren` counts async children whose metadata could not be read; treat `childTotal` as a lower bound when it is non-zero, exactly as documented for `/subagent-cost` in [observability.md](observability.md). `ping.capabilities.cost` advertises `{ version: 1 }`.
+- `stop` accepts current-session running or queued async runs and whole paused runs. Paused runs are sealed only with exact observed native runner-terminal proof; missing or unknown proof returns an error even if a stop request was persisted. A successful reply's `state: "stopping"` acknowledges the stop operation for the exact run, not its current lifecycle or retirement. Read status and process-terminal evidence to establish termination. Child-scoped stop remains limited to pending or running children of eligible runs; already-terminal targets are rejected.
 - `status` keeps targeted and rich requests on the executor-backed path. A request with no `id`, `runId`, `dir`, `index`, `view`, or `lines` may use the restored in-memory projections and a short summary; when the live state is missing, stale, session-mismatched, or not restored, it falls back to normal executor status. Status `view`, `lines`, and `index` are forwarded for targeted transcript/fleet requests. Successful replies retain `text`, `details`, `fleet`, and `asyncSnapshot`; the short summary intentionally omits canonical filesystem details, wait subscriptions, and budget annotations.
 
 Capability advertisements on `ping`:
@@ -45,8 +137,23 @@ Capability advertisements on `ping`:
 - `resume` — the revival seam described above.
 - `statusProjection: { version: 1, untargeted: "in-memory-when-ready", targeted: "executor" }` — untargeted status may use restored bounded projections; targeted or rich status remains executor-backed.
 - `fleetStatus: { version: 1 }` — successful `status` replies additionally include `data.fleet`.
+- `cost: { version: 1 }` — the `cost` method is available and returns the versioned report shape above.
 
 Structured delegation progress updates carry `runId` as soon as foreground execution allocates it, so a caller can retain the package-owned revival target even if its own tool turn is interrupted before the terminal response. Foreground `details.results[]` rows also include a numeric `index` that is unique within the run and stable across partial progress snapshots and the final result; use `(runId, index)` instead of row position to correlate single, counted parallel, and chain children.
+
+### Direct async launch correlation
+
+Direct async runs retain their originating `toolCallId` in status and result
+artifacts. After a lost RPC spawn reply, request `status` with
+`id: "rpc-spawn-<original-requestId>"`. The raw request UUID is not a run ID.
+Default targeted replies expose the resolved `runId` and retained `toolCallId`
+in `data.details`; older artifacts can omit the latter.
+
+Lookup uses the existing run indexes and retained artifacts. Terminal indexing
+keeps the alias after result delivery while the run's status is retained.
+Correlation is not idempotent spawn: multiple runs with one alias are ambiguous, and missing or
+expired evidence never proves that execution did not start. Do not redispatch
+on that basis.
 
 ### Fleet status DTO
 
@@ -97,9 +204,11 @@ const registration = request.result.registration;
 
 If `dm-subagents` is a resolvable dependency of the consumer package, `dm-subagents/agents` exports `RUNTIME_AGENT_REGISTER_EVENT`, the request/result types, and `registerAgentViaEvents()` for the same contract. A separately installed DM package is not automatically a Node dependency of another package. In that case, use the event contract directly instead of a runtime import. A type-only development dependency is optional.
 
+A registered agent follows the operator's subagent model settings like any other agent: `subagents.defaultModel`, `defaultProvider`, and `defaultThinking` fill a definition that omits `model` or `thinking`, and the `model`, `defaultProvider`, `fast`, and `thinking` fields of `agentOverrides.<name>` win over the definition. Every other definition field stays extension-owned, and other override fields are ignored for runtime agents. Set `model` in the definition only when the agent must not follow operator model settings; `model: "inherit"` selects the parent session model explicitly.
+
 The installed owner applies the existing runtime-agent validation, collision checks, limits, runtime source metadata, and cleanup. If more than one owner listens, the first handler that writes `request.result` wins. Unsupported versions, malformed requests, and registration failures return `{ ok: false, error }`. No result means no compatible owner handled the event.
 
-This contract is process-local. It does not register agents in child processes or other DM processes, and it does not change package discovery or package resolution.
+This contract is process-local. It does not register agents in child sessions or other DM processes, and it does not change package discovery or package resolution.
 
 ## External jobs in FleetView
 
@@ -135,7 +244,7 @@ unregisterExternalRun(ctx.sessionManager.getSessionId(), "dependency-review");
 
 The API validates and caches bounded display fields when the caller registers or updates a job. FleetView reads that cache only. It does not poll caller code. `snapshotExternalRuns(sessionId)` and `listExternalRuns(sessionId)` return bounded current-session snapshots. Snapshots filter the session-qualified cache key before inspecting record fields; API-written records avoid repeated normalization through module-private provenance, while records replaced or mutated through the process-local registry are validated on demand. By default, malformed records for the requested session throw with the validation error. Display-only Fleet callers can pass `{ ignoreMalformed: true, onMalformedRecord }` to remove bad records and keep rendering with a programmatic diagnostic.
 
-External jobs are observational. The caller owns execution, persistence, cancellation, and result delivery. FleetView does not expose stop, steer, resume, cancel, or Herdr controls for them. Supplied report and transcript paths are shown as bounded text only; FleetView does not read arbitrary external paths.
+External jobs are observational. The caller owns execution, persistence, cancellation, and result delivery. FleetView does not expose stop, steer, resume, cancel, or inspector controls for them. Supplied report and transcript paths are shown as bounded text only; FleetView does not read arbitrary external paths.
 
 ## Launch contract preflight
 
@@ -155,7 +264,8 @@ const result = await resolveSubagentLaunchContract({
 
 if (!result.ok) {
   // missing_agent, ambiguous_agent, missing_skill, denied_required_tool,
-  // invalid_artifact_dir, invalid_cwd, or unsupported_mode
+  // invalid_artifact_dir, invalid_cwd, unsupported_mode, restricted_agent,
+  // thinking_ceiling, model_scope, invalid_extension_bindings, or invalid_intercom_bridge
   throw new Error(result.message);
 }
 
@@ -165,11 +275,19 @@ console.log(result.contract.digest, result.contract.tools.effectiveAllowlist);
 Preflight covers ordinary single-agent launch resolution:
 
 - Selected agent identity and shadowed candidates.
-- A parsed-definition digest, including system prompt and launch-affecting model, tool, skill, extension, output, and memory fields.
-- Fresh/fork context, effective model and thinking, skill and tool resolution, direct MCP selections, runtime/configured extensions.
+- A parsed-definition digest, including system prompt and launch-affecting model, tool, skill, extension, output, and memory fields. Runtime overlays such as the Intercom bridge never change it.
+- Fresh/fork context, effective model and thinking, skill and tool resolution, direct MCP selections, runtime/configured extensions. Pass your extension's `dm` as `runtimeSnapshotHost` so `mcp:` selections resolve against DM's built-in MCP the way a launch does. Without it, preflight cannot see built-in MCP and resolves `mcp:` selections through dm-mcp-adapter's configuration, as before.
+- Model scope allow lists accept the reserved tokens `inherit` and `scoped`; `scoped` expands to the caller-supplied `scopedModelIds` snapshot, degrading to `inherit` when it is omitted. Callers whose `modelScope.allow` uses `scoped` must pass `scopedModelIds` (the session's `/scoped-models` snapshot) alongside `parentModel`, otherwise preflight resolves it as `inherit` and may reject models the actual launch allows.
+- Pass `projectTrusted: ctx.isProjectTrusted()` to match a session that declined project trust. With `false`, project agents and project subagent settings are ignored and an explicit `agentScope: "project"` returns `restricted_agent`. It defaults to `true`.
+- The resolved Intercom bridge state (`intercomBridge.mode` and `intercomBridge.active`). An active bridge appends the bridge instruction to the child prompt and adds `contact_supervisor` to a declared tool list, exactly as execution does.
 - Artifact/session paths, async lifecycle/status/result/event/process-terminal paths, package/lifecycle versions, capability-ceiling audit data, and stable digests.
 
-`launchContractDigest` is the canonical digest of the caller task, effective system prompt, model candidates, effective tools/extensions/MCP (including inherited capability ceilings), output binding, and structured-output schema that ordinary foreground and async execution report in results/status/events and metadata.
+`launchContractDigest` is the canonical digest of the caller task, effective system prompt (including an active bridge instruction), model candidates, effective tools/extensions/MCP (including inherited capability ceilings and the bridge tool), output binding, and structured-output schema that ordinary foreground and async execution report in results/status/events and metadata. Preflight and each execution path that reports the digest assemble it through one shared binding, so equal inputs produce equal digests.
+
+Bridge inputs:
+
+- `intercomBridge` replaces the global `intercomBridge` config for this launch, with the same semantics as the `subagent` tool and delegation overrides. Pass the same value to the launch you compare against. Preflight reads the global config from disk on each call while the running extension keeps the config it loaded at startup, so pass the override when the digest must not depend on that file.
+- The default bridge instruction never names the parent session, so most hosts need no further input. When the configured `instructionFile` interpolates `{orchestratorTarget}`, preflight reports a `host_required` diagnostic unless the host supplies a non-empty `orchestratorTarget`; the executor derives that target with `resolveIntercomSessionTarget` from `dm-subagents/intercom-bridge`, given the parent session name and id.
 
 Boundaries:
 
@@ -231,12 +349,15 @@ Identity:
 Results:
 
 - Result mode is explicit. Text remains literal even when it looks like JSON. Structured mode returns the separately captured, schema-validated JSON value.
-- Terminal usage reports input, output, cache-read, cache-write, cost, turns, tool calls, and duration alongside the effective model and thinking level when known.
+- Terminal usage reports input, output, cache-read, cache-write, cost, turns, tool calls, and duration alongside the effective model and thinking level when known. Native child totals are reconciled per attempt from post-prompt session messages: complete persisted fields replace live aggregates, while incomplete fields retain them.
+
+Live update events are bounded progress snapshots, not patches, so consumers should replace the prior snapshot rather than merge it as a delta. Structured delegation coalesces heartbeats whose delegation-visible progress and recent output are unchanged; a duration-only heartbeat therefore does not produce another update. The terminal response remains authoritative for the complete result, error, and final usage details.
 
 Bounds:
 
 - Schemas are capped at 64 KiB; tasks and returned text/structured values are capped at 1 MiB, with smaller bounds on identity/configuration strings and a maximum `timeoutMs` of 2,147,483,647.
 - Structured delegation accepts `toolBudget: { hard: 0, block: "*" }` to block the first tool call and run a zero-tool leaf; ordinary model-facing/configured budgets keep their existing minimum of one.
+- `intercomBridge` optionally replaces the global bridge config for one delegation, for example `{ mode: "off" }` when no supervisor session will answer the child. Pass the same value to `resolveSubagentLaunchContract` to compare `launchContractDigest` against the terminal response.
 - The foreground bridge retains up to 8,192 exact pending-cancellation and settled-attempt identities per extension context. If either history fills, it fails closed with `unavailable_context` for later starts rather than evicting identity facts; lifecycle reset clears the bounded history.
 
 Constraints:
@@ -307,7 +428,9 @@ Semantics:
 - Providers share a registry through `Symbol.for("dm-subagents.background-work.v1")`, allowing independently loaded extension modules to meet in one DM process.
 - Registration is reload-safe: a new provider with the same name replaces the old callback, and the old disposer cannot remove the replacement. Call the disposer during extension shutdown when possible.
 
-Child processes do not gain provider tools or extensions automatically. Add `bg_wait` to the child agent's `tools` allowlist (or the deprecated `subagent_wait` compatibility alias) and load each provider through `extensions` or `subagentOnlyExtensions`. The parent's effective `waitTool` setting is serialized through foreground, async, resume, chain, parallel, and fanout launch paths; `DM_SUBAGENT_WAIT_TOOL_ENABLED` keeps precedence.
+Children do not gain provider tools or extensions automatically. Add `bg_wait` to the child agent's `tools` allowlist and load each provider through `extensions` or `subagentOnlyExtensions`. The parent's effective `waitTool` setting reaches every child through its typed runtime config; `DM_SUBAGENT_WAIT_TOOL_ENABLED` keeps precedence in the parent.
+
+Local foreground children never load the parent's ambient extensions: they share the parent's process, and loading them would start a second copy of every ambient extension, including this one, inside it. They do inherit the providers the parent's extensions registered, so a provider extension's models resolve in a local foreground child. Pane-native remote foreground children instead use the remote machine's provider discovery and configuration. Agents that need MCP tools (`mcpDirectTools`, or MCP tools from an ambient adapter such as dm-mcp-adapter) must run as background children (`async: true`), which load the ambient extensions inside the detached runner process unless the agent sets `extensions` or the capability ceiling denies extensions.
 
 ## External job provider bridge
 
@@ -330,7 +453,90 @@ The provider returns handles with `providerJobId`, `state`, optional `handleUrl`
 
 `followUp(input)` is optional. When it is present, a completed external-job run can be continued with `subagent({ action: "resume", id: "<run>", message: "..." })`. DM sends the completed parent provider job id plus a stable `requestId` and `requestDigest`. The provider must continue that parent conversation or fail closed. It must not open a fresh thread when the parent conversation is missing.
 
-The async runner process does not import provider internals. It writes operation requests into its async run directory. The parent DM process services those requests against the registered provider and writes operation responses. If the provider is not registered, the bridge fails closed with an actionable error. If a run is recovered after provider job metadata exists, the runner calls `reattach` and `result`; it does not call `start` or `follow-up` again.
+The async runner process does not import provider internals. It writes operation requests into its async run directory. The DM process of the session that launched the run services those requests against the registered provider and writes operation responses. A child session services the external-job runs it launches. Register the provider in that child too, for example through the child agent's `extensions`. If the provider is not registered, the bridge fails closed with an actionable error. If a run is recovered after provider job metadata exists, the runner calls `reattach` and `result`; it does not call `start` or `follow-up` again.
+
+## Inspect integration
+
+Inspect is the portable command and action surface for an existing async run. The public actions are:
+
+```ts
+subagent({ action: "inspector.command", id: "<run-id>", options: { index: 0 } })
+subagent({ action: "inspector.open", id: "<run-id>", options: { index: 0, focus: true } })
+subagent({ action: "inspector.status", id: "<run-id>", options: { index: 0 } })
+subagent({ action: "inspector.close", id: "<run-id>", options: { index: 0 } })
+```
+
+`inspector.command` returns a standalone runner command without contacting a host or writing a binding. `inspector.open` selects an available built-in or externally registered inspector plugin. `status` and `close` select the plugin that owns the run binding and report clearly when that plugin does not support the requested lifecycle action. Without an available plugin, `open` fails closed with an actionable message; ordinary launches remain headless. Closing an inspector never stops the run.
+
+### Register an external inspector
+
+A loaded DM extension can add an inspector through the synchronous
+`dm-subagents:inspector-register:v1` event. This lets terminal integrations use
+Fleet's existing Enter/H actions without modifying dm-subagents. Registration
+adds no runner, tool, or configuration option.
+
+```ts
+import type { ExtensionAPI } from "@duckmind/dm-coding-agent";
+import type { InspectorRegistration, InspectorRegistrationRequest } from "dm-subagents/inspectors";
+import { myInspector } from "./my-inspector.ts"; // Your InspectorPlugin implementation.
+
+export default function (dm: ExtensionAPI) {
+  let registration: InspectorRegistration | undefined;
+  dm.on("session_start", () => {
+    registration?.dispose();
+    const request: InspectorRegistrationRequest = { version: 1, plugin: myInspector };
+    dm.events.emit("dm-subagents:inspector-register:v1", request);
+    if (!request.result) throw new Error("dm-subagents inspector registration is unavailable.");
+    if (!request.result.ok) throw request.result.error;
+    registration = request.result.registration;
+  });
+  dm.on("session_shutdown", () => registration?.dispose());
+}
+```
+
+`dm-subagents/inspectors` exports the event name as `INSPECTOR_REGISTER_EVENT`,
+the request and registration types, and the existing `InspectorPlugin`,
+`InspectorContext`, `InspectorLaunch`, `InspectorParams`, and `InspectorTarget`
+types. When dm-subagents is a resolvable dependency, `registerInspector(dm, plugin)`
+emits the same request and returns the registration or throws. Independently
+installed extensions can use the event directly; type-only imports need only a
+development dependency and create no runtime module dependency.
+
+An `InspectorPlugin` supplies:
+
+- `name`: 1–128 letters, digits, dots, underscores, or hyphens, starting with a letter or digit.
+- `available(context)`: whether this terminal host can open an inspector; may be async.
+- `open(context, launch, params)`: open the supplied inspector command and return an `AgentToolResult<Details>`, like the built-in plugins. `launch.executable` and `launch.argv` carry the existing runner, target, trusted session roots, and steer/stop permission flags. Preserve these arguments and respect `params.focus`.
+- `owns(context)`: synchronously check whether the provider owns an inspector binding for this target.
+- Optional `status(context)` and `close(context)`: inspect or close that binding, returning the same result type. Closing an inspector must not stop the subagent.
+
+The existing dispatcher tries Herdr, then Ghostty, then tmux, then external providers in
+registration order. Names are case-sensitive; duplicate names and the built-in
+names `herdr`, `ghostty`, and `tmux` are rejected. A selected provider's failure is not
+retried through another provider. Status/close use the first provider whose
+`owns` returns true; unavailable lifecycle methods remain explicit errors.
+Providers own their pane bindings and must verify ownership before closing one.
+
+Registrations belong to the dm-subagents runtimes listening on the DM event bus,
+not the consumer module; they survive runtime replacement, are isolated from
+child runtimes and other DM instances, and are cleared when the last owner shuts
+down or reloads. Disposal is idempotent, removes callbacks without closing panes,
+and takes effect even while Fleet is open because it resolves providers per
+action. Providers receive the current action context, so do not capture a stale
+session context; dispose before re-registering on session changes. Unsupported
+versions and malformed plugins return `{ ok: false, error }`, and the first owner
+to fill `result` handles the request.
+
+This is a trusted-code integration, not a sandbox. Registration does not change
+run resolution, child-safe restrictions, authority policy, or supervisor routing.
+
+### Herdr inspector plugin
+
+The bundled Herdr inspector plugin supports Herdr 0.7.5+. It opens a raw dashboard pane, not the child session and not a literal attach. It reads lifecycle, status, output, and mission artifacts; steer and stop continue through dm-subagents' existing control inbox. Use `focus` only with `inspector.open`; Herdr 0.7.5 cannot focus an arbitrary existing raw pane id.
+
+### Ghostty inspector plugin
+
+Ghostty 1.3+ on macOS is the second bundled open-only plugin, using Ghostty's preview AppleScript API. It splits the focused terminal and launches the read-only inspector command; status and close are unavailable because it writes no binding. Ghostty Automation permission is required.
 
 ## Herdr integration
 
@@ -338,7 +544,7 @@ When DM runs inside [Herdr](https://herdr.dev), dm-subagents automatically repor
 
 - The bridge is enabled only when Herdr supplies `HERDR_ENV=1` and `HERDR_PANE_ID`; outside Herdr it registers no listeners or timers.
 - It restores current-session active runs after `/reload` or `/resume`, refreshes metadata while work is active, and clears it on completion or shutdown.
-- The bridge uses Herdr's existing `herdr:blocked` sibling event when an async child needs attention, and emits `herdr:busy` while async work remains. Herdr versions that support the sibling event keep the pane's semantic state `working`; older versions ignore it safely and still display the metadata label while the DM integration remains the lifecycle authority.
+- The bridge emits `herdr:busy` while async work remains and never raises `herdr:blocked`, because a child's attention request goes to the parent agent, not the user. Herdr's DM integration does not consume `herdr:busy` yet, so the pane's dot follows the parent's own turn and the metadata label shows the active work.
 - The owning DM session is the only publisher for its own pane metadata. When an active workflow has an explicit bounded `label`, the newest active label appears in the summary and compact `title-suffix`; overlapping completion restores the previous active label. Raw task and goal prompts never enter Herdr metadata. Without a label, one active run uses its agent name and two or more use the active-run count. Attention adds `⚠`, and the suffix is cleared when active work reaches zero.
 
 To show the reported label in the expanded Agent sidebar, include `state_text` or `$summary` in its row layout:
@@ -350,20 +556,6 @@ rows = [
   ["agent", "state_text"],
 ]
 ```
-
-### Inspector panes
-
-Herdr 0.7.5+ can open an on-demand inspector for an existing async run:
-
-```ts
-subagent({ action: "inspector.open", id: "<run-id>", index: 0, focus: true })
-subagent({ action: "inspector.status", id: "<run-id>", index: 0 })
-subagent({ action: "inspector.close", id: "<run-id>", index: 0 })
-```
-
-The inspector is a raw dashboard pane, not the child process and not a literal attach. It reads lifecycle/status/output/mission artifacts and sends `steer` or `stop` through dm-subagents' existing control inbox. Closing it never stops the run.
-
-Herdr remains optional. Ordinary launches stay headless, and missing/older Herdr versions affect only Herdr-specific inspector and project-pane actions. FleetView opens the selected active async child with `H`. Use `focus` only with `inspector.open`; Herdr 0.7.5 cannot focus an arbitrary existing raw pane id.
 
 ### Project panes
 
@@ -404,11 +596,23 @@ The API returns discriminated structured results with canonical project root, bi
 
 A host that embeds this extension owns whether completion wakes can be delivered at all.
 
-Ordinary async and foreground completion wakes use `registerSubagentNotify` and `sendCompletion`. They listen for completion events and deliver through `dm.sendMessage(..., { triggerTurn })`. Session shutdown stops the result watcher and disposes this completion notifier. `createWaitSubscriptionManager` is separate: it is the explicit non-blocking `bg_wait` subscription path for work without native notification, not the ordinary completion wake path. `subagent_wait` remains a deprecated compatibility alias.
+Ordinary async and foreground completion wakes use `registerSubagentNotify` and `sendCompletion`. They listen for completion events and deliver through `dm.sendMessage(..., { triggerTurn })`. When the parent is idle, every dm-subagents notice that should start a turn (completions, supervisor asks, control and steering notices, wait subscriptions) is instead appended without a turn, followed by one user message, `PARENT_WAKE_TEXT` from `src/shared/parent-wake.ts`, sent with `dm.sendUserMessage`. DM runs `before_agent_start` only for prompts, so this keeps extension-set system prompt sections in the woken run. A busy parent still gets the notice as a steering message. After the user aborts a parent run in a host with a UI, these notices are only appended, with no turn and no wake message, until the next parent run starts. Session shutdown stops the result watcher and disposes this completion notifier. `createWaitSubscriptionManager` is separate: it is the explicit non-blocking `bg_wait` subscription path for work without native notification, not the ordinary completion wake path.
+
+Each completion notice is a custom message with `customType: "subagent-notify"`. Its `content` is the text the model reads. DM does not send `details` to the model, so hosts can use it to match a notice to its runs by id without parsing the text. `details.runs` has one entry per finished run, in the order of the notice. A grouped notice has several entries. Each entry has `agent` and `status` (`completed`, `failed`, `paused` or `stopped`). When known, an entry also has these fields:
+
+- `runId`: the finished run's id. For a workflow it equals `workflowRunId`.
+- `workflowRunId`: set only for workflows.
+- `childRuns`: `{ runId, workflowKey?, agent?, status }` for each workflow, chain or parallel child.
+- `childOutputs`: the per-child saved output paths of a workflow.
+- `source`, `durationMs`, `asyncDir`, `workflowReceiptPath`, `handoffPath`, and `sessionLabel` with `sessionValue` (a session file, share URL or share error).
+
+Entries can also carry other values the notice text is built from, such as `scheduleOrigin` and `watchdogBlockers`. The output previews are only in `content`.
 
 Detached children do not stop when the session does. They are the host process's children, not the session's, so the run keeps going, completes, and notifies nobody. What is lost is the notification, not the work.
 
 This matters because "is the parent busy?" is the wrong idle signal. A parent that launches a detached run and hands control back — which is what the async launch output tells it to do — is not prompting, streaming, compacting, or running a shell command. A host that reaps sessions on those signals alone will dispose exactly the session that was waiting to be woken.
+
+When dm-subagents runs inside a compatible dm-web host, it discovers the versioned `Symbol.for("@agegr/dm-web/session-liveness/v1")` registry and registers one provider for the current session. The provider reports live `queued`/`running` async jobs, active nested descendants (including foreground routes retained after their direct parent settles), foreground controls that still have a scheduling owner or active child, async runs that ended but whose result has not reached the parent (including a rejected send waiting for retry), completion notifications until DM starts the wake message (`message_start`), even when DM queued it behind the current turn or past `agent_settled`, and a wake prompt sent to an idle parent until its run starts (`agent_start`). Accepted wakes remain owned by the same DM session manager and session UUID across extension reloads, until they start. Independent session managers never share this ownership, and changing the UUID on an existing manager discards the old session's wakes. A wake message DM discards without starting keeps the session live until the session shuts down for a reason other than reload. A wake prompt whose run has not started 10 seconds later, while the parent is idle, no longer keeps the session live: an input handler consumed it or it failed, and its notices are already in the session. Retained terminal history, future schedules, and wait subscriptions do not make a session live by themselves. The registration is replaced on session changes and released during runtime shutdown or reload; other hosts remain unaffected.
 
 If your host reclaims idle sessions, keep a session alive while it still has live detached work:
 
@@ -427,10 +631,18 @@ The main runtime files in this repository:
 | File | Purpose |
 |------|---------|
 | `src/extension/index.ts` | Extension registration, tool registration, message/render wiring. |
+| `src/integrations/dm-web-session-liveness.ts` | Optional dm-web idle-eviction liveness bridge. |
 | `src/agents/agents.ts` | Agent and chain discovery, frontmatter parsing. |
 | `src/runs/foreground/subagent-executor.ts` | Main execution routing for single, parallel, chain, management, status, interrupt, and doctor actions. |
-| `src/runs/foreground/execution.ts` | Core foreground `runSync` handling. |
-| `src/runs/background/subagent-runner.ts` | Detached async runner. |
+| `src/runs/foreground/execution.ts` | Core foreground `runSync` handling: drives one in-process child session per attempt. |
+| `src/runs/shared/child-session.ts` | In-process child session factory (`createAgentSession` behind an injectable seam) and the shared model runtime; used by both launch paths. |
+| `src/runs/shared/child-launch.ts` | Builds the tool plan, typed child runtime config, and session launch for a child in either host process. |
+| `src/runs/shared/child-tool-plan.ts` | Tool, MCP, and extension resolution for a child launch. |
+| `src/runs/shared/child-runtime-config.ts` | `ChildRuntimeConfig`: everything the child-side hooks need. |
+| `src/runs/shared/child-hooks.ts` | The inline hook extensions every child gets (prompt runtime, fast mode, fanout). |
+| `src/runs/background/subagent-runner.ts` | Detached async runner; hosts background child sessions in its own process. |
+| `src/runs/background/run-child-session.ts` | Drives one background child session and mirrors its events into the run artifacts. |
+| `src/runs/background/runner-aliases.ts` | Aliases the host peer packages to the installed dm package for the runner (`JITI_ALIAS`). |
 | `src/runs/background/async-execution.ts` | Background launch support. |
 | `src/runs/background/async-status.ts` | Status discovery and formatting for async runs. |
 | `src/workflows/scripted-workflow.ts` / `src/runs/foreground/subagent-executor.ts` | Scripted workflow orchestration and child launch routing. |
@@ -438,4 +650,8 @@ The main runtime files in this repository:
 | `src/runs/shared/worktree.ts` | Git worktree isolation. |
 | `src/intercom/intercom-bridge.ts` | Runtime intercom bridge instructions and diagnostics. |
 | `src/extension/schemas.ts` / `src/shared/types.ts` | Tool schemas, shared types, and event constants. |
-| `test/unit/` / `test/integration/` / `test/e2e/` | Unit, loader-based integration, and real-session E2E tests. |
+| `test/unit/` / `test/integration/` | Unit and loader-based integration tests. |
+
+### Published package vs source checkout
+
+The npm tarball ships TypeScript compiler output with the same file layout and a compiled `index.js` entry. A Git checkout continues to run `index.ts` directly, so local extension development does not require a build step. Run `npm run pack:pkg` to build and pack the same artifact published to npm.

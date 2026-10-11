@@ -12,12 +12,12 @@ const activityModuleUrl = new URL("../activity.ts", import.meta.url).href;
 
 // Every child starts from a config-less HOME. Deleting DM_CODING_AGENT_DIR and
 // XDG_CONFIG_HOME is not enough: getWebSearchConfigDir() then falls through to
-// join(homedir(), ".dm"), i.e. the developer's real ~/.dm/web-search.json — which is
-// exactly the file the README tells a reviewer to create. Without this, a maintainer
-// with brightdataApiKey configured sees unrelated failures, and if that key is a
-// `!command` source (`!op read …`, `!pass show …`) their secret manager is invoked by
-// `npm test`. Tests that need a config point DM_CODING_AGENT_DIR at a temp dir; the
-// two variables below only decide where "no config at all" resolves to.
+// join(homedir(), ".dm", "agent"), the DM agent config directory. Without an
+// isolated HOME, a maintainer with brightdataApiKey configured sees unrelated
+// failures, and if that key is a `!command` source (`!op read …`, `!pass show …`)
+// their secret manager is invoked by `npm test`. Tests that need a config point
+// DM_CODING_AGENT_DIR at a temp dir; the two variables below only decide where
+// "no config at all" resolves to.
 const EMPTY_HOME = mkdtempSync(join(tmpdir(), "dm-web-access-brightdata-empty-"));
 
 function runChild(script, env = {}) {

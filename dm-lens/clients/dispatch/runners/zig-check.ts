@@ -1,5 +1,7 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
 import type {
 	Diagnostic,
@@ -8,13 +10,19 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 // zig rejects `--version`; the version subcommand is `zig version`. Using the
 // default probe would make this runner skip on every machine.
 const zig = createAvailabilityChecker("zig", ".exe", ["version"]);
 
-function parseZigOutput(raw: string, filePath: string): Diagnostic[] {
+function parseZigOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const line of raw.split(/\r?\n/)) {
 		const match = line.match(
 			/^(.*?):(\d+):(\d+):\s*(error|warning|note):\s*(.+)$/,
@@ -22,9 +30,8 @@ function parseZigOutput(raw: string, filePath: string): Diagnostic[] {
 		if (!match) continue;
 
 		const [, rawFile, lineStr, colStr, level, message] = match;
-		const resolvedSource = path.resolve(rawFile.trim());
-		const resolvedTarget = path.resolve(filePath);
-		if (resolvedSource !== resolvedTarget) continue;
+		// #3278: one seam for reported-path attribution — see javac.ts.
+		if (!pathsEqual(path.resolve(cwd, rawFile.trim()), absTarget)) continue;
 
 		const severity = level === "error" ? "error" : "warning";
 		diagnostics.push({
@@ -45,13 +52,6 @@ function parseZigOutput(raw: string, filePath: string): Diagnostic[] {
 	return diagnostics;
 }
 
-function firstOutputLine(result: { stdout?: string; stderr?: string }): string {
-	return `${result.stderr || ""}\n${result.stdout || ""}`
-		.trim()
-		.split(/\r?\n/, 1)[0]
-		.slice(0, 200);
-}
-
 const zigCheckRunner: RunnerDefinition = {
 	id: "zig-check",
 	appliesTo: ["zig"],
@@ -59,7 +59,7 @@ const zigCheckRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "zig-check");
 		if (!(await zig.isAvailableAsync(cwd))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
@@ -76,40 +76,30 @@ const zigCheckRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const diagnostics = parseZigOutput(
-			`${result.stderr || ""}\n${result.stdout || ""}`,
-			ctx.filePath,
+		const raw = `${result.stdout || ""}\n${result.stderr || ""}`;
+		const parsed = parseToolRun(
+			"zig-check",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (Zig 0.13 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(output) => parseZigOutput(output, ctx.filePath, cwd),
 		);
-		if (diagnostics.length === 0) {
-			if (result.status && result.status !== 0) {
-				return {
-					status: "failed",
-					diagnostics: [
-						{
-							id: "zig-check-nonzero-no-diagnostics",
-							message:
-								firstOutputLine(result) ||
-								"zig build-exe exited non-zero without structured diagnostics",
-							filePath: ctx.filePath,
-							severity: "warning",
-							semantic: "warning",
-							tool: "zig",
-							rule: "zig-check",
-							fixable: false,
-						},
-					],
-					semantic: "warning",
-				};
-			}
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasErrors = diagnostics.some((d) => d.severity === "error");
-		return {
-			status: hasErrors ? "failed" : "succeeded",
-			diagnostics,
-			semantic: "warning",
-		};
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "zig-check",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+			classify: (diagnostics) => ({
+				status: diagnostics.some((d) => d.severity === "error")
+					? "failed"
+					: "succeeded",
+				semantic: "warning",
+			}),
+		});
 	},
 };
 

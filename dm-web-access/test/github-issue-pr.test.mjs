@@ -15,6 +15,15 @@ async function writeFakeExecutable(binDir, name, source) {
 	return executable;
 }
 
+// For tests that assert a wall-clock bound: a Node shim costs 300–900 ms just
+// to boot on a loaded host and the bound is 1 s, so the probe alone can fail
+// the assertion. A /bin/sh shim starts in a few ms.
+async function writeFakeShellExecutable(binDir, name, script) {
+	const executable = join(binDir, name);
+	await writeFile(executable, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+	return executable;
+}
+
 test("parseGitHubIssuePrUrl accepts PR and issue variants without changing repo parsing", async () => {
 	const { parseGitHubIssuePrUrl } = await import(moduleUrl);
 	assert.deepEqual(parseGitHubIssuePrUrl("https://github.com/owner/repo/pull/123/files#discussion_r42"), {
@@ -75,9 +84,10 @@ test("renderer orders sections, marks truncation, and forces anchored comments i
 	assert.equal(result.error, null);
 	assert.match(result.content, /#7 Improve fetch/);
 	assert.ok(result.content.indexOf("## Body") < result.content.indexOf("## Checks"));
-	assert.match(result.content, /\[body truncated; use get_search_content/);
+	assert.ok(result.content.includes('[body truncated; the rest is stored under "body (continued)": use get_search_content findText or offset]'));
 	assert.match(result.content, /user19.*\[anchored\]/s);
-	assert.match(result.content, /15 of 20 comments shown|16 of 20 comments shown/);
+	assert.ok(result.content.includes('[16 of 20 comments shown; 4 more stored under "Conversation comments (continued)": use get_search_content findText or offset, or gh issue view -c]'));
+	assert.equal(result.content.split("anchored comment body").length - 1, 1);
 	assert.match(result.content, /gh pr diff 7 --repo owner\/repo/);
 });
 
@@ -100,6 +110,22 @@ test("renderer marks truncated review verdicts", async () => {
 	});
 
 	assert.match(result.content, /10 of 11 review verdicts shown/);
+});
+
+test("renderer cuts a long body at a word boundary so each word stays searchable", async () => {
+	const { renderGitHubPrIssue } = await import(moduleUrl);
+	const result = renderGitHubPrIssue({
+		url: "https://github.com/owner/repo/issues/7",
+		owner: "owner",
+		repo: "repo",
+		kind: "issue",
+		number: 7,
+		reviewThreads: [],
+		fallbackNotes: [],
+		view: { number: 7, title: "Boundary", state: "OPEN", author: { login: "alice" }, body: `${"word ".repeat(799)}BOUNDARY_TOKEN tail` },
+	});
+
+	assert.equal(result.content.split("BOUNDARY_TOKEN").length - 1, 1);
 });
 
 test("extractGitHubIssuePr retries gh view with core fields on unknown --json field", async () => {
@@ -294,11 +320,7 @@ test("extractGitHubIssuePr aborts active gh work with the caller signal", async 
 	const agentDir = join(root, "agent");
 	await mkdir(binDir, { recursive: true });
 	await mkdir(agentDir, { recursive: true });
-	await writeFakeExecutable(binDir, "gh", `
-		const args = process.argv.slice(2);
-		if (args[0] === "--version") { console.log("gh version 2.0.0"); process.exit(0); }
-		setTimeout(() => {}, 30000);
-	`);
+	await writeFakeShellExecutable(binDir, "gh", `if [ "$1" = "--version" ]; then echo "gh version 2.0.0"; exit 0; fi\nsleep 30`);
 
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
 		input: `
@@ -320,7 +342,8 @@ test("extractGitHubIssuePr aborts active gh work with the caller signal", async 
 	assert.equal(child.status, 0, child.stderr);
 	const output = JSON.parse(child.stdout);
 	assert.equal(output.result.error, "Aborted");
-	assert.ok(output.elapsed < 1000, `expected abort before gh timeout, got ${output.elapsed}ms`);
+	// Alternative outcome is the 30 s gh hang; 5 s proves the abort won without racing process spawn on a loaded host.
+	assert.ok(output.elapsed < 5000, `expected abort before gh timeout, got ${output.elapsed}ms`);
 });
 
 test("extractGitHubIssuePr aborts a hung gh availability probe", async () => {
@@ -329,7 +352,7 @@ test("extractGitHubIssuePr aborts a hung gh availability probe", async () => {
 	const agentDir = join(root, "agent");
 	await mkdir(binDir, { recursive: true });
 	await mkdir(agentDir, { recursive: true });
-	await writeFakeExecutable(binDir, "gh", `setTimeout(() => {}, 30000);`);
+	await writeFakeShellExecutable(binDir, "gh", `sleep 30`);
 
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
 		input: `
@@ -347,7 +370,7 @@ test("extractGitHubIssuePr aborts a hung gh availability probe", async () => {
 	assert.equal(child.status, 0, child.stderr);
 	const output = JSON.parse(child.stdout);
 	assert.equal(output.result.error, "Aborted");
-	assert.ok(output.elapsed < 1000, `expected abort before gh probe timeout, got ${output.elapsed}ms`);
+	assert.ok(output.elapsed < 5000, `expected abort before gh probe timeout, got ${output.elapsed}ms`);
 });
 
 test("REST fallback preserves caller cancellation", async () => {
@@ -356,20 +379,21 @@ test("REST fallback preserves caller cancellation", async () => {
 	const agentDir = join(root, "agent");
 	await mkdir(binDir, { recursive: true });
 	await mkdir(agentDir, { recursive: true });
-	await writeFakeExecutable(binDir, "gh", `process.exit(1);`);
+	await writeFakeShellExecutable(binDir, "gh", `exit 1`);
 
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
 		input: `
 			const controller = new AbortController();
-			globalThis.fetch = async (_input, init = {}) => {
+			const fetched = [];
+			globalThis.fetch = async (input, init = {}) => {
+				fetched.push(String(input));
 				setTimeout(() => controller.abort(), 10);
 				await new Promise((resolve, reject) => init.signal.addEventListener("abort", () => reject(new Error("Aborted REST fetch")), { once: true }));
 			};
 			const { extractContent } = await import(${JSON.stringify(extractUrl)});
 			const lookup = ${publicLookup.toString()};
-			const started = Date.now();
 			const result = await extractContent("https://github.com/owner/repo/issues/12", controller.signal, { lookup });
-			console.log(JSON.stringify({ elapsed: Date.now() - started, result }));
+			console.log(JSON.stringify({ fetched, result }));
 		`,
 		encoding: "utf8",
 		env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH || ""}`, DM_CODING_AGENT_DIR: agentDir },
@@ -378,7 +402,11 @@ test("REST fallback preserves caller cancellation", async () => {
 	assert.equal(child.status, 0, child.stderr);
 	const output = JSON.parse(child.stdout.split("\n").at(-2));
 	assert.equal(output.result.error, "Aborted");
-	assert.ok(output.elapsed < 1000, `expected REST abort before generic fallback, got ${output.elapsed}ms`);
+	// The invariant is ORDERING, not speed: the aborted REST request must be the
+	// only fetch — the generic github.com page fallback must never start. (A
+	// wall-clock bound here raced process spawn, which is 300–900 ms on a loaded
+	// host before any code of ours runs.)
+	assert.deepEqual(output.fetched, ["https://api.github.com/repos/owner/repo/issues/12"]);
 });
 
 test("extractContent returns an actionable GitHub rate-limit result instead of HTML fall-through", async () => {
@@ -546,4 +574,116 @@ test("REST fallback does not render positive changedFiles as none when files are
 	const result = JSON.parse(child.stdout.split("\n").at(-2));
 	assert.match(result.content, /0 files shown from at least 3/);
 	assert.doesNotMatch(result.content, /Files\nnone/);
+});
+
+// DM's registered fetch_content and the MCP core, over a fake gh, with the given web-search.json.
+async function fetchGitHubDocument(config) {
+	const root = await mkdtemp(join(tmpdir(), "dm-web-access-gh-retrieval-name-"));
+	const binDir = join(root, "bin");
+	await mkdir(binDir, { recursive: true });
+	await writeFile(join(root, "web-search.json"), JSON.stringify(config));
+	await writeFakeExecutable(binDir, "gh", `
+		const args = process.argv.slice(2);
+		if (args[0] === "--version") { console.log("gh version 2.0.0"); process.exit(0); }
+		if (args[0] === "pr" && args[1] === "view") {
+			const comments = Array.from({ length: 16 }, (_, index) => ({ id: index + 1, author: { login: "fixture" }, body: "comment " + index }));
+			const reviews = Array.from({ length: 11 }, (_, index) => ({ author: { login: "reviewer" + index }, state: "COMMENTED", body: "review " + index }));
+			console.log(JSON.stringify({ number: 7, title: "Retrieval names", state: "OPEN", author: { login: "alice" }, body: "BODY_PREFIX_" + "x".repeat(4100), comments, reviews }));
+			process.exit(0);
+		}
+		if (args[0] === "api") { console.log("[]"); process.exit(0); }
+		process.exit(1);
+	`);
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+			const { default: initialize } = await import(${JSON.stringify(new URL("../index.ts", import.meta.url).href)});
+			const { createStandaloneWebToolCore } = await import(${JSON.stringify(new URL("../web-tool-core.ts", import.meta.url).href)});
+			const tools = [];
+			initialize({ registerTool(tool) { tools.push(tool); }, registerCommand() {}, registerShortcut() {}, on() {}, appendEntry() {} });
+			const text = result => result.content.filter(item => item.type === "text").map(item => item.text).join("\\n");
+			const url = "https://github.com/owner/repo/pull/7";
+			const pi = await tools.find(tool => tool.name === "fetch_content").execute("fetch", { url });
+			const mcp = await createStandaloneWebToolCore().fetchContent({ url });
+			console.log(JSON.stringify({ pi: text(pi), mcp: text(mcp) }));
+		`,
+		encoding: "utf8",
+		env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH || ""}`, DM_CODING_AGENT_DIR: root, HOME: join(root, "home"), USERPROFILE: join(root, "home"), XDG_CONFIG_HOME: "" },
+	});
+	assert.equal(child.status, 0, child.stderr);
+	return JSON.parse(child.stdout.trim().split("\n").at(-1));
+}
+
+test("GitHub document hints name the renamed retrieval tool in DM and keep the MCP name", async () => {
+	const { pi, mcp } = await fetchGitHubDocument({ toolNames: { getSearchContent: "grab_content" } });
+	assert.doesNotMatch(pi, /get_search_content/);
+	assert.ok(pi.includes('[body truncated; the rest is stored under "body (continued)": use grab_content findText or offset]'));
+	assert.ok(pi.includes('[15 of 16 comments shown; 1 more stored under "Conversation comments (continued)": use grab_content findText or offset, or gh issue view -c]'));
+	assert.ok(pi.includes('[10 of 11 review verdicts shown; 1 more stored under "Review verdicts (continued)": use grab_content findText or offset, or the gh command below]'));
+	assert.match(pi, /Stored full document: use `grab_content`/);
+	assert.ok(mcp.includes('[body truncated; the rest is stored under "body (continued)": use get_search_content findText or offset]'));
+	assert.match(mcp, /Stored full document: use `get_search_content`/);
+	assert.doesNotMatch(mcp, /grab_content/);
+});
+
+test("GitHub document hints point only at gh when retrieval is disabled", async () => {
+	const { pi, mcp } = await fetchGitHubDocument({ tools: { getSearchContent: { enabled: false } } });
+	for (const text of [pi, mcp]) {
+		assert.doesNotMatch(text, /get_search_content|Stored full document/);
+		assert.match(text, /\[body truncated; use the gh escalation commands below for the rest\]/);
+		assert.match(text, /\[15 of 16 comments shown; use gh issue view -c\]/);
+		assert.match(text, /\[10 of 11 review verdicts shown; use the gh command below\]/);
+		assert.match(text, /Full view: `gh pr view 7 --repo owner\/repo`/);
+	}
+});
+
+test("stored GitHub document holds each fetched item once, including tails and items past inline caps", async () => {
+	const root = await mkdtemp(join(tmpdir(), "dm-web-access-gh-stored-once-"));
+	const fixture = {
+		url: "https://github.com/owner/repo/pull/7", owner: "owner", repo: "repo", kind: "pull", number: 7, fallbackNotes: [],
+		reviewThreads: Array.from({ length: 31 }, (_, index) => ({ id: 1000 + index, path: "a.ts", line: 1, user: { login: "reviewer" },
+			body: index === 0 ? `THREAD_HEAD ${"t".repeat(800)} THREAD_TAIL` : index === 30 ? "OMITTED_THREAD_SENTINEL" : `thread ${index}` })),
+		view: {
+			number: 7, title: "Stored once", state: "OPEN", author: { login: "alice" },
+			body: `BODY_PREFIX_${"x".repeat(3989)} BODY_TAIL`,
+			comments: Array.from({ length: 16 }, (_, index) => ({ id: index + 1, author: { login: "fixture" },
+				body: index === 0 ? `COMMENT_HEAD ${"c".repeat(800)} COMMENT_TAIL` : index === 15 ? "OMITTED_COMMENT_SENTINEL" : `comment ${index}` })),
+			reviews: [{ author: { login: "bob" }, state: "COMMENTED", body: `REVIEW_HEAD ${"r".repeat(400)} REVIEW_TAIL` }],
+			files: Array.from({ length: 51 }, (_, index) => ({ path: index === 50 ? "omitted-file-sentinel.ts" : `file${index}.ts`, additions: 1, deletions: 0 })),
+			commits: Array.from({ length: 21 }, (_, index) => ({ oid: `${index}`.padStart(7, "0"), messageHeadline: index === 20 ? "OMITTED_COMMIT_SENTINEL" : `commit ${index}` })),
+			statusCheckRollup: Array.from({ length: 16 }, (_, index) => ({ name: index === 15 ? "OMITTED_CHECK_SENTINEL" : `check ${index}`, conclusion: "SUCCESS" })),
+		},
+	};
+	const sentinels = ["BODY_PREFIX_", "BODY_TAIL", "COMMENT_HEAD", "COMMENT_TAIL", "OMITTED_COMMENT_SENTINEL", "REVIEW_HEAD", "REVIEW_TAIL",
+		"THREAD_HEAD", "THREAD_TAIL", "OMITTED_THREAD_SENTINEL", "omitted-file-sentinel.ts", "OMITTED_COMMIT_SENTINEL", "OMITTED_CHECK_SENTINEL"];
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+			const { renderGitHubPrIssue } = await import(${JSON.stringify(moduleUrl)});
+			const { storeResult } = await import(${JSON.stringify(new URL("../storage.ts", import.meta.url).href)});
+			const { createStandaloneWebToolCore } = await import(${JSON.stringify(new URL("../web-tool-core.ts", import.meta.url).href)});
+			const document = renderGitHubPrIssue(${JSON.stringify(fixture)});
+			storeResult("doc", { id: "doc", type: "fetch", timestamp: Date.now(), urls: [document] });
+			const core = createStandaloneWebToolCore();
+			const matches = {};
+			for (const findText of ${JSON.stringify(sentinels)}) matches[findText] = (await core.getSearchContent({ responseId: "doc", findText })).details.matchCount;
+			console.log(JSON.stringify(matches));
+		`,
+		encoding: "utf8",
+		env: { ...process.env, DM_CODING_AGENT_DIR: root, PI_WEB_ACCESS_CACHE_ROOT: root },
+	});
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout.trim().split("\n").at(-1)), Object.fromEntries(sentinels.map(sentinel => [sentinel, 1])));
+});
+
+test("markers for data never fetched point only at gh, and the document ceiling names the gh commands", async () => {
+	const { renderGitHubPrIssue } = await import(moduleUrl);
+	const render = (view) => renderGitHubPrIssue({ url: "https://github.com/owner/repo/pull/7", owner: "owner", repo: "repo", kind: "pull", number: 7, reviewThreads: [], fallbackNotes: [], view: { number: 7, title: "T", state: "OPEN", ...view } }).content;
+	const comments = count => Array.from({ length: count }, (_, index) => ({ id: index + 1, author: { login: "a" }, body: `comment ${index}` }));
+
+	assert.ok(render({ comments: comments(2), commentsCount: 40 }).includes("[2 comments shown from at least 40; use gh issue view -c]"));
+	assert.ok(render({ comments: comments(16), commentsCount: 40 }).includes('[15 comments shown from at least 40; 1 more stored under "Conversation comments (continued)": use get_search_content findText or offset; for the rest use gh issue view -c]'));
+	assert.ok(render({ changedFiles: 3, files: [] }).includes("[0 files shown from at least 3; use the gh command below]"));
+
+	const huge = render({ body: "y".repeat(200_000) });
+	assert.ok(huge.includes("## Escalation commands"));
+	assert.ok(huge.endsWith("[GitHub document truncated at 150000 chars; use `gh pr view 7 --repo owner/repo` or `gh pr diff 7 --repo owner/repo` for complete data]"));
 });

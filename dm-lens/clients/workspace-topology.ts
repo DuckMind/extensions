@@ -39,7 +39,11 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { PROJECT_CONFIG_BASENAMES } from "./config-locations.js";
+import {
+	PROJECT_CONFIG_BASENAMES,
+	isResolvedGlobalConfigPath,
+} from "./config-locations.js";
+import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	isAtOrAboveHomeDir,
@@ -111,6 +115,7 @@ export function registerWorkspaceTopologyReset(reset: () => void): void {
 type WalkCacheEntry = {
 	dir: string | undefined;
 	dirMtimes: Array<{ dir: string; mtimeMs: number }>;
+	walkedAtMs: number;
 	lastUsedAt: number;
 	idleTimer?: ReturnType<typeof setTimeout>;
 };
@@ -280,10 +285,81 @@ function walkCacheKey(startDir: string, markerKey: string): string {
 	return `${path.resolve(startDir)}\0${markerKey}`;
 }
 
-function walkStillFresh(
-	dirMtimes: Array<{ dir: string; mtimeMs: number }>,
+/**
+ * One directory a cached marker walk probed, with the mtime it carried when the
+ * walk ran. Hits compare every record; cached misses compare the start-directory
+ * record and the shared freshness cadence.
+ */
+export type DirMtimeRecord = { dir: string; mtimeMs: number };
+
+export function dirMtimesStillFresh(
+	dirMtimes: readonly DirMtimeRecord[],
 ): boolean {
 	return dirMtimes.every(({ dir, mtimeMs }) => safeDirMtimeMs(dir) === mtimeMs);
+}
+
+/**
+ * Async arm of `dirMtimesStillFresh` — same records, same comparison, stats
+ * issued in parallel. It exists for the async marker walk in
+ * `clients/lsp/server.ts`'s `NearestRoot`, whose own marker probes are
+ * `fs/promises` and which runs on the per-file LSP touch path: a `statSync` per
+ * directory there would block the event loop the walk deliberately keeps free.
+ * Both arms live here so "is this recorded walk still current" has one owner
+ * (#3412).
+ *
+ * Written with promise combinators rather than `await`, along with the two
+ * readers below, so the ONLY place that waits on these stats is the caller's
+ * `await bounded(...)` — a hook-path await that a later editor cannot leave
+ * unbounded, instead of an inner await bounded only by a registry admission
+ * (#3412 review round 1, M-3421-02).
+ */
+export function dirMtimesStillFreshAsync(
+	dirMtimes: readonly DirMtimeRecord[],
+): Promise<boolean> {
+	return Promise.all(dirMtimes.map(({ dir }) => dirMtimeMsAsync(dir))).then(
+		(current) =>
+			dirMtimes.every(({ mtimeMs }, index) => current[index] === mtimeMs),
+	);
+}
+
+/**
+ * Current mtime of `dir`, or `-1` when it cannot be stat'ed — the async arm of
+ * `safeDirMtimeMs`. A recorder and `dirMtimesStillFreshAsync` MUST read through
+ * the same function so the absent-directory sentinel is the same value on both
+ * sides: `prisma/` not existing yet is a recordable state, and the record must
+ * compare unequal once it is created (#3412).
+ */
+function dirMtimeMsAsync(dir: string): Promise<number> {
+	return fs.promises.stat(dir).then(
+		(stats) => stats.mtimeMs,
+		() => -1,
+	);
+}
+
+/** One freshness record per directory, read in parallel (#3412). */
+export function dirMtimeRecordsAsync(
+	dirs: readonly string[],
+): Promise<DirMtimeRecord[]> {
+	return Promise.all(
+		dirs.map((dir) =>
+			dirMtimeMsAsync(dir).then((mtimeMs) => ({ dir, mtimeMs })),
+		),
+	);
+}
+
+/**
+ * Records for directories whose mtime could NOT be read — because the caller's
+ * bound fired, so the answer is unknown rather than absent. `NaN` compares
+ * unequal to every mtime including itself, so an entry carrying one of these
+ * can never be served: the walk's answer is still returned, it is simply not
+ * memoized. Unknown must never be spelled as a number a directory could
+ * actually have, and dropping the directory from the signature (recording
+ * nothing) would hide every later change in it (#3412 review round 1, S9).
+ */
+export function unknownDirMtimeRecords(
+	dirs: readonly string[],
+): DirMtimeRecord[] {
+	return dirs.map((dir) => ({ dir, mtimeMs: Number.NaN }));
 }
 
 /**
@@ -304,9 +380,18 @@ function walkToNearestMatch(
 ): string | undefined {
 	const key = walkCacheKey(startDir, cacheSuffix);
 	const cached = walkCache.get(key);
-	if (cached && walkStillFresh(cached.dirMtimes)) {
-		touchWalk(key, cached);
-		return cached.dir;
+	if (cached) {
+		const startDirMtime = cached.dirMtimes[0];
+		const isFresh =
+			cached.dir === undefined
+				? startDirMtime !== undefined &&
+					Date.now() - cached.walkedAtMs < FRESHNESS_CADENCE_MS &&
+					safeDirMtimeMs(startDirMtime.dir) === startDirMtime.mtimeMs
+				: dirMtimesStillFresh(cached.dirMtimes);
+		if (isFresh) {
+			touchWalk(key, cached);
+			return cached.dir;
+		}
 	}
 
 	const dirMtimes: Array<{ dir: string; mtimeMs: number }> = [];
@@ -333,10 +418,12 @@ function walkToNearestMatch(
 		depth += 1;
 	}
 
+	const walkedAtMs = Date.now();
 	const entry: WalkCacheEntry = {
 		dir: found,
 		dirMtimes,
-		lastUsedAt: Date.now(),
+		walkedAtMs,
+		lastUsedAt: walkedAtMs,
 	};
 	const outgoing = walkCache.get(key);
 	if (outgoing?.idleTimer !== undefined) {
@@ -364,9 +451,10 @@ function walkToNearestMatch(
  *   - Depth-capped at `MAX_WALK_DEPTH`; a cap trip is logged as a latency
  *     phase (not silently truncated) so a pathological deep tree is visible.
  *
- * Cached per `(startDir, markerKey)`, invalidated when any visited
- * directory's mtime changes (the same "revalidate every dir on the path"
- * pattern `project-lens-config.ts`'s `discoveryCache` established).
+ * Cached per `(startDir, markerKey)`. Hits are invalidated when any visited
+ * directory's mtime changes. Misses are revalidated against `startDir`'s mtime
+ * and the shared freshness cadence, so ancestor marker changes are eventually
+ * found without unrelated ancestor churn forcing a re-walk.
  */
 export function findNearestDirWithMarker(
 	startDir: string,
@@ -463,12 +551,21 @@ export interface DmLensConfigMarker {
  * `.dm-lens.json`/`dm-lens.json` directly IN `dir` — no upward walk. The
  * shared-index equivalent of `project-lens-config.ts`'s old private
  * `findDmLensConfigInDir` probe loop.
+ *
+ * A candidate that IS the resolved global config path is refused
+ * (global-config-location PR, refs #2457): the global tier reads that file by
+ * absolute path, and discovering it here a second time made the nested ignore
+ * layering full-validate it and warn that its global-only keys are "not
+ * honored in a project config" — including the notice advising the user to
+ * set them in the very file being ignored. The refusal is observable through
+ * the marker staying absent, the same shape as a directory with no marker.
  */
 export function findDmLensConfigMarkerInDir(
 	dir: string,
 ): DmLensConfigMarker | undefined {
 	const markers = getDirectoryMarkers(dir);
 	if (!markers.piLensConfigPath) return undefined;
+	if (isResolvedGlobalConfigPath(markers.piLensConfigPath)) return undefined;
 	const stat = (() => {
 		try {
 			return fs.statSync(markers.piLensConfigPath!);

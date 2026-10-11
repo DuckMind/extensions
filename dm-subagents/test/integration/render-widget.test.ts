@@ -4,7 +4,7 @@ import { visibleWidth } from "@duckmind/dm-tui";
 import { extractToolArgsPreview } from "../../src/shared/utils.ts";
 
 const { buildWidgetLines, clearLegacyResultAnimationTimer, compactTaskText, projectAsyncLane, renderWidget, widgetRenderKey } = await import("../../src/tui/render.ts") as {
-	buildWidgetLines: (jobs: Array<Record<string, unknown>>, theme: { fg(name: string, text: string): string; bold(text: string): string }, width?: number, expanded?: boolean, frame?: number) => string[];
+	buildWidgetLines: (jobs: Array<Record<string, unknown>>, theme: { fg(name: string, text: string): string; bold(text: string): string; getThinkingBorderColor(level: string): (text: string) => string }, width?: number, expanded?: boolean, frame?: number) => string[];
 	clearLegacyResultAnimationTimer: (context: { state: { subagentResultAnimationTimer?: ReturnType<typeof setInterval> } }) => void;
 	compactTaskText: (task: string | undefined, label?: string) => string | undefined;
 	projectAsyncLane: (job: Record<string, unknown>) => { label?: string; role: string; phase?: string; state: string; gate?: string; next?: string; output?: string; workspace?: string; ref: string; chips: string[] } | undefined;
@@ -15,6 +15,7 @@ const { buildWidgetLines, clearLegacyResultAnimationTimer, compactTaskText, proj
 const theme = {
 	fg: (_name: string, text: string) => text,
 	bold: (text: string) => text,
+	getThinkingBorderColor: (_level: string) => (text: string) => text,
 };
 
 const runningGlyphPattern = "[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●]";
@@ -91,17 +92,167 @@ function resetWidgetLayout(): void {
 }
 
 describe("subagent async widget rendering", () => {
-	it("renders compact workflow plan status by default and keeps details expanded", () => {
+	it("advances quiet workflow clocks without advancing a terminal sibling", () => {
+		const originalNow = Date.now;
 		const job = {
-			asyncId: "workflow-preflight",
+			asyncId: "quiet-workflow", asyncDir: "/tmp/quiet", mode: "workflow", status: "running", startedAt: 1_000, updatedAt: 1_083,
+			steps: [
+				{ index: 0, workflowKey: "live", agent: "worker", status: "running", startedAt: 1_000, durationMs: 0 },
+				{ index: 1, workflowKey: "done", agent: "reviewer", status: "complete", startedAt: 1_000, endedAt: 3_000, durationMs: 2_000 },
+			],
+		};
+		try {
+			Date.now = () => 415_000;
+			assert.match(buildWidgetLines([job], theme, 180).join("\n"), /6m54s/);
+			const first = buildWidgetLines([job], theme, 180, true).join("\n");
+			assert.match(first, /worker.*6m54s/);
+			assert.match(first, /reviewer.*2\.0s/);
+			Date.now = () => 425_000;
+			const second = buildWidgetLines([job], theme, 180, true).join("\n");
+			assert.match(second, /worker.*7m4s/);
+			assert.match(second, /reviewer.*2\.0s/);
+			assert.match(buildWidgetLines([{ ...job, status: "complete", updatedAt: 3_000 }], theme, 180).join("\n"), /2\.0s/);
+			assert.equal(job.steps[0]!.durationMs, 0, "rendering must not persist clocks");
+		} finally { Date.now = originalNow; }
+	});
+
+	it("nests two same-agent workflow children once and collapses the group adaptively", () => {
+		const children = ["t7", "t9"].map((key) => ({
+			asyncId: `child-${key}`, asyncDir: `/tmp/${key}`, parentWorkflowRunId: "parent", workflowKey: key,
+			mode: "single", agents: ["chorus-worker"], status: "running", startedAt: 1_000, updatedAt: 1_083,
+		}));
+		const parent = { asyncId: "parent", asyncDir: "/tmp/parent", mode: "workflow", status: "running", startedAt: 1_000, updatedAt: 1_083,
+			steps: children.map((child, index) => ({ index, workflowKey: child.workflowKey, runId: child.asyncId, agent: "chorus-worker", status: "running" })) };
+		for (const expanded of [false, true]) {
+			const lines = buildWidgetLines([children[0]!, parent, children[1]!], theme, 180, expanded);
+			const text = lines.join("\n");
+			for (const key of ["t7", "t9"]) {
+				assert.equal(text.match(new RegExp(`[├└]─ ${key} `, "g"))?.length, 1, text);
+				assert.match(text, new RegExp(`  [├└]─ ${key} .*chorus-worker`));
+				assert.doesNotMatch(text, new RegExp(`${runningGlyphPattern} ${key} · chorus-worker`), "no mirrored lane row");
+			}
+			assert.doesNotMatch(text, new RegExp(`[├└]─ ${runningGlyphPattern} chorus-worker`), "children must not also be sibling cards");
+			assert.ok(lines.every((line) => visibleWidth(line) <= 180));
+		}
+		assert.equal(buildWidgetLines(children, theme, 180).join("\n").match(new RegExp(`[├└]─ ${runningGlyphPattern} chorus-worker`, "g"))?.length, 2, "orphans stay visible");
+		for (const rows of [12, 30, 80]) withStdoutSize(rows, 100, () => {
+			resetWidgetLayout();
+			const { ctx, widgets } = createUiContext();
+			renderWidget(ctx, [parent, ...children]);
+			const lines = renderWidgetLines(widgets[0], 100);
+			const text = lines.join("\n");
+			for (const key of ["t7", "t9"]) {
+				const count = text.match(new RegExp(`[├└]─ ${key} `, "g"))?.length ?? 0;
+				assert.ok(count <= 1, text);
+				if (rows === 80) assert.equal(count, 1, "roomy adaptive layout keeps both child rows");
+			}
+			assert.ok(lines.every((line) => visibleWidth(line) <= 100));
+			assert.ok(lines.length <= 14);
+			resetWidgetLayout();
+		});
+	});
+	it("keeps live children visible when their workflow parent is not running", () => {
+		for (const status of ["complete", "queued"]) {
+			const parent = { asyncId: "parent", asyncDir: "/tmp/parent", mode: "workflow", status, startedAt: 1_000, updatedAt: 2_000 };
+			const child = { asyncId: "live-child", asyncDir: "/tmp/live-child", mode: "single", status: "running", agents: ["live-worker"], parentWorkflowRunId: "parent", workflowKey: "live" };
+			const jobs = status === "queued"
+				? [parent, child, { asyncId: "other", asyncDir: "/tmp/other", status: "running", agents: ["other-worker"] }]
+				: [parent, child];
+			const full = buildWidgetLines(jobs, theme, 180).join("\n");
+			assert.equal(full.match(new RegExp(`[├└]─ (?:live )?${runningGlyphPattern} live-worker`, "g"))?.length, 1, full);
+			assert.match(full, status === "queued" ? /1 queued/ : /id: parent · 1\.0s/);
+			for (const rows of [12, 23]) withStdoutSize(rows, 100, () => {
+				resetWidgetLayout();
+				const { ctx, widgets } = createUiContext();
+				try {
+					renderWidget(ctx, jobs);
+					const lines = renderWidgetLines(widgets[0], 100);
+					const text = lines.join("\n");
+					if (rows === 12) {
+						assert.match(text, status === "queued" ? /2\/3 running, 1 queued/ : /1\/2 running/);
+						assert.equal(lines.length, 1);
+					} else {
+						assert.equal(text.match(new RegExp(`${runningGlyphPattern} live-worker`, "g"))?.length, 1, text);
+						assert.ok(lines.length <= 4);
+					}
+					assert.ok(lines.every((line) => visibleWidth(line) <= 100));
+				} finally { resetWidgetLayout(); }
+			});
+		}
+	});
+
+	it("updates the mounted async widget without changing host insertion order", () => {
+		type Widget = { render(width: number): string[]; dispose?(): void };
+		const widgets = new Map<string, Widget>();
+		let registrations = 0;
+		let renderRequests = 0;
+		const tui = { requestRender: () => { renderRequests += 1; } };
+		const ctx = {
+			hasUI: true,
+			ui: {
+				// DM 0.85 setExtensionWidget disposes/deletes before inserting.
+				setWidget(key: string, factory: ((tui: typeof tui, theme: typeof theme) => Widget) | undefined) {
+					widgets.get(key)?.dispose?.();
+					widgets.delete(key);
+					if (factory) {
+						registrations += 1;
+						widgets.set(key, factory(tui, theme));
+					}
+				},
+			},
+		};
+		const job = { asyncId: "same-run", asyncDir: "/tmp/run", status: "running", agents: ["before-update"] };
+		const originalNow = Date.now;
+		try {
+			Date.now = () => 1_000;
+			renderWidget(ctx, [job]);
+			const mounted = widgets.get("subagent-async")!;
+			assert.match(mounted.render(180).join("\n"), /before-update/);
+			ctx.ui.setWidget("other-extension", () => ({ render: () => ["other"] }));
+			for (const agent of ["after-update", "latest-update"]) {
+				renderWidget({ ...ctx }, [{ ...job, agents: [agent] }]);
+				assert.deepEqual([...widgets.keys()], ["subagent-async", "other-extension"]);
+				assert.equal(widgets.get("subagent-async"), mounted);
+				assert.match(mounted.render(180).join("\n"), new RegExp(agent), "same-frame cache must be invalidated");
+			}
+			assert.equal(registrations, 2, "progress must not re-register either widget");
+			assert.equal(renderRequests, 2, "each update requests a repaint without a timer");
+
+			ctx.ui.setWidget("subagent-async", undefined);
+			renderWidget(ctx, [job]);
+			assert.notEqual(widgets.get("subagent-async"), mounted, "host disposal allows remounting");
+			renderWidget(ctx, []);
+			assert.deepEqual([...widgets.keys()], ["other-extension"]);
+			renderWidget(ctx, [job]);
+			assert.ok(widgets.has("subagent-async"), "cleared widgets can mount again");
+		} finally {
+			Date.now = originalNow;
+			renderWidget(ctx, []);
+		}
+	});
+
+	it("renders compact workflow lanes by default and keeps details expanded", () => {
+		const job = {
+			asyncId: "a6b9aa6b-workflow",
 			asyncDir: "/tmp/workflow-preflight",
 			status: "running",
 			mode: "workflow",
+			description: "Review workflow",
+			toolCount: 5,
+			startedAt: 100,
+			updatedAt: 2_600,
 			preflight: {
 				version: 1,
 				coverage: "partial",
-				lanes: [{ key: "review", mode: "review", claims: ["src/tui"], expectedOutput: "review.md" }],
+				lanes: [
+					{ key: "write", mode: "mutation", decision: "apply the smallest fix", claims: ["src/tui"], expectedOutput: "fix.md" },
+					{ key: "review", mode: "review", decision: "check the compact surface", claims: ["src/tui"], expectedOutput: "review.md" },
+				],
 			},
+			steps: [
+				{ index: 0, workflowKey: "review", agent: "reviewer", label: "Review the compact surface", status: "running", toolCount: 2 },
+				{ index: 1, workflowKey: "write", agent: "worker", label: "Apply the smallest fix", status: "complete", toolCount: 3 },
+			],
 			workflow: {
 				trace: [],
 				emits: [],
@@ -110,18 +261,50 @@ describe("subagent async widget rendering", () => {
 			},
 		};
 		const compact = buildWidgetLines([job], theme, 180).join("\n");
-		assert.match(compact, /Plan: 1 lane · review/);
-		assert.match(compact, /Plan note: 1 preflight mismatch · expand for debug\./);
-		assert.doesNotMatch(compact, /key \| mode \| decision \| claims \| expected output \| independence/);
-		assert.doesNotMatch(compact, /review \| review \|/);
-		assert.doesNotMatch(compact, /Preflight advisory/);
+		assert.match(compact, /async workflow: Review workflow ─ background/);
+		assert.match(compact, /id: a6b9aa6b · 1\/2 done · 1 active · 5 tool uses/);
+		assert.match(compact, /write · worker\/mutation · apply the smallest fix · src\/tui · fix\.md/);
+		assert.match(compact, /review · reviewer\/review · active · check the compact surface · src\/tui · review\.md/);
+		assert.doesNotMatch(compact, /Plan:|Plan note:|preflight mismatch|Preflight advisory/);
+		assert.doesNotMatch(compact, /decision:|claims:|expected:/);
+		assert.doesNotMatch(compact, /output:\s|next:/i);
 
 		const expanded = buildWidgetLines([job], theme, 180, true).join("\n");
-		assert.match(expanded, /Preflight: v1 · partial · 1 lane/);
-		assert.match(expanded, /review \| review \|/);
+		assert.match(expanded, /Preflight: v1 · partial · 2 lanes/);
+		assert.match(expanded, /write \| mutation \| apply the smallest fix \| src\/tui \| fix\.md/);
+		assert.match(expanded, /review \| review \| check the compact surface \| src\/tui \| review\.md/);
 		assert.match(expanded, /expected output \| independence/);
 		assert.match(expanded, /Preflight warnings:/);
 		assert.match(expanded, /review\.extra.*without a declared lane/);
+	});
+
+	it("degrades compact workflow rows without preflight metadata", () => {
+		const job = {
+			asyncId: "workflow-fallback-123",
+			asyncDir: "/tmp/workflow-fallback",
+			status: "running",
+			mode: "workflow",
+			steps: [
+				{ index: 0, workflowKey: "scope", agent: "scout", label: "Scope the request", description: "Inspect the repository", status: "complete", outputName: "scope.md" },
+				{ index: 1, workflowKey: "implement", agent: "worker", label: "Implement the fix", description: "Change only the renderer", status: "running", outputName: "fix.md" },
+			],
+		};
+		const compact = buildWidgetLines([job], theme, 180).join("\n");
+		assert.match(compact, /async workflow: workflow ─ background/);
+		assert.match(compact, /scope · scout · Scope the request/);
+		assert.match(compact, /implement · worker · active · Implement the fix/);
+		assert.doesNotMatch(compact, /Plan:|next:|output:/i);
+
+		const narrow = buildWidgetLines([job], theme, 72);
+		assert.match(narrow[1] ?? "", /id: workflow · 1\/2 done · 1 active/);
+		for (const line of narrow) assert.ok(visibleWidth(line) <= 72, `workflow row exceeds width: ${visibleWidth(line)}`);
+		const tightHeader = buildWidgetLines([{ ...job, description: "backlog-wave" }], theme, 40)[0] ?? "";
+		assert.match(tightHeader, /async workflow backlog-wave · background/);
+		assert.doesNotMatch(tightHeader, /workflow:/);
+		const longJob = { ...job, steps: job.steps.map((step, index) => ({ ...step, label: `${step.label} ${"with a deliberately long lane description ".repeat(4)}`, description: index === 1 ? `${step.description} ${"and more detail ".repeat(8)}` : step.description })) };
+		const truncated = buildWidgetLines([longJob], theme, 72);
+		assert.match(truncated[1] ?? "", /id: workflow · 1\/2 done · 1 active/);
+		assert.ok(truncated.some((line) => line.includes("...")), "narrow lane rows should be truncated");
 	});
 
 	it("projects known workflow metadata into a compact lane row", () => {
@@ -307,9 +490,46 @@ describe("subagent async widget rendering", () => {
 		};
 
 		const text = buildWidgetLines([job], theme, 180).join("\n");
-		assert.match(text, /ci: CI checks · running · provider:local-tests · PR #1614/);
-		assert.match(text, /gate: Review gate · inconclusive · provider:opaque-provider · reason:stale-head · stale · out:gate.json/);
-		assert.doesNotMatch(text, /async subagent .*CI checks/);
+		assert.match(text, /async workflow: host-run ─ background/);
+		assert.match(text, /id: host-run · 0\/2 done · 1 active · 1 blocked/);
+		assert.match(text, /ci-1 · active · CI checks/);
+		assert.match(text, /gate-1 · blocked · Review gate/);
+		assert.match(text, /bottleneck · gate-1 · blocked/);
+		assert.doesNotMatch(text, /Plan:|next:|output:/i);
+
+		const expanded = buildWidgetLines([job], theme, 180, true).join("\n");
+		assert.match(expanded, /ci: CI checks · running · provider:local-tests · PR #1614/);
+		assert.match(expanded, /gate: Review gate · inconclusive · provider:opaque-provider · reason:stale-head · stale · out:gate.json/);
+	});
+
+	it("chooses the most severe compact workflow bottleneck", () => {
+		const text = buildWidgetLines([{
+			asyncId: "workflow-bottleneck-severity",
+			asyncDir: "/tmp/workflow-bottleneck-severity",
+			status: "running",
+			mode: "workflow",
+			steps: [
+				{ index: 0, workflowKey: "paused-first", agent: "worker", status: "paused" },
+				{ index: 1, workflowKey: "failed-later", agent: "reviewer", status: "failed", error: "review failed" },
+			],
+		}], theme, 180).join("\n");
+		assert.match(text, /paused-first · worker · paused/);
+		assert.match(text, /failed-later · reviewer · failed/);
+		assert.match(text, /bottleneck · failed-later · failed/);
+		assert.doesNotMatch(text, /bottleneck · paused-first/);
+	});
+
+	it("renders a workflow failure detail once in expanded checklist output", () => {
+		const detail = "review failed with one canonical diagnostic";
+		const text = buildWidgetLines([{
+			asyncId: "workflow-error-dedup",
+			asyncDir: "/tmp/workflow-error-dedup",
+			status: "failed",
+			mode: "workflow",
+			steps: [{ index: 0, workflowKey: "review", agent: "reviewer", status: "failed", error: detail }],
+		}], theme, 180, true).join("\n");
+
+		assert.equal(text.match(new RegExp(detail, "g"))?.length, 1, text);
 	});
 
 	it("keeps simple one-off async rows on the existing fallback projection", () => {
@@ -747,7 +967,7 @@ describe("subagent async widget rendering", () => {
 		assert.match(text, /Agent 1\/3: reviewer · running · active now · 5 turns · 18 tool uses · 44k token/);
 		assert.match(text, /Agent 2\/3: reviewer · running · active 2s ago · 4 turns · 13 tool uses · 22k token/);
 		assert.match(text, /Agent 3\/3: reviewer · running · grep \| 1\.0s · 3 turns · 11 tool uses · 19k token/);
-		assert.match(text, /Press configured-expand-key for live detail/);
+		assert.match(text, /Configure the expand key for live detail/);
 		assert.doesNotMatch(text, /widget truncated/);
 		assert.ok(lines.length <= 10, "collapsed component should stay under DM's string-widget cap even though it bypasses it");
 	});
@@ -834,8 +1054,9 @@ describe("subagent async widget rendering", () => {
 
 			renderWidget(ui.ctx as never, crowdedJobs);
 			const crowdedLines = renderWidgetLines(ui.widgets.at(-1));
-			assert.equal(crowdedLines.length, 10, "30 terminal rows should keep the compact widget cap while locking height");
-			assert.match(crowdedLines.join("\n"), /Async agents · 3 agents running/);
+			assert.equal(crowdedLines.length, 4, "the crowded progressive card locks to its content rows");
+			assert.equal(crowdedLines.filter((line) => line.trim() === "").length, 0);
+			assert.match(crowdedLines.join("\n"), /Async agents · 6 agents running/);
 
 			renderWidget(ui.ctx as never, [{
 				...crowdedJobs[0]!,
@@ -848,15 +1069,36 @@ describe("subagent async widget rendering", () => {
 				],
 			}]);
 			const settledLines = renderWidgetLines(ui.widgets.at(-1));
-			assert.equal(settledLines.length, 10, "collapsed widget keeps its locked row count until cleared or resized");
+			assert.equal(settledLines.length, 2, "the card shrinks to header plus the remaining job when jobs leave");
+			assert.equal(settledLines.filter((line) => line.trim() === "").length, 0);
 			assert.match(settledLines.join("\n"), /parallel · done/);
 
 			renderWidget(ui.ctx as never, []);
 			renderWidget(ui.ctx as never, [{ asyncId: "small", asyncDir: "/tmp/small", status: "running", agents: ["worker"], currentTool: "read" }]);
 			const resetLines = renderWidgetLines(ui.widgets.at(-1));
-			assert.ok(resetLines.length < 10, "clearing the widget starts a fresh layout session");
+			assert.ok(resetLines.length < 4, `clearing the widget starts a fresh layout session, got ${resetLines.length}`);
 		});
 		resetWidgetLayout();
+	});
+
+	it("counts unloaded workflow children and step-less parallel runs like FleetView in the progressive header", () => {
+		resetWidgetLayout();
+		// FleetView counts only loaded workflow children, and synthesizes steps from `agents` for step-less runs.
+		const solo = { asyncId: "solo", asyncDir: "/tmp/solo", mode: "single", agents: ["worker"], status: "running", currentTool: "bash" };
+		const cases = [
+			{ expected: "1 agent running", job: { asyncId: "wf", asyncDir: "/tmp/wf", mode: "workflow", status: "running",
+				steps: [0, 1, 2, 3].map((index) => ({ index, workflowKey: `lane-${index}`, runId: `unloaded-${index}`, agent: "scout", status: "running" })) } },
+			{ expected: "3 agents running", job: { asyncId: "par", asyncDir: "/tmp/par", mode: "parallel", status: "running", agents: ["a", "b"] } },
+			{ expected: "3 agents running", job: { asyncId: "par", asyncDir: "/tmp/par", mode: "parallel", status: "running", agents: ["a", "b"], steps: [], runningSteps: 2 } },
+		];
+		for (const { expected, job } of cases) {
+			withStdoutSize(22, 120, () => {
+				const ui = createUiContext();
+				renderWidget(ui.ctx as never, [job, solo]);
+				assert.match(renderWidgetLines(ui.widgets.at(-1), 120)[0] ?? "", new RegExp(`Async agents · ${expected}`), `${job.asyncId} header should say ${expected}`);
+			});
+			resetWidgetLayout();
+		}
 	});
 
 	it("keeps medium terminal progressive fallback within the compact cap", () => {
@@ -878,8 +1120,122 @@ describe("subagent async widget rendering", () => {
 
 			renderWidget(ui.ctx as never, jobs);
 			const lines = renderWidgetLines(ui.widgets.at(-1));
-			assert.equal(lines.length, 14);
+			assert.ok(lines.length <= 14, `progressive card should stay within the compact cap, got ${lines.length}`);
+			assert.equal(lines.filter((line) => line.trim() === "").length, 0, "progressive card should not pad with blank rows");
 			assert.match(lines.join("\n"), /parallel · running/);
+		});
+		resetWidgetLayout();
+	});
+
+	it("shows workflow lanes instead of blank rows in the progressive card (#2578)", () => {
+		resetWidgetLayout();
+		withStdoutSize(36, 120, () => {
+			const lanes = ["lane-1", "lane-2", "lane-3", "lane-4"].map((key) => ({
+				asyncId: `child-${key}`, asyncDir: `/tmp/${key}`, parentWorkflowRunId: "wf", workflowKey: key,
+				mode: "single", agents: ["scout"], status: "running", currentTool: "read",
+			}));
+			const workflow = { asyncId: "wf", asyncDir: "/tmp/wf", mode: "workflow", status: "running",
+				steps: lanes.map((lane, index) => ({ index, workflowKey: lane.workflowKey, runId: lane.asyncId, agent: "scout", status: "running" })) };
+			const single = { asyncId: "solo", asyncDir: "/tmp/solo", mode: "single", agents: ["worker"], status: "running", currentTool: "bash" };
+			const ui = createUiContext();
+			renderWidget(ui.ctx as never, [workflow, ...lanes, single]);
+			const lines = renderWidgetLines(ui.widgets.at(-1), 120);
+			assert.match(lines[0] ?? "", /Async agents · 5 agents running/, "4 workflow lanes plus 1 single run, matching FleetView's active agent count");
+			assert.equal(lines.filter((line) => line.trim() === "").length, 0, lines.join("\n"));
+			assert.equal(lines.length, 7, "header, workflow, four lanes, single run");
+			for (const key of ["lane-1", "lane-2", "lane-3", "lane-4"]) assert.match(lines.join("\n"), new RegExp(`${key} · scout`));
+
+			const extra = { asyncId: "solo-2", asyncDir: "/tmp/solo-2", mode: "single", agents: ["reviewer"], status: "running", currentTool: "grep" };
+			renderWidget(ui.ctx as never, [workflow, ...lanes, single, extra]);
+			const grown = renderWidgetLines(ui.widgets.at(-1), 120);
+			assert.equal(grown.length, lines.length, "a job started before the next relock keeps the locked height");
+			assert.equal(grown.filter((line) => line.trim() === "").length, 0, grown.join("\n"));
+			assert.match(grown.join("\n"), /reviewer · running/);
+		});
+		resetWidgetLayout();
+	});
+
+	it("grows a content-sized progressive card when a job starts before the next relock", () => {
+		resetWidgetLayout();
+		withStdoutSize(30, 120, () => {
+			const wide = {
+				asyncId: "run-wide", asyncDir: "/tmp/run-wide", status: "running", mode: "parallel",
+				agents: Array.from({ length: 40 }, (_, index) => `agent-${index}`), activeParallelGroup: true,
+				runningSteps: 40, completedSteps: 0, stepsTotal: 40,
+				steps: Array.from({ length: 40 }, (_, index) => ({ index, agent: `agent-${index}`, status: "running", currentTool: "read" })),
+			};
+			const ui = createUiContext();
+			renderWidget(ui.ctx as never, [wide]);
+			assert.equal(renderWidgetLines(ui.widgets.at(-1)).length, 2, "one job locks a two-row progressive card");
+
+			const late = { asyncId: "run-late", asyncDir: "/tmp/run-late", status: "running", mode: "single", agents: ["reviewer"], currentTool: "grep" };
+			renderWidget(ui.ctx as never, [wide, late]);
+			const grown = renderWidgetLines(ui.widgets.at(-1));
+			const text = grown.join("\n");
+			assert.equal(grown.length, 3, text);
+			assert.match(text, /parallel · running/);
+			assert.match(text, /reviewer · running/);
+			assert.doesNotMatch(text, /\+\d+ more/);
+			assert.equal(grown.filter((line) => line.trim() === "").length, 0, text);
+
+			renderWidget(ui.ctx as never, [wide, { ...late, status: "complete", currentTool: undefined }]);
+			assert.equal(renderWidgetLines(ui.widgets.at(-1)).length, 3, "a finished job that is still listed keeps the grown height");
+
+			renderWidget(ui.ctx as never, [wide]);
+			assert.equal(renderWidgetLines(ui.widgets.at(-1)).length, 2, "the card shrinks once the finished job leaves the list");
+		});
+		resetWidgetLayout();
+	});
+
+	it("shrinks the progressive card without blank rows when root jobs leave (#2651)", () => {
+		const singles = Array.from({ length: 6 }, (_, index) => ({
+			asyncId: `solo-${index}`, asyncDir: `/tmp/solo-${index}`, mode: "single", agents: ["worker"], status: "running", currentTool: "read",
+		}));
+		const lanes = ["lane-1", "lane-2", "lane-3", "lane-4"].map((key) => ({
+			asyncId: `child-${key}`, asyncDir: `/tmp/${key}`, parentWorkflowRunId: "wf", workflowKey: key,
+			mode: "single", agents: ["scout"], status: "running", currentTool: "read",
+		}));
+		const workflow = { asyncId: "wf", asyncDir: "/tmp/wf", mode: "workflow", status: "running",
+			steps: lanes.map((lane, index) => ({ index, workflowKey: lane.workflowKey, runId: lane.asyncId, agent: "scout", status: "running" })) };
+		const single = singles[0]!;
+		for (const { rows, before, after } of [
+			{ rows: 26, before: singles, after: [single] },
+			{ rows: 36, before: [workflow, ...lanes, single], after: [single] },
+		]) {
+			resetWidgetLayout();
+			withStdoutSize(rows, 120, () => {
+				const ui = createUiContext();
+				renderWidget(ui.ctx as never, before);
+				assert.equal(renderWidgetLines(ui.widgets.at(-1), 120).length, 7, `${rows} rows: progressive card before jobs leave`);
+				for (let pass = 0; pass < 2; pass++) {
+					renderWidget(ui.ctx as never, after);
+					const lines = renderWidgetLines(ui.widgets.at(-1), 120);
+					assert.equal(lines.length, 2, `${rows} rows, pass ${pass}: ${lines.join("\n")}`);
+					assert.equal(lines.filter((line) => line.trim() === "").length, 0, lines.join("\n"));
+				}
+			});
+		}
+		resetWidgetLayout();
+	});
+
+	it("keeps the progressive height when content shrinks but every root job remains", () => {
+		resetWidgetLayout();
+		withStdoutSize(36, 120, () => {
+			const lanes = ["lane-1", "lane-2", "lane-3", "lane-4"].map((key) => ({
+				asyncId: `child-${key}`, asyncDir: `/tmp/${key}`, parentWorkflowRunId: "wf", workflowKey: key,
+				mode: "single", agents: ["scout"], status: "running", currentTool: "read",
+			}));
+			const steps = lanes.map((lane, index) => ({ index, workflowKey: lane.workflowKey, runId: lane.asyncId, agent: "scout", status: "running" }));
+			const workflow = { asyncId: "wf", asyncDir: "/tmp/wf", mode: "workflow", status: "running", steps };
+			const single = { asyncId: "solo", asyncDir: "/tmp/solo", mode: "single", agents: ["worker"], status: "running", currentTool: "bash" };
+			const ui = createUiContext();
+			renderWidget(ui.ctx as never, [workflow, ...lanes, single]);
+			assert.equal(renderWidgetLines(ui.widgets.at(-1), 120).length, 7);
+
+			renderWidget(ui.ctx as never, [{ ...workflow, steps: steps.slice(0, 2) }, lanes[0]!, lanes[1]!, single]);
+			const lines = renderWidgetLines(ui.widgets.at(-1), 120);
+			assert.equal(lines.length, 7, "dropping two lanes with the same root jobs keeps the locked height");
+			assert.doesNotMatch(lines.join("\n"), /lane-3/);
 		});
 		resetWidgetLayout();
 	});
@@ -926,16 +1282,16 @@ describe("subagent async widget rendering", () => {
 		resetWidgetLayout();
 	});
 
-	it("keeps the active runs.lanes stage in focus before collapsed history", () => {
+	it("renders loaded workflow lanes without normal-running bottleneck noise", () => {
 		resetWidgetLayout();
-		withStdoutSize(60, 120, () => {
+		withStdoutSize(30, 120, () => {
 			const stageKeys = ["scope-scout", "red-tests", "label-helpers", "summary-title", "detail-row", "tiers-noise", "validation", "minimality-challenge", "fresh-review"];
 			const nodeIds = stageKeys.map((key) => `issue-1695.${key}`);
-			const statuses = stageKeys.map((_, index) => index < 3 ? "completed" : index === 3 ? "running" : "pending");
+			const statuses = stageKeys.map((_, index) => index < 7 ? "completed" : index === 7 ? "running" : "pending");
 			const workflowGraph = {
 				runId: "workflow-1695",
 				mode: "workflow",
-				phases: [{ title: "issue-1695 staged lane", nodeIds }],
+				phases: stageKeys.map((title, index) => ({ title, nodeIds: [nodeIds[index]!] })),
 				nodes: stageKeys.map((key, index) => ({
 					id: nodeIds[index],
 					kind: "step",
@@ -945,7 +1301,7 @@ describe("subagent async widget rendering", () => {
 					flatIndex: index,
 					stepIndex: index,
 				})),
-				currentNodeId: nodeIds[3],
+				currentNodeId: nodeIds[7],
 			};
 			const job = {
 				asyncId: "workflow-1695",
@@ -953,11 +1309,11 @@ describe("subagent async widget rendering", () => {
 				status: "running",
 				mode: "workflow",
 				agents: ["scout", "worker"],
-				currentStep: 3,
-				stepsTotal: 4,
+				currentStep: 7,
+				stepsTotal: stageKeys.length,
 				updatedAt: 200,
 				workflowGraph,
-				steps: stageKeys.slice(0, 4).map((key, index) => ({
+				steps: stageKeys.slice(0, 8).map((key, index) => ({
 					index,
 					agent: index === 0 ? "scout" : "worker",
 					status: statuses[index],
@@ -969,18 +1325,16 @@ describe("subagent async widget rendering", () => {
 					...(index < 3 ? { lastActivityAt: 100 } : { currentTool: "read", currentToolStartedAt: 190, lastActivityAt: 195 }),
 				})),
 			};
-			const ui = createUiContext();
-			renderWidget(ui.ctx as never, [job]);
-			const lines = renderWidgetLines(ui.widgets.at(-1));
+			const lines = buildWidgetLines([job], theme, 220);
 			const text = lines.join("\n");
-			const activeIndex = lines.findIndex((line) => line.includes("summary-title"));
-			const hiddenIndex = lines.findIndex((line) => /lines hidden/.test(line));
-			assert.ok(hiddenIndex >= 0, `collapsed history should expose a hidden-lines marker:\n${text}`);
-			assert.ok(activeIndex >= 0, `active stage should remain visible:\n${text}`);
-			assert.ok(activeIndex < hiddenIndex, `active stage must precede the hidden-lines marker:\n${text}`);
-			assert.match(text, /stage\s+4\/9/i);
-			assert.match(text, /summary-title task/);
-			assert.match(lines[activeIndex]!, /worker/);
+			assert.match(text, /async workflow: workflow ─ background/);
+			assert.match(text, /id: workflow · 7\/9 done · 1 active · 1 queued/);
+			assert.match(text, /issue-1695\.minimality-challenge · worker · active/);
+			assert.match(text, /issue-1695\.fresh-review · worker · queued/);
+			assert.doesNotMatch(text, /bottleneck ·/);
+			assert.match(text, /Configure the expand key for details/);
+			assert.match(text, /label-helpers/);
+			assert.doesNotMatch(text, /Step \d+\/9|task:|workspace:|out(?:put)?:|next:/i);
 		});
 		resetWidgetLayout();
 	});
@@ -1018,7 +1372,7 @@ describe("subagent async widget rendering", () => {
 			stepsTotal: stages.length,
 			workflowGraph,
 			steps: stages,
-		}], theme, 220, false).join("\n");
+		}], theme, 220, true).join("\n");
 		const rowIndex = (label: string): number => text.split("\n").findIndex((line) => line.includes(label));
 		const completed = rowIndex("completed-history");
 		const failed = rowIndex("failed-stage");
@@ -1164,7 +1518,7 @@ describe("subagent async widget rendering", () => {
 		assert.doesNotMatch(text, /Agent 1\/3: reviewer/);
 		assert.match(text, /⎿  active now/);
 		assert.match(text, /Agent 2\/3: reviewer · running\n\s+⎿  read \| 2\.0s/);
-		assert.match(text, /Press configured-expand-key for live detail/);
+		assert.match(text, /Configure the expand key for live detail/);
 		assert.match(text, /Agent 3\/3: reviewer · complete · 1\.5k token/);
 	});
 
@@ -1243,9 +1597,8 @@ describe("subagent async widget rendering", () => {
 		], theme, 180);
 
 		const text = lines.join("\n");
-		assert.match(text, /reviewer · running \(gpt-5\.5 · thinking high\)/);
-		assert.match(text, /scout · running \(claude-haiku-4-5 · thinking low\)/);
-		assert.doesNotMatch(text, /openai-codex\/gpt-5\.5/);
+		assert.match(text, /reviewer · running \(openai-codex\/gpt-5\.5 · thinking high\)/);
+		assert.match(text, /scout · running \(anthropic\/claude-haiku-4-5 · thinking low\)/);
 		assert.doesNotMatch(text, /gpt-5\.5:high/);
 	});
 
@@ -1300,11 +1653,11 @@ describe("subagent async widget rendering", () => {
 		};
 
 		const collapsedText = buildWidgetLines([job], theme, 180).join("\n");
-		assert.match(collapsedText, /Press configured-expand-key for live detail/);
+		assert.match(collapsedText, /Configure the expand key for live detail/);
 		assert.doesNotMatch(collapsedText, /found renderWidget/);
 
 		const expandedText = buildWidgetLines([job], theme, 180, true).join("\n");
-		assert.doesNotMatch(expandedText, /Press configured-expand-key for live detail/);
+		assert.doesNotMatch(expandedText, /Configure the expand key for live detail/);
 		assert.match(expandedText, /⎿  read: src\/tui\/render\.ts \| 2\.0s/);
 		assert.match(expandedText, outputPathPattern("/tmp/1/output-0.log"));
 		assert.match(expandedText, /grep: async widget/);
@@ -1518,14 +1871,14 @@ describe("subagent async widget rendering", () => {
 		assert.match(collapsedText, /reviewer · running · 23 tool uses · 49\.1s/);
 		assert.match(collapsedText, /task: Review the widget/);
 		assert.match(collapsedText, /⎿  read: src\/tui\/render\.ts \| 2\.0s/);
-		assert.match(collapsedText, /Press configured-expand-key for live detail/);
+		assert.match(collapsedText, /Configure the expand key for live detail/);
 		assert.match(collapsedText, outputPathPattern("/tmp/single-run/output-0.log"));
 		assert.doesNotMatch(collapsedText, /error: failed to inspect the widget/);
 
 		const expandedText = buildWidgetLines([job], theme, 180, true).join("\n");
 		const expandedLines = expandedText.split("\n");
 		const expandedSummary = expandedLines.slice(0, 2).join("\n");
-		assert.doesNotMatch(expandedText, /Press configured-expand-key for live detail/);
+		assert.doesNotMatch(expandedText, /Configure the expand key for live detail/);
 		assert.doesNotMatch(expandedSummary, /step 1\/1/i);
 		assert.match(expandedSummary, /async subagent · background/);
 		assert.match(expandedSummary, /reviewer/);
@@ -1654,7 +2007,7 @@ describe("subagent async widget rendering", () => {
 
 		assert.match(text, /⎿  read 1\.0s/);
 		assert.doesNotMatch(text, /Step 1\/1/);
-		assert.doesNotMatch(text, /Press configured-expand-key for live detail/);
+		assert.doesNotMatch(text, /Configure the expand key for live detail/);
 	});
 
 	it("includes logical chain context for active async chain parallel groups", () => {
@@ -1790,7 +2143,7 @@ describe("subagent async widget rendering", () => {
 		assert.match(text, /chain · step 2\/2/);
 		assert.match(text, /Step 1\/2: parallel group · 3\/3 done/);
 		assert.match(text, /Step 2\/2: writer · running · 1 tool use/);
-		assert.match(text, /Press configured-expand-key for live detail/);
+		assert.match(text, /Configure the expand key for live detail/);
 		assert.match(text, outputPathPattern("/tmp/chain/output-3.log"));
 		assert.doesNotMatch(text, /step 4\/4/);
 		assert.doesNotMatch(text, /Step 4\/4/);
@@ -1926,7 +2279,7 @@ describe("subagent async widget rendering", () => {
 		);
 	});
 
-	it("advances running widget glyphs when the wall clock moves despite unchanged progress", () => {
+	it("keeps running widget glyphs stable across unrelated renders of the same frame", () => {
 		const originalNow = Date.now;
 		const job = {
 			asyncId: "run-stable",
@@ -1941,14 +2294,16 @@ describe("subagent async widget rendering", () => {
 		};
 		try {
 			Date.now = () => 1_000;
-			const first = buildWidgetLines([job], theme, 120);
+			const first = buildWidgetLines([job], theme, 120, false, 0);
 			Date.now = () => 1_125;
-			const second = buildWidgetLines([job], theme, 120);
+			const second = buildWidgetLines([job], theme, 120, false, 0);
+			const third = buildWidgetLines([job], theme, 120, false, 1);
 			const withoutRunningGlyphs = (lines: string[]) => lines.map((line) => line.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/gu, ""));
 
-			assert.notDeepEqual(second, first);
-			assert.deepEqual(withoutRunningGlyphs(second), withoutRunningGlyphs(first), "only the running glyph should change");
-			assert.notEqual(firstGrapheme(first[1] ?? ""), firstGrapheme(second[1] ?? ""));
+			assert.deepEqual(second, first, "unrelated renders of the same frame must not retick the glyph");
+			assert.notDeepEqual(third, first);
+			assert.deepEqual(withoutRunningGlyphs(third), withoutRunningGlyphs(first), "only the running glyph should change");
+			assert.notEqual(firstGrapheme(first[1] ?? ""), firstGrapheme(third[1] ?? ""));
 		} finally {
 			Date.now = originalNow;
 		}

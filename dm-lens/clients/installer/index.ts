@@ -29,16 +29,17 @@
  * - rust-analyzer (Rust LSP) [GitHub release]
  * - golangci-lint (Go linting) [GitHub release]
  *
- * Manual install required (25+ tools):
- * - yaml-language-server: npm install -g yaml-language-server
- * - vscode-json-languageserver: npm install -g vscode-langservers-extracted
- * - bash-language-server: npm install -g bash-language-server
- * - svelte-language-server: npm install -g svelte-language-server
- * - vscode-css-languageserver: npm install -g vscode-langservers-extracted
- * - @prisma/language-server: npm install -g @prisma/language-server
- * - dockerfile-language-server: npm install -g dockerfile-language-server-nodejs
- * - @vue/language-server: npm install -g @vue/language-server
- * - And all language-specific servers (gopls, rust-analyzer, etc.)
+ * Every other managed tool (including several the list above omits, e.g.
+ * bash-language-server, yaml-language-server, svelte-language-server,
+ * @prisma/language-server, @vue/language-server, dockerfile-language-server-nodejs,
+ * and vscode-css-languageserver — all of which ARE auto-installed) is
+ * documented by the `TOOLS` array below, not restated here. #2638: a
+ * hand-kept "manual install" list naming specific package specs used to live
+ * in this comment, drifted from `TOOLS` (it named a since-unpublished npm
+ * package for the CSS entry, and several tools it called "manual" were
+ * already auto-install above) and nothing caught it. `TOOLS` is the single
+ * source of truth for every id, package, and strategy; deleted rather than
+ * re-derived, since a comment cannot be generated from code at write time.
  *
  * Strategies:
  * - npm packages via npx/bun
@@ -47,8 +48,15 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, statSync, unlinkSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import fs from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import https from "node:https";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -66,9 +74,26 @@ const _installerRequire = createRequire(import.meta.url);
 
 import { createGunzip } from "node:zlib";
 import { TRANSIENT_MAX_COOLDOWN_MS } from "../dispatch/runners/utils/availability-policy.js";
-import { recordDegradationOnce } from "../degradation-ledger.js";
+import {
+	getDegradationLedgerGeneration,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import { commitDurableStoreAsync } from "../durable-store.js";
 import { getGlobalDmLensDir } from "../file-utils.js";
+import { createGenerationMap } from "../generation-guard.js";
+import {
+	type GenerationHeartbeat,
+	type GenerationHold,
+	heartbeatIntervalMs,
+	isLockContention,
+	ownsTopGeneration,
+	recordGenerationTakeover,
+	recordLegacyLockHeld,
+	releaseGeneration,
+	startGenerationHeartbeat,
+	tryAcquireGeneration,
+} from "../generation-lock.js";
+import { resolveToolCwd } from "../tool-cwd.js";
 import {
 	allAvailableGlobalBinDirs,
 	installArgs,
@@ -79,12 +104,20 @@ import {
 	resetSafeSpawnWindowsCommandCache,
 	safeSpawnAsync,
 } from "../safe-spawn.js";
+import {
+	type BoundedOutputSink,
+	createBoundedOutputSink,
+	DEFAULT_MAX_OUTPUT_BYTES,
+} from "../spawn-output-cap.js";
+import { probeToolAsync } from "../tool-probe.js";
 import { logSessionStart } from "../sessionstart-logger.js";
+import { resolveGitHubToken } from "../zizmor-config.js";
 
 // Global installation directory for dm-lens tools
 const TOOLS_DIR = path.join(getGlobalDmLensDir(), "tools");
 const INSTALL_LOCK_PATH = path.join(TOOLS_DIR, ".install.lock");
-const activeInstallLocks = new Set<string>();
+const INSTALL_LOCK_GENERATIONS = `${INSTALL_LOCK_PATH}s`;
+const activeInstallLocks = new Set<InstallLockHold>();
 let installLockExitCleanupRegistered = false;
 
 /**
@@ -101,6 +134,20 @@ interface InstallLockOwner {
 	createdAt: number;
 }
 
+/**
+ * A held install lock: its generation, the exact text it wrote to the old
+ * file, and the heartbeat keeping the generation's mtime fresh for the whole
+ * hold (#3515). Release compares that text, as the bounded lock compares its
+ * token: a pid alone also matches a newer hold of this same process (#3476
+ * review F3). The `nonce` keeps two holds created in one millisecond apart;
+ * older installers read only `pid` and `createdAt`.
+ */
+interface InstallLockHold {
+	generation: GenerationHold;
+	token: string;
+	heartbeat: GenerationHeartbeat;
+}
+
 function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -110,11 +157,152 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
+/**
+ * How old a lock may be before it is stale whatever its pid says: longer than
+ * any legitimate install (the owner's install bound plus slack). #946 review
+ * F1: pid liveness alone cannot detect a hard-killed owner whose pid Windows
+ * has recycled, and that lock would poison every later install.
+ */
+function installLockMaxAgeMs(): number {
+	return (Number(process.env.DM_LENS_INSTALL_TIMEOUT_MS) || 120_000) + 60_000;
+}
+
+/**
+ * The pre-#3476 install lock file. Installers from older versions take only
+ * this file, so while mixed versions run a generation holder holds it too: an
+ * older installer blocks on it, and a live older installer blocks the holder.
+ * Only a generation holder creates or removes it, so installers of this
+ * version never race each other for it. A stale one is removed by path,
+ * which races only an older installer's own takeover.
+ */
+function legacyInstallLockIsStale(maxAgeMs: number): boolean {
+	try {
+		const owner = JSON.parse(
+			readFileSync(INSTALL_LOCK_PATH, "utf8"),
+		) as InstallLockOwner;
+		const expired =
+			Number.isFinite(owner.createdAt) &&
+			Date.now() - owner.createdAt > maxAgeMs;
+		return (
+			expired ||
+			(Number.isInteger(owner.pid) &&
+				owner.pid > 0 &&
+				!isProcessAlive(owner.pid))
+		);
+	} catch {
+		// An unreadable/empty lock has no createdAt to age out: fall back to the
+		// file's own mtime so it is eventually recoverable (#946 review F1/F6).
+		try {
+			return Date.now() - statSync(INSTALL_LOCK_PATH).mtimeMs > maxAgeMs;
+		} catch {
+			return false;
+		}
+	}
+}
+
+function createLegacyInstallLock(token: string): boolean {
+	try {
+		writeFileSync(INSTALL_LOCK_PATH, token, { flag: "wx" });
+		return true;
+	} catch (cause) {
+		if (isLockContention(cause)) return false;
+		throw cause;
+	}
+}
+
+function takeLegacyInstallLock(maxAgeMs: number, token: string): boolean {
+	if (createLegacyInstallLock(token)) return true;
+	if (!legacyInstallLockIsStale(maxAgeMs)) return false;
+	try {
+		unlinkSync(INSTALL_LOCK_PATH);
+	} catch {
+		// Gone since the create, or (Windows) still open elsewhere: retry.
+		return false;
+	}
+	return createLegacyInstallLock(token);
+}
+
+function installLockOwner(): string {
+	try {
+		const owner = JSON.parse(
+			readFileSync(INSTALL_LOCK_PATH, "utf8"),
+		) as InstallLockOwner;
+		return `pid=${owner.pid} createdAt=${owner.createdAt}`;
+	} catch {
+		return "unknown owner";
+	}
+}
+
+/**
+ * One attempt at the install lock (#3476): a generation in
+ * `TOOLS_DIR/.install.locks` with the install max age as its lease, then the
+ * pre-#3476 file. Of two takers of one stale generation exactly one exclusive
+ * create succeeds; the old takeover removed the lock by path, and a taker
+ * acting on an earlier judgement could remove a live successor's lock.
+ *
+ * #3515: the generation's mtime is kept fresh by a heartbeat for as long as
+ * the hold lives — an ERESOLVE npm install can run two 120s
+ * `runInstallAttempt`s inside `maxAgeMs` (180s by default), and nothing
+ * previously renewed the generation while that ran.
+ */
+function tryAcquireInstallLock(
+	maxAgeMs: number,
+): InstallLockHold | "busy" | "legacy-held" {
+	const hold = tryAcquireGeneration(INSTALL_LOCK_GENERATIONS, maxAgeMs);
+	if (!hold) return "busy";
+	if (hold.tookOverStale) recordGenerationTakeover(hold);
+	const heartbeat = startGenerationHeartbeat(
+		hold,
+		heartbeatIntervalMs(maxAgeMs),
+	);
+	const token = JSON.stringify({
+		pid: process.pid,
+		createdAt: Date.now(),
+		nonce: randomUUID(),
+	});
+	let took: boolean;
+	try {
+		took = takeLegacyInstallLock(maxAgeMs, token);
+	} catch (cause) {
+		heartbeat.stop();
+		releaseGeneration(hold);
+		throw cause;
+	}
+	if (took) return { generation: hold, token, heartbeat };
+	heartbeat.stop();
+	releaseGeneration(hold);
+	return "legacy-held";
+}
+
+/**
+ * Release a held install lock. The old file is removed only while it still
+ * holds this hold's own text: after an age-out takeover it names the new
+ * holder, an older installer or a newer hold of this process.
+ */
+function releaseInstallLock(hold: InstallLockHold): void {
+	activeInstallLocks.delete(hold);
+	hold.heartbeat.stop();
+	try {
+		if (readFileSync(INSTALL_LOCK_PATH, "utf8") === hold.token)
+			unlinkSync(INSTALL_LOCK_PATH);
+	} catch {
+		// Already gone: nothing of ours to remove.
+	}
+	releaseGeneration(hold.generation);
+}
+
 async function acquireInstallLock(): Promise<{
 	release?: () => Promise<void>;
 	reason?: string;
+	/**
+	 * Present only when `release` is: whether this hold is still the live top
+	 * generation right now (#3515). The heartbeat is what usually keeps this
+	 * true for the hold's whole lifetime; a strategy with more than one
+	 * critical write inside one hold (npm's ERESOLVE retry) checks this
+	 * between them and aborts rather than risk racing a second holder.
+	 */
+	ownsLock?: () => boolean;
 }> {
-	await fs.mkdir(TOOLS_DIR, { recursive: true });
 	// #946 review F2: the waiter's bound must exceed the owner's install bound
 	// (DM_LENS_INSTALL_TIMEOUT_MS, default 120s) — a 30s waiter gave up on a
 	// legitimate slow install and reported the tool unavailable for the whole
@@ -122,26 +310,21 @@ async function acquireInstallLock(): Promise<{
 	const timeoutMs =
 		Number(process.env.DM_LENS_INSTALL_LOCK_TIMEOUT_MS) || 150_000;
 	const deadline = Date.now() + timeoutMs;
-	let lastOwner = "unknown owner";
+	const maxAgeMs = installLockMaxAgeMs();
+	let legacyHeldRecorded = false;
 
 	while (Date.now() < deadline) {
-		try {
-			const handle = await fs.open(INSTALL_LOCK_PATH, "wx");
-			await handle.writeFile(
-				JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
-			);
-			await handle.close();
-			activeInstallLocks.add(INSTALL_LOCK_PATH);
+		const hold = tryAcquireInstallLock(maxAgeMs);
+		if (hold === "legacy-held" && !legacyHeldRecorded) {
+			legacyHeldRecorded = true;
+			recordLegacyLockHeld(INSTALL_LOCK_PATH);
+		}
+		if (typeof hold === "object") {
+			activeInstallLocks.add(hold);
 			if (!installLockExitCleanupRegistered) {
 				installLockExitCleanupRegistered = true;
 				process.once("exit", () => {
-					for (const lockPath of activeInstallLocks) {
-						try {
-							unlinkSync(lockPath);
-						} catch {
-							// Best effort; the next owner verifies this PID is dead.
-						}
-					}
+					for (const held of activeInstallLocks) releaseInstallLock(held);
 				});
 			}
 			let released = false;
@@ -149,60 +332,15 @@ async function acquireInstallLock(): Promise<{
 				release: async () => {
 					if (released) return;
 					released = true;
-					activeInstallLocks.delete(INSTALL_LOCK_PATH);
-					await fs.rm(INSTALL_LOCK_PATH, { force: true });
+					releaseInstallLock(hold);
 				},
+				ownsLock: () => ownsTopGeneration(hold.generation),
 			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			try {
-				const owner = JSON.parse(
-					await fs.readFile(INSTALL_LOCK_PATH, "utf8"),
-				) as InstallLockOwner;
-				lastOwner = `pid=${owner.pid} createdAt=${owner.createdAt}`;
-				// #946 review F1: PID liveness alone cannot detect a hard-killed
-				// owner whose PID Windows has recycled — that lock would poison
-				// every future install with a full-timeout wait. A lock older
-				// than any legitimate install (owner install bound + slack) is
-				// stale regardless of what the PID now points at.
-				const maxAgeMs =
-					(Number(process.env.DM_LENS_INSTALL_TIMEOUT_MS) || 120_000) + 60_000;
-				const expired =
-					Number.isFinite(owner.createdAt) &&
-					Date.now() - owner.createdAt > maxAgeMs;
-				if (
-					expired ||
-					(Number.isInteger(owner.pid) &&
-						owner.pid > 0 &&
-						!isProcessAlive(owner.pid))
-				) {
-					await fs.rm(INSTALL_LOCK_PATH, { force: true });
-					continue;
-				}
-			} catch (readError) {
-				lastOwner = "unreadable owner";
-				// An unreadable/empty lock has no createdAt to age out — fall
-				// back to the file's own mtime for the max-age check so it is
-				// eventually recoverable (#946 review F1/F6).
-				try {
-					const stat = await fs.stat(INSTALL_LOCK_PATH);
-					const maxAgeMs =
-						(Number(process.env.DM_LENS_INSTALL_TIMEOUT_MS) || 120_000) +
-						60_000;
-					if (Date.now() - stat.mtimeMs > maxAgeMs) {
-						await fs.rm(INSTALL_LOCK_PATH, { force: true });
-						continue;
-					}
-				} catch {
-					// stat raced a release — loop and retry acquisition.
-				}
-				void readError;
-			}
-			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
+		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
 	return {
-		reason: `timed out after ${timeoutMs}ms waiting for shared tools install lock (${lastOwner})`,
+		reason: `timed out after ${timeoutMs}ms waiting for shared tools install lock (${installLockOwner()})`,
 	};
 }
 
@@ -272,6 +410,8 @@ interface GitHubAssetSpec {
 	 * so the `ktlint` jar must land next to it (#218).
 	 */
 	extraAssets?: (platform: string, arch: string) => string[];
+	/** Runtime wrapper for a platform asset that is a PHAR or runnable JAR. */
+	launcher?: "php" | "java";
 }
 
 /**
@@ -302,8 +442,8 @@ export interface ArchiveSpec {
 	 *   arch:     "x64" | "arm64" | ...
 	 */
 	url: string | ((platform: string, arch: string) => string | undefined);
-	/** Archive kind — both extracted via `tar` (Windows bsdtar handles zip too). */
-	kind: "tgz" | "zip";
+	/** Archive kind, or a platform/arch resolver for releases that vary by OS. */
+	kind: "tgz" | "zip" | ((platform: string, arch: string) => "tgz" | "zip");
 	/**
 	 * Launcher path relative to the archive's top-level dir (which is stripped on
 	 * extraction), e.g. "bin/spotbugs". On win32 the installer resolves the
@@ -328,6 +468,29 @@ export interface ArchiveSpec {
 	 * launcher-existence check.
 	 */
 	treeMarker?: string;
+	/**
+	 * Lowercase-hex sha256 of every archive this spec can resolve, KEYED BY THE
+	 * RESOLVED URL (#3400). An archive install has no `--version` verdict, so the
+	 * bytes are checked against this pin before anything is extracted; a missing
+	 * key is a refusal, never an unchecked install. Keying by URL (not by a
+	 * parallel `(platform, arch)` resolver) means bumping a URL without its pin
+	 * reds `tests/clients/installer/tool-registry-consistency.test.ts` offline,
+	 * and a wrong pin reds the nightly tool-smoke row that downloads the archive.
+	 * Refresh a pin from the release: `gh api repos/<o>/<r>/releases/tags/<tag>
+	 * --jq '.assets[]|[.name,.digest]|@tsv'` (GitHub publishes `sha256:<hex>`).
+	 */
+	sha256?: Record<string, string>;
+	/**
+	 * Command the extracted launcher needs at run time (`java` for a JVM launcher
+	 * script), checked spawn-free BEFORE the download so a box without it is
+	 * `unavailable` rather than holding an 87 MB tree that cannot start. The
+	 * check is "the executable under the runtime's home env var when that is set
+	 * and non-empty (it decides alone, as the launcher's own does), else a
+	 * non-empty file named `runtime` on PATH" (`ARCHIVE_RUNTIME_HOMES`). It is a presence check, not a
+	 * working-JDK check: stock macOS ships `/usr/bin/java` as a stub, so there the
+	 * precheck passes and the download still happens.
+	 */
+	runtime?: string;
 }
 
 export interface ToolDefinition {
@@ -352,6 +515,33 @@ export interface ToolDefinition {
 	 * mechanism for any npm/pnpm/bun-distributed platform-CLI tool.
 	 */
 	platformPackage?: PlatformPackageSpec;
+	/**
+	 * Extra requirement specifiers that bound what pip may resolve for a
+	 * `"pip"`-strategy entry, applied through pip's own `PIP_CONSTRAINT` (#3311).
+	 * For a package whose published metadata under-constrains a dependency that
+	 * then breaks it: `cmake-language-server` 0.1.11 declares `pygls>=1.1.1`,
+	 * pip resolves pygls 2.x, and pygls 2 removed `pygls.server.LanguageServer`
+	 * — so every invocation of the installed launcher, `--version` included, dies
+	 * in an ImportError. A constraint, not a `packageName` pin: the app version
+	 * is fine, its dependency floor is what is wrong, and `packageName` is a
+	 * single argv token that cannot say anything about a dependency.
+	 */
+	pipConstraints?: string[];
+	/**
+	 * How the managed binary is verified. Absent (the default) spawns
+	 * `checkArgs`. `"package-entry"` verifies SPAWN-FREE — see
+	 * {@link verifyNpmPackageEntry} — for an npm stdio LSP server that has no
+	 * CLI surface at all AND whose transport-required diagnostic cannot be read
+	 * back through a pipe, so neither `checkArgs` nor #208's rescue can produce
+	 * a verdict (#2722). `"tree-manifest"` is the same spawn-free stance for an
+	 * ARCHIVE whose launcher starts a JVM/BEAM on any argument: it is verified AT
+	 * INSTALL by the pinned archive sha256 plus the launcher/marker found on disk
+	 * by `installArchiveTool` (later resolution only checks the shim exists), and
+	 * no `--version` is ever spawned: not after a refresh, not on the PATH rung,
+	 * not in the `/lens-tools` listing (#3400). The
+	 * initialize handshake stays in the nightly tool-smoke.
+	 */
+	verification?: "package-entry" | "tree-manifest";
 }
 
 export interface PlatformPackageSpec {
@@ -392,6 +582,171 @@ const OS_ARCH_ZIP_ASSETS = {
 	win32: { x64: "windows_amd64.zip", arm64: "windows_arm64.zip" },
 };
 
+type ManagedPackageFormatterSpec = {
+	id: string;
+	name: string;
+	installStrategy: "npm" | "pip";
+	packageName: string;
+};
+
+function managedPackageFormatterTool(
+	spec: ManagedPackageFormatterSpec,
+): ToolDefinition {
+	return {
+		id: spec.id,
+		name: spec.name,
+		checkCommand: spec.id,
+		checkArgs: ["--version"],
+		installStrategy: spec.installStrategy,
+		packageName: spec.packageName,
+		binaryName: spec.id,
+	};
+}
+
+const MANAGED_PACKAGE_FORMATTERS = [
+	{ id: "black", name: "Black", installStrategy: "pip", packageName: "black" },
+	{
+		id: "cmake-format",
+		name: "cmake-format",
+		installStrategy: "pip",
+		// The `yaml` EXTRA, never the bare distribution (#3312). cmakelang reads a
+		// `.cmake-format.yaml` project config through `import yaml`, and upstream
+		// puts PyYAML behind an extra: cmakelang 0.6.13's PyPI metadata declares
+		// `pyyaml (>=5.3) ; extra == 'yaml'`. A bare install still answers
+		// `cmake-format --version` with status 0 and then dies with
+		// `ModuleNotFoundError: No module named 'yaml'` on the first YAML config —
+		// the nightly's red cmake row. Every rung of the pip ladder passes this
+		// string verbatim to pip/pipx, which both accept the `pkg[extra]` spec.
+		packageName: "cmakelang[yaml]",
+	},
+	{ id: "oxfmt", name: "oxfmt", installStrategy: "npm", packageName: "oxfmt" },
+] satisfies ManagedPackageFormatterSpec[];
+
+type ManagedGitHubFormatterSpec = {
+	id: string;
+	name: string;
+	owner: string;
+	repo: string;
+	assetPattern: GitHubAssetSpec["assetMatch"];
+	kind: "binary" | "phar" | "jar";
+	binaryInArchive?: string;
+};
+
+function managedGitHubFormatterTool(
+	spec: ManagedGitHubFormatterSpec,
+): ToolDefinition {
+	return {
+		id: spec.id,
+		name: spec.name,
+		checkCommand: spec.id,
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: spec.id,
+		github: {
+			repo: `${spec.owner}/${spec.repo}`,
+			assetMatch: spec.assetPattern,
+			...(spec.binaryInArchive && { binaryInArchive: spec.binaryInArchive }),
+			...(spec.kind === "phar" && { launcher: "php" as const }),
+			...(spec.kind === "jar" && { launcher: "java" as const }),
+		},
+	};
+}
+
+const MANAGED_GITHUB_FORMATTERS = [
+	{
+		id: "typstyle",
+		name: "typstyle",
+		owner: "typstyle-rs",
+		repo: "typstyle",
+		assetPattern: archAssetMatch({
+			linux: {
+				x64: "typstyle-x86_64-unknown-linux-gnu",
+				arm64: "typstyle-aarch64-unknown-linux-gnu",
+			},
+			darwin: {
+				x64: "typstyle-x86_64-apple-darwin",
+				arm64: "typstyle-aarch64-apple-darwin",
+			},
+			win32: {
+				x64: "typstyle-x86_64-pc-windows-msvc.exe",
+				arm64: "typstyle-aarch64-pc-windows-msvc.exe",
+			},
+		}),
+		kind: "binary",
+	},
+	{
+		id: "stylua",
+		name: "StyLua",
+		owner: "JohnnyMorganz",
+		repo: "StyLua",
+		assetPattern: archAssetMatch({
+			linux: { x64: "linux-x86_64.zip", arm64: "linux-aarch64.zip" },
+			darwin: { x64: "macos-x86_64.zip", arm64: "macos-aarch64.zip" },
+			win32: { x64: "windows-x86_64.zip" },
+		}),
+		kind: "binary",
+		binaryInArchive: "stylua",
+	},
+	{
+		id: "php-cs-fixer",
+		name: "PHP CS Fixer",
+		owner: "PHP-CS-Fixer",
+		repo: "PHP-CS-Fixer",
+		assetPattern: (platform) =>
+			platform === "linux" || platform === "darwin" || platform === "win32"
+				? "php-cs-fixer.phar"
+				: undefined,
+		kind: "phar",
+	},
+	{
+		id: "cljfmt",
+		name: "cljfmt",
+		owner: "weavejester",
+		repo: "cljfmt",
+		assetPattern: (platform, arch) => {
+			if (platform === "linux")
+				return arch === "arm64"
+					? "standalone.jar"
+					: "linux-amd64-static.tar.gz";
+			if (platform === "darwin") return "standalone.jar";
+			if (platform === "win32") return "win-amd64.zip";
+			return undefined;
+		},
+		kind: "jar",
+		binaryInArchive: "cljfmt",
+	},
+] satisfies ManagedGitHubFormatterSpec[];
+
+const MANAGED_MAVEN_FORMATTERS = [
+	{
+		id: "google-java-format",
+		name: "google-java-format",
+		groupId: "com.google.googlejavaformat",
+		artifactId: "google-java-format",
+		version: "1.27.0",
+		classifier: "all-deps",
+	},
+];
+
+function managedMavenFormatterTool(
+	spec: (typeof MANAGED_MAVEN_FORMATTERS)[number],
+): ToolDefinition {
+	return {
+		id: spec.id,
+		name: spec.name,
+		checkCommand: spec.id,
+		checkArgs: ["--version"],
+		installStrategy: "maven",
+		binaryName: spec.id,
+		maven: {
+			groupId: spec.groupId,
+			artifactId: spec.artifactId,
+			version: spec.version,
+			classifier: spec.classifier,
+		},
+	};
+}
+
 export const TOOLS: ToolDefinition[] = [
 	// Core LSP servers
 	{
@@ -400,7 +755,12 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "typescript-language-server",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "typescript-language-server",
+		// Pinned below the package's own floor: 6.0.0 declares
+		// engines.node >=22.22.2, above the pi host's own floor (dm-lens
+		// must never require more than pi does — #2633) — an unpinned
+		// install here resolves latest and prints EBADENGINE on any pi
+		// host's supported Node. 5.3.0's own floor is engines.node >=20.
+		packageName: "typescript-language-server@5.3.0",
 		binaryName: "typescript-language-server",
 	},
 	{
@@ -435,6 +795,7 @@ export const TOOLS: ToolDefinition[] = [
 		packageName: "prettier",
 		binaryName: "prettier",
 	},
+	...MANAGED_PACKAGE_FORMATTERS.map(managedPackageFormatterTool),
 	{
 		id: "ruff",
 		name: "Ruff",
@@ -492,7 +853,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "jscpd",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "jscpd@5.0.12", // v4's packaging bug (reprism dep missing lib/languages/) is gone in v5's ground-up Rust rewrite — verified: real per-platform native binary (jscpd-windows-x64-msvc etc. via optionalDependencies, no missing-dir regression), --min-lines/--min-tokens/--reporters/--output/--ignore all unchanged, JSON schema fields read by clients/jscpd-client.ts's parseReport() (statistics.total.*, duplicates[].firstFile/secondFile.name+start, .lines, .tokens) are identical, and it's ~50x faster on this repo (4.1s -> 76ms detection time) — closes #582
+		packageName: "jscpd@5.4.0", // v5.4.0 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
 		binaryName: "jscpd",
 	},
 	// Structural search and dead code detection
@@ -576,6 +937,15 @@ export const TOOLS: ToolDefinition[] = [
 		installStrategy: "pip",
 		packageName: "cmake-language-server",
 		binaryName: "cmake-language-server",
+		// Upstream 0.1.11 (the latest release) imports `LanguageServer` from
+		// `pygls.server`, a symbol pygls 2 removed, while declaring only
+		// `pygls>=1.1.1` — so an unconstrained install resolves pygls 2.1.1 and
+		// produces a launcher that cannot start. Measured against PyPI for the
+		// nightly's interpreter (#3311): `pip download --python-version 3.12
+		// cmake-language-server` → `pygls-2.1.1`; with this constraint →
+		// `pygls-1.3.1` + `lsprotocol-2023.0.1`, and `cmake-language-server
+		// --version` then prints `cmake-language-server 0.1.11` and exits 0.
+		pipConstraints: ["pygls<2"],
 	},
 	{
 		id: "yaml-language-server",
@@ -606,7 +976,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "vscode-html-language-server",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "vscode-html-languageserver-bin",
+		packageName: "vscode-langservers-extracted",
 		binaryName: "vscode-html-language-server",
 	},
 	{
@@ -690,7 +1060,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "vscode-css-language-server",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "vscode-css-languageserver",
+		packageName: "vscode-langservers-extracted",
 		binaryName: "vscode-css-language-server",
 	},
 	{
@@ -703,10 +1073,27 @@ export const TOOLS: ToolDefinition[] = [
 		binaryName: "docker-langserver",
 	},
 	{
+		// #2722: intelephense has no CLI — its entry calls createConnection()
+		// unconditionally — and Node prints the offending source line before the
+		// error. The bundle is one ~4 MB minified line, so the transport-required
+		// marker #208 rescues on lands at byte 4,154,741 of a 4,423,356-byte
+		// stderr while Node truncates piped stderr at 1 MiB on exit. Measured on
+		// intelephense@1.18.5, linux, Node v22.22.1:
+		//   $ intelephense --version 2>&1 | wc -c              -> 1048576
+		//   $ intelephense --version 2>&1 | grep -c "Connection input stream is not set" -> 0
+		//   $ intelephense --version 2>err.txt; wc -c < err.txt -> 4423356
+		// Same run over the alternatives, each with stdin closed the way
+		// verifyToolBinary closes it (`input: ""`):
+		//   --help, -v, --socket=0 -> identical dump (exit 1, 4423356 bytes,
+		//     marker at 4154741, 1048576 through a pipe, marker absent)
+		//   --stdio                -> exit 1 with ZERO bytes on either stream,
+		//     so it carries no marker to rescue on either.
+		// No checkArgs value produces a verdict. Verified spawn-free instead.
 		id: "intelephense",
 		name: "Intelephense",
 		checkCommand: "intelephense",
 		checkArgs: ["--version"],
+		verification: "package-entry",
 		installStrategy: "npm",
 		packageName: "intelephense",
 		binaryName: "intelephense",
@@ -844,6 +1231,8 @@ export const TOOLS: ToolDefinition[] = [
 			// bare binary, no archive
 		},
 	},
+	...MANAGED_GITHUB_FORMATTERS.map(managedGitHubFormatterTool),
+	...MANAGED_MAVEN_FORMATTERS.map(managedMavenFormatterTool),
 	{
 		id: "rust-analyzer",
 		name: "rust-analyzer",
@@ -974,6 +1363,40 @@ export const TOOLS: ToolDefinition[] = [
 			url: "https://github.com/spotbugs/spotbugs/releases/download/4.10.2/spotbugs-4.10.2.tgz",
 			kind: "tgz",
 			launcher: "bin/spotbugs",
+			sha256: {
+				"https://github.com/spotbugs/spotbugs/releases/download/4.10.2/spotbugs-4.10.2.tgz":
+					"63d7687c35fba12cbc8e55ec2a889a2bbf1b9be299dea91f2b0d351dc285308a",
+			},
+		},
+	},
+	{
+		// kotlin-language-server (fwcd, #3400) — a platform-agnostic launcher ZIP
+		// (`server/{bin,lib}`, 87 MB) whose `bin/kotlin-language-server` script
+		// starts a JVM on ANY argument and has no stable `--version`, so it is
+		// verified at install by manifest, not by spawn: the pinned sha256, the
+		// launcher on disk with an exec bit, and `java` on PATH or JAVA_HOME before
+		// the download (`verification: "tree-manifest"`). The 2025 release publishes
+		// no digest, so its pin is trust-on-first-use (the hash of the download). The initialize handshake is the nightly
+		// tool-smoke `kotlin` row. fwcd 1.3.13 (2025-01-18) rather than JetBrains'
+		// kotlin-lsp (v263.4702.0): its CDN ships the macOS standalone archives as
+		// `.sit`, which this installer's tar/unzip/Expand-Archive paths cannot
+		// extract, and its six per-platform archives would need six pins.
+		id: "kotlin-language-server",
+		name: "Kotlin Language Server",
+		checkCommand: "kotlin-language-server",
+		checkArgs: ["--version"],
+		installStrategy: "archive",
+		binaryName: "kotlin-language-server",
+		verification: "tree-manifest",
+		archive: {
+			url: "https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip",
+			kind: "zip",
+			launcher: "bin/kotlin-language-server",
+			runtime: "java",
+			sha256: {
+				"https://github.com/fwcd/kotlin-language-server/releases/download/1.3.13/server.zip":
+					"4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2",
+			},
 		},
 	},
 	{
@@ -1000,6 +1423,10 @@ export const TOOLS: ToolDefinition[] = [
 			kind: "zip",
 			stripComponents: 0,
 			treeMarker: "PowerShellEditorServices/Start-EditorServices.ps1",
+			sha256: {
+				"https://github.com/PowerShell/PowerShellEditorServices/releases/download/v4.6.0/PowerShellEditorServices.zip":
+					"0d91898f73d4faeb64291336f6386f0c890a933df012827571adf7008480a04a",
+			},
 		},
 	},
 	{
@@ -1034,6 +1461,14 @@ export const TOOLS: ToolDefinition[] = [
 			kind: "zip",
 			stripComponents: 1,
 			treeMarker: "bin",
+			sha256: {
+				"https://github.com/clangd/clangd/releases/download/22.1.0/clangd-linux-22.1.0.zip":
+					"c54e57dbff3ccc9e8352367ddb7030ad3f624073ec58c7477424e7919f578572",
+				"https://github.com/clangd/clangd/releases/download/22.1.0/clangd-mac-22.1.0.zip":
+					"71eddc5303da9a5bc5e8b509488b5b2c5acf45f20e33b8394e71a12a56d67198",
+				"https://github.com/clangd/clangd/releases/download/22.1.0/clangd-windows-22.1.0.zip":
+					"e31e271fe11f6dcd7cf87ca74be4a12788ff8ce5a0b07762583e335c058e939a",
+			},
 		},
 	},
 	{
@@ -1073,9 +1508,21 @@ export const TOOLS: ToolDefinition[] = [
 						: `${base}/lua-language-server-${version}-win32-x64.zip`;
 				return undefined;
 			},
-			kind: "zip",
+			kind: (platform) => (platform === "win32" ? "zip" : "tgz"),
 			stripComponents: 0,
 			treeMarker: "bin",
+			sha256: {
+				"https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-linux-arm64.tar.gz":
+					"273af33f26f4a1143f27c96d9f9e1188aba619c71e0807042134f66b4bd27f24",
+				"https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-linux-x64.tar.gz":
+					"ca71415dd19f19e30aaa35a4915aefca9fdb5fec31b98331cc3d77f778d539c5",
+				"https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-darwin-arm64.tar.gz":
+					"cec99d70b1f612acec4a10a79a03664e3aa0c229d4d8a586cb3f928ec37d509e",
+				"https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-darwin-x64.tar.gz":
+					"e26cfefe423dd7326fc7c649539e4d4aaa4f35f34d2fefd8af2ed7090b72c556",
+				"https://github.com/LuaLS/lua-language-server/releases/download/3.18.2/lua-language-server-3.18.2-win32-x64.zip":
+					"a4439a8f5e8e9e6505c11f045a7bf45db602124a1e246371c1dbe34924f3cf71",
+			},
 		},
 	},
 	{
@@ -1447,6 +1894,34 @@ export const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		// Tinymist publishes cargo-dist archives containing the `tinymist` binary
+		// for the supported desktop targets. The LSP server uses `tinymist lsp`.
+		id: "tinymist",
+		name: "Tinymist",
+		checkCommand: "tinymist",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "tinymist",
+		github: {
+			repo: "Myriad-Dreamin/tinymist",
+			assetMatch: archAssetMatch({
+				linux: {
+					x64: "tinymist-x86_64-unknown-linux-gnu.tar.gz",
+					arm64: "tinymist-aarch64-unknown-linux-gnu.tar.gz",
+				},
+				darwin: {
+					x64: "tinymist-x86_64-apple-darwin.tar.gz",
+					arm64: "tinymist-aarch64-apple-darwin.tar.gz",
+				},
+				win32: {
+					x64: "tinymist-x86_64-pc-windows-msvc.zip",
+					arm64: "tinymist-aarch64-pc-windows-msvc.zip",
+				},
+			}),
+			binaryInArchive: "tinymist",
+		},
+	},
+	{
 		// marksman ships a single BARE (uncompressed) binary per platform on GitHub
 		// releases — no archive, so it lands via the bare-binary branch of
 		// installGitHubTool (the `else` that writes the asset directly, like shfmt).
@@ -1517,15 +1992,23 @@ export function getInstallFailureReason(toolId: string): string | undefined {
 /**
  * What the last install attempt for a tool actually DID (#1500 review).
  *
- * `installFailureReasons` cannot answer this and never could: it is a REFUSAL
- * map, written by the `DM_LENS_DISABLE_TOOL_INSTALL` branches and the install-lock
- * skip, and by nothing on the genuine-failure or success paths. Inferring
- * attempt-ness from it inverts the answer in both directions — a kill-switch
- * decline reads as a failed download, and a failed download reads as a policy
- * decision. So the outcome is recorded explicitly, at each branch that knows it.
+ * `installFailureReasons` cannot reliably answer this on its own: it started as
+ * a REFUSAL map (written by the `DM_LENS_DISABLE_TOOL_INSTALL` branches and the
+ * install-lock skip) and #2638 added writers on the npm/pip/gem genuine-failure
+ * paths too (so a caller that specifically needs the installer's own error TEXT
+ * for a KNOWN failure — e.g. the tool-smoke lane's row detail — can read it),
+ * but it still says nothing for github/maven/archive failures, and a decline
+ * can still overwrite a stale failure's entry or vice versa across calls.
+ * Inferring ATTEMPT-NESS (did an install even run) from presence-in-this-map
+ * would still invert the answer in both directions — so that question is
+ * answered here instead, explicitly, at each branch that knows it, and a
+ * caller that needs to tell "genuinely failed" from "declined"/"skipped" MUST
+ * gate on `outcome` first and treat `installFailureReasons`/`reason` as detail
+ * only, never as the yes/no signal itself.
  *
  *   * `succeeded`  — an install ran and reported success.
  *   * `failed`     — an install ran and did not succeed. The retry candidate.
+ *   * `unavailable` — the install cannot run on this platform. Nothing ran.
  *   * `declined`   — policy said no: kill switch, `allowInstall: false`, project
  *                    trust, an unknown tool id. Nothing ran.
  *   * `skipped`    — another process holds the install lock. Nothing ran.
@@ -1533,6 +2016,7 @@ export function getInstallFailureReason(toolId: string): string | undefined {
 export type InstallAttemptOutcome =
 	| "succeeded"
 	| "failed"
+	| "unavailable"
 	| "declined"
 	| "skipped";
 
@@ -1890,28 +2374,18 @@ function isAstGrepVersionOutput(output: string): boolean {
 }
 
 async function verifyAstGrepProbePath(binPath: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		let proc: ReturnType<typeof spawn>;
-		try {
-			proc = spawn(binPath, ["--version"], {
-				stdio: ["ignore", "pipe", "pipe"],
-				shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(binPath),
-				timeout: 5000,
-			});
-		} catch {
-			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
-			// bug class, #533) — best-effort probe, resolve rather than reject.
-			resolve(false);
-			return;
-		}
-		let output = "";
-		proc.stdout?.on("data", (data) => (output += data));
-		proc.stderr?.on("data", (data) => (output += data));
-		proc.on("exit", (code) => {
-			resolve(code === 0 && isAstGrepVersionOutput(output));
-		});
-		proc.on("error", () => resolve(false));
+	// #2894: through the probe seam rather than a hand-rolled `spawn` promise.
+	// `probeToolAsync` already owns the synchronous-throw case (#533), the
+	// Windows `.cmd`/`.bat` resolution this used `shell: true` for, and the
+	// timeout tree-kill a bare `spawn({ timeout })` does not do.
+	const result = await probeToolAsync(binPath, ["--version"], {
+		timeout: 5000,
 	});
+	return (
+		!result.error &&
+		result.status === 0 &&
+		isAstGrepVersionOutput(`${result.stdout}${result.stderr}`)
+	);
 }
 
 // Exported for testing only.
@@ -2140,7 +2614,7 @@ const lspTransportRequiredMatcher =
  * correctly reports "no pin" rather than mistaking the scope for a version.
  * Returns undefined when packageName has no explicit `@version` suffix.
  */
-function parsePinnedVersion(packageName: string): string | undefined {
+export function parsePinnedVersion(packageName: string): string | undefined {
 	const at = packageName.lastIndexOf("@");
 	if (at <= 0) return undefined;
 	return packageName.slice(at + 1) || undefined;
@@ -2163,6 +2637,130 @@ function extractVersionToken(output: string): string | undefined {
  * maven/archive) never populate or read this map.
  */
 const lastManagedInstallVersion = new Map<string, string>();
+
+/**
+ * The package whose entry module verifies `tool`'s managed install spawn-free,
+ * or undefined when the tool is verified by spawning `checkArgs` (#2722).
+ * Registry-declared per tool — never inferred from the strategy: a spawn probe
+ * is the stronger check everywhere it can actually return a verdict.
+ */
+export function packageEntryVerification(
+	tool: ToolDefinition,
+): string | undefined {
+	return tool.verification === "package-entry" ? tool.packageName : undefined;
+}
+
+/**
+ * Spawn-free verification of a managed npm install (#2722).
+ *
+ * For an stdio LSP server with no CLI surface, every `checkArgs` value is a
+ * throw, and #208's transport-required rescue is output-ORDER dependent: Node
+ * prints the offending source line ahead of the error, so a server whose bundle
+ * is megabytes of minified JS pushes the marker past both our retained window
+ * and Node's own 1 MiB pipe truncation. The bytes never leave the child, so no
+ * spawn can answer "is this install intact".
+ *
+ * The evidence used instead is the same class the `archive` strategy already
+ * accepts through `treeMarker`: the installed tree is inspected on disk. The
+ * install verifies when the package directory beside the `.bin` shim carries a
+ * readable `package.json` with a `version`, and the entry module that
+ * package.json itself names — `bin[<shim name>]` or a bare `bin` string —
+ * exists as a non-empty file. `main` is deliberately NOT a fallback: npm
+ * creates the `node_modules/.bin/<shim>` this function is given only from a
+ * `bin` field, so a manifest without one cannot be the manifest behind this
+ * shim. That is exactly what `verifyToolBinary` was documented to catch here —
+ * broken symlinks and partial installs — and it is strictly more than the
+ * `--version` spawn can report for this class.
+ */
+export async function verifyNpmPackageEntry(
+	binPath: string,
+	packageName: string,
+): Promise<boolean> {
+	// `<...>/node_modules/.bin/<shim>` → `<...>/node_modules`.
+	const nodeModulesDir = path.dirname(path.dirname(binPath));
+	const pinned = parsePinnedVersion(packageName);
+	const bareName = pinned
+		? packageName.slice(0, -(pinned.length + 1))
+		: packageName;
+	const packageDir = path.join(nodeModulesDir, ...bareName.split("/"));
+	const shimName = path
+		.basename(binPath)
+		.replace(/\.(cmd|exe|ps1|bat)$/i, "")
+		.toLowerCase();
+
+	const fail = (reason: string): false => {
+		logSessionStart(
+			`auto-install verify: failed for ${binPath} (check=package-entry, kind=${reason})`,
+		);
+		return false;
+	};
+
+	// R2-F1: the shim ITSELF, before anything else. Every path below is DERIVED
+	// from `binPath`, so without this a partial install — npm never wrote the
+	// `.bin` entry, or wrote one that is empty, a directory, or a symlink
+	// dangling at a deleted target — verified `true` on the strength of a
+	// package tree that nothing can execute, and `installNpmTool` then recorded
+	// the install as SUCCEEDED. `classifyInstallOutcome` grades any non-"failed"
+	// outcome as `⚠ unavailable (succeeded)`, so that answer re-hid exactly the
+	// nightly row #2722 exists to expose. `statSync` FOLLOWS the link, which is
+	// what makes missing and dangling one branch.
+	try {
+		const shim = statSync(binPath);
+		if (!shim.isFile() || shim.size === 0) return fail("shim-not-a-file");
+	} catch {
+		return fail("shim-missing");
+	}
+
+	let manifest: {
+		version?: unknown;
+		bin?: unknown;
+	};
+	try {
+		manifest = JSON.parse(
+			await fs.readFile(path.join(packageDir, "package.json"), "utf8"),
+		) as typeof manifest;
+	} catch {
+		return fail("package-json-unreadable");
+	}
+	if (typeof manifest.version !== "string" || !manifest.version) {
+		return fail("package-json-no-version");
+	}
+
+	const bin = manifest.bin;
+	const entry =
+		typeof bin === "string"
+			? bin
+			: bin && typeof bin === "object"
+				? Object.entries(bin as Record<string, unknown>).find(
+						// Case-folded on purpose: on a case-insensitive filesystem the
+						// shim on disk can differ in case from the manifest key npm
+						// wrote it from, and `path.basename` reads the disk name.
+						([name]) => name.toLowerCase() === shimName,
+					)?.[1]
+				: undefined;
+	if (typeof entry !== "string" || !entry) {
+		return fail("package-json-no-entry");
+	}
+
+	try {
+		const stat = statSync(path.join(packageDir, entry));
+		if (!stat.isFile() || stat.size === 0) return fail("entry-not-a-file");
+	} catch {
+		return fail("entry-missing");
+	}
+
+	// R2-F3 (catalog shape 31): "did the new verifier run at all, and on what"
+	// has to be answerable from sessionstart.log, not only from a debug build —
+	// the failure branches above already log there. Measured volume on a real
+	// intelephense install, scratch DM_LENS_HOME: TWO rows on the session that
+	// installs (installNpmTool's verify, then the post-install resolution), and
+	// ZERO on every later session — the probe cache answers before any verify
+	// runs (`auto-install ensure intelephense: probe cache hit`).
+	logSessionStart(
+		`auto-install verify: succeeded for ${binPath} (check=package-entry, version=${manifest.version}, entry=${entry})`,
+	);
+	return true;
+}
 
 /**
  * Verify a tool binary actually works by running its configured checkArgs.
@@ -2195,7 +2793,26 @@ export async function verifyToolBinary(
 	 */
 	timeoutMs = 10000,
 	verificationArgs: string[] = ["--version"],
+	/**
+	 * Package name from {@link packageEntryVerification} — present only for a
+	 * registry entry declaring `verification: "package-entry"`. When present the
+	 * spawn is skipped entirely and {@link verifyNpmPackageEntry} answers (#2722).
+	 */
+	packageEntryOf?: string,
+	/**
+	 * Called when a `false` verdict is INCONCLUSIVE rather than a verdict: the
+	 * transport-required matcher was armed, never matched, and the child's
+	 * output was cut off before the tail arrived, so the #208 rescue could not
+	 * be evaluated at all (#2722). Distinct from `onTransient` on purpose — the
+	 * prober DID run to completion and re-probing reproduces it exactly, so this
+	 * is a durable "cannot be verified", not a stall (catalog shape 13). A
+	 * caller must not treat it as "broken" and delete the installation.
+	 */
+	onInconclusive?: () => void,
 ): Promise<boolean> {
+	if (packageEntryOf !== undefined) {
+		return verifyNpmPackageEntry(binPath, packageEntryOf);
+	}
 	// #2015: safeSpawnAsync instead of raw spawn. Raw spawn's timeout
 	// SIGTERMed only cmd.exe on Windows (.cmd shims run shell:true), orphaning
 	// the grandchild node process - which kept scanning, held handles against
@@ -2258,6 +2875,33 @@ export async function verifyToolBinary(
 		// A kill (timeout fired) or spawn-boundary failure is a stall, not a
 		// verdict from the binary (#1569 transient semantics).
 		if (result.signal !== undefined || result.spawnFailure) onTransient?.();
+		if (
+			result.outputTruncated &&
+			result.signal === undefined &&
+			!result.spawnFailure
+		) {
+			// #2722: the transport-required matcher above is armed on EVERY probe,
+			// and it never matched — but the output we kept is a prefix, so the
+			// marker may simply sit past it (intelephense emits ~4 MB of bundle
+			// ahead of its own diagnostic). "Unmatched within a truncated prefix"
+			// is not "this binary is broken"; callers must not delete the install
+			// on it. Recorded as its own kind so a monitor can tell an unreadable
+			// probe apart from a rejected binary.
+			//
+			// R2-F4: gated on the probe having actually FINISHED. A verbose child
+			// that is SIGTERMed at the timeout also arrives here truncated, and
+			// that is the #1569 transient class one line above, not this one —
+			// ungated, the two overlapped and `installNpmTool` (which tests
+			// inconclusive first) replaced the #2015 transient message with this
+			// one. The doc comment's "the prober DID run to completion" is now
+			// true rather than aspirational.
+			onInconclusive?.();
+			recordDegradationOnce({
+				kind: "installer-verification-inconclusive",
+				subject: binPath,
+				reason: `transport-required marker unresolved in truncated output (${verificationArgs.join(" ")})`,
+			});
+		}
 		const kind =
 			result.spawnFailure?.kind ??
 			(result.signal
@@ -2335,30 +2979,21 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			status.installed = true;
 			status.source = "global-path";
 			status.path = tool.checkCommand;
-			// Try to get version
-			const versionResult = await new Promise<string>((resolve) => {
-				let proc: ReturnType<typeof spawn>;
-				try {
-					proc = spawn(tool.checkCommand, ["--version"], {
-						stdio: ["ignore", "pipe", "pipe"],
-						shell: process.platform === "win32",
-						timeout: 5000,
-					});
-				} catch {
-					// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
-					// pidusage bug class, #533) — best-effort, resolve empty version.
-					resolve("");
-					return;
-				}
-				let out = "";
-				proc.stdout?.on("data", (d) => (out += d));
-				proc.stderr?.on("data", (d) => (out += d));
-				proc.on("exit", () =>
-					resolve(out.trim().split("\n")[0]?.slice(0, 30) || ""),
-				);
-				proc.on("error", () => resolve(""));
-			});
-			status.version = versionResult || undefined;
+			// Try to get version — through the probe seam (#2894), which owns the
+			// synchronous-throw case (#533) and the timeout tree-kill that a bare
+			// `spawn({ timeout })` promise did not do.
+			// #3400: a `tree-manifest` launcher answers any argument by starting a
+			// JVM, so `--version` is no probe there; the listing shows no version.
+			if (tool.verification !== "tree-manifest") {
+				const probe = await probeToolAsync(tool.checkCommand, ["--version"], {
+					timeout: 5000,
+				});
+				status.version =
+					`${probe.stdout}${probe.stderr}`
+						.trim()
+						.split("\n")[0]
+						?.slice(0, 30) || undefined;
+			}
 			statuses.push(status);
 			continue;
 		}
@@ -2436,6 +3071,7 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 					undefined,
 					getToolVerificationTimeout(tool),
 					tool.checkArgs,
+					packageEntryVerification(tool),
 				)
 			) {
 				status.installed = true;
@@ -2634,6 +3270,7 @@ async function getToolPathResolved(
 					onTransient,
 					getToolVerificationTimeout(tool),
 					tool.checkArgs,
+					packageEntryVerification(tool),
 				)
 			) {
 				return cmdPath;
@@ -2656,6 +3293,7 @@ async function getToolPathResolved(
 					onTransient,
 					getToolVerificationTimeout(tool),
 					tool.checkArgs,
+					packageEntryVerification(tool),
 				)
 			) {
 				return exePath;
@@ -2677,6 +3315,7 @@ async function getToolPathResolved(
 					onTransient,
 					getToolVerificationTimeout(tool),
 					tool.checkArgs,
+					packageEntryVerification(tool),
 				)
 			) {
 				return localBase;
@@ -2728,9 +3367,70 @@ async function getToolPathResolved(
 		if (githubPath) return githubPath;
 	}
 
-	// Check if global
-	if (await isCommandAvailable(tool.checkCommand, tool.checkArgs)) {
-		return tool.checkCommand;
+	// Check if global. `isCommandAvailable` is a PATH walk plus a stat — it
+	// ignores its `_args` parameter by construction — so it answers "a file with
+	// that name is on PATH", never "that command runs". Every OTHER rung of this
+	// ladder spawn-verifies its candidate with the entry's own `checkArgs` before
+	// resolving to it; this rung did not, and a PATH entry that is a file but
+	// cannot run then SHADOWED the managed install that would have worked
+	// (#3311 lane C):
+	//   - rust-analyzer: rustup's `DUP_TOOLS` proxy (rustup 1.29.1 src/lib.rs:32)
+	//     sits in ~/.cargo/bin on every rustup box whether or not the
+	//     `rust-analyzer` COMPONENT is installed. Where it is not, the proxy
+	//     errors out instead of speaking LSP — and the github-release install
+	//     dm-lens would have downloaded was never attempted.
+	//   - cmake-language-server: `pipx install` exits 0 and drops a launcher on
+	//     PATH whose venv resolved pygls 2.x, which removed the symbol the 0.1.11
+	//     server imports. This rung returned it ahead of the pip-user rung, whose
+	//     verification would have caught it.
+	// A VERDICT — the binary ran and rejected its own check (nonzero exit) —
+	// falls through to the rungs below and, for an installable strategy, to the
+	// managed install. A STALL (timeout/signal, or a spawn-boundary refusal the
+	// binary never saw) and an INCONCLUSIVE probe are not verdicts (#1569/#2722
+	// semantics), so those keep the pre-#3311 behaviour and resolve to PATH —
+	// dropping a working-but-slow tool on a kill would be a worse lie than the
+	// one this fixes. `recordVersion` is deliberately NOT passed: version-pin
+	// drift (#589) is about dm-lens's own managed installs, and feeding a
+	// system-installed version into it would turn every PATH tool at another
+	// version into a forced reinstall.
+	if (await isCommandAvailable(tool.checkCommand)) {
+		// A `verification: "package-entry"` entry (#2722) is verified from the
+		// installed tree BESIDE its shim — `verifyNpmPackageEntry` derives the
+		// package dir from `<…>/node_modules/.bin/<shim>`. A bare PATH name has no
+		// such tree to read, so that evidence is unavailable here and its absence
+		// says nothing about the command: this rung keeps the pre-#3311 behaviour
+		// for those entries rather than inventing a verdict from a failed lookup.
+		if (packageEntryVerification(tool) !== undefined) return tool.checkCommand;
+		// #3400: a `tree-manifest` launcher answers any argument by starting a JVM,
+		// so `checkArgs` is no verdict here either — a nonzero exit from that probe
+		// would drop a working PATH install for a managed one.
+		if (tool.verification === "tree-manifest") return tool.checkCommand;
+		let probeStalled = false;
+		const verified = await verifyToolBinary(
+			tool.checkCommand,
+			undefined,
+			() => {
+				probeStalled = true;
+				onTransient();
+			},
+			getToolVerificationTimeout(tool),
+			tool.checkArgs,
+			undefined,
+			() => {
+				probeStalled = true;
+			},
+		);
+		if (verified || probeStalled) return tool.checkCommand;
+		// One record per tool per session: the rejected candidate and the check
+		// that rejected it. verifyToolBinary already logged the kind/exit code.
+		recordDegradationOnce({
+			kind: "installer-path-candidate-unrunnable",
+			subject: toolId,
+			reason: `${tool.checkCommand} on PATH failed its own check (${tool.checkArgs.join(" ")}); ignoring PATH for this tool`,
+		});
+		logSessionStart(
+			`auto-install ${toolId}: PATH candidate ${tool.checkCommand} failed ${tool.checkArgs.join(" ")} — ignoring PATH, trying managed install`,
+		);
 	}
 
 	if (tool.installStrategy === "npm") {
@@ -2815,6 +3515,15 @@ function getGitHubInstalledBinaryName(
 	if (assetName.endsWith(".bat")) return `${binaryName}.bat`;
 	if (assetName.endsWith(".cmd")) return `${binaryName}.cmd`;
 	return `${binaryName}.exe`;
+}
+
+function launcherForGitHubAsset(
+	spec: GitHubAssetSpec,
+	assetName: string,
+): "php" | "java" | undefined {
+	if (spec.launcher === "php" && assetName.endsWith(".phar")) return "php";
+	if (spec.launcher === "java" && assetName.endsWith(".jar")) return "java";
+	return undefined;
 }
 
 function getArchiveBinaryCandidates(
@@ -2913,13 +3622,15 @@ async function findPipUserToolPath(
 	verificationArgs: string[] = ["--version"],
 	verificationTimeoutMs = 10_000,
 ): Promise<string | undefined> {
-	const isWindows = process.platform === "win32";
-	const userBaseCandidates = await getPythonUserBaseCandidates();
+	const isWindows = installerPlatform() === "win32";
+	const userBaseCandidates = [
+		path.join(getGlobalDmLensDir(), "pip-tools"),
+		path.join(getGlobalDmLensDir(), "pip-user"),
+		...(await getPythonUserBaseCandidates()),
+	];
 
 	for (const userBase of userBaseCandidates) {
-		const scriptDirs: string[] = [
-			path.join(userBase, isWindows ? "Scripts" : "bin"),
-		];
+		const scriptDirs: string[] = [pipScriptsDir(userBase, installerPlatform())];
 
 		if (isWindows) {
 			try {
@@ -2965,6 +3676,44 @@ async function findPipUserToolPath(
 	}
 
 	return undefined;
+}
+
+/**
+ * The verdict of one `<interpreter> -m site --user-base` probe (#3383).
+ *
+ * Both probes accumulate through {@link createBoundedOutputSink} instead of
+ * `stdout += data`: the concatenation ran inside a `data` handler, where V8's
+ * `RangeError: Invalid string length` is an uncaught exception rather than this
+ * promise's value, and nothing bounded an interpreter that decides to write
+ * forever. A TRUNCATED probe resolves EMPTY rather than trimming a prefix,
+ * because the prefix of a path is a different path: `addBinToPath` would put a
+ * plausible-looking wrong directory on PATH. Empty is the value both probes
+ * already resolve when an interpreter is missing, and every caller handles it.
+ *
+ * Exported for `tests/clients/off-seam-output-bounds.test.ts`: both `data`
+ * handlers that feed it sit inside module-private probe loops that only a real
+ * `python3` on PATH can drive, so this is the seam the bound is pinned at.
+ */
+export function userBaseProbeResult(
+	command: string,
+	code: number | null,
+	stdout: BoundedOutputSink,
+): string {
+	if (stdout.truncated) {
+		recordDegradationOnce({
+			kind: "spawn-output-cap-truncated",
+			subject: `user-base-probe:${command}`,
+			reason: `\`${command} -m site --user-base\` reached the ${DEFAULT_MAX_OUTPUT_BYTES}-byte default cap after ${stdout.observedBytes} bytes; the probed user base is unusable`,
+			metadata: {
+				capBytes: DEFAULT_MAX_OUTPUT_BYTES,
+				capSource: "default",
+				observedBytes: stdout.observedBytes,
+				killed: false,
+			},
+		});
+		return "";
+	}
+	return code === 0 ? stdout.text.trim() : "";
 }
 
 async function getPythonUserBaseCandidates(): Promise<string[]> {
@@ -3015,9 +3764,11 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
 				return;
 			}
 
-			let stdout = "";
-			proc.stdout?.on("data", (data: Buffer | string) => (stdout += data));
-			proc.on("exit", (code) => resolve(code === 0 ? stdout.trim() : ""));
+			const stdout = createBoundedOutputSink();
+			proc.stdout?.on("data", (data: Buffer | string) => stdout.append(data));
+			proc.on("exit", (code) =>
+				resolve(userBaseProbeResult(probe.command, code, stdout)),
+			);
 			proc.on("error", () => resolve(""));
 		});
 		add(userBase);
@@ -3036,9 +3787,57 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
  * call, never the asset download (see installGitHubTool) — the release CDN must
  * not receive the token.
  */
-function githubApiAuthHeaders(): Record<string, string> {
-	const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+async function githubApiAuthHeaders(): Promise<Record<string, string>> {
+	const token = await resolveGitHubToken();
 	return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+class HttpStatusError extends Error {
+	readonly statusCode: number;
+
+	constructor(statusCode: number, url?: string) {
+		super(url ? `HTTP ${statusCode} for ${url}` : `HTTP ${statusCode}`);
+		this.name = "HttpStatusError";
+		this.statusCode = statusCode;
+	}
+}
+
+class GitHubHttpError extends HttpStatusError {
+	readonly anonymousRateLimitExhausted: boolean;
+
+	constructor(
+		statusCode: number,
+		requestHeaders: Record<string, string>,
+		responseHeaders: Record<string, string | string[] | undefined>,
+	) {
+		super(statusCode);
+		this.name = "GitHubHttpError";
+		this.message = `GitHub API HTTP ${statusCode}`;
+		this.anonymousRateLimitExhausted =
+			statusCode === 403 &&
+			!Object.keys(requestHeaders).some(
+				(key) => key.toLowerCase() === "authorization",
+			) &&
+			readHeader(responseHeaders, "x-ratelimit-remaining") === "0";
+	}
+}
+
+function readHeader(
+	headers: Record<string, string | string[] | undefined>,
+	name: string,
+): string | undefined {
+	const entry = Object.entries(headers).find(
+		([key]) => key.toLowerCase() === name.toLowerCase(),
+	)?.[1];
+	return Array.isArray(entry) ? entry[0]?.trim() : entry?.trim();
+}
+
+function isGitHubApiUrl(url: string): boolean {
+	try {
+		return new URL(url).host.toLowerCase() === "api.github.com";
+	} catch {
+		return false;
+	}
 }
 
 function sameHost(a: string, b: string): boolean {
@@ -3108,7 +3907,11 @@ function httpsGetWithMeta(
 					}
 					if (res.statusCode !== 200) {
 						res.resume();
-						return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+						return reject(
+							isGitHubApiUrl(url)
+								? new GitHubHttpError(res.statusCode ?? 0, headers, res.headers)
+								: new HttpStatusError(res.statusCode ?? 0, url),
+						);
 					}
 					const chunks: Buffer[] = [];
 					res.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -3208,13 +4011,22 @@ async function installGitHubTool(
 			const body = await httpsGet(
 				`https://api.github.com/repos/${spec.repo}/releases/latest`,
 				5,
-				githubApiAuthHeaders(),
+				await githubApiAuthHeaders(),
 			);
 			releaseJson = JSON.parse(body.toString("utf8"));
 		} catch (err) {
-			logSessionStart(
-				`github-install ${tool.id}: release fetch failed: ${(err as Error).message}`,
-			);
+			const reason =
+				err instanceof GitHubHttpError && err.anonymousRateLimitExhausted
+					? "GitHub API rate limit exhausted; authenticate with `gh auth login` or set GITHUB_TOKEN/GH_TOKEN and retry"
+					: `release fetch failed: ${(err as Error).message}`;
+			if (err instanceof GitHubHttpError && err.anonymousRateLimitExhausted) {
+				recordDegradationOnce({
+					kind: "github-api-rate-limit",
+					subject: tool.id,
+					reason,
+				});
+			}
+			logSessionStart(`github-install ${tool.id}: ${reason}`);
 			return undefined;
 		}
 	}
@@ -3276,12 +4088,43 @@ async function installGitHubTool(
 		platform,
 		asset.name,
 	);
-	const destPath = path.join(GITHUB_BIN_DIR, finalBinaryName);
+	let destPath = path.join(GITHUB_BIN_DIR, finalBinaryName);
 
 	const assetName = asset.name;
+	const launcherRuntime = launcherForGitHubAsset(spec, assetName);
+	if (
+		launcherRuntime &&
+		!(await isCommandAvailable(launcherRuntime, ["--version"]))
+	) {
+		logSessionStart(
+			`github-install ${tool.id}: ${launcherRuntime} not found — asset requires a runtime launcher`,
+		);
+		return undefined;
+	}
 
 	try {
-		if (assetName.endsWith(".gz") && !assetName.endsWith(".tar.gz")) {
+		if (launcherRuntime) {
+			const assetPath = path.join(
+				GITHUB_BIN_DIR,
+				`${tool.id}${assetName.endsWith(".phar") ? ".phar" : ".jar"}`,
+			);
+			await writeFileAtomicAsync(assetPath, assetBuffer, {
+				bestEffort: false,
+				mode: 0o750,
+			});
+			const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
+			destPath = path.join(GITHUB_BIN_DIR, launcherName);
+			const runtimeTarget = assetName.endsWith(".phar")
+				? `${tool.id}.phar`
+				: `${tool.id}.jar`;
+			const command = isWindows
+				? `@echo off\r\n${launcherRuntime} "%~dp0${runtimeTarget}" %*\r\n`
+				: `#!/bin/sh\nexec ${launcherRuntime} "$(dirname "$0")/${runtimeTarget}" "$@"\n`;
+			await writeFileAtomicAsync(destPath, command, {
+				bestEffort: false,
+				mode: isWindows ? undefined : 0o750,
+			});
+		} else if (assetName.endsWith(".gz") && !assetName.endsWith(".tar.gz")) {
 			// Bare gzip (e.g. rust-analyzer-x86_64-unknown-linux-gnu.gz) — decompress directly
 			const decompressed = await new Promise<Buffer>((resolve, reject) => {
 				const gunzip = createGunzip();
@@ -3503,6 +4346,7 @@ export function getRefreshableManagedNpmTools(): Array<{
 	packageName: string;
 	binaryName: string;
 }> {
+	const seenPackages = new Set<string>();
 	return getRefreshableManagedTools()
 		.filter((candidate) => candidate.strategy === "npm")
 		.map((candidate) => ({
@@ -3511,7 +4355,12 @@ export function getRefreshableManagedNpmTools(): Array<{
 			// have both, so these are total.
 			packageName: candidate.packageName as string,
 			binaryName: candidate.binaryName as string,
-		}));
+		}))
+		.filter((candidate) => {
+			if (seenPackages.has(candidate.packageName)) return false;
+			seenPackages.add(candidate.packageName);
+			return true;
+		});
 }
 
 // --- Periodic refresh seam for the non-npm strategies (#1747) ---
@@ -3527,6 +4376,13 @@ export interface RefreshableManagedTool {
 	binaryName?: string;
 	/** Registry-scoped ceiling for managed verification probes. */
 	verificationTimeoutMs?: number;
+	/**
+	 * npm only — see {@link packageEntryVerification}. Carried on the candidate
+	 * because the refresh verifies the SAME binary `installNpmTool` does, and a
+	 * tool whose `--version` probe can never return a verdict must not have one
+	 * demanded of it after an update either (#2722).
+	 */
+	packageEntryOf?: string;
 	/**
 	 * The identity of what the tool's coordinate resolves to TODAY, when that
 	 * identity is knowable without a network call. `archive` and `maven` entries
@@ -3582,6 +4438,7 @@ export function getRefreshableManagedTools(): RefreshableManagedTool[] {
 					packageName: tool.packageName,
 					binaryName: tool.binaryName,
 					verificationTimeoutMs: tool.verificationTimeoutMs,
+					packageEntryOf: packageEntryVerification(tool),
 				});
 				break;
 			}
@@ -3706,7 +4563,7 @@ async function probeManagedToolVersion(
 	const cached = (await readProbeCache())[tool.id];
 	if (!cached?.path || !existsSync(cached.path)) return undefined;
 	try {
-		const result = await safeSpawnAsync(cached.path, tool.checkArgs, {
+		const result = await probeToolAsync(cached.path, tool.checkArgs, {
 			timeout: getToolVerificationTimeout(tool),
 			input: "",
 			ignoreAmbientSignal: true,
@@ -3901,15 +4758,26 @@ async function refreshGitHubManagedTool(
 			`https://api.github.com/repos/${spec.repo}/releases/latest`,
 			5,
 			{
-				...githubApiAuthHeaders(),
+				...(await githubApiAuthHeaders()),
 				...(known.etag ? { "If-None-Match": known.etag } : {}),
 			},
 		);
 	} catch (err) {
+		const reason =
+			err instanceof GitHubHttpError && err.anonymousRateLimitExhausted
+				? "GitHub API rate limit exhausted; authenticate with `gh auth login` or set GITHUB_TOKEN/GH_TOKEN and retry"
+				: `release query failed: ${(err as Error).message}`;
+		if (err instanceof GitHubHttpError && err.anonymousRateLimitExhausted) {
+			recordDegradationOnce({
+				kind: "github-api-rate-limit",
+				subject: tool.id,
+				reason,
+			});
+		}
 		return {
 			ok: false,
 			unchanged: true,
-			reason: `release query failed: ${(err as Error).message}`,
+			reason,
 		};
 	}
 
@@ -4003,7 +4871,10 @@ async function verifyRefreshedArtifact(
 	tool: ToolDefinition,
 	installedPath: string,
 ): Promise<boolean> {
-	if (tool.installStrategy === "archive" && !tool.archive?.launcher) {
+	if (
+		tool.installStrategy === "archive" &&
+		(!tool.archive?.launcher || tool.verification === "tree-manifest")
+	) {
 		// A tree bundle has no single binary to run — `installArchiveTool` already
 		// confirmed its tree marker — but it still needs its NEW mtime recorded
 		// (#1759 review F7), or the persisted probe entry keeps the pre-refresh
@@ -4050,10 +4921,17 @@ async function refreshPackageManagerManagedTool(
 		tool.installStrategy === "pip"
 			? // `-U` is the whole fix: without it pip treats the installed copy as
 				// satisfying the requirement and the day-one version never moves.
-				await installPipTool(tool.packageName, { upgrade: true })
+				await installPipTool(
+					tool.id,
+					tool.packageName,
+					tool.binaryName ?? tool.id,
+					{
+						upgrade: true,
+					},
+				)
 			: // `gem install` always fetches the newest version that satisfies the
 				// requirement, so the install command IS the upgrade command.
-				await installGemTool(tool.packageName);
+				await installGemTool(tool.id, tool.packageName);
 	if (!installed) {
 		return {
 			ok: false,
@@ -4281,10 +5159,49 @@ async function installMavenTool(
  */
 export function resolveArchiveUrl(
 	spec: ArchiveSpec,
-	platform: string = process.platform,
+	platform: string = installerPlatform(),
 	arch: string = process.arch,
 ): string | undefined {
 	return typeof spec.url === "function" ? spec.url(platform, arch) : spec.url;
+}
+
+/** Resolve the archive format independently from the extractor implementation. */
+export function resolveArchiveKind(
+	spec: ArchiveSpec,
+	platform: string = installerPlatform(),
+	arch: string = process.arch,
+): "tgz" | "zip" {
+	return typeof spec.kind === "function"
+		? spec.kind(platform, arch)
+		: spec.kind;
+}
+
+function recordArchiveExtractionDegradation(
+	toolId: string,
+	format: "tgz" | "zip",
+	reason: string,
+): void {
+	recordDegradationOnce({
+		kind: "managed-tool-install",
+		subject: `${toolId}:${format}`,
+		reason: `archive extraction ${reason}`,
+	});
+}
+
+async function stripExtractedArchiveRoot(
+	dir: string,
+	components: number,
+): Promise<boolean> {
+	for (let i = 0; i < components; i++) {
+		const entries = await fs.readdir(dir, { withFileTypes: true });
+		const [entry] = entries;
+		if (entries.length !== 1 || !entry?.isDirectory()) return false;
+		const root = path.join(dir, entry.name);
+		for (const child of await fs.readdir(root))
+			await fs.rename(path.join(root, child), path.join(dir, child));
+		await fs.rm(root, { recursive: true, force: true });
+	}
+	return true;
 }
 
 /**
@@ -4360,15 +5277,54 @@ export async function swapExtractedDir(
 	}
 }
 
+/**
+ * Where a launcher's runtime lives when it is not on PATH: the home env var the
+ * launcher itself honours and the dir under it that holds the executable (#3400).
+ * fwcd's Gradle launcher resolves `$JAVA_HOME/bin/java`, so a JAVA_HOME-only box
+ * can run it and must not be refused. A new runtime (OmniSharp's dotnet) adds a
+ * row here, not a branch.
+ */
+const ARCHIVE_RUNTIME_HOMES: Record<string, { env: string; dir: string }> = {
+	java: { env: "JAVA_HOME", dir: "bin" },
+};
+
+/**
+ * The runtime's home-env verdict, or `undefined` when that env var is unset or
+ * empty (fall back to PATH). A NON-EMPTY home decides ALONE: fwcd's launcher
+ * treats a set JAVA_HOME as authoritative and dies with "JAVA_HOME is set to an
+ * invalid directory" when `$JAVA_HOME/bin/java` is not executable, whatever
+ * `java` PATH would have found. So the verdict is "a non-empty regular file,
+ * with an exec bit on POSIX" at that one path (#3400).
+ */
+function runtimeHomeVerdict(runtime: string): boolean | undefined {
+	const home = ARCHIVE_RUNTIME_HOMES[runtime];
+	const root = home ? process.env[home.env] : undefined;
+	if (!home || !root) return undefined;
+	const windows = installerPlatform() === "win32";
+	const names = windows ? [`${runtime}.exe`, runtime] : [runtime];
+	return names.some((name) => {
+		try {
+			const stat = statSync(path.join(root, home.dir, name));
+			return (
+				stat.isFile() && stat.size > 0 && (windows || (stat.mode & 0o111) !== 0)
+			);
+		} catch {
+			return false;
+		}
+	});
+}
+
 async function installArchiveTool(
 	tool: ToolDefinition,
 ): Promise<string | undefined> {
 	const spec = tool.archive;
 	if (!spec) return undefined;
 	const binaryName = tool.binaryName ?? tool.id;
-	const isWindows = process.platform === "win32";
+	const platform = installerPlatform();
+	const isWindows = platform === "win32";
+	const archiveKind = resolveArchiveKind(spec, platform, process.arch);
 
-	const url = resolveArchiveUrl(spec);
+	const url = resolveArchiveUrl(spec, platform, process.arch);
 	if (!url) {
 		logSessionStart(
 			`archive-install ${tool.id}: no archive for ${process.platform}/${process.arch} — unsupported, skipping`,
@@ -4389,6 +5345,30 @@ async function installArchiveTool(
 		return undefined;
 	}
 
+	// #3400: an archive has no `--version`, so the pinned sha256 is the only
+	// integrity evidence there is — checked BEFORE a byte reaches the extractor,
+	// and failing closed on a URL with no pin. Its own ledger subject (not the
+	// extraction one): `recordDegradationOnce` keys on kind+subject, so sharing
+	// `${id}:${format}` would let an earlier extraction row swallow this one.
+	const pinned = spec.sha256?.[url];
+	const digest = createHash("sha256").update(archiveBuffer).digest("hex");
+	if (digest !== pinned) {
+		const reason = pinned === undefined ? "sha256-unpinned" : "sha256-mismatch";
+		recordDegradationOnce({
+			kind: "managed-tool-install",
+			subject: `${tool.id}:${archiveKind}:integrity`,
+			reason: `archive integrity ${reason}`,
+		});
+		installFailureReasons.set(
+			tool.id,
+			`archive integrity ${reason} (${archiveBuffer.length} bytes from ${url})`,
+		);
+		logSessionStart(
+			`archive-install ${tool.id}: refused ${reason} (got ${digest}, pinned ${pinned ?? "none"}) — keeping installed version`,
+		);
+		return undefined;
+	}
+
 	// Use basenames + cwd:TOOLS_DIR for the tar spawn so no argument contains a
 	// drive-letter colon — GNU tar (MSYS) otherwise reads `C:\…` as an rsync
 	// `host:path` ("Cannot connect to C:"). Relative paths work for both GNU tar
@@ -4404,7 +5384,7 @@ async function installArchiveTool(
 	// installed copy is now untouched until the replacement is proven good.
 	const extractName = tool.id;
 	const tmpExtractName = `${extractName}.refresh-tmp`;
-	const archiveName = `${tool.id}.download.${spec.kind === "zip" ? "zip" : "tgz"}`;
+	const archiveName = `${tool.id}.download.${archiveKind === "zip" ? "zip" : "tgz"}`;
 	const extractDir = path.join(TOOLS_DIR, extractName);
 	const tmpExtractDir = path.join(TOOLS_DIR, tmpExtractName);
 	const tmpArchive = path.join(TOOLS_DIR, archiveName);
@@ -4423,35 +5403,78 @@ async function installArchiveTool(
 		// dir — stripping would flatten/merge its sibling module folders — so the
 		// flag is omitted. bsdtar handles both .tgz and .zip with -xf.
 		const stripComponents = spec.stripComponents ?? 1;
-		const tarArgs = [
-			spec.kind === "tgz" ? "-xzf" : "-xf",
-			archiveName,
-			"-C",
-			tmpExtractName,
-			...(stripComponents > 0 ? [`--strip-components=${stripComponents}`] : []),
-		];
+		const extractionArgs =
+			archiveKind === "zip" && isWindows
+				? [
+						"-NoProfile",
+						"-Command",
+						`Expand-Archive -LiteralPath '${archiveName}' -DestinationPath '${tmpExtractName}' -Force`,
+					]
+				: archiveKind === "zip"
+					? ["-q", "-o", archiveName, "-d", tmpExtractName]
+					: [
+							"-xzf",
+							archiveName,
+							"-C",
+							tmpExtractName,
+							...(stripComponents > 0
+								? [`--strip-components=${stripComponents}`]
+								: []),
+						];
 		// Resolve `tar` to an absolute path on Windows (System32\tar.exe is the
 		// bsdtar shipped with Windows 10+) so extraction can't be hijacked via a
 		// writable PATH entry — same hardening as the taskkill spawn. On POSIX `tar`
 		// is a trusted coreutil whose absolute path varies by distro, so it stays
 		// bare (consistent with every other tool spawn).
-		const tarBin = isWindows
-			? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
-			: "tar";
-		const extractResult = await safeSpawnAsync(tarBin, tarArgs, {
+		const extractor =
+			archiveKind === "zip" && isWindows
+				? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+				: archiveKind === "zip"
+					? "unzip"
+					: isWindows
+						? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
+						: "tar";
+		const extractionResult = await safeSpawnAsync(extractor, extractionArgs, {
 			cwd: TOOLS_DIR,
 			timeout: 120_000,
 			ignoreAmbientSignal: true,
 			lifetimeCoupled: true,
 		});
 		const extracted = {
-			ok: extractResult.status === 0,
-			stderr: extractResult.error?.message ?? extractResult.stderr,
+			ok: extractionResult.status === 0,
+			reason:
+				extractionResult.spawnFailure?.kind === "tool-not-found"
+					? "extractor-unavailable"
+					: extractionResult.spawnFailure
+						? "extractor-error"
+						: "extractor-exit",
 		};
 		await fs.rm(tmpArchive, { force: true });
 		if (!extracted.ok) {
+			recordArchiveExtractionDegradation(
+				tool.id,
+				archiveKind,
+				extracted.reason,
+			);
 			logSessionStart(
-				`archive-install ${tool.id}: extraction failed: ${extracted.stderr} — keeping installed version`,
+				`archive-install ${tool.id}: ${archiveKind} extraction failed (${extracted.reason}) — keeping installed version`,
+			);
+			await fs
+				.rm(tmpExtractDir, { recursive: true, force: true })
+				.catch(() => {});
+			return undefined;
+		}
+		if (
+			archiveKind === "zip" &&
+			!(await stripExtractedArchiveRoot(tmpExtractDir, stripComponents))
+		) {
+			recordArchiveExtractionDegradation(
+				tool.id,
+				archiveKind,
+				"layout-invalid",
+			);
+			logSessionStart(
+				`archive-install ${tool.id}: ${archiveKind} layout invalid — keeping installed version`,
 			);
 			await fs
 				.rm(tmpExtractDir, { recursive: true, force: true })
@@ -4470,8 +5493,13 @@ async function installArchiveTool(
 			try {
 				await fs.access(tmpMarker);
 			} catch {
+				recordArchiveExtractionDegradation(
+					tool.id,
+					archiveKind,
+					"marker-missing",
+				);
 				logSessionStart(
-					`archive-install ${tool.id}: tree marker not found at ${tmpMarker} after extraction — keeping installed version`,
+					`archive-install ${tool.id}: ${archiveKind} marker missing after extraction — keeping installed version`,
 				);
 				await fs
 					.rm(tmpExtractDir, { recursive: true, force: true })
@@ -4480,7 +5508,7 @@ async function installArchiveTool(
 			}
 			await swapExtractedDir(tool.id, tmpExtractDir, extractDir);
 			logSessionStart(
-				`archive-install ${tool.id}: installed tree bundle → ${extractDir} (extracted ${archiveBuffer.length} bytes)`,
+				`archive-install ${tool.id}: installed tree bundle → ${extractDir} (extracted ${archiveBuffer.length} bytes, sha256 verified ${digest})`,
 			);
 			debugLog(`[archive] installed ${tool.name} bundle → ${extractDir}`);
 			return extractDir;
@@ -4496,8 +5524,13 @@ async function installArchiveTool(
 		try {
 			await fs.access(tmpResolvedInner);
 		} catch {
+			recordArchiveExtractionDegradation(
+				tool.id,
+				archiveKind,
+				"launcher-missing",
+			);
 			logSessionStart(
-				`archive-install ${tool.id}: launcher not found at ${tmpResolvedInner} after extraction — keeping installed version`,
+				`archive-install ${tool.id}: ${archiveKind} launcher missing after extraction — keeping installed version`,
 			);
 			await fs
 				.rm(tmpExtractDir, { recursive: true, force: true })
@@ -4505,6 +5538,30 @@ async function installArchiveTool(
 			return undefined;
 		}
 		if (!isWindows) await fs.chmod(tmpResolvedInner, 0o750).catch(() => {});
+		// #3400: "present" is not "runnable" — an empty file, a directory, or a
+		// launcher whose exec bit did not stick (a zip entry extracted without it,
+		// or a chmod that silently did nothing, e.g. FAT) would otherwise be shimmed
+		// and recorded as a successful install. This reads the mode bits: it cannot
+		// see a noexec mount.
+		const launcherStat = await fs.stat(tmpResolvedInner).catch(() => undefined);
+		const launcherRunnable =
+			launcherStat?.isFile() === true &&
+			launcherStat.size > 0 &&
+			(isWindows || (launcherStat.mode & 0o111) !== 0);
+		if (!launcherRunnable) {
+			recordArchiveExtractionDegradation(
+				tool.id,
+				archiveKind,
+				"launcher-invalid",
+			);
+			logSessionStart(
+				`archive-install ${tool.id}: ${archiveKind} launcher is empty or not executable — keeping installed version`,
+			);
+			await fs
+				.rm(tmpExtractDir, { recursive: true, force: true })
+				.catch(() => {});
+			return undefined;
+		}
 
 		await swapExtractedDir(tool.id, tmpExtractDir, extractDir);
 
@@ -4534,7 +5591,7 @@ async function installArchiveTool(
 			);
 		}
 		logSessionStart(
-			`archive-install ${tool.id}: installed → ${shimPath} (extracted ${archiveBuffer.length} bytes)`,
+			`archive-install ${tool.id}: installed → ${shimPath} (extracted ${archiveBuffer.length} bytes, sha256 verified ${digest})`,
 		);
 		debugLog(`[archive] installed ${tool.name} → ${shimPath}`);
 		return shimPath;
@@ -4550,12 +5607,75 @@ async function installArchiveTool(
 	}
 }
 
+/**
+ * Record a genuine package-manager install exception against `toolId` and
+ * log it — the one place `installNpmTool`/`installPipTool`/`installGemTool`'s
+ * catch blocks funnel through (#2661 review F3/Sonar: the three catches were
+ * byte-identical but for the strategy label, a duplication SonarCloud's new-
+ * code gate correctly flagged). The real error (registry E404, EBADENGINE, a
+ * network failure, "no version satisfies…") lands in `installFailureReasons`
+ * so a caller that distinguishes a genuine installer defect from a policy
+ * decline (the tool-smoke lane, #2638) sees the actual message, never the
+ * generic fallback `finishInstallAttempt` uses when nothing set it.
+ */
+function recordPackageManagerInstallException(
+	toolId: string,
+	strategyLabel: string,
+	packageName: string,
+	err: unknown,
+): undefined {
+	const message = boundInstallError((err as Error).message);
+	logSessionStart(
+		`auto-install ${strategyLabel} ${packageName}: exception: ${message}`,
+	);
+	installFailureReasons.set(toolId, message);
+	return undefined;
+}
+
+const INSTALL_ERROR_LINE_LIMIT = 1000;
+const INSTALL_CANDIDATE_ERROR_LIMIT = 200;
+
+function boundInstallError(
+	value: string,
+	limit = INSTALL_ERROR_LINE_LIMIT,
+): string {
+	const line = value.replace(/[\r\n]+/g, " ").trim();
+	return line.length > limit ? `${line.slice(0, limit - 3)}...` : line;
+}
+
+/**
+ * #3515: thrown when a re-check right before a second critical write finds
+ * the install lock's generation no longer owned — a competing installer
+ * judged this hold stale (the heartbeat missed enough ticks, or the process
+ * was suspended) and took over. Caught by `installNpmTool`'s own outer catch
+ * like any other install failure; never continues to spawn a second npm
+ * process that would race the new holder's writes into `TOOLS_DIR`.
+ */
+class InstallLockLostError extends Error {}
+
 async function installNpmTool(
+	toolId: string,
 	packageName: string,
 	binaryName: string,
 	verificationArgs: string[] = ["--version"],
 	verificationTimeoutMs = 10_000,
+	/** See {@link packageEntryVerification} — spawn-free verification (#2722). */
+	packageEntryOf?: string,
+	/** See {@link installTool}'s `ownsLock` parameter. */
+	ownsLock?: () => boolean,
 ): Promise<string | undefined> {
+	const assertOwnsLock = (context: string): void => {
+		if (ownsLock && !ownsLock()) {
+			recordDegradationOnce({
+				kind: "install-lock-lost-mid-install",
+				subject: toolId,
+				reason: `install lock generation lost before ${context}; aborting rather than risk a second writer in TOOLS_DIR`,
+			});
+			throw new InstallLockLostError(
+				`install lock lost before ${context} for ${packageName} (#3515)`,
+			);
+		}
+	};
 	try {
 		// Ensure tools directory exists
 		await fs.mkdir(TOOLS_DIR, { recursive: true });
@@ -4604,6 +5724,7 @@ async function installNpmTool(
 			};
 		};
 
+		assertOwnsLock(`spawning ${pmCommand} install`);
 		let outcome = await runInstallAttempt([
 			...(testNpmScript ? [testNpmScript] : []),
 			...baseInstallArgs,
@@ -4617,6 +5738,12 @@ async function installNpmTool(
 			);
 
 		if (pm === "npm" && erResolve) {
+			// #3515: the first attempt alone can run up to INSTALL_TIMEOUT_MS
+			// (120s default); a second attempt on top of it is exactly the hold
+			// the fixed 180s lease used to be too short for. The heartbeat above
+			// is what keeps the lock's generation from going stale for real, but
+			// this re-check is what stops a WRITE if it ever did anyway.
+			assertOwnsLock(`retrying ${pmCommand} install with --legacy-peer-deps`);
 			const retryArgs = installArgs(pm, packageName, {
 				ignoreScripts: !needsScripts,
 				legacyPeerDeps: true,
@@ -4658,8 +5785,10 @@ async function installNpmTool(
 		debugLog(`Verifying ${binaryName}...`);
 		let isValid = false;
 		let lastAttemptTransient = false;
+		let lastAttemptInconclusive = false;
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			lastAttemptTransient = false;
+			lastAttemptInconclusive = false;
 			isValid = await verifyToolBinary(
 				binPath,
 				undefined,
@@ -4668,6 +5797,10 @@ async function installNpmTool(
 				},
 				verificationTimeoutMs,
 				verificationArgs,
+				packageEntryOf,
+				() => {
+					lastAttemptInconclusive = true;
+				},
 			);
 			if (isValid) break;
 			if (attempt < 3) {
@@ -4676,6 +5809,41 @@ async function installNpmTool(
 				);
 				await new Promise((r) => setTimeout(r, 1000 * attempt));
 			}
+		}
+		if (!isValid && lastAttemptInconclusive) {
+			// #2722: the probe ran to completion but could not decide — the #208
+			// transport-required matcher was armed, never matched, and the kept
+			// output is a truncated prefix, so the marker may sit past it (the
+			// class intelephense fell into: ~4 MB of bundle ahead of the marker,
+			// unreachable through any pipe). Same rule as the transient branch
+			// below (#2015): a non-verdict must not delete a freshly installed
+			// package. Deliberately NOT folded into `lastAttemptTransient` —
+			// re-probing reproduces this exactly, so it is durable, and a
+			// transient verdict would keep re-arming the reinstall path
+			// (catalog shape 13).
+			// R2-F2: a non-verdict is a reason to keep ONLY while the tree on disk
+			// still looks like a complete install. With intelephense verified
+			// spawn-free, no registry entry reaches this branch healthy (measured:
+			// no other npm-strategy LSP server emits more than 1,527 bytes), so
+			// its live population is BROKEN servers that spew past the retained
+			// window and die — and for those the delete was the only repair that
+			// existed. Measured on npm 9.2.0 against a real managed prefix: a
+			// package file corrupted IN PLACE is not repaired by re-installing
+			// (`up to date`, the zeroed file stays zeroed), while a package
+			// directory, a `.bin` shim or a nested dependency that is GONE is
+			// reinstalled. So the same on-disk evidence `verification:
+			// "package-entry"` uses decides keep-vs-delete here — strictly as a
+			// gate, never as a verdict: the install is still recorded as failed,
+			// so the tool still reads `✗` and nothing is re-hidden.
+			if (await verifyNpmPackageEntry(binPath, packageName)) {
+				logSessionStart(
+					`auto-install ${packageName}: verification inconclusive (output truncated before the transport-required marker) but the installed tree is intact; keeping installation for re-probe`,
+				);
+				return undefined;
+			}
+			logSessionStart(
+				`auto-install ${packageName}: verification inconclusive AND the installed tree is incomplete; cleaning up so the next install can repair it`,
+			);
 		}
 		if (!isValid && lastAttemptTransient) {
 			// #2015: a killed/spawn-failed prober is NOT a verdict about the
@@ -4712,77 +5880,319 @@ async function installNpmTool(
 
 		return binPath;
 	} catch (err) {
-		logSessionStart(
-			`auto-install npm ${packageName}: exception: ${(err as Error).message}`,
+		return recordPackageManagerInstallException(
+			toolId,
+			"npm",
+			packageName,
+			err,
 		);
-		return undefined;
 	}
 }
+/**
+ * The pip command ladder `installPipTool` tries, per platform, in priority
+ * order — exported so a caller that needs to know "is ANY pip toolchain
+ * reachable on this runner" (without running an install) probes the SAME
+ * candidates rather than a second, narrower guess (#2661 review F4/S5: the
+ * tool-smoke lane's own presence check tried bare `pip` only and missed a
+ * `pip3`-only or python-module-only runner).
+ */
+export function pipCommandCandidates(): string[] {
+	return process.platform === "win32"
+		? ["pip", "py", "python"]
+		: ["pip3", "pip", "python3", "python"];
+}
+
+/** Resolve the script directory used by a Python installation on each OS. */
+export function pipScriptsDir(
+	base: string,
+	platform: NodeJS.Platform = installerPlatform(),
+): string {
+	return path.join(base, platform === "win32" ? "Scripts" : "bin");
+}
+
+const pipPep668LoggedRefusals = createGenerationMap("installer-pep668-log");
+
+/**
+ * The constraints environment for `toolId` — `PIP_CONSTRAINT` **and**
+ * `UV_CONSTRAINT`, both naming the same written file — or `{}` when its registry
+ * entry declares no `pipConstraints` (#3311).
+ *
+ * Each resolver's own mechanism, not a dm-lens one, and BOTH are needed because
+ * `installPipTool`'s first rung is pipx, which chooses its own resolver:
+ * - `PIP_CONSTRAINT` is pip's environment form of `-c/--constraint`, and covers
+ *   pipx's pip backend, the dm-lens venv rung, `pip --user` and the
+ *   private-prefix rung.
+ * - `UV_CONSTRAINT` is uv's ("Equivalent to the `--constraints` command-line
+ *   argument", uv 0.12.10 `crates/uv-static/src/env_vars.rs`, added in uv
+ *   0.1.36) and covers pipx's uv backend — which pipx 1.17.6 makes the DEFAULT
+ *   "when uv is available … else 'pip'" (`pipx install --help`). That backend
+ *   ignores `PIP_CONSTRAINT` entirely, and its `--pip-args` translation covers
+ *   an allowlist (`--index-url`, `--extra-index-url`, `--find-links`,
+ *   `--trusted-host`, `--no-binary`, `--only-binary`, `--pre`, `--upgrade`,
+ *   `--no-cache-dir`) that does not include constraints — so neither the pip env
+ *   var nor a pip argv flag can reach it. Measured on pipx 1.17.6 + uv 0.12.10;
+ *   the transcripts are in the PR body (#3396 round 2).
+ *
+ * Both variables carry a WHITESPACE-SEPARATED LIST of files, so a path with a
+ * space in it is not a path to either resolver: uv fails the install outright
+ * (`error: File not found: …/space`, measured). The file therefore goes to the
+ * first whitespace-free directory, and without one the install proceeds
+ * unconstrained rather than broken — which the ladder's PATH verification then
+ * judges on its merits.
+ *
+ * The file is (re)written from the registry on every install, so a constraint
+ * that is edited or removed in the registry cannot be served from a stale file.
+ * A write failure is recorded and the install proceeds unconstrained — the same
+ * resolution as before this field existed.
+ */
+async function pipConstraintEnvFor(toolId: string): Promise<NodeJS.ProcessEnv> {
+	const constraints = TOOLS.find((t) => t.id === toolId)?.pipConstraints;
+	if (!constraints || constraints.length === 0) return {};
+	const directories = [
+		path.join(getGlobalDmLensDir(), "pip-constraints"),
+		path.join(os.tmpdir(), "dm-lens-pip-constraints"),
+	];
+	const directory = directories.find((candidate) => !/\s/.test(candidate));
+	if (!directory) {
+		recordDegradationOnce({
+			kind: "pip-constraint-path-unusable",
+			subject: toolId,
+			reason: `no whitespace-free directory for the constraints file (tried ${directories.join(", ")}); installing unconstrained`,
+		});
+		return {};
+	}
+	const file = path.join(directory, `${toolId}.txt`);
+	try {
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		// The shared atomic seam (#1609), not a raw write: a second dm-lens process
+		// may be reading this file as pip's `PIP_CONSTRAINT` while this one
+		// rewrites it, and a torn read would silently under-constrain the install.
+		await writeFileAtomicAsync(file, `${constraints.join("\n")}\n`, {
+			bestEffort: false,
+		});
+	} catch (err) {
+		recordDegradationOnce({
+			kind: "pip-constraint-file-unwritable",
+			subject: toolId,
+			reason: `${file}: ${err instanceof Error ? err.message : String(err)}`,
+		});
+		return {};
+	}
+	logSessionStart(
+		`auto-install pip ${toolId}: constraining resolution with ${constraints.join(", ")} (${file})`,
+	);
+	return { PIP_CONSTRAINT: file, UV_CONSTRAINT: file };
+}
+
 /**
  * Install a pip package tool
  */
 async function installPipTool(
+	toolId: string,
 	packageName: string,
+	binaryName: string,
 	/**
 	 * Add `-U`, turning the install into an upgrade. Without it `pip install`
 	 * treats an already-present package as satisfied and leaves the day-one
 	 * version in place forever — the freeze #1747 is about. The flag is the ONLY
-	 * difference between install and refresh: same command ladder, same
-	 * `--user` target, so a refresh can never write somewhere the install would
-	 * not have.
+	 * difference between install and refresh within each selected environment.
 	 */
 	options: { upgrade?: boolean } = {},
 ): Promise<string | undefined> {
 	try {
-		const isWindows = process.platform === "win32";
-		const verb = options.upgrade
-			? ["install", "-U", "--user"]
-			: ["install", "--user"];
-		const pipCandidates = isWindows
-			? [
-					{ command: "pip", args: [...verb, packageName] },
-					{
-						command: "py",
-						args: ["-m", "pip", ...verb, packageName],
-					},
-					{
-						command: "python",
-						args: ["-m", "pip", ...verb, packageName],
-					},
-				]
-			: [
-					{ command: "pip3", args: [...verb, packageName] },
-					{ command: "pip", args: [...verb, packageName] },
-					{
-						command: "python3",
-						args: ["-m", "pip", ...verb, packageName],
-					},
-					{
-						command: "python",
-						args: ["-m", "pip", ...verb, packageName],
-					},
-				];
+		const isWindows = installerPlatform() === "win32";
+		const verb = options.upgrade ? ["install", "-U"] : ["install"];
+		// Read from the registry entry rather than added to this function's
+		// signature: every pip rung below, and pipx's OWN internal pip, is bounded
+		// by one env var, so there is nothing per-call to thread through.
+		const pipConstraintEnv = await pipConstraintEnvFor(toolId);
+		// Built from `pipCommandCandidates()` — the single source of truth this
+		// module and any other caller (the tool-smoke lane's toolchain-presence
+		// probe, #2661 review) share, rather than a second, independently
+		// maintained ladder that can drift.
+		const pipCandidates = pipCommandCandidates().map((command) => ({
+			command,
+			args:
+				command === "pip" || command === "pip3"
+					? [...verb, packageName]
+					: ["-m", "pip", ...verb, packageName],
+		}));
 
-		let lastError = "";
-		for (const candidate of pipCandidates) {
-			const pipResult = await safeSpawnAsync(
-				candidate.command,
-				candidate.args,
-				{
-					timeout: 120_000,
-					ignoreAmbientSignal: true,
-					lifetimeCoupled: true,
-				},
+		const pep668 = /externally-managed-environment/i;
+		const refuse = (strategy: string, reason: string): void => {
+			if (!pep668.test(reason)) return;
+			const subject = `${toolId}:${strategy}`;
+			recordDegradationOnce({
+				kind: "pip-pep668-strategy-refused",
+				subject,
+				reason,
+			});
+			const logKey = `${getDegradationLedgerGeneration()}:${subject}`;
+			if (pipPep668LoggedRefusals.current(logKey) === 0) {
+				pipPep668LoggedRefusals.bump(logKey);
+				logSessionStart(
+					`auto-install pip ${packageName}: ${strategy} refused by PEP 668 (${boundInstallError(reason)})`,
+				);
+			}
+		};
+		const succeeded = (strategy: string, binaryPath: string): string => {
+			recordDegradationOnce({
+				kind: "pip-install-strategy-succeeded",
+				subject: `${toolId}:${strategy}`,
+				reason: binaryPath,
+			});
+			return binaryPath;
+		};
+		const run = (command: string, args: string[], env?: NodeJS.ProcessEnv) => {
+			// `pipConstraintEnv` is empty unless the entry declares
+			// `pipConstraints`, and it is applied HERE — the single spawn seam every
+			// rung of the ladder (pipx, venv, --user, private-prefix) goes through —
+			// so no rung can be reached with the constraint missing. pipx forwards
+			// it: its `run_subprocess` starts from `dict(os.environ)` and blocklists
+			// only PYTHONPATH/__PYVENV_LAUNCHER__ (pipx 1.16.7 src/pipx/util.py
+			// `_fix_subprocess_env`), so PIP_CONSTRAINT reaches the pip it drives.
+			const spawnEnv =
+				Object.keys(pipConstraintEnv).length > 0
+					? { ...(env ?? process.env), ...pipConstraintEnv }
+					: env;
+			return safeSpawnAsync(command, args, {
+				timeout: 120_000,
+				ignoreAmbientSignal: true,
+				lifetimeCoupled: true,
+				cwd: resolveToolCwd("runner", toolId, getGlobalDmLensDir(), {
+					cwd: getGlobalDmLensDir(),
+					suppressTelemetry: true,
+				}).cwd,
+				...(spawnEnv ? { env: spawnEnv } : {}),
+			});
+		};
+		const addBinToPath = async (
+			binDir: string,
+		): Promise<string | undefined> => {
+			try {
+				await fs.access(binDir);
+			} catch {
+				return undefined;
+			}
+			const currentPath = process.env.PATH || process.env.Path || "";
+			const separator = isWindows ? ";" : path.delimiter;
+			if (
+				!currentPath
+					.toLowerCase()
+					.split(separator)
+					.includes(binDir.toLowerCase())
+			) {
+				const updatedPath = `${binDir}${separator}${currentPath}`;
+				process.env.PATH = updatedPath;
+				if (isWindows) process.env.Path = updatedPath;
+			}
+			const names = isWindows
+				? [`${binaryName}.exe`, `${binaryName}.cmd`, binaryName]
+				: [binaryName];
+			for (const name of names) {
+				const candidate = path.join(binDir, name);
+				try {
+					await fs.access(candidate);
+					return candidate;
+				} catch {
+					// continue
+				}
+			}
+			return undefined;
+		};
+
+		if (await isCommandAvailable("pipx")) {
+			// `--force` on the install verb (#3312): this function runs ONLY when the
+			// tool was not resolvable, yet plain `pipx install <pkg>` over an
+			// existing venv exits 0 while printing "not modifying existing
+			// installation. Pass '--force' …" — so an install that changes nothing
+			// reports success and hands back the same unusable launcher. That is the
+			// #2638/#2661 shape (an install that installs nothing reporting like a
+			// real one) and it also swallows a changed package spec, e.g. a venv
+			// created before `cmakelang` grew its `[yaml]` extra above.
+			const result = await run(
+				"pipx",
+				options.upgrade
+					? ["upgrade", packageName]
+					: ["install", "--force", packageName],
 			);
-			const outcome = {
-				ok: pipResult.status === 0,
-				error: (pipResult.error?.message ?? pipResult.stderr).trim(),
-			};
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status === 0) {
+				const location = await run("pipx", [
+					"environment",
+					"--value",
+					"PIPX_BIN_DIR",
+				]);
+				const binDir =
+					location.status === 0 && location.stdout.trim()
+						? location.stdout.trim()
+						: path.join(os.homedir(), ".local", "bin");
+				const binaryPath = await addBinToPath(binDir);
+				if (binaryPath) return succeeded("pipx", binaryPath);
+				throw new Error(
+					`pipx installed ${packageName} but ${binaryName} is not resolvable`,
+				);
+			}
+			refuse("pipx", error);
+		}
 
-			if (outcome.ok) {
-				// Ensure user-level scripts directory is available in current process PATH.
-				// This helps tools installed via `pip install --user` become immediately callable.
-				const userBaseResult = await new Promise<string>((resolve) => {
+		const pythonCandidates = pipCandidates.filter(
+			({ command }) =>
+				command === "python3" || command === "python" || command === "py",
+		);
+		const pythonAvailability = await Promise.all(
+			pythonCandidates.map(({ command }) => isCommandAvailable(command)),
+		);
+		const availablePythonCandidates = pythonCandidates.filter(
+			(_, index) => pythonAvailability[index],
+		);
+		const venvRoot = path.join(getGlobalDmLensDir(), "pip-tools");
+		for (const candidate of availablePythonCandidates) {
+			const venvBin = pipScriptsDir(venvRoot, installerPlatform());
+			let venvPip = path.join(venvBin, isWindows ? "pip.exe" : "pip");
+			try {
+				await fs.access(venvPip);
+			} catch {
+				const created = await run(candidate.command, ["-m", "venv", venvRoot]);
+				const error = (created.error?.message ?? created.stderr).trim();
+				if (created.status !== 0) {
+					refuse("venv", error || "python venv module unavailable");
+					continue;
+				}
+			}
+			try {
+				await fs.access(venvPip);
+			} catch {
+				venvPip = path.join(venvBin, isWindows ? "pip.cmd" : "pip3");
+				try {
+					await fs.access(venvPip);
+				} catch {
+					continue;
+				}
+			}
+			const result = await run(venvPip, [...verb, packageName]);
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status === 0) {
+				const binaryPath = await addBinToPath(venvBin);
+				if (binaryPath) return succeeded("venv", binaryPath);
+				throw new Error(
+					`venv installed ${packageName} but ${binaryName} is not resolvable`,
+				);
+			}
+			refuse("venv", error);
+		}
+
+		const candidateErrors: string[] = [];
+		let userRefused = false;
+		for (const candidate of pipCandidates) {
+			const args =
+				candidate.command === "pip" || candidate.command === "pip3"
+					? [...verb, "--user", packageName]
+					: ["-m", "pip", ...verb, "--user", packageName];
+			const result = await run(candidate.command, args);
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status === 0) {
+				const base = await new Promise<string>((resolve) => {
 					let probe: ReturnType<typeof spawn>;
 					try {
 						probe = spawn(candidate.command, ["-m", "site", "--user-base"], {
@@ -4790,93 +6200,81 @@ async function installPipTool(
 							shell: isWindows,
 						});
 					} catch {
-						// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
-						// pidusage bug class, #533) — best-effort probe, resolve empty.
 						resolve("");
 						return;
 					}
-					let stdout = "";
-					probe.stdout?.on("data", (data) => (stdout += data));
-					probe.on("exit", (code) => {
-						if (code === 0) resolve(stdout.trim());
-						else resolve("");
-					});
+					const stdout = createBoundedOutputSink();
+					probe.stdout?.on("data", (data) => stdout.append(data));
+					probe.on("exit", (code) =>
+						resolve(userBaseProbeResult(candidate.command, code, stdout)),
+					);
 					probe.on("error", () => resolve(""));
 				});
-
-				if (userBaseResult) {
-					const candidateScriptDirs: string[] = [
-						path.join(userBaseResult, isWindows ? "Scripts" : "bin"),
-					];
-
-					if (isWindows) {
-						// Some Python setups report USER_BASE as ...\Roaming\Python,
-						// while scripts live in ...\Roaming\Python\PythonXY\Scripts.
-						try {
-							const children = await fs.readdir(userBaseResult, {
-								withFileTypes: true,
-							});
-							for (const entry of children) {
-								if (!entry.isDirectory()) continue;
-								if (!/^python\d+$/i.test(entry.name)) continue;
-								candidateScriptDirs.push(
-									path.join(userBaseResult, entry.name, "Scripts"),
-								);
-							}
-						} catch {
-							// ignore
-						}
-					}
-
-					const currentPath =
-						process.env.PATH || process.env.Path || process.env.path || "";
-					const separator = isWindows ? ";" : ":";
-					const normalizedPath = currentPath
-						.toLowerCase()
-						.split(separator)
-						.map((p) => p.trim());
-
-					for (const scriptsDir of candidateScriptDirs) {
-						try {
-							await fs.access(scriptsDir);
-							if (!normalizedPath.includes(scriptsDir.toLowerCase())) {
-								const existingPath =
-									process.env.PATH ||
-									process.env.Path ||
-									process.env.path ||
-									"";
-								const updatedPath = `${scriptsDir}${separator}${existingPath}`;
-								process.env.PATH = updatedPath;
-								if (isWindows) {
-									process.env.Path = updatedPath;
-								}
-								debugLog(`Added pip user scripts dir to PATH: ${scriptsDir}`);
-							}
-						} catch {
-							debugLog(`pip user scripts dir not accessible: ${scriptsDir}`);
-						}
-					}
-				}
-
-				return packageName;
+				const binaryPath = base
+					? await addBinToPath(pipScriptsDir(base, installerPlatform()))
+					: undefined;
+				// Keep the historical normal-user result even when the interpreter's
+				// user-base probe is unavailable. The next availability probe owns
+				// resolution through PATH and its user-base candidates.
+				return succeeded("user", binaryPath ?? packageName);
 			}
+			const candidateError = `${candidate.command} ${args.join(" ")}: ${boundInstallError(error, INSTALL_CANDIDATE_ERROR_LIMIT)}`;
+			candidateErrors.push(candidateError);
+			if (pep668.test(error)) {
+				userRefused = true;
+				refuse("user", error);
+			}
+		}
+		if (!userRefused)
+			throw new Error(
+				`pip install failed: ${candidateErrors.join(" | ") || "unknown error"}`,
+			);
 
-			lastError = `${candidate.command} ${candidate.args.join(" ")}: ${outcome.error}`;
-			debugLog(`[pip-fallback] ${lastError}`);
+		const privateBase = path.join(getGlobalDmLensDir(), "pip-user");
+		const privateEnv = { ...process.env, PYTHONUSERBASE: privateBase };
+		for (const candidate of pipCandidates) {
+			const args =
+				candidate.command === "pip" || candidate.command === "pip3"
+					? [...verb, "--user", "--break-system-packages", packageName]
+					: [
+							"-m",
+							"pip",
+							...verb,
+							"--user",
+							"--break-system-packages",
+							packageName,
+						];
+			const result = await run(candidate.command, args, privateEnv);
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status !== 0) {
+				const candidateError = `${candidate.command} ${args.join(" ")}: ${boundInstallError(error, INSTALL_CANDIDATE_ERROR_LIMIT)}`;
+				candidateErrors.push(candidateError);
+				continue;
+			}
+			const binaryPath = await addBinToPath(
+				pipScriptsDir(privateBase, installerPlatform()),
+			);
+			if (binaryPath) return succeeded("private-prefix", binaryPath);
+			throw new Error(
+				`private-prefix pip installed ${packageName} but ${binaryName} is not resolvable`,
+			);
 		}
 
 		throw new Error(
-			`Failed to install ${packageName}: no usable pip command found (${lastError || "unknown error"})`,
+			`pip install failed: ${candidateErrors.join(" | ") || "unknown error"}`,
 		);
 	} catch (err) {
-		logSessionStart(
-			`auto-install pip ${packageName}: exception: ${(err as Error).message}`,
+		return recordPackageManagerInstallException(
+			toolId,
+			"pip",
+			packageName,
+			err,
 		);
-		return undefined;
 	}
 }
 
 async function installGemTool(
+	toolId: string,
 	packageName: string,
 ): Promise<string | undefined> {
 	try {
@@ -4902,10 +6300,12 @@ async function installGemTool(
 
 		return packageName;
 	} catch (err) {
-		logSessionStart(
-			`auto-install gem ${packageName}: exception: ${(err as Error).message}`,
+		return recordPackageManagerInstallException(
+			toolId,
+			"gem",
+			packageName,
+			err,
 		);
-		return undefined;
 	}
 }
 
@@ -4988,7 +6388,16 @@ async function finishInstallAttempt(
 /**
  * Install a tool by ID
  */
-export async function installTool(toolId: string): Promise<boolean> {
+export async function installTool(
+	toolId: string,
+	/**
+	 * #3515: whether the caller's install-lock hold is still the live top
+	 * generation, threaded down to the npm strategy so it can abort its
+	 * ERESOLVE retry rather than risk a second write past a lost lock.
+	 * Undefined for a caller with no lock context (there is none today).
+	 */
+	ownsLock?: () => boolean,
+): Promise<boolean> {
 	if (process.env.DM_LENS_DISABLE_TOOL_INSTALL === "1") {
 		installFailureReasons.set(
 			toolId,
@@ -5021,10 +6430,13 @@ export async function installTool(toolId: string): Promise<boolean> {
 			case "npm": {
 				if (!tool.packageName || !tool.binaryName) return false;
 				const npmPath = await installNpmTool(
+					tool.id,
 					tool.packageName,
 					tool.binaryName,
 					tool.checkArgs,
 					getToolVerificationTimeout(tool),
+					packageEntryVerification(tool),
+					ownsLock,
 				);
 				if (npmPath !== undefined) {
 					// #1746 review F4: an install just resolved this package's range
@@ -5053,18 +6465,28 @@ export async function installTool(toolId: string): Promise<boolean> {
 
 			case "pip": {
 				if (!tool.packageName) return false;
-				const pipPath = await installPipTool(tool.packageName);
+				const pipPath = await installPipTool(
+					tool.id,
+					tool.packageName,
+					tool.binaryName ?? tool.id,
+				);
 				return finishInstallAttempt(tool.id, pipPath !== undefined, startedAt);
 			}
 
 			case "gem": {
 				if (!tool.packageName) return false;
-				const gemPath = await installGemTool(tool.packageName);
+				const gemPath = await installGemTool(tool.id, tool.packageName);
 				return finishInstallAttempt(tool.id, gemPath !== undefined, startedAt);
 			}
 
 			case "github": {
 				if (!tool.github) return false;
+				if (!tool.github.assetMatch(process.platform, process.arch)) {
+					const reason = `unsupported platform=${process.platform} arch=${process.arch}`;
+					noteInstallAttempt(tool.id, "unavailable", reason);
+					logSessionStart(`auto-install ${tool.id}: ${reason}`);
+					return false;
+				}
 				const ghPath = await installGitHubTool(tool);
 				return finishInstallAttempt(tool.id, ghPath !== undefined, startedAt);
 			}
@@ -5081,6 +6503,26 @@ export async function installTool(toolId: string): Promise<boolean> {
 
 			case "archive": {
 				if (!tool.archive) return false;
+				if (!resolveArchiveUrl(tool.archive)) {
+					const reason = `unsupported platform=${process.platform} arch=${process.arch}`;
+					noteInstallAttempt(tool.id, "unavailable", reason);
+					logSessionStart(`auto-install ${tool.id}: ${reason}`);
+					return false;
+				}
+				// #3400: a launcher that needs a runtime (java) is `unavailable`
+				// without it, decided BEFORE the download, no spawn. A set home env
+				// var (JAVA_HOME) decides alone; otherwise a PATH walk.
+				const runtime = tool.archive.runtime;
+				const viaHome = runtime ? runtimeHomeVerdict(runtime) : undefined;
+				if (runtime && !(viaHome ?? (await isCommandAvailable(runtime)))) {
+					const reason =
+						viaHome === undefined
+							? `runtime ${runtime} not found on PATH`
+							: `runtime ${runtime} is not an executable file under ${ARCHIVE_RUNTIME_HOMES[runtime]?.env}`;
+					noteInstallAttempt(tool.id, "unavailable", reason);
+					logSessionStart(`auto-install ${tool.id}: ${reason}`);
+					return false;
+				}
 				const archivePath = await installArchiveTool(tool);
 				return finishInstallAttempt(
 					tool.id,
@@ -5206,7 +6648,7 @@ async function ensureToolResolved(
 		}
 		let installed: boolean;
 		try {
-			installed = await installTool(toolId);
+			installed = await installTool(toolId, lock.ownsLock);
 		} finally {
 			await lock.release();
 		}
@@ -5380,7 +6822,7 @@ async function ensureToolResolved(
 				);
 				return installedByPeer;
 			}
-			installed = await installTool(toolId);
+			installed = await installTool(toolId, lock.ownsLock);
 		} finally {
 			await lock.release();
 		}
@@ -5502,6 +6944,8 @@ export function getToolInstallStrategy(
  * "at least one platform" guard instead.
  */
 export const GITHUB_TOOLS = [
+	"cljfmt",
+	"php-cs-fixer",
 	"shellcheck",
 	"shfmt",
 	"rust-analyzer",
@@ -5524,6 +6968,8 @@ export const GITHUB_TOOLS = [
 	"clojure-lsp",
 	"cue",
 	"gleam",
+	"typstyle",
+	"tinymist",
 	"marksman",
 	"expert",
 ] as const;
@@ -5541,6 +6987,17 @@ export function resolveGitHubAsset(
 ): string | undefined {
 	const tool = TOOLS.find((t) => t.id === toolId);
 	return tool?.github?.assetMatch(platform, arch);
+}
+
+export function resolveGitHubAssetLauncher(
+	toolId: string,
+	_platform: string,
+	assetName: string,
+): "php" | "java" | undefined {
+	const tool = TOOLS.find((t) => t.id === toolId);
+	return tool?.github
+		? launcherForGitHubAsset(tool.github, assetName)
+		: undefined;
 }
 
 export function resolveGitHubInstalledBinaryName(

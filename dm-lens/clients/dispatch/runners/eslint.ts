@@ -7,7 +7,10 @@
  * Gate: skips when no ESLint config is detected (project uses Biome/OxLint instead).
  */
 
+import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getAutofixCapability, hasEslintConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -20,6 +23,7 @@ import {
 	createCwdCachedProbe,
 	resolveToolCommand,
 } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 const ESLINT_PROBE_BUDGET_MS = 5000;
 
@@ -75,13 +79,22 @@ interface EslintFileResult {
 function parseEslintJson(
 	raw: string,
 	filePath: string,
+	cwd: string,
 ): { diagnostics: Diagnostic[]; parseError?: string } {
 	try {
 		const results: EslintFileResult[] = JSON.parse(raw);
 		const autofix = getAutofixCapability("eslint");
 		const diagnostics: Diagnostic[] = [];
+		const absTarget = path.resolve(cwd, filePath);
 
 		for (const fileResult of results) {
+			// #3295: flat config `files`/`ignores` and a directory argv both put a
+			// SECOND result in this array; each names its own `filePath`.
+			if (
+				fileResult.filePath &&
+				!pathsEqual(path.resolve(cwd, fileResult.filePath), absTarget)
+			)
+				continue;
 			for (const msg of fileResult.messages) {
 				const severity = msg.severity === 2 ? "error" : "warning";
 				diagnostics.push({
@@ -120,7 +133,7 @@ const eslintRunner: RunnerDefinition = {
 	priority: PRIORITY.LINT_SECONDARY,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "eslint");
 		const userHasConfig = hasEslintConfig(cwd);
 
 		// Only run if project has an ESLint config.
@@ -141,12 +154,11 @@ const eslintRunner: RunnerDefinition = {
 			{ timeout: 30000, cwd },
 		);
 
-		// ESLint exits 2 on fatal/config errors — nothing was linted, so this
-		// is an unavailable run, not a clean or failed one.
-		if (result.status === 2) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
+		// Exit table: 0 is clean-or-findings, and 1/2 are ran outcomes whose
+		// JSON parser decides whether findings or a parse/config error reached the
+		// user. In particular, status 2 carries file-local fatal parse messages
+		// as JSON and must not be discarded before parsing.
+		//
 		// ESLint exits 0 whenever nothing reached ERROR severity — that
 		// includes a run that found only warnings (#1954), which also prints a
 		// full JSON report. So parse stdout unconditionally and branch on the
@@ -160,49 +172,23 @@ const eslintRunner: RunnerDefinition = {
 			raw = result.stderr || "";
 		}
 
-		const parsed = parseEslintJson(raw, ctx.filePath);
-		if (parsed.parseError && raw.trim().length > 0) {
-			const preview = raw.replace(/\s+/g, " ").slice(0, 160);
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: "eslint:parse-error:1",
-						message:
-							"ESLint JSON parse failed: " +
-							parsed.parseError +
-							(preview ? " (output preview: " + preview + ")" : ""),
-						filePath: ctx.filePath,
-						line: 1,
-						column: 1,
-						severity: "warning",
-						semantic: "warning",
-						tool: "eslint",
-					},
-				],
-				semantic: "warning",
-			};
-		}
-
-		const diagnostics = parsed.diagnostics;
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
-		// A warning-only result on exit 0 is ESLint's normal outcome, not a
-		// failure: exit 0 means nothing hit ERROR severity. Keying status off
-		// blocking severity plus exit code (the sibling convention from oxlint,
-		// biome-check, golangci-lint, rubocop) keeps plan.ts's fallback group
-		// ["eslint", "oxlint", "biome-check-json"] stopping at eslint instead
-		// of re-running oxlint and biome-check-json on every warning-only save.
-		// The findings reach delivery regardless of status — dispatcher.ts
-		// buckets by each diagnostic's own `semantic`.
-		return {
-			status: !hasErrors && result.status === 0 ? "succeeded" : "failed",
-			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
-		};
+		const parsed = parseToolRun(
+			"eslint",
+			{
+				result,
+				output: raw,
+				// EXIT TABLE (ESLint 9.10 docs https://eslint.org/docs/latest/use/command-line-interface): 0 clean; 1 findings; 2 fatal findings/error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(rawOutput) => parseEslintJson(rawOutput, ctx.filePath, cwd).diagnostics,
+		);
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "eslint",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+		});
 	},
 };
 

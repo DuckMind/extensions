@@ -27,6 +27,7 @@ import { isTestMode } from "./env-utils.js";
 import { getGlobalDmLensLogDir } from "./probe-home-state.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
+import { getTurnId } from "./turn-context.js";
 
 export const EXTENSION_LOG_FILE = path.join(
 	getGlobalDmLensLogDir(),
@@ -52,6 +53,7 @@ export interface ExtensionLogEntry {
 	/** Defaults to `error` (the level every migrated ungated site wrote at). */
 	level?: ExtensionLogLevel;
 	metadata?: Record<string, unknown>;
+	turnId?: string;
 }
 
 export function logExtension(entry: ExtensionLogEntry): void {
@@ -59,6 +61,7 @@ export function logExtension(entry: ExtensionLogEntry): void {
 	writer.log({
 		ts: new Date().toISOString(),
 		pid: process.pid,
+		turnId: getTurnId(),
 		level: entry.level ?? "error",
 		subsystem: entry.subsystem,
 		message: entry.message,
@@ -279,11 +282,61 @@ function isCaptureSeam(prop: PropertyKey): boolean {
 }
 
 /**
+ * True for a host SCHEMA value that happens to be callable.
+ *
+ * A tool definition's `parameters` is DATA the host reads, not a dm-lens
+ * callback — but the schema builder dm-lens imports is host-provided
+ * (`clients/deps/typebox.ts`: the host resolves the bare `typebox`
+ * specifier), and on a host whose builders are ArkType-style the schema is a
+ * FUNCTION. `@oh-my-pi/pi-coding-agent` rewrites an extension's `typebox`
+ * import to its own `src/extensibility/legacy-typebox.ts`, which re-exports
+ * `@oh-my-pi/omptype`'s builders; those return a callable whose prototype
+ * carries `toJsonSchema`/`assert`. `inCaptureWindow` returns a plain rest
+ * wrapper with neither, so the host falls off its ark branch, the wire schema
+ * degrades to `undefined`, and every xd:// device renders `type Args =
+ * unknown` and rejects every call with `root: schema must be an object or
+ * boolean` (#3195).
+ *
+ * The predicate IS the host's own, copied from `@oh-my-pi/pi-ai@18.2.4`
+ * `src/utils/schema/wire.ts:21-27` (`isArkSchema`) — the same test the host's
+ * `applyToolProxy` (`@oh-my-pi/pi-coding-agent@18.2.4`
+ * `src/extensibility/tool-proxy.ts:26`) uses to leave a callable schema
+ * unbound for exactly this hazard ("`bind()` … drops the schema surface …
+ * so a bound schema later stringifies to `undefined`"). Matching it means
+ * dm-lens declines to wrap precisely the values the host reads as schemas,
+ * and still wraps everything else.
+ * `tests/clients/pi-host-callable-schema-contract.test.ts` asserts against
+ * that upstream predicate (and against a fixture measured from a real
+ * `@oh-my-pi/omptype@18.2.4` schema), not against this copy of it.
+ *
+ * Deliberately NOT an allow-list of handler keys (`execute`, `renderResult`,
+ * `handler` — the measured set today): that is `isCaptureSeam`'s #1434 S1a
+ * mistake one level down (defect shape 34, spelling enumerator). The host's
+ * own `ToolDefinition` already declares `onSession`, `renderCall` and
+ * `shellEnv`, and `registerCommand` takes `getArgumentCompletions`; the day
+ * dm-lens adopts one of those, an allow-list drops its console capture
+ * SILENTLY — the #1333 regression this seam exists to prevent — while this
+ * predicate keeps wrapping it.
+ */
+function isCallableSchema(value: unknown): boolean {
+	return (
+		typeof value === "function" &&
+		typeof (value as { toJsonSchema?: unknown }).toJsonSchema === "function" &&
+		typeof (value as { assert?: unknown }).assert === "function"
+	);
+}
+
+/**
  * Wrap every function value found in `value`, in place. Handles the two
  * shapes a `register*`/`on` call takes today: a function passed directly
  * (`on(event, handler)`, `registerMessageRenderer(type, fn)`), and a
  * function ONE level inside a plain options/definition object
  * (`options.handler`, `tool.execute`).
+ *
+ * Only the property walk screens for a callable schema (#3195): every
+ * function dm-lens passes as a register argument DIRECTLY is a handler
+ * (`on`, `registerMessageRenderer`), measured across the whole activation,
+ * so a schema can only ever arrive as a property of a definition object.
  *
  * Deliberately NOT recursive past that one level (#1434 perf review): a tool
  * definition's `parameters`/`schema` is a large, deeply nested TypeBox object
@@ -294,7 +347,7 @@ function isCaptureSeam(prop: PropertyKey): boolean {
  * the commit body for the measured before/after). Checking only the
  * argument's own top-level keys is O(keys), independent of how deep an
  * unrelated nested value's own structure goes, and covers every shape
- * PI-LENS actually registers (`options.handler`, `tool.execute` — never two
+ * DM-LENS actually registers (`options.handler`, `tool.execute` — never two
  * levels deep). It does NOT cover every shape the host's `ExtensionAPI` type
  * permits: `registerProvider`'s `config.oauth.*` callbacks sit two levels
  * deep and `config.models[]` sits behind a skipped array. dm-lens never
@@ -316,7 +369,7 @@ function wrapFunctionsInPlace<T>(value: T): T {
 	const obj = value as Record<string, unknown>;
 	for (const key of Object.keys(obj)) {
 		const propValue = obj[key];
-		if (typeof propValue === "function") {
+		if (typeof propValue === "function" && !isCallableSchema(propValue)) {
 			assignWrapped(obj, key, propValue as ConsoleFn);
 		}
 	}

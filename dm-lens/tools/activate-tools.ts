@@ -33,15 +33,16 @@ export type ActiveToolsHost = {
 };
 
 export interface ActivateToolsOptions {
+	onRejected?: (name: string) => void;
 	deferredToolSupport?: (ctx: unknown) => boolean;
 	/**
 	 * Called with every lazy tool name the model asked for, so the extension
 	 * can remember this logical session's activations and restore them after
 	 * the host rebuilds the session — fork/reload/resume construct a fresh
-	 * AgentSession with every registered tool active again, while dm-lens's
-	 * closure state survives (see clients/tool-set-policy.ts).
+	 * AgentSession with every registered tool active again. The module-level
+	 * session-file store survives the factory re-run (see clients/tool-set-policy.ts).
 	 */
-	onActivated?: (names: string[]) => void;
+	onActivated?: (names: string[], ctx: unknown) => void;
 	onMutation?: (mutation: {
 		addedCount: number;
 		removedCount: number;
@@ -57,22 +58,26 @@ export function createActivateToolsTool(
 ) {
 	const lazyNames = lazyTools.map((t) => t.name);
 	const lazyNameSet = new Set(lazyNames);
-	const catalog = lazyTools.map((t) => `${t.name} — ${t.summary}`).join("\n");
+	// #2967: the example must name a tool this build actually exposes. Derive it
+	// from `lazyNames` (already the enabled-only registry projection) instead of
+	// a hard-coded `lsp_navigation`; a disabled example would otherwise advertise
+	// a name the model cannot activate — the issue's own symptom. With no enabled
+	// situational tool the example is dropped rather than left stale.
+	const exampleName = lazyNames[0];
 
 	return {
 		name: "dm_lens_activate_tools" as const,
 		label: "Activate dm-lens Tools",
-		description:
-			"Activate one or more situational dm-lens tools that stay registered but inactive by default, so the default tool list stays lean. " +
-			"Call this ONCE with the tools you need before using them — they become callable starting the NEXT turn. " +
-			`Available:\n${catalog}`,
-		promptSnippet:
-			"Activate situational ast-grep / lsp_navigation tools before using them",
+		description: exampleName
+			? `Activate registered situational tools for the next turn. Example: \`{tools: ["${exampleName}"]}\`.`
+			: "Activate registered situational tools for the next turn.",
+		promptSnippet: "Activate a situational tool",
 		parameters: Type.Object({
 			tools: Type.Array(Type.String({ enum: lazyNames }), {
 				minItems: 1,
-				description:
-					"Names of situational tools to activate (see this tool's description for the catalog).",
+				description: exampleName
+					? `Names of situational tools to activate, e.g. \`${exampleName}\`.`
+					: "Names of situational tools to activate.",
 			}),
 		}),
 		async execute(
@@ -87,6 +92,12 @@ export function createActivateToolsTool(
 						(t): t is string => typeof t === "string" && lazyNameSet.has(t),
 					)
 				: [];
+			if (Array.isArray(params.tools)) {
+				for (const name of params.tools) {
+					if (typeof name === "string" && !lazyNameSet.has(name))
+						options.onRejected?.(name);
+				}
+			}
 
 			if (requested.length === 0) {
 				return {
@@ -106,7 +117,7 @@ export function createActivateToolsTool(
 			// Remember every requested tool, not just the newly-added ones: a
 			// tool that is already active still has to survive the next
 			// fork/reload/resume restore.
-			options.onActivated?.(requested);
+			options.onActivated?.(requested, ctx);
 
 			const active =
 				typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];

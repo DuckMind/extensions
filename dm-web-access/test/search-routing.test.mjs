@@ -90,6 +90,36 @@ test("configured routing fails closed on quota errors not selected by fallbackOn
 	assert.deepEqual(output.calls, ["https://api.search.brave.com/res/v1/web/search?q=quota+route&count=5"]);
 });
 
+test("configured routing falls back from Tavily monthly plan exhaustion", async () => {
+	const home = await createConfig({
+		searchRouting: { providers: ["tavily", "brave"], fallbackOn: ["quota"] },
+	});
+	const child = runChild(`
+		const calls = [];
+		globalThis.fetch = async (url) => {
+			calls.push(String(url));
+			if (String(url) === "https://api.tavily.com/search") return new Response("Monthly plan usage limit exceeded", { status: 432 });
+			if (String(url).startsWith("https://api.search.brave.com/")) {
+				return new Response(JSON.stringify({ web: { results: [{ title: "Brave fallback", url: "https://example.com/brave", description: "Fallback answer" }] } }), { status: 200 });
+			}
+			throw new Error("Unexpected fetch " + url);
+		};
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const result = await search("tavily quota route", { provider: "auto" });
+		console.log(JSON.stringify({ provider: result.provider, answer: result.answer, calls }));
+	`, {
+		DM_CODING_AGENT_DIR: home,
+		TAVILY_API_KEY: "tavily-test-key",
+		BRAVE_API_KEY: "brave-test-key",
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.equal(output.provider, "brave");
+	assert.equal(output.answer, "Fallback answer\nSource: Brave fallback (https://example.com/brave)");
+	assert.deepEqual(output.calls, ["https://api.tavily.com/search", "https://api.search.brave.com/res/v1/web/search?q=tavily+quota+route&count=5"]);
+});
+
 test("auth status fails closed even when the response text looks like quota", async () => {
 	const home = await createConfig({
 		searchRouting: { providers: ["brave", "tavily"], fallbackOn: ["quota"] },
@@ -193,8 +223,8 @@ test("legacy single-provider config takes precedence over searchRouting", async 
 		const calls = [];
 		globalThis.fetch = async (url) => {
 			calls.push(String(url));
-			if (String(url) === "https://api.perplexity.ai/chat/completions") {
-				return new Response(JSON.stringify({ choices: [{ message: { content: "Perplexity answer" } }], citations: [] }), { status: 200 });
+			if (String(url) === "https://api.perplexity.ai/search") {
+				return new Response(JSON.stringify({ id: "search-id", results: [] }), { status: 200 });
 			}
 			throw new Error("Routing provider must not run");
 		};
@@ -211,7 +241,7 @@ test("legacy single-provider config takes precedence over searchRouting", async 
 	assert.equal(child.status, 0, child.stderr);
 	assert.deepEqual(JSON.parse(child.stdout.trim()), {
 		provider: "perplexity",
-		calls: ["https://api.perplexity.ai/chat/completions"],
+		calls: ["https://api.perplexity.ai/search"],
 	});
 });
 
@@ -541,6 +571,87 @@ test("a Hosted response without web_search_call is invalid and can fall back", a
 		calls: ["https://api.openai.com/v1/responses", "https://api.tavily.com/search"],
 	});
 });
+
+for (const scenario of [
+	{ name: "quoting a rate_limit code", zone: "pi_serp", body: JSON.stringify({ error: "rate_limit_exceeded" }) },
+	{ name: "for a zone named rate_limit_exceeded", zone: "rate_limit_exceeded", body: "<html>oops</html>" },
+]) {
+	test(`a billed Bright Data 200 ${scenario.name} fails as invalid-response, not quota`, async () => {
+		const home = await createConfig({
+			searchRouting: { providers: ["brightdata", "tavily"], fallbackOn: ["quota"] },
+		});
+		const child = runChild(`
+			const calls = [];
+			globalThis.fetch = async (url) => {
+				calls.push(String(url));
+				if (String(url) === "https://api.brightdata.com/request") return new Response(${JSON.stringify(scenario.body)}, { status: 200 });
+				if (String(url) === "https://api.tavily.com/search") throw new Error("Tavily must not run");
+				throw new Error("Unexpected fetch " + url);
+			};
+			const { search } = await import(${JSON.stringify(searchModuleUrl)});
+			try {
+				await search("billed route", { provider: "auto" });
+				console.log(JSON.stringify({ ok: true, calls }));
+			} catch (error) {
+				console.log(JSON.stringify({ ok: false, error: String(error), calls }));
+			}
+		`, {
+			DM_CODING_AGENT_DIR: home,
+			BRIGHTDATA_API_KEY: "bd-test-key",
+			BRIGHTDATA_SERP_ZONE: scenario.zone,
+			TAVILY_API_KEY: "tavily-test-key",
+		});
+
+		assert.equal(child.status, 0, child.stderr);
+		const output = JSON.parse(child.stdout.trim());
+		assert.equal(output.ok, false);
+		assert.match(output.error, /brightdata search failed \(invalid-response\)/);
+		assert.deepEqual(output.calls, ["https://api.brightdata.com/request"]);
+	});
+}
+
+for (const scenario of [
+	{ name: "server_error", fallbackOn: ["transient"], error: { type: "server_error", code: "internal_error", message: "backend exploded" } },
+	{ name: "rate_limit_exceeded", fallbackOn: ["quota"], error: { type: "requests", code: "rate_limit_exceeded", message: "slow down" } },
+	{ name: "unrecognised", fallbackOn: ["invalid-response"], error: { type: "mystery", code: "odd_failure", message: "something broke" } },
+	{ name: "subscription usage limit", fallbackOn: ["quota"], error: { type: "invalid_request_error", code: "subscription_sharing_usage_limit_exceeded", message: "The ChatGPT user has reached their Subscription Sharing usage limit." } },
+	{ name: "permission", fallbackOn: ["invalid-response", "transient", "quota"], error: { type: "permission_error", code: "forbidden", message: "Project does not have access to web search" }, failsAs: "auth" },
+	{ name: "authentication_error", fallbackOn: ["invalid-response", "transient", "quota"], error: { type: "authentication_error", code: "invalid_api_key", message: "Incorrect API key provided" }, failsAs: "auth" },
+	{ name: "internal_error", fallbackOn: ["transient"], error: { code: "internal_error", message: "The server had an error while processing your request" } },
+]) {
+	test(`an OpenAI ${scenario.name} stream error ${scenario.failsAs ? `fails as ${scenario.failsAs}` : "can fall back"} with fallbackOn ${scenario.fallbackOn}`, async () => {
+		const home = await createConfig({
+			searchRouting: { providers: ["openai", "tavily"], fallbackOn: scenario.fallbackOn },
+		});
+		const child = runChild(`
+			const calls = [];
+			const events = [{ type: "response.created", response: { status: "in_progress" } }, { type: "error", error: ${JSON.stringify(scenario.error)} }];
+			globalThis.fetch = async (url) => {
+				const target = String(url);
+				calls.push(target);
+				if (target === "https://api.openai.com/v1/responses") return new Response(events.map((e) => "data: " + JSON.stringify(e) + "\\n").join("\\n"), { status: 200, headers: { "content-type": "text/event-stream" } });
+				if (target === "https://api.tavily.com/search") return new Response(JSON.stringify({ answer: "Tavily fallback answer", results: [] }), { status: 200 });
+				throw new Error("Unexpected fetch: " + target);
+			};
+			const { search } = await import(${JSON.stringify(searchModuleUrl)});
+			try {
+				const result = await search("stream error route", { provider: "auto" });
+				console.log(JSON.stringify({ provider: result.provider, calls }));
+			} catch (err) {
+				console.log(JSON.stringify({ error: err.message.split(":")[0], calls }));
+			}
+		`, {
+			DM_CODING_AGENT_DIR: home,
+			OPENAI_API_KEY: "openai-test-key",
+			TAVILY_API_KEY: "tavily-test-key",
+		});
+
+		assert.equal(child.status, 0, child.stderr);
+		assert.deepEqual(JSON.parse(child.stdout.trim()), scenario.failsAs
+			? { error: `openai search failed (${scenario.failsAs})`, calls: ["https://api.openai.com/v1/responses"] }
+			: { provider: "tavily", calls: ["https://api.openai.com/v1/responses", "https://api.tavily.com/search"] });
+	});
+}
 
 test("useCurrentModel is strictly validated", async () => {
 	const home = await createConfig({ searchRouting: { providers: ["openai", "tavily"], useCurrentModel: "yes", fallbackOn: ["network"] } });

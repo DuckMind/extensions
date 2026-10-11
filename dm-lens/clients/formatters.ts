@@ -12,10 +12,12 @@
 import { logExtension } from "./extension-log.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { findNearestContaining, normalizeMapKey } from "./path-utils.js";
+import { resolveToolCwd } from "./tool-cwd.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
 import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
 import { resolvePhpCsFixerConfig } from "./php-cs-fixer-config.js";
@@ -37,12 +39,18 @@ import {
 import {
 	findGlobalBinary,
 	findLocalBinUpwards,
+	localBinPath,
 	VENDOR_BIN_DIRS,
 	VENV_BIN_DIRS,
 } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { establishToolAgreement } from "./tool-agreement.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
+import { probeToolAsync } from "./tool-probe.js";
 import { assertInstallAllowed } from "./project-trust.js";
 import { tryLazyInstallForFormatter } from "./dispatch/runners/utils/lazy-installer.js";
+import { getToolPath } from "./installer/index.js";
+import { getIsolatedNpxSpawnOptions } from "./tool-probe.js";
 import {
 	findPSScriptAnalyzerConfigPath,
 	getAutoInstallToolIdForFormatter,
@@ -123,11 +131,14 @@ export const SKIP_FORMATTING = "skip-formatting" as const;
  * producer collapsed into an ordinary failed result).
  */
 export const FORMATTER_UNAVAILABLE = "formatter-unavailable" as const;
+export const FORMATTER_AGREEMENT_UNAVAILABLE =
+	"formatter-agreement-unavailable" as const;
 export type ResolvedFormatterCommand =
 	| string[]
 	| null
 	| typeof SKIP_FORMATTING
-	| typeof FORMATTER_UNAVAILABLE;
+	| typeof FORMATTER_UNAVAILABLE
+	| typeof FORMATTER_AGREEMENT_UNAVAILABLE;
 
 /**
  * #1940: what formatter selection actually did to answer one file.
@@ -583,7 +594,7 @@ async function resolveGoFmtBinary(): Promise<string | null> {
 	const inPath = await which("gofmt");
 	if (inPath) return inPath;
 
-	const goCheck = await safeSpawnAsync("go", ["env", "GOROOT"], {
+	const goCheck = await probeToolAsync("go", ["env", "GOROOT"], {
 		timeout: 5000,
 	});
 	if (goCheck.error || goCheck.status !== 0) return null;
@@ -618,10 +629,12 @@ async function resolveGoFmtBinary(): Promise<string | null> {
  */
 async function findInVenv(binary: string, cwd: string): Promise<string | null> {
 	return (
-		findLocalBinUpwards(binary, cwd, {
-			windowsExt: ".exe",
-			binDirs: VENV_BIN_DIRS,
-		}) ?? null
+		localBinPath(
+			findLocalBinUpwards(binary, cwd, {
+				windowsExt: ".exe",
+				binDirs: VENV_BIN_DIRS,
+			}),
+		) ?? null
 	);
 }
 
@@ -640,10 +653,12 @@ async function findInVendorBin(
 	cwd: string,
 ): Promise<string | null> {
 	return (
-		findLocalBinUpwards(binary, cwd, {
-			windowsExt: ".bat",
-			binDirs: VENDOR_BIN_DIRS,
-		}) ?? null
+		localBinPath(
+			findLocalBinUpwards(binary, cwd, {
+				windowsExt: ".bat",
+				binDirs: VENDOR_BIN_DIRS,
+			}),
+		) ?? null
 	);
 }
 
@@ -667,7 +682,7 @@ async function findInNodeModules(
 	binary: string,
 	cwd: string,
 ): Promise<string | null> {
-	return findLocalBinUpwards(binary, cwd) ?? null;
+	return localBinPath(findLocalBinUpwards(binary, cwd)) ?? null;
 }
 
 /**
@@ -684,13 +699,63 @@ async function resolveManagedSmartDefaultCommand(
 	formatterName: string,
 	filePath: string,
 	args: string[],
-): Promise<string[] | null> {
+): Promise<string[] | typeof FORMATTER_UNAVAILABLE> {
 	const toolId = getAutoInstallToolIdForFormatter(formatterName);
-	if (!toolId) return null;
+	if (!toolId) return FORMATTER_UNAVAILABLE;
 	const { ensureTool } = await import("./installer/index.js");
 	const installed = await ensureTool(toolId);
-	if (!installed) return null;
+	if (!installed) {
+		recordDegradationOnce({
+			kind: "formatter-unavailable",
+			subject: formatterName,
+			reason:
+				"managed formatter lookup and installation returned no executable",
+		});
+		return FORMATTER_UNAVAILABLE;
+	}
 	return [installed, ...args, filePath];
+}
+
+/** Resolve an explicitly selected formatter from the shared managed-tool seam. */
+async function resolveManagedFormatterCommand(
+	toolId: string,
+	filePath: string,
+	args: string[],
+	findLocal?: (
+		binary: string,
+		cwd: string,
+	) => string | null | undefined | Promise<string | null | undefined>,
+	cwd?: string,
+): Promise<string[] | typeof FORMATTER_UNAVAILABLE> {
+	const local = findLocal && cwd ? await findLocal(toolId, cwd) : null;
+	const installed =
+		local ?? (await which(toolId)) ?? (await getToolPath(toolId));
+	return installed ? [installed, ...args, filePath] : FORMATTER_UNAVAILABLE;
+}
+
+function managedFormatterResolver(
+	toolId: string,
+	args: string[],
+	findLocal?: (
+		binary: string,
+		cwd: string,
+	) => string | null | undefined | Promise<string | null | undefined>,
+): NonNullable<FormatterInfo["resolveCommand"]> {
+	return (filePath, cwd) =>
+		resolveManagedFormatterCommand(toolId, filePath, args, findLocal, cwd);
+}
+
+function managedToolDetect(
+	toolId: string,
+	configDetect?: (cwd: string) => boolean | Promise<boolean>,
+	nativeDetect?: (cwd: string) => boolean | Promise<boolean>,
+): NonNullable<FormatterInfo["detect"]> {
+	return async (cwd) => {
+		const available =
+			(nativeDetect && (await nativeDetect(cwd))) ||
+			Boolean(await getToolPath(toolId));
+		return available && (configDetect ? await configDetect(cwd) : true);
+	};
 }
 
 /**
@@ -791,12 +856,7 @@ export const FORMATTERS_WITH_EXPLICIT_CONFIG_CHECK = new Set<string>(
 // --- Formatter Definitions ---
 
 async function hasEditorConfig(cwd: string): Promise<boolean> {
-	try {
-		await fs.access(path.join(cwd, ".editorconfig"));
-		return true;
-	} catch {
-		return false;
-	}
+	return findNearestContaining(cwd, [".editorconfig"]) !== undefined;
 }
 
 async function indentationArgs(
@@ -819,6 +879,20 @@ async function indentationArgs(
 	}
 	if (!hasDetectableIndentation(content)) return null;
 	const indentation = detectIndentation(content);
+	if (!indentation) {
+		// #3038: the file HAS indentation, but only nested runs, so no unit can be
+		// proven. The caller turns this into SKIP_FORMATTING — a file the user
+		// expected to be formatted silently is not — so the refusal gets one
+		// bounded row. Subject is the tool (four possible values, recorded once
+		// per session each) rather than the path: a session that edits many such
+		// files must not write one ledger key per file.
+		recordDegradationOnce({
+			kind: "formatter-skip",
+			subject: tool,
+			reason: "indentation evidence is ambiguous; formatter style not pinned",
+		});
+		return null;
+	}
 	if (tool === "shfmt")
 		return indentation.style === "tab"
 			? ["-i", "0"]
@@ -848,6 +922,25 @@ async function indentationArgs(
 		"--indent-width",
 		String(indentation.width),
 	];
+}
+
+/**
+ * Resolve the cwd for the formatter child, capped at the user's home
+ * directory. Files outside a project retain the historical file-directory
+ * cwd. The optional homeDir is only for the ceiling regression test.
+ */
+export function resolveFormatterCwd(
+	absolutePath: string,
+	formatterName?: string,
+	homeDir: string = os.homedir(),
+): string {
+	return resolveToolCwd("formatter", formatterName ?? "unknown", absolutePath, {
+		// Formatter discovery historically walks above the file directory. The
+		// filesystem root is the neutral dispatch boundary; the seam's `$HOME`
+		// ceiling prevents it from escaping the user's workspace.
+		cwd: path.parse(path.resolve(absolutePath)).root,
+		homeDir,
+	}).cwd;
 }
 
 /**
@@ -1027,11 +1120,15 @@ export const oxfmtFormatter: FormatterInfo = {
 		if (local) return [local, OXFMT_NO_ERROR_ON_UNMATCHED, filePath];
 		const found = await which("oxfmt");
 		if (found) return [found, OXFMT_NO_ERROR_ON_UNMATCHED, filePath];
-		// #2413: neither node_modules/.bin nor PATH has oxfmt, and `detect()` is
-		// config-only (it never probes the binary), so selection can reach here
-		// with nothing installed. The static command is bare `oxfmt` — spawning it
-		// only reproduces the reported `spawn oxfmt ENOENT`. Prove it unavailable.
-		return FORMATTER_UNAVAILABLE;
+		return (
+			(await resolveManagedFormatterCommand(
+				"oxfmt",
+				filePath,
+				[OXFMT_NO_ERROR_ON_UNMATCHED],
+				findInNodeModules,
+				cwd,
+			)) ?? FORMATTER_UNAVAILABLE
+		);
 	},
 	// Single source of truth: OXFMT_SUPPORTED_EXTENSIONS in tool-policy.ts.
 	// Do not hand-maintain a second copy of this list (#1134 — previously two
@@ -1078,9 +1175,7 @@ export const ruffFormatter: FormatterInfo = {
 		if (hasRuffConfig(cwd)) return true;
 		// No-config fallback: if Ruff is already available, allow formatter usage.
 		// This keeps Python default behavior consistent with startup defaults.
-		const { getToolPath } = await import("./installer/index.js");
-		const installed = await getToolPath("ruff");
-		return Boolean(installed);
+		return Boolean(await getToolPath("ruff"));
 	},
 };
 
@@ -1088,11 +1183,7 @@ export const blackFormatter: FormatterInfo = {
 	name: "black",
 	command: ["black", "$FILE"],
 	extensions: [".py", ".pyi"],
-	async resolveCommand(filePath, cwd) {
-		const venv = await findInVenv("black", cwd);
-		if (venv) return [venv, filePath];
-		return null;
-	},
+	resolveCommand: managedFormatterResolver("black", [], findInVenv),
 	async detect(cwd: string) {
 		return hasBlackConfig(cwd);
 	},
@@ -1190,11 +1281,11 @@ export const shfmtFormatter: FormatterInfo = {
 			...styleArgs,
 		]);
 	},
-	async detect(_cwd: string) {
-		if ((await which("shfmt")) !== null) return true;
-		const { getToolPath } = await import("./installer/index.js");
-		return Boolean(await getToolPath("shfmt"));
-	},
+	detect: managedToolDetect(
+		"shfmt",
+		undefined,
+		async () => (await which("shfmt")) !== null,
+	),
 };
 
 export const nixfmtFormatter: FormatterInfo = {
@@ -1259,11 +1350,11 @@ export const ktlintFormatter: FormatterInfo = {
 		if (inPath) return [inPath, "-F", filePath];
 		return resolveManagedSmartDefaultCommand("ktlint", filePath, ["-F"]);
 	},
-	async detect(_cwd: string) {
-		if ((await which("ktlint")) !== null) return true;
-		const { getToolPath } = await import("./installer/index.js");
-		return Boolean(await getToolPath("ktlint"));
-	},
+	detect: managedToolDetect(
+		"ktlint",
+		undefined,
+		async () => (await which("ktlint")) !== null,
+	),
 };
 
 export const ktfmtFormatter: FormatterInfo = {
@@ -1354,6 +1445,22 @@ export const gleamFormatter: FormatterInfo = {
 	},
 };
 
+export const typstyleFormatter: FormatterInfo = {
+	name: "typstyle",
+	command: ["typstyle", "-i", "$FILE"],
+	extensions: [".typ", ".typc"],
+	async resolveCommand(filePath) {
+		const inPath = await which("typstyle");
+		if (inPath) return [inPath, "-i", filePath];
+		return resolveManagedSmartDefaultCommand("typstyle", filePath, ["-i"]);
+	},
+	detect: managedToolDetect(
+		"typstyle",
+		undefined,
+		async () => (await which("typstyle")) !== null,
+	),
+};
+
 export const terraformFormatter: FormatterInfo = {
 	name: "terraform",
 	command: ["terraform", "fmt", "$FILE"],
@@ -1398,34 +1505,37 @@ export const phpCsFixerFormatter: FormatterInfo = {
 		const binary =
 			(await findInVendorBin("php-cs-fixer", cwd)) ??
 			(await which("php-cs-fixer"));
+		const managed = await resolveManagedFormatterCommand(
+			"php-cs-fixer",
+			filePath,
+			[],
+			findInVendorBin,
+			cwd,
+		);
+		if (managed === FORMATTER_UNAVAILABLE) return FORMATTER_UNAVAILABLE;
+		const resolved = binary ?? managed[0];
 		// #2413/#2472 review F4: both probes (vendor/bin, then PATH) have
 		// PROVEN the binary is absent — returning `null` here would fall back
 		// to the static `command` above, which is the SAME bare
 		// `php-cs-fixer` this just failed to find, spawning it only to
 		// re-observe the ENOENT already known. Report the proven-missing
 		// state instead so `formatFile` skips the wasted spawn.
-		if (!binary) return FORMATTER_UNAVAILABLE;
+		if (!resolved) return FORMATTER_UNAVAILABLE;
 		return configPath
-			? [binary, "fix", "--config", configPath, filePath]
-			: [binary, "fix", filePath];
+			? [resolved, "fix", "--config", configPath, filePath]
+			: [resolved, "fix", filePath];
 	},
-	async detect(cwd: string) {
-		const vendorBin = await findInVendorBin("php-cs-fixer", cwd);
-		const globalBin = await which("php-cs-fixer");
-		if (!vendorBin && !globalBin) return false;
-		// Only run if project has explicit config. This is a presence-only
-		// climb from the project `cwd` (not necessarily the formatted file's
-		// own directory) via this file's own `findUp` — deliberately NOT
-		// merged with `resolvePhpCsFixerConfig` above (#2472 AC4): that
-		// resolver climbs from the FILE's directory and needs the exact
-		// winning path for `--config`, while this only needs a yes/no answer
-		// from whatever `cwd` the caller passed. `rustfmtFormatter.detect`
-		// keeps the same non-merged shape against `resolveCargoPackageEdition`
-		// for the identical reason.
-		const configs = [".php-cs-fixer.php", ".php-cs-fixer.dist.php"];
-		const found = await findUp(configs, cwd);
-		return found.length > 0;
-	},
+	detect: managedToolDetect(
+		"php-cs-fixer",
+		async (cwd) =>
+			(await findUp([".php-cs-fixer.php", ".php-cs-fixer.dist.php"], cwd))
+				.length > 0,
+		async (cwd) =>
+			Boolean(
+				(await findInVendorBin("php-cs-fixer", cwd)) ||
+				(await which("php-cs-fixer")),
+			),
+	),
 };
 
 export const csharpierFormatter: FormatterInfo = {
@@ -1442,12 +1552,10 @@ export const csharpierFormatter: FormatterInfo = {
 		}
 		// CSharpier 0.x: invoked through the dotnet driver.
 		if ((await which("dotnet")) !== null) {
-			const legacy = await safeSpawnAsync(
+			const legacy = await probeToolAsync(
 				"dotnet",
 				["csharpier", "--version"],
-				{
-					timeout: 5000,
-				},
+				{ timeout: 5000 },
 			);
 			if (!legacy.error && legacy.status === 0) {
 				return ["dotnet", "csharpier", filePath];
@@ -1460,7 +1568,7 @@ export const csharpierFormatter: FormatterInfo = {
 		if ((await which("csharpier")) !== null) return true;
 		// … or the legacy dotnet-driver form (CSharpier 0.x).
 		if ((await which("dotnet")) === null) return false;
-		const result = await safeSpawnAsync("dotnet", ["csharpier", "--version"], {
+		const result = await probeToolAsync("dotnet", ["csharpier", "--version"], {
 			timeout: 5000,
 		});
 		return !result.error && result.status === 0;
@@ -1489,22 +1597,19 @@ export const styluaFormatter: FormatterInfo = {
 	name: "stylua",
 	command: ["stylua", "$FILE"],
 	extensions: [".lua"],
-	async resolveCommand(filePath, cwd) {
-		// Project binary first (#1731, discipline B): stylua has no dm-lens
-		// managed install, so before this the ONLY resolution was a bare
-		// `stylua` PATH lookup — a project-local install via npm
-		// `@johnnymorganz/stylua` (`node_modules/.bin/stylua`) was invisible.
-		const local = findLocalBinUpwards("stylua", cwd);
-		return local ? [local, filePath] : null;
-	},
-	async detect(cwd: string) {
-		const local = findLocalBinUpwards("stylua", cwd);
-		if (!local && (await which("stylua")) === null) return false;
-		// Prefer explicit config but also run if binary is present in a Lua project
-		const configs = ["stylua.toml", ".stylua.toml"];
-		const found = await findUp(configs, cwd);
-		return found.length > 0;
-	},
+	resolveCommand: managedFormatterResolver("stylua", [], (binary, cwd) =>
+		localBinPath(findLocalBinUpwards(binary, cwd)),
+	),
+	detect: managedToolDetect(
+		"stylua",
+		async (cwd) =>
+			(await findUp(["stylua.toml", ".stylua.toml"], cwd)).length > 0,
+		async (cwd) =>
+			Boolean(
+				localBinPath(findLocalBinUpwards("stylua", cwd)) ||
+				(await which("stylua")),
+			),
+	),
 };
 
 export const ormoluFormatter: FormatterInfo = {
@@ -1525,41 +1630,47 @@ export const taploFormatter: FormatterInfo = {
 		if (inPath) return [inPath, "fmt", filePath];
 		return resolveManagedSmartDefaultCommand("taplo", filePath, ["fmt"]);
 	},
-	async detect(_cwd: string) {
-		if ((await which("taplo")) !== null) return true;
-		const { getToolPath } = await import("./installer/index.js");
-		return Boolean(await getToolPath("taplo"));
-	},
+	detect: managedToolDetect(
+		"taplo",
+		undefined,
+		async () => (await which("taplo")) !== null,
+	),
 };
 
 export const googleJavaFormatFormatter: FormatterInfo = {
 	name: "google-java-format",
 	command: ["google-java-format", "--replace", "$FILE"],
 	extensions: [".java"],
-	async detect(cwd: string) {
-		if ((await which("google-java-format")) === null) return false;
-		return hasGoogleJavaFormatConfig(cwd);
-	},
+	resolveCommand: managedFormatterResolver("google-java-format", ["--replace"]),
+	detect: managedToolDetect(
+		"google-java-format",
+		hasGoogleJavaFormatConfig,
+		async () => (await which("google-java-format")) !== null,
+	),
 };
 
 export const cljfmtFormatter: FormatterInfo = {
 	name: "cljfmt",
 	command: ["cljfmt", "fix", "$FILE"],
 	extensions: [".clj", ".cljc", ".cljs"],
-	async detect(cwd: string) {
-		if ((await which("cljfmt")) === null) return false;
-		return hasCljfmtConfig(cwd);
-	},
+	resolveCommand: managedFormatterResolver("cljfmt", ["fix"]),
+	detect: managedToolDetect(
+		"cljfmt",
+		hasCljfmtConfig,
+		async () => (await which("cljfmt")) !== null,
+	),
 };
 
 export const cmakeFormatFormatter: FormatterInfo = {
 	name: "cmake-format",
 	command: ["cmake-format", "-i", "$FILE"],
 	extensions: [".cmake"],
-	async detect(cwd: string) {
-		if ((await which("cmake-format")) === null) return false;
-		return hasCmakeFormatConfig(cwd);
-	},
+	resolveCommand: managedFormatterResolver("cmake-format", ["-i"]),
+	detect: managedToolDetect(
+		"cmake-format",
+		hasCmakeFormatConfig,
+		async () => (await which("cmake-format")) !== null,
+	),
 };
 
 export const cueFormatter: FormatterInfo = {
@@ -1636,7 +1747,7 @@ export const psscriptanalyzerFormatFormatter: FormatterInfo = {
 		const pwsh = (await which("pwsh")) ?? (await which("powershell"));
 		if (!pwsh) return false;
 		// Check PSScriptAnalyzer module is available
-		const result = await safeSpawnAsync(
+		const result = await probeToolAsync(
 			pwsh,
 			[
 				"-NoProfile",
@@ -1684,6 +1795,7 @@ export const ALL_FORMATTERS: FormatterInfo[] = [
 	rubocopFormatter,
 	standardrbFormatter,
 	gleamFormatter,
+	typstyleFormatter,
 	taploFormatter,
 	googleJavaFormatFormatter,
 	cljfmtFormatter,
@@ -1705,10 +1817,10 @@ const detectionCache = new BoundedLruCache<
 // The signature is immutable for a cache generation. This memo is separate
 // from detectionCache because a cwd can have several extension entries, and a
 // warm lookup must not repeat the ancestor walk or stat matched configs.
-const formatterSignatureFlights = new Map<
+const formatterSignatureFlights = new BoundedLruCache<
 	string,
 	{ promise: Promise<string> }
->();
+>(32);
 const formatterCacheGeneration = createGenerationSource("formatter-cache");
 
 // These are the formatter configuration files consulted by the policy helpers
@@ -2124,12 +2236,17 @@ export function _getFormatterResetStateForTests(): {
 		string,
 		{ signature: string; entries: Map<string, string[]> }
 	>;
+	formatterSignatureFlights: BoundedLruCache<
+		string,
+		{ promise: Promise<string> }
+	>;
 } {
 	return {
 		whichLatchByCommand,
 		whichTransientCommands,
 		cooldownRecordedForRetryAtMs,
 		detectionCache,
+		formatterSignatureFlights,
 	};
 }
 
@@ -2143,7 +2260,10 @@ export function clearFormatterRuntimeState(): void {
 }
 
 const BOX_DRAWING_GLOBAL = /[\u2500-\u257F]/g;
-const HAS_BOX_DRAWING = /[\u2500-\u257F]/;
+/** Blank, or a rule made of box-drawing characters and spacing alone. */
+const DECORATION_RULE = /^[\u2500-\u257F\s]*$/;
+/** The renderer's section heading: one word, then box-drawing to end of line. */
+const DECORATION_HEADING = /^\S+[ \t]+[\u2500-\u257F][\u2500-\u257F\s]*$/;
 
 /**
  * First line of `text` that actually carries a diagnostic.
@@ -2162,15 +2282,76 @@ export function firstDiagnosticLine(
 ): string | undefined {
 	for (const raw of (text ?? "").split("\n")) {
 		const line = stripAnsi(raw).trimEnd();
-		const stripped = line.replace(BOX_DRAWING_GLOBAL, "").trim();
-		if (!stripped) continue;
-		// "format ━━━━━━━━" is a section banner, not a diagnostic. Require a rule
-		// AND a short remainder so a real one-line error containing a box
-		// character is not discarded.
-		if (HAS_BOX_DRAWING.test(line) && stripped.length <= 24) continue;
-		return stripped.slice(0, 300);
+		if (isDecorativeLine(line)) continue;
+		return line.replace(BOX_DRAWING_GLOBAL, "").trim().slice(0, 300);
 	}
 	return undefined;
+}
+
+/**
+ * The two decoration SHAPES a renderer emits, and nothing else: a rule made of
+ * box-drawing characters alone (blank lines included), and a `<word> ━━━━`
+ * section heading whose remainder after the word is box-drawing only.
+ *
+ * The single normalization both readers above and below share, so the bounded
+ * tail cannot surface what the first-line reader already rejects (#3312 review
+ * R3-4: the tail put biome's `format ━━━━` banner back in front of the strict
+ * #1337 seam). Matching SHAPES rather than "contains a box character and is
+ * short" is #3312 review R4-1: the length heuristic deleted
+ * `━ traceback source excerpt`, a diagnostic whose own text opens with a box
+ * character. A line carrying any non-decorative text is never decoration.
+ */
+function isDecorativeLine(line: string): boolean {
+	return DECORATION_RULE.test(line) || DECORATION_HEADING.test(line);
+}
+
+const FORMATTER_ERROR_TAIL_LINES = 20;
+
+/**
+ * Preserve a bounded tail of a formatter's diagnostic output.
+ *
+ * A traceback's first line is not actionable on its own (#3312). Keep the
+ * final lines, which include the exception and its message, while bounding
+ * the model-facing error when a formatter emits an unexpectedly large log.
+ *
+ * Decorative lines are dropped FIRST, by the same predicate `firstDiagnosticLine`
+ * uses: a tail that kept them would hand the strict #1337 seam the banner this
+ * module already decided is not a diagnostic, and every banner line it kept
+ * would evict a real traceback line from the bound.
+ */
+export function diagnosticTail(
+	text: string | undefined,
+	maxLines = FORMATTER_ERROR_TAIL_LINES,
+): string | undefined {
+	const lines: string[] = [];
+	for (const raw of (text ?? "").split("\n")) {
+		const line = stripAnsi(raw).trimEnd();
+		if (isDecorativeLine(line)) continue;
+		lines.push(line.slice(0, 300));
+	}
+	if (lines.length === 0) return undefined;
+	return lines.slice(-maxLines).join("\n");
+}
+
+/**
+ * Resolve a static npx fallback to a dm-lens-managed binary so the tool runs
+ * with the PROJECT cwd and still honours cwd-relative config/ignore files
+ * (#4268 HIGH-2). The managed install itself runs from the dm-lens-owned env
+ * (see `getIsolatedNpxSpawnOptions`), so the project's `.npmrc` is never read.
+ * Returns the fallback unchanged when no managed tool id exists or the install
+ * fails; `formatFile` then runs npx from the neutral dm-lens-owned cwd.
+ */
+async function resolveNpxFallback(
+	formatterName: string,
+	fallback: string[],
+): Promise<string[]> {
+	const toolId = getAutoInstallToolIdForFormatter(formatterName);
+	if (!toolId) return fallback;
+	const { ensureTool } = await import("./installer/index.js");
+	const installed = await ensureTool(toolId);
+	if (!installed) return fallback;
+	// Drop the leading `npx <package>` pair; keep the tool's own argv.
+	return [installed, ...fallback.slice(2)];
 }
 
 /**
@@ -2184,7 +2365,21 @@ async function resolveFormatterCommand(
 	formatter: FormatterInfo,
 	absolutePath: string,
 	cwd: string,
-): Promise<string[] | typeof SKIP_FORMATTING | typeof FORMATTER_UNAVAILABLE> {
+): Promise<
+	| string[]
+	| typeof SKIP_FORMATTING
+	| typeof FORMATTER_UNAVAILABLE
+	| typeof FORMATTER_AGREEMENT_UNAVAILABLE
+> {
+	const agreement = establishToolAgreement(formatter.name, cwd);
+	if (agreement.decision === "decline") {
+		recordDegradationOnce({
+			kind: "formatter-agreement-unavailable",
+			subject: agreement.subject,
+			reason: agreement.reason,
+		});
+		return FORMATTER_AGREEMENT_UNAVAILABLE;
+	}
 	const resolved = formatter.resolveCommand
 		? await formatter.resolveCommand(absolutePath, cwd)
 		: null;
@@ -2201,14 +2396,17 @@ async function resolveFormatterCommand(
 	// Trust gate on the install-capable static fallback (#1334 S5): npx can
 	// DOWNLOAD packages, so an untrusted project treats the fallback as
 	// unavailable -- a skip, not a formatter failure; may converge next turn.
-	if (
-		fallback[0] === "npx" &&
-		!assertInstallAllowed(`formatter npx fallback: ${formatter.name}`)
-	) {
-		// No second ledger entry here (#1366 review): assertInstallAllowed just
-		// recorded the trust-refusal with this formatter's context — recording
-		// formatter-skip too would count one user-visible degradation twice.
-		return SKIP_FORMATTING;
+	if (fallback[0] === "npx") {
+		if (!assertInstallAllowed(`formatter npx fallback: ${formatter.name}`)) {
+			// No second ledger entry here (#1366 review): assertInstallAllowed just
+			// recorded the trust-refusal with this formatter's context — recording
+			// formatter-skip too would count one user-visible degradation twice.
+			return SKIP_FORMATTING;
+		}
+		// Install/resolve from the dm-lens-owned env, then run the resolved
+		// binary with the project cwd so `.prettierignore`/`biome.json` still win
+		// (#4268 HIGH-2).
+		return resolveNpxFallback(formatter.name, fallback);
 	}
 	return fallback;
 }
@@ -2216,11 +2414,21 @@ async function resolveFormatterCommand(
 export async function formatFile(
 	filePath: string,
 	formatter: FormatterInfo,
+	/**
+	 * #3558: enters pi's mutation queue for the file. Called once the command
+	 * is resolved (an install can take minutes) and before the before-read.
+	 */
+	enter?: () => Promise<void>,
 ): Promise<FormatterResult> {
 	try {
 		const absolutePath = path.resolve(filePath);
 		const cwd = path.dirname(absolutePath);
-		const contentBefore = await fs.readFile(absolutePath, "utf-8");
+		const formatterCwd = resolveToolCwd(
+			"formatter",
+			formatter.name,
+			absolutePath,
+			{ cwd: path.parse(absolutePath).root },
+		).cwd;
 
 		// Resolve command: prefer local (venv/vendor/node_modules) over global.
 		// The shared seam must honor SKIP_FORMATTING before selecting the static
@@ -2243,10 +2451,25 @@ export async function formatFile(
 				error: `${formatter.name}: formatter executable not found`,
 			};
 		}
-		// Run formatter without blocking the event loop.
+		if (cmd === FORMATTER_AGREEMENT_UNAVAILABLE) {
+			return {
+				success: true,
+				changed: false,
+				outcome: "unavailable",
+				error: `${formatter.name}: project tool agreement could not be established`,
+			};
+		}
+		await enter?.();
+		const contentBefore = await fs.readFile(absolutePath, "utf-8");
+		// Run formatter without blocking the event loop. An unresolved npx/bunx
+		// fallback is the ONLY case that gets the neutral dm-lens-owned cwd
+		// (#4268 acceptance 3); a resolved binary keeps the project cwd.
 		const result = await safeSpawnAsync(cmd[0], cmd.slice(1), {
 			timeout: 15000,
-			cwd,
+			cwd: formatterCwd,
+			...(cmd[0] === "npx" || cmd[0] === "bunx"
+				? getIsolatedNpxSpawnOptions()
+				: {}),
 		});
 
 		// A resolver that could NOT prove absence (it never probed PATH — e.g.
@@ -2281,11 +2504,11 @@ export async function formatFile(
 				outcome: "failed",
 				error:
 					result.error?.message ||
-					firstDiagnosticLine(result.stderr) ||
+					diagnosticTail(result.stderr) ||
 					// biome, ktlint and `mix format` report on STDOUT; without this
 					// their diagnostic is discarded and the user is told only that
 					// the tool "exited with status 1".
-					firstDiagnosticLine(result.stdout) ||
+					diagnosticTail(result.stdout) ||
 					`${formatter.name} exited with status ${result.status}`,
 			};
 		}

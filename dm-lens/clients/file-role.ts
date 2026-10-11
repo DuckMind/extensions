@@ -63,6 +63,28 @@ function isTypeStub(content: string): boolean {
 	return typeOnlyLines.length / lines.length >= 0.75;
 }
 
+// Shared filename predicate (#2928). The parity test iterates the runner's
+// discovery table; additional conventions are pinned in file-role.test.ts.
+// Keep the case-preserved basename for CamelCase suffixes (contest.java is source).
+function testFileNameMatches(rawBase: string, base: string): boolean {
+	return (
+		base.includes(".test.") ||
+		base.includes(".spec.") ||
+		base.includes("_test.") ||
+		base.includes("_spec.") ||
+		base.startsWith("test_") ||
+		base.startsWith("spec_") ||
+		/(Test|Tests|TestCase)\.(java|kt|kts|cs|fs|php)$/.test(rawBase)
+	);
+}
+
+/** Filename-only classification for consumers with their own directory policy. */
+export function isTestFileName(filePath: string): boolean {
+	const windowsShaped = isWindowsPath(filePath);
+	const rawBase = windowsShaped ? win32.basename(filePath) : basename(filePath);
+	return testFileNameMatches(rawBase, rawBase.toLowerCase());
+}
+
 /**
  * Classify the structural role of a file. Pass `content` for higher
  * accuracy (enables generated-code detection, barrel detection, etc.).
@@ -80,20 +102,17 @@ function isTypeStub(content: string): boolean {
  */
 export function detectFileRole(filePath: string, content?: string): FileRole {
 	const windowsShaped = isWindowsPath(filePath);
-	const base = (
-		windowsShaped ? win32.basename(filePath) : basename(filePath)
-	).toLowerCase();
+	const rawBase = windowsShaped ? win32.basename(filePath) : basename(filePath);
+	const base = rawBase.toLowerCase();
 	const dir = (windowsShaped ? win32.dirname(filePath) : dirname(filePath))
 		.replace(/\\/g, "/")
 		.toLowerCase();
 
 	// --- Test ---
+	// #2928: dirname has no trailing slash; match direct __tests__ children too.
 	if (
-		base.includes(".test.") ||
-		base.includes(".spec.") ||
-		base.startsWith("test_") ||
-		base.startsWith("spec_") ||
-		dir.includes("/__tests__/") ||
+		testFileNameMatches(rawBase, base) ||
+		/(^|[\\/])__tests__([\\/]|$)/.test(dir) ||
 		dir.includes("/test/") ||
 		dir.includes("/tests/") ||
 		dir.includes("/spec/") ||

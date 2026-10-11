@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { resolveRunnerCwd } from "../../tool-cwd.js";
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -8,6 +9,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 import { createCwdCachedProbe } from "./utils/runner-helpers.js";
 
 const CREDO_PROBE_BUDGET_MS = 10_000;
@@ -86,7 +88,7 @@ const credoRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "credo");
 
 		if (!hasMixExs(cwd)) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -104,22 +106,24 @@ const credoRunner: RunnerDefinition = {
 			{ timeout: 30000, cwd },
 		);
 
-		// credo exits 1 when issues found, 0 when clean
-		if (result.status === null || result.status > 1) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
-		const diagnostics = parseCredoJson(result.stdout ?? "", ctx.filePath, cwd);
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
-		return {
-			status: hasBlocking ? "failed" : "succeeded",
-			diagnostics,
-			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+		const parsed = parseToolRun(
+			"credo",
+			{
+				result,
+				output,
+				// EXIT TABLE (Credo 1.7 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(raw) => parseCredoJson(raw, ctx.filePath, cwd),
+		);
+		if (parsed.skipped) return parsed.skipped;
+		return finishParsedRun({
+			tool: "credo",
+			ctx,
+			result,
+			diagnostics: parsed.diagnostics,
+		});
 	},
 };
 

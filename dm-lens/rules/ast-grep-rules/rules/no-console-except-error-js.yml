@@ -11,8 +11,8 @@ note: |
   just trains users to ignore the rule; `ignores` below carves those paths
   out while application/library code elsewhere still gets flagged (#965).
 ignores:
-  - "scripts/**"
-  - "bin/**"
+  - "**/scripts/**"
+  - "**/bin/**"
   - "**/logger.ts"
   - "**/logger.js"
   - "**/logger.mjs"

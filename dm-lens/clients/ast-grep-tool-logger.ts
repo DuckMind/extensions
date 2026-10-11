@@ -31,7 +31,7 @@ const writer = createNdjsonLogger({
 	backupPath: AG_LOG_BACKUP_FILE,
 });
 
-export type AstGrepToolName = "ast_grep_search" | "ast_grep_replace";
+type AstGrepToolName = "ast_grep_search" | "ast_grep_replace";
 
 export type AstGrepToolOutcome = "success" | "no_matches" | "error";
 
@@ -144,7 +144,7 @@ export function astGrepRemediationHint(kind: AstGrepErrorKind): string | null {
 		case "json_parse_failed":
 			return "Hint: ast-grep produced output that could not be parsed — retry with a simpler pattern; the installed CLI version may be incompatible.";
 		default:
-			return "Hint: verify the pattern is a single valid AST node for this `lang` (use ast_grep_dump to discover node kinds), or fall back to grep for plain-text search.";
+			return "Hint: verify the pattern is a single valid AST node for this `lang` (use ast_grep_search with dump=true to discover node kinds), or fall back to grep for plain-text search.";
 	}
 }
 
@@ -165,15 +165,6 @@ export function logAstGrepToolEvent(
 		errorRaw: truncate(event.errorRaw, ERROR_TRUNCATE_AT),
 	};
 	writer.log({ ts: new Date().toISOString(), ...payload });
-}
-
-export function getAstGrepToolLogPath(): string {
-	return AG_LOG_FILE;
-}
-
-/** Resolve once all enqueued ast-grep-tool writes are on disk. */
-export function flushAstGrepToolLog(): Promise<void> {
-	return writer.flush();
 }
 
 export { countLines as _countLinesForTest };

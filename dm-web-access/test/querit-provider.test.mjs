@@ -39,9 +39,9 @@ const PROVIDER_ENV_KEYS = [
 
 async function createHome(config = {}) {
 	const home = await mkdtemp(join(tmpdir(), "dm-web-access-querit-"));
-	await mkdir(join(home, ".dm"), { recursive: true });
+	await mkdir(join(home, ".dm", "agent"), { recursive: true });
 	await writeFile(
-		join(home, ".dm", "web-search.json"),
+		join(home, ".dm", "agent", "web-search.json"),
 		JSON.stringify(config) + "\n",
 		"utf8",
 	);
@@ -409,7 +409,7 @@ test("configured search routing can select Querit", async () => {
 		{
 			HOME: home,
 			USERPROFILE: home,
-			DM_CODING_AGENT_DIR: join(home, ".dm"),
+			DM_CODING_AGENT_DIR: join(home, ".dm", "agent"),
 			QUERIT_API_KEY: "synthetic-querit-test-key",
 		},
 	);

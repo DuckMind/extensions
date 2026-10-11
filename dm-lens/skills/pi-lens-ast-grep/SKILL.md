@@ -7,7 +7,22 @@ description: Use when searching or replacing code patterns - use ast-grep instea
 
 Use `ast_grep_search` and `ast_grep_replace` for semantic code search/replace. ast-grep understands code structure, not just text.
 
-These tools (plus `ast_grep_outline`, `ast_grep_dump`, `lsp_navigation`) are registered but inactive by default on hosts that support pi's dynamic tooling. If a call to one of them isn't recognized, activate it first: `dm_lens_activate_tools tools=["ast_grep_search", "ast_grep_replace"]`.
+These tools (plus `ast_grep_outline`, `lsp_navigation`) are registered but inactive by default on hosts that support pi's dynamic tooling. If a call to one of them isn't recognized, activate it first: `dm_lens_activate_tools tools=["ast_grep_search", "ast_grep_replace"]`.
+
+On hosts that aggregate dm-lens behind a single `lens` tool, the `ast_grep_*` tools and `dm_lens_activate_tools` may not be registered at all. There, fall back to the `ast-grep` CLI (alias `sg`) — patterns, metavariables, and YAML rules are identical:
+
+```bash
+# search (≈ ast_grep_search)
+ast-grep run -p 'fetchMetrics($$$ARGS)' -l ts src/
+
+# rewrite (≈ ast_grep_replace; -U applies all)
+ast-grep run -p 'var $X' -r 'let $X' -l js src/ -U
+
+# full YAML rule (≈ the rule: parameter)
+ast-grep scan --rule my-rule.yml src/
+```
+
+Structural-intent parameters map to YAML constraints: `insideKind` → `inside: { kind: ..., stopBy: end }`, `hasKind`/`hasDescendantKind` → `has: { kind: ... }`, `follows` → `follows: { pattern: ... }`, `precedes` → `precedes: { pattern: ... }`.
 
 ## When to Use
 
@@ -88,15 +103,15 @@ rule:
     stopBy: end" lang="typescript"
 ```
 
-### Debugging unknown node kinds — `ast_grep_dump`
+### Debugging unknown node kinds — `ast_grep_search` dump mode
 
-When a pattern returns zero matches and you don't know the correct node kind or field name, use `ast_grep_dump` to inspect a SMALL representative snippet:
+When a pattern returns zero matches and you don't know the correct node kind or field name, use `ast_grep_search` with `dump=true` to inspect a SMALL representative snippet:
 
 ```
-ast_grep_dump source="function foo() { return 1; }" lang="typescript"
+ast_grep_search dump=true pattern="function foo() { return 1; }" lang="typescript"
 ```
 
-Returns the full indented AST with node kinds and positions. Then use the correct kind in your pattern or `insideKind`. `ast_grep_dump` is registered but inactive by default — call `dm_lens_activate_tools` with `tools: ["ast_grep_dump"]` first if it isn't already active.
+Returns the full indented AST with node kinds and positions. Then use the correct kind in your pattern or `insideKind`.
 
 ### Composite (has/inside) in raw YAML
 
@@ -146,8 +161,10 @@ kind: arrow_function
 
 **No matches?**
 
+For `nodeKind`, do not also pass `pattern` or `rule`; those forms are mutually exclusive. For `rule`, provide YAML containing both `id` and `language` fields. Use `strictness: relaxed` when unnamed punctuation is the only mismatch.
+
 1. Try `strictness: relaxed` — ignores unnamed punctuation (trailing commas, semicolons) that `smart` mode requires
-2. Use `ast_grep_dump` on a sample snippet to verify the correct node kind
+2. Use `ast_grep_search dump=true` on a sample snippet to verify the correct node kind
 3. Simplify the pattern and retry once
 4. Fall back to `grep` or `lsp_navigation`
 

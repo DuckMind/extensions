@@ -14,6 +14,7 @@ import type {
 import { readStatus } from "../../shared/utils.ts";
 import { previewDisplayText } from "../../shared/display-text.ts";
 import { redactSecretValues } from "../shared/permissions.ts";
+import type { SteerDeliveryMode } from "./control-channel.ts";
 
 export const MAX_STEERING_REQUESTS = 20;
 export const STEERING_MESSAGE_PREVIEW_LIMIT = 160;
@@ -22,8 +23,26 @@ export function steeringMessagePreview(message: string): string {
 	return previewDisplayText(redactSecretValues(message), STEERING_MESSAGE_PREVIEW_LIMIT);
 }
 
+/** FIFO match of one accepted steer to an emitted user message; equal text claims the oldest entry. */
+export function takeMatchingAcceptedSteer<T extends { text: string }>(accepted: T[], messageText: string): T | undefined {
+	const index = accepted.findIndex((entry) => entry.text === messageText);
+	if (index < 0) return undefined;
+	const [entry] = accepted.splice(index, 1);
+	return entry;
+}
+
+/** Settlement reason for one accepted request that never got a matching user `message_end`. */
+export function unconsumedSteerReason(mode?: SteerDeliveryMode): string {
+	return mode === "follow_up"
+		? "child completed before consuming follow-up"
+		: "child completed before consuming steering";
+}
+
 export function steeringReceipt(message: string, receipt: string): string {
-	return `${receipt} Message: ${JSON.stringify(steeringMessagePreview(message))}`;
+	const preview = steeringMessagePreview(message);
+	const longestFence = Math.max(2, ...[...preview.matchAll(/`{3,}/g)].map((match) => match[0]!.length));
+	const fence = "`".repeat(longestFence + 1);
+	return `${receipt}\n\nMessage sent:\n${fence}text\n${preview}\n${fence}`;
 }
 
 export function createSteeringStatus(): SteeringStatus {
@@ -90,7 +109,9 @@ export function updateSteeringTarget(
 		if (fields.replacementRunId) target.replacementRunId = fields.replacementRunId;
 		return target;
 	}
-	if ((target.state === "routed" || target.state === "queued") && state !== "routed" && state !== "queued") status.pending = Math.max(0, status.pending - 1);
+	const wasPending = target.state === "routed" || target.state === "queued";
+	const nowPending = state === "routed" || state === "queued";
+	if (wasPending && !nowPending) status.pending = Math.max(0, status.pending - 1);
 	target.state = state;
 	if (state === "routed") target.routedAt = now;
 	if (state === "delivered") {
@@ -105,7 +126,7 @@ export function updateSteeringTarget(
 	if (state === "recovered") target.recoveredAt = now;
 	if (fields.reason) target.reason = fields.reason;
 	if (fields.replacementRunId) target.replacementRunId = fields.replacementRunId;
-	incrementStateCount(status, state);
+	if (!wasPending || !nowPending) incrementStateCount(status, state);
 	return target;
 }
 

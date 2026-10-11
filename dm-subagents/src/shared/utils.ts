@@ -135,6 +135,9 @@ function isNotFoundError(error: unknown): boolean {
  * Read async job status from disk (with mtime-based caching)
  */
 export function readStatus(asyncDir: string): AsyncStatus | null {
+	if (Buffer.byteLength(path.basename(asyncDir), "utf-8") > 255) {
+		return null;
+	}
 	const statusPath = path.join(asyncDir, "status.json");
 
 	let stat: fs.Stats;
@@ -237,6 +240,12 @@ export function findLatestSessionFile(sessionDir: string): string | null {
 	return latest ? latest.path : null;
 }
 
+const PI_TURN_TIMING_FOOTER = /(?:\r?\n)*\x1b\[38;2;136;136;136m✻ Turn took [^()\r\n]+ \(Total time [^·\r\n]+ · \d+ turns?\)\x1b\[0m[ \t]*$/u;
+
+function stripPiTurnTimingFooter(text: string): string {
+	return text.replace(PI_TURN_TIMING_FOOTER, "");
+}
+
 export function getFinalOutput(messages: Message[]): string {
 	const validTextParts: string[] = [];
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -246,21 +255,26 @@ export function getFinalOutput(messages: Message[]): string {
 			|| ("stopReason" in msg && msg.stopReason === "error");
 		if (hasAssistantError) continue;
 		const messageText = msg.content
-			.filter((part) => part.type === "text" && part.text.trim().length > 0)
-			.map((part) => part.type === "text" ? part.text : "")
+			.flatMap((part) => {
+				if (part.type !== "text") return [];
+				const text = stripPiTurnTimingFooter(part.text);
+				return text.trim().length > 0 ? [text] : [];
+			})
 			.join("\n");
 		for (let j = msg.content.length - 1; j >= 0; j--) {
 			const part = msg.content[j];
-			if (!part || part.type !== "text" || part.text.trim().length === 0) continue;
-			validTextParts.push(part.text);
-			if (/```acceptance[-_]report\s*\n[\s\S]*?```/i.test(part.text)) return messageText;
-			for (const match of part.text.matchAll(/```(?:json|jsonc|json5)\s*\n([\s\S]*?)```/gi)) {
+			if (!part || part.type !== "text") continue;
+			const text = stripPiTurnTimingFooter(part.text);
+			if (text.trim().length === 0) continue;
+			validTextParts.push(text);
+			if (/```acceptance[-_]report\s*\n[\s\S]*?```/i.test(text)) return messageText;
+			for (const match of text.matchAll(/```(?:json|jsonc|json5)\s*\n([\s\S]*?)```/gi)) {
 				const body = match[1] ?? "";
 				if (/"(?:criteriaSatisfied|criteria_satisfied)"/.test(body) && /"(?:changedFiles|changed_files|testsAddedOrUpdated|tests_added_or_updated|commandsRun|commands_run|validationOutput|validation_output|residualRisks|residual_risks|noStagedFiles|no_staged_files|diffSummary|diff_summary|reviewFindings|review_findings|manualNotes|manual_notes)"/.test(body)) {
 					return messageText;
 				}
 			}
-			if (/ACCEPTANCE_REPORT\s*:/i.test(part.text)) return messageText;
+			if (/ACCEPTANCE_REPORT\s*:/i.test(text)) return messageText;
 		}
 	}
 	return validTextParts[0] ?? "";
@@ -307,12 +321,14 @@ function compactCompletedProgress(progress: AgentProgress): AgentProgress {
 	};
 }
 
-function extractToolCallSummaries(messages: Message[] | undefined): ToolCallSummary[] {
-	if (!messages?.length) return [];
+/** Summaries of the latest `limit` tool calls, in chronological order; older calls are never read. */
+function extractToolCallSummaries(messages: Message[] | undefined, limit = Infinity): ToolCallSummary[] {
 	const summaries: ToolCallSummary[] = [];
-	for (const msg of messages) {
+	for (let i = (messages?.length ?? 0) - 1; i >= 0 && summaries.length < limit; i--) {
+		const msg = messages![i]!;
 		if (msg.role !== "assistant") continue;
-		for (const part of msg.content) {
+		for (let j = msg.content.length - 1; j >= 0 && summaries.length < limit; j--) {
+			const part = msg.content[j]!;
 			if (part.type !== "toolCall") continue;
 			const args = typeof part.arguments === "object" && part.arguments !== null && !Array.isArray(part.arguments)
 				? part.arguments
@@ -323,7 +339,7 @@ function extractToolCallSummaries(messages: Message[] | undefined): ToolCallSumm
 			});
 		}
 	}
-	return summaries;
+	return summaries.reverse();
 }
 
 export function sumResultsUsage(results: SingleResult[]): Usage {
@@ -402,10 +418,9 @@ export function compactForegroundDetails(details: Details): Details {
  *
  * The completed-compaction helpers above bail out while a child is still
  * `running`, so a long or deeply nested fan-out streams full, unbounded progress on
- * every tick. DM serializes each streamed `tool_execution_update` as a single
- * child-stdout line, which the parent reads under `MAX_CHILD_PENDING_LINE_BYTES`;
- * an unbounded running snapshot can cross that cap and kill the child with
- * `protocol_output_limit`.
+ * every tick. The parent records every streamed `tool_execution_update` in its
+ * transcript and `events.jsonl`, so an unbounded running snapshot grows those
+ * artifacts and the live display state without bound.
  *
  * These bound the STREAMED snapshot only. The final returned result keeps the full
  * live progress and message transcript, and every live-display consumer already
@@ -435,7 +450,7 @@ export function boundStreamedRecentOutput(recentOutput: string[]): string[] {
  * derives one from `messages`; bounded to the most recent calls.
  */
 export function boundStreamedToolCalls(result: Pick<SingleResult, "toolCalls" | "messages">): ToolCallSummary[] | undefined {
-	const summaries = result.toolCalls?.length ? result.toolCalls : extractToolCallSummaries(result.messages);
+	const summaries = result.toolCalls?.length ? result.toolCalls : extractToolCallSummaries(result.messages, MAX_STREAMED_TOOL_CALLS);
 	if (!summaries.length) return undefined;
 	return summaries.slice(-MAX_STREAMED_TOOL_CALLS).map((summary) => ({ ...summary }));
 }
@@ -444,8 +459,13 @@ export function hasEmptyTerminalAssistantResponse(messages: Message[]): boolean 
 	const lastAssistant = messages.findLast((message) => message.role === "assistant");
 	return lastAssistant?.role === "assistant"
 		&& Array.isArray(lastAssistant.content)
-		&& lastAssistant.content.length === 0
-		&& lastAssistant.usage.output === 0;
+		&& ((lastAssistant.content.length === 0 && lastAssistant.usage.output === 0)
+			|| (messages.at(-1) === lastAssistant
+				&& lastAssistant.stopReason === "stop"
+				&& !lastAssistant.errorMessage
+				&& lastAssistant.content.length > 0
+				// Token accounting can be nonzero even when no response text was emitted.
+				&& lastAssistant.content.every((part) => part.type === "text" && part.text === "")));
 }
 
 export function formatEmptyTerminalAssistantResponseError(messages: Message[]): string {

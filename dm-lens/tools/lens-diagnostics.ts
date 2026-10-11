@@ -25,14 +25,23 @@ import {
 } from "../clients/diagnostic-dispositions.js";
 import { DEPENDENCY_DRIFT_MAX_DELIVERIES } from "../clients/blocker-freshness.js";
 import { freshnessFromMtime } from "../clients/freshness.js";
-import { applyInlineSuppressions } from "../clients/dispatch/inline-suppressions.js";
-import { gateFindingsByPathFreshness } from "../clients/advisory-provenance.js";
+import {
+	applyFindingPolicy,
+	loadProjectRulePolicyMap,
+} from "../clients/dispatch/finding-policy.js";
+import {
+	gateFindingsByPathFreshness,
+	parseScannedAtMs,
+} from "../clients/advisory-provenance.js";
+import {
+	formatCacheAgeLabel,
+	markUnreconciledFindings,
+} from "../clients/finding-delivery-gate.js";
 import { normalizeRuleId } from "../clients/dispatch/rule-id-normalize.js";
 import {
 	applyRulePolicy,
 	rulePolicyMapFromConfig,
 } from "../clients/dispatch/rule-policy.js";
-import { loadDmLensProjectConfig } from "../clients/project-lens-config.js";
 import { compactRenderResult } from "./render-compact.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
 import { getProjectIgnoreMatcher } from "../clients/file-utils.js";
@@ -40,11 +49,17 @@ import {
 	isAtOrAboveHomeDir,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
+	normalizeMapKey,
+	realpathOrResolve,
 } from "../clients/path-utils.js";
-import { getLSPService } from "../clients/lsp/index.js";
-import { primaryServerId } from "../clients/lsp/config.js";
+import { getLSPService } from "../clients/lsp/capabilities.js";
+import { retireInlineBlockerAndResyncGuard } from "../clients/git-guard.js";
+import {
+	primaryServerId,
+	resolveLspCwdForFile,
+} from "../clients/lsp/config.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
-import type { LSPWorkspaceUnconfirmedReason } from "../clients/lsp/index.js";
+import type { LSPWorkspaceUnconfirmedReason } from "../clients/lsp/capabilities.js";
 import { getFullScanWallClockMs } from "../clients/lsp/workspace-sweep-hold.js";
 import { demoteInferredProjectSweepResults } from "../clients/lsp/inferred-project.js";
 import {
@@ -62,12 +77,19 @@ import {
 	formatCacheAgeOld,
 	formatNotRunEntry,
 } from "../clients/project-diagnostics/extractors.js";
-import type { FreshProjectDiagnosticsResult } from "../clients/project-diagnostics/fresh-fetch.js";
+import type {
+	FreshProjectDiagnosticsResult,
+	ProjectRunnerCoverage,
+} from "../clients/project-diagnostics/fresh-fetch.js";
 import {
 	ANALYZER_IDS,
 	fetchFreshProjectDiagnostics,
 } from "../clients/project-diagnostics/fresh-fetch.js";
 import { loadBootstrapClients } from "../clients/bootstrap.js";
+import {
+	resolveLensToolName,
+	type LensToolHost,
+} from "../clients/tool-config.js";
 import {
 	generatedSkipNotice,
 	scanTruncationNotice,
@@ -91,12 +113,27 @@ import {
 	type WidgetDiagnostic,
 	widgetDiagnosticUri,
 } from "../clients/widget-state.js";
-import { logLatency } from "../clients/latency-logger.js";
+import {
+	claimPhaseOncePerSession,
+	logLatency,
+} from "../clients/latency-logger.js";
+import { logExtension } from "../clients/extension-log.js";
+import { recordDegradationOnce } from "../clients/degradation-ledger.js";
 import { convertLspDiagnostics } from "../clients/dispatch/utils/lsp-diagnostics.js";
-import { retagAuxiliaryDiagnostics } from "../clients/dispatch/auxiliary-lsp.js";
+import {
+	findAuxiliaryProfileForSource,
+	retagAuxiliaryDiagnostics,
+} from "../clients/dispatch/auxiliary-lsp.js";
 import { detectFileRole } from "../clients/file-role.js";
 import { STALE_LINE_MARKER } from "../clients/stale-marker.js";
 import { makeProgressReporter, scanningSummaryLine } from "./scan-progress.js";
+import {
+	createLspDiagnosticsTool,
+	LSP_SEVERITY_FILTERS,
+	MAX_BATCH_FILES,
+	renderBatchOutcomeLines,
+	type BatchOutcomeDetail,
+} from "./lsp-diagnostics.js";
 import {
 	demotePastEofDiagnostics,
 	PAST_EOF_STALE_MARKER,
@@ -113,16 +150,21 @@ const MAX_DIAGNOSTICS_PER_FILE = 50;
 // narrow, not paginate. Erroring (rather than silently truncating) means a
 // caller can never believe it checked files it didn't (issue's stated
 // invariant).
-const MAX_PATHS_ENTRIES = 200;
+const MAX_PATHS_ENTRIES = MAX_BATCH_FILES;
 
 // #1623: the reason rendered for every heavyweight-analyzer lane (gitleaks,
 // trivy, govulncheck, dead-code, knip, jscpd, madge, opengrep, test-runner)
 // when mode=full is called without refreshRunners=cheap/all/cached — the
 // "quick mode" gate that skips the expensive fresh-fetch entirely (see
-// `formatFullMode`'s `analyzersPromise`). One shared string so it renders
-// identically everywhere it's used.
-const NOT_REQUESTED_REASON =
-	"refreshRunners not requested this call (quick mode) — pass refreshRunners=cheap/all/cached to lens_diagnostics mode=full to run it";
+// `formatFullMode`'s `analyzersPromise`). One shared function so it renders
+// identically everywhere it's used, naming the tool THIS host can call
+// (#2535 F1 — the shared const named the pi tool on MCP too).
+function notRequestedReason(host: LensToolHost): string {
+	return (
+		"refreshRunners not requested this call (quick mode) — pass " +
+		`refreshRunners=cheap/all/cached to ${resolveLensToolName("lens_diagnostics", host) ?? "diagnostics"} mode=full to run it`
+	);
+}
 
 type LSPServiceLike = ReturnType<typeof getLSPService> & {
 	runWorkspaceDiagnostics?: (
@@ -152,11 +194,11 @@ type WorkspaceLspDiagnosticResult = {
 	// Auxiliary lanes that did not answer. Other servers' diagnostics remain
 	// usable, but this result must not replace fully-covered cached/widget state.
 	unconfirmedServerIds?: string[];
-	// #1093: set only for cache-hit results (a replay of an older scan) — the
-	// wall-clock time the diagnostics were originally observed. Threaded into the
-	// footer reconcile so a cache-served mode=full doesn't re-arm the widget's
-	// mtime-staleness gate. See LSPWorkspaceDiagnosticResult.observedAt.
-	observedAt?: number;
+	// #1093: the wall-clock time the diagnostics were observed — a cache hit's
+	// original scan, or (#3573) a fresh result's read. Threaded into the footer
+	// reconcile so neither a cache-served nor a fresh mode=full row is stamped
+	// after a write it never saw. See LSPWorkspaceDiagnosticResult.observedAt.
+	observedAt?: number | undefined;
 	contentHash?: string;
 	boundToCurrentDisk?: BoundToCurrentDisk;
 	writeIndex?: number;
@@ -247,36 +289,41 @@ export function createLensDiagnosticsTool(
 	getRuntime?: () =>
 		| import("../clients/runtime-coordinator.js").RuntimeCoordinator
 		| undefined,
+	isLensGuardEnabled: () => boolean = () => true,
 ) {
+	const lspProbe = createLspDiagnosticsTool(
+		nextWriteIndex,
+		(info) => {
+			const runtime = getRuntime?.();
+			if (!runtime) return;
+			const retired = retireInlineBlockerAndResyncGuard({
+				runtime,
+				cacheManager,
+				cwd: info.cwd,
+				filePath: info.filePath,
+				...(info.writeIndex === undefined
+					? {}
+					: { writeIndex: info.writeIndex }),
+				coveredSources: info.coveredSources,
+				lensGuardEnabled: isLensGuardEnabled(),
+			});
+			if (retired) {
+				logExtension({
+					subsystem: "git-guard",
+					level: "debug",
+					message: `inline_blocker: retired for ${info.filePath}`,
+				});
+			}
+		},
+		getLspService,
+	);
 	return {
 		name: "lens_diagnostics" as const,
 		label: "Project Diagnostics",
 		description:
-			"Query dm-lens's diagnostic state. mode=delta/all are cache-only and instant; " +
-			"mode=full is an expensive active project-wide LSP scan merged with cached runner state.\n\n" +
-			"IMPORTANT: unlike lsp_diagnostics (LSP only), this tool covers ALL dispatch " +
-			"runners: LSP errors, tree-sitter structural rules, ast-grep security rules, " +
-			"biome/ruff/eslint lint findings, complexity violations, and more.\n\n" +
-			"mode=delta (default): all warnings for the current agent turn — fixable warnings " +
-			"(actionable-warnings cache) AND code quality/style/complexity issues " +
-			"(code-quality-warnings cache). Same scope as the turn-end advisory, current turn only.\n\n" +
-			"mode=all: blocking errors and warnings — with the actual messages (line, rule, " +
-			"text), not just counts — for every file the agent has " +
-			"EDITED this session (files that went through the dispatch pipeline). " +
-			"NOTE: unedited files with pre-existing errors do NOT appear here — this is " +
-			"not a full project scan. Use before declaring work done; stale blocking " +
-			"errors from earlier turns are visible even if they dropped from turn-end context.\n\n" +
-			"mode=full: EXPENSIVE active scan. Runs project-wide LSP diagnostics for " +
-			"all supported files (including unedited files), then merges/deduplicates " +
-			"that with mode=all cached runner state. Optional refreshRunners=cheap/all/cached " +
-			"folds in project-wide runner findings: the in-process scanners (tree-sitter + " +
-			"fact-rules + ast-grep) plus a FRESH run of the heavyweight analyzers — knip, " +
-			"jscpd (copy-paste), madge (circular deps), gitleaks (secrets), govulncheck/trivy " +
-			"(CVEs), dead-code — rather than a possibly-stale session_start cache; each " +
-			"analyzer de-dupes against a concurrent background run of itself, so this can't " +
-			"double-spawn. Bounded by the slowest analyzer (trivy's own ~180s ceiling).",
+			'Query dm-lens diagnostics from the session cache or an active LSP probe, at paths or workspace scope. Empty cache is not proof of clean; probe changed paths when findings are absent or stale. Example: `{source: "lsp", scope: "paths", paths: ["src/app.ts"]}`.',
 		promptSnippet:
-			"Use lens_diagnostics mode=all to verify no blocking errors remain; use mode=full for expensive project-wide checks",
+			"lens_diagnostics source=session reads the session cache and an empty cache is not proof of a clean file; use source=lsp scope=paths for changed files when cached findings are absent or stale",
 		renderResult: compactRenderResult<{
 			mode?: string;
 			phase?: string;
@@ -287,13 +334,72 @@ export function createLensDiagnosticsTool(
 			projectDiagnostics?: number;
 			filesWithIssues?: number;
 			filesChecked?: number;
+			filesScanned?: number;
 			totalBlocking?: number;
 			totalErrors?: number;
 			totalWarnings?: number;
 			totalAdvisories?: number;
 			coldRunners?: string[];
+			partialRunners?: string[];
 			failedAnalyzers?: { id: string; summary: string }[];
+			source?: string;
+			totalDiagnostics?: number;
+			cleanFiles?: number;
+			unconfirmedFiles?: number;
+			navigationOnlyFiles?: number;
+			timedOutFiles?: number;
+			outcomeCounts?: Record<string, number>;
+			outcomes?: BatchOutcomeDetail[];
+			incompleteFiles?: number;
+			unconfirmed?: boolean;
+			timedOut?: boolean;
+			filePath?: string;
 		}>(({ details, args, isError, text }) => {
+			if (details?.source === "lsp") {
+				const count = details.totalDiagnostics ?? 0;
+				const files = details.filesChecked ?? details.filesScanned ?? 0;
+				const noun = count === 1 ? "diagnostic" : "diagnostics";
+				const filePath =
+					typeof details?.filePath === "string"
+						? details.filePath
+						: Array.isArray(args?.paths) &&
+							  args.paths.length === 1 &&
+							  typeof args.paths[0] === "string"
+							? args.paths[0]
+							: undefined;
+				const singleFile =
+					(details?.mode === "file" || files === 1) &&
+					typeof filePath === "string"
+						? ` ${path.basename(filePath)}`
+						: "";
+				const scope = files > 1 ? ` across ${files} files` : singleFile;
+				if (isError)
+					return `lens_diagnostics lsp — ${text.split("\n")[0] ?? "error"}`;
+				if ((details.navigationOnlyFiles ?? 0) > 0)
+					return `lens_diagnostics${scope} — ${count} ${noun} · ${details.cleanFiles ?? 0} clean · ${details.navigationOnlyFiles} navigation-only`;
+				if ((details.unconfirmedFiles ?? 0) > 0)
+					return `lens_diagnostics${scope} — ${count} ${noun} · ${details.cleanFiles ?? 0} clean · ${details.unconfirmedFiles} unconfirmed${details.timedOutFiles ? ` (${details.timedOutFiles} timed out)` : ""}`;
+				const outcomeCounts = details.outcomeCounts;
+				const tooLargeLines = renderBatchOutcomeLines(details.outcomes ?? []);
+				if (tooLargeLines.length > 0)
+					return `lens_diagnostics${scope} — too large: ${tooLargeLines.join("; ")}`;
+				const notConfirmed = outcomeCounts
+					? (outcomeCounts.inconclusive ?? 0) +
+						(outcomeCounts.unavailable ?? 0) +
+						(outcomeCounts.unsupported ?? 0) +
+						(outcomeCounts.failed ?? 0) +
+						(outcomeCounts.too_large ?? 0)
+					: 0;
+				if (notConfirmed > 0)
+					return `lens_diagnostics${scope} — ${count} ${noun} · ${notConfirmed} checks not confirmed`;
+				if ((details.incompleteFiles ?? 0) > 0)
+					return `lens_diagnostics${scope} — incomplete (${details.incompleteFiles} files not confirmed)`;
+				if (count === 0 && details.unconfirmed)
+					return details.timedOut
+						? `lens_diagnostics${scope} — timed out (result may be incomplete)`
+						: `lens_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
+				return `lens_diagnostics${scope} — ${count} ${noun}`;
+			}
 			// Streaming progress partials render the live bar (see scanningSummaryLine)
 			// instead of the details-driven summary, which would show "0 diagnostics"
 			// mid-scan.
@@ -354,13 +460,52 @@ export function createLensDiagnosticsTool(
 			return `lens_diagnostics ${mode} — ${parts.join(" · ")} (${files} files)${coldSuffix}${failedSuffix}`;
 		}),
 		parameters: Type.Object({
+			source: Type.Optional(
+				Type.String({
+					enum: ["session", "lsp"],
+					description:
+						"Evidence source: session cache (empty cache is not proof of a " +
+						"clean file — use source=lsp for changed files) or an active LSP probe.",
+				}),
+			),
+			scope: Type.Optional(
+				Type.String({
+					enum: ["paths", "workspace"],
+					description:
+						// #2860: no schema value maps to "current turn's delta" — the
+						// default (omitted scope) already gives that for
+						// source=session, and for source=lsp `delta` was byte-identical
+						// to `paths` (round-2 verify N/F4), so exposing it would only
+						// invite a caller to believe it does something distinct.
+						"Coverage scope: explicit paths, or workspace (default: current turn's delta for source=session).",
+				}),
+			),
 			mode: Type.Optional(
 				Type.String({
 					enum: ["delta", "all", "full"],
 					description:
-						"delta = current turn's fixable warnings (default). " +
-						"all = session diagnostics for edited/dispatched files. " +
-						"full = expensive active project-wide LSP scan plus cached runner diagnostics.",
+						"delta = current turn; all = cache-only; full = active LSP scan of paths. Empty cache is not proof of clean.",
+				}),
+			),
+			path: Type.Optional(
+				Type.String({
+					description: "One file or directory for source=lsp checks.",
+				}),
+			),
+			concurrency: Type.Optional(
+				Type.Number({
+					description: "Source=lsp batch concurrency (maximum 16).",
+				}),
+			),
+			waitMs: Type.Optional(
+				Type.Number({
+					description: "Source=lsp per-file wait budget in milliseconds.",
+				}),
+			),
+			serverScope: Type.Optional(
+				Type.String({
+					enum: ["primary", "all"],
+					description: "Source=lsp server coverage: primary or all.",
 				}),
 			),
 			refreshRunners: Type.Optional(
@@ -370,57 +515,42 @@ export function createLensDiagnosticsTool(
 						Type.String({ enum: ["cached", "cheap", "all", "none"] }),
 					],
 					{
-						description:
-							"mode=full only: false/none = LSP + widget state only. cached/cheap/all all now trigger a FRESH run (#585) of the heavyweight project analyzers (knip, jscpd, madge, gitleaks, govulncheck, trivy, dead-code) in parallel — bounded by the slowest one (trivy's own ~180s ceiling) — instead of reading a possibly-stale session_start cache; safe to relaunch since each analyzer de-dupes concurrent runs against the same project root. cheap/all additionally refresh the in-process runners (tree-sitter + fact-rules + ast-grep) first.",
+						description: "Analyzer refresh mode for full view.",
 					},
 				),
 			),
 			maxProjectFiles: Type.Optional(
 				Type.Number({
-					description:
-						"mode=full refreshRunners=cheap/all only: cap project files scanned by the cheap project runners (tree-sitter + fact-rules + ast-grep). Does NOT bound the LSP sweep — use maxLspFiles for that.",
+					description: "Project-file limit for cheap runners.",
 				}),
 			),
 			maxLspFiles: Type.Optional(
 				Type.Number({
-					description:
-						"mode=full only: cap the number of files routed through the language server for the project-wide LSP sweep. On large projects (e.g. a Next.js app with thousands of source files) the uncapped sweep can take many minutes; set this to bound it. Default is generous (env DM_LENS_LSP_WORKSPACE_MAX_FILES, else 5000).",
+					description: "File limit for the LSP sweep.",
 				}),
 			),
 			includeGenerated: Type.Optional(
 				Type.Boolean({
+					description: "Include generated-name paths in full scans.",
+				}),
+			),
+			analysisRoot: Type.Optional(
+				Type.String({
 					description:
-						"mode=full refreshRunners=cheap/all only (no effect with refreshRunners=cached/none, since no project scan runs to apply it to): scan WITHOUT the generated/artifact NAME-heuristic filter (lockfiles, gen.ts-style names, generated/ dirs, …). Default false. Use when a scan's 'excluded by generated-name heuristics' notice suggests a real file was skipped.",
+						"Explicit project directory for heavyweight analyzers; it must exist and resolve strictly below the home directory.",
 				}),
 			),
 			severity: Type.Optional(
 				Type.String({
-					enum: ["error", "warning", "all"],
-					description: "Filter by severity (default: all).",
+					enum: [...LSP_SEVERITY_FILTERS],
+					description:
+						"Filter by severity threshold (default: all): error shows errors; warning includes errors and warnings; information includes errors, warnings, and information; hint and all show every known tier.",
 				}),
 			),
 			paths: Type.Optional(
 				Type.Array(Type.String(), {
 					maxItems: MAX_PATHS_ENTRIES,
-					description:
-						`Restrict any mode to an explicit file/directory list (max ${MAX_PATHS_ENTRIES} entries; ` +
-						"more errors instead of silently truncating). Entries may be relative " +
-						"(resolved against cwd) or absolute, and a directory entry matches all " +
-						'files under it (e.g. "src/"). mode=delta/all are a pure post-filter ' +
-						"of cached/session state — they can only show findings for files dm-lens " +
-						"has already dispatched, so an unseen file shows nothing (use mode=full " +
-						"for an active scan). mode=full actively scans exactly these paths (LSP " +
-						"sweep + cheap in-process runners); cached heavyweight analyzers " +
-						"(jscpd/madge/gitleaks/knip) and the project snapshot are still post-filtered " +
-						"cache reads, never relaunched. Explicitly-listed files are NOT filtered " +
-						"through the project ignore matcher (matching lsp_diagnostics' paths " +
-						"semantics) — naming a file is assumed to mean it regardless of " +
-						".gitignore/.dm-lens.json; a directory entry's expansion still honors " +
-						"ignore (and when the list mixes directories and files, mode=full scans " +
-						"via the ignore-filtered walk, so an ignore-excluded file entry is only " +
-						"guaranteed an active scan in a files-only list). Nonexistent entries " +
-						"are skipped (mode=full notes them; useful for git-staged-file wrappers " +
-						"where a deleted-but-staged path can appear).",
+					description: "Files or directories to filter.",
 				}),
 			),
 		}),
@@ -429,8 +559,83 @@ export function createLensDiagnosticsTool(
 			params: Record<string, unknown>,
 			signal: AbortSignal | undefined,
 			onUpdate: unknown,
-			ctx: { cwd?: string; signal?: AbortSignal },
+			ctx: { cwd?: string; signal?: AbortSignal; host?: LensToolHost },
 		) {
+			const requestedSource = params.source as string | undefined;
+			const requestedScope = params.scope as string | undefined;
+			const legacyMode = params.mode as string | undefined;
+			const source = requestedSource ?? "session";
+			const scope =
+				requestedScope ??
+				(legacyMode === "delta" || legacyMode === undefined
+					? source === "lsp"
+						? "paths"
+						: "delta"
+					: "workspace");
+			const cwd = ctx.cwd ?? getCwd();
+			if (source === "lsp") {
+				const lspParams = { ...params };
+				delete lspParams.source;
+				delete lspParams.scope;
+				// #2860: explicit `path`/`paths` always win. `scope=workspace`
+				// only supplies a `cwd` default (a full workspace sweep) when the
+				// caller gave NEITHER — it must never override an explicit
+				// narrower request (the #2052 root-eviction hang and the
+				// SKILL.md "check a folder" recipe both depend on this: a
+				// directory `path` under scope=workspace scans that directory,
+				// not the whole project).
+				const hasExplicitPath =
+					typeof lspParams.path === "string" && lspParams.path.length > 0;
+				const hasExplicitPaths =
+					Array.isArray(lspParams.paths) && lspParams.paths.length > 0;
+				if (scope === "workspace" && !hasExplicitPath && !hasExplicitPaths) {
+					lspParams.path = cwd;
+				}
+				const lspStart = Date.now();
+				const result = (await lspProbe.execute(
+					_toolCallId,
+					lspParams,
+					signal,
+					onUpdate,
+					ctx.signal ? { cwd, signal: ctx.signal } : { cwd },
+				)) as {
+					content: Array<{ type: "text"; text: string }>;
+					isError?: boolean;
+					details?: Record<string, unknown>;
+				};
+				// #2860 F11: the folded route's own durable trace — without this,
+				// F1's class of defect (a real LSP result rendering as "clean")
+				// leaves no record in latency.log distinguishing source=lsp from
+				// source=session. One record per tool call (not per file), same
+				// convention as the mode=all `blocker_freshness_widget_gate`
+				// phase above.
+				logLatency({
+					type: "phase",
+					toolName: "lens_diagnostics",
+					filePath: cwd,
+					phase: "lens_diagnostics_lsp_route",
+					durationMs: Date.now() - lspStart,
+					metadata: {
+						scope,
+						isError: result.isError === true,
+						totalDiagnostics: result.details?.totalDiagnostics ?? 0,
+						cleanFiles: result.details?.cleanFiles ?? 0,
+						unconfirmedFiles: result.details?.unconfirmedFiles ?? 0,
+						timedOutFiles: result.details?.timedOutFiles ?? 0,
+					},
+				});
+				return {
+					...result,
+					isError: result.isError === true,
+					details: { ...result.details, source, scope },
+				};
+			}
+			if (requestedSource !== undefined) {
+				const effectiveMode =
+					legacyMode ??
+					(scope === "workspace" ? "all" : scope === "paths" ? "all" : "delta");
+				params = { ...params, mode: effectiveMode };
+			}
 			const repaintLspStatus = captureLspStatusRepaint?.(ctx);
 			const mode = (params.mode as string | undefined) ?? "delta";
 			const severity = (params.severity as string | undefined) ?? "all";
@@ -442,7 +647,6 @@ export function createLensDiagnosticsTool(
 			const maxProjectFiles = parsePositiveInt(params.maxProjectFiles);
 			const maxLspFiles = parsePositiveInt(params.maxLspFiles);
 			const includeGenerated = params.includeGenerated === true;
-			const cwd = ctx.cwd ?? getCwd();
 
 			let pathsScope: PathsScope | undefined;
 			try {
@@ -527,6 +731,11 @@ export function createLensDiagnosticsTool(
 					pathsScope,
 					nextWriteIndex,
 					runtime: getRuntime?.(),
+					analysisRoot:
+						typeof params.analysisRoot === "string"
+							? params.analysisRoot
+							: undefined,
+					host: ctx.host ?? "pi",
 				});
 			}
 			return formatDeltaMode(cacheManager, cwd, severity, pathsScope);
@@ -567,7 +776,7 @@ function formatProjectDeltaDiagnostic(
  * surface `lens-diagnostics:mode-delta`.
  */
 function appendProjectDiagnosticsDeltaLines(
-	lines: string[],
+	groups: Map<string, DeltaFileGroup>,
 	cwd: string,
 	report: ProjectDiagnosticsDeltaReport | undefined,
 	severity: string,
@@ -581,14 +790,18 @@ function appendProjectDiagnosticsDeltaLines(
 				severity,
 			),
 	);
-	const gated = gateFindingsByPathFreshness({
-		store: "lens-diagnostics-delta-project",
-		findings: scoped,
-		cwd,
-		scannedAt: report?.generatedAt,
-		citedPath: (d) => d.filePath,
-		onMissing: "drop",
-	});
+	const { "lens-diagnostics-delta-project": gated } =
+		gateFindingsByPathFreshness({
+			cwd,
+			sources: {
+				"lens-diagnostics-delta-project": {
+					findings: scoped,
+					scannedAt: report?.generatedAt,
+					citedPath: (d: (typeof scoped)[number]) => d.filePath,
+					onMissing: "drop",
+				},
+			},
+		});
 	const staleSet = new Set(gated.stale);
 	// Concatenating live-then-stale reorders a file's demoted rows to the end
 	// of its bucket below (rather than each diagnostic's original report
@@ -602,10 +815,9 @@ function appendProjectDiagnosticsDeltaLines(
 		byFile.set(filePath, bucket);
 	}
 	for (const [filePath, fileDiagnostics] of byFile) {
-		const rel = path.relative(cwd, filePath);
-		if (!lines.includes(rel)) lines.push(rel);
+		const group = getDeltaFileGroup(groups, cwd, filePath);
 		for (const diagnostic of fileDiagnostics) {
-			lines.push(
+			group.projectLines.push(
 				formatProjectDeltaDiagnostic(diagnostic, staleSet.has(diagnostic)),
 			);
 		}
@@ -748,21 +960,12 @@ function filterDeltaReportDispositions(
 				d.filePath,
 			).length === 1,
 	);
-	const policyKept = applyRulePolicy(kept, policyMap);
+	const policyKept = applyRulePolicy(kept, policyMap, {
+		root: cwd,
+		filePath: cwd,
+	});
 	if (policyKept.length === report.diagnostics.length) return report;
 	return { ...report, diagnostics: policyKept };
-}
-
-/**
- * Load the rule-policy map from a project's `.dm-lens.json` — same source the
- * per-edit dispatch path uses, so a project's policy applies consistently
- * across every output surface. `loadDmLensProjectConfig` is mtime-cached, and
- * the map is filtered to entries that actually have a `disable`/`select` list
- * (thresholds are handled elsewhere), so the common case returns undefined and
- * the filter step is skipped outright.
- */
-function loadProjectRulePolicyMap(cwd: string) {
-	return rulePolicyMapFromConfig(loadDmLensProjectConfig(cwd).rules);
 }
 
 /**
@@ -781,7 +984,10 @@ function applyDeltaFreshnessGate<W extends DispositionCandidate>(
 	files: Array<{ filePath: string; warnings: W[]; generatedAt?: string }>,
 	cwd: string,
 	generatedAt: string | undefined,
-): Array<{ filePath: string; warnings: Array<W & { stale?: boolean }> }> {
+): Array<{
+	filePath: string;
+	warnings: Array<W & { stale?: boolean; staleAsOf?: string }>;
+}> {
 	// #2504 review round 4 (F1): an actionable-warnings report is no longer the
 	// product of exactly ONE pass. A deferred off-hook LSP pull upserts its
 	// per-file entries into whatever report is persisted when it lands, so one
@@ -836,18 +1042,24 @@ function applyDeltaFreshnessGate<W extends DispositionCandidate>(
 			flat.push({ filePath: file.filePath, warning });
 	}
 	if (flat.length === 0) return files;
-	const gated = gateFindingsByPathFreshness({
-		store: "lens-diagnostics-delta",
-		findings: flat,
+	const { "lens-diagnostics-delta": gated } = gateFindingsByPathFreshness({
 		cwd,
-		scannedAt: effectiveAt,
-		citedPath: (f) => f.filePath,
-		onMissing: "drop",
+		sources: {
+			"lens-diagnostics-delta": {
+				findings: flat,
+				scannedAt: effectiveAt,
+				citedPath: (f: (typeof flat)[number]) => f.filePath,
+				onMissing: "drop",
+			},
+		},
 	});
 	// Two passes (live, then stale) reorder a file's demoted rows to the end
 	// of its warnings array rather than the original report order — cosmetic
 	// only, nothing is dropped or duplicated.
-	const byFile = new Map<string, Array<W & { stale?: boolean }>>();
+	const byFile = new Map<
+		string,
+		Array<W & { stale?: boolean; staleAsOf?: string }>
+	>();
 	for (const f of gated.live) {
 		const arr = byFile.get(f.filePath) ?? [];
 		arr.push(f.warning);
@@ -855,7 +1067,15 @@ function applyDeltaFreshnessGate<W extends DispositionCandidate>(
 	}
 	for (const f of gated.stale) {
 		const arr = byFile.get(f.filePath) ?? [];
-		arr.push({ ...f.warning, stale: true, line: undefined });
+		// Fix B (#3167): carry the stamp the row was judged against so the render
+		// can emit one age label per file group — the row's own observation stamp,
+		// not the report-level one (the #2504 r4 multi-stamp case).
+		arr.push({
+			...f.warning,
+			stale: true,
+			line: undefined,
+			staleAsOf: effectiveAt,
+		});
 		byFile.set(f.filePath, arr);
 	}
 	return files
@@ -864,6 +1084,58 @@ function applyDeltaFreshnessGate<W extends DispositionCandidate>(
 			warnings: byFile.get(file.filePath) ?? [],
 		}))
 		.filter((file) => file.warnings.length > 0);
+}
+
+/**
+ * #3196: one render pass grouped by file — every tier (actionable, quality,
+ * project) appends its rows into the SAME group instead of pushing a header
+ * onto a flat `lines` buffer and testing `lines.includes(rel)` to guess
+ * whether that file's group is still open. That membership test only proves
+ * the header was pushed somewhere in the buffer, not that the group being
+ * appended to is the one it heads — a file present in more than one report
+ * had its later tier's rows land under whichever OTHER file's header was
+ * last pushed. Keying by file up front makes the question unaskable: a
+ * tier's rows for a file always land in that file's own bucket, wherever in
+ * the buffer its header ends up.
+ *
+ * One age label (Fix B, #3167) plus the `(re-verify incomplete)` gap label
+ * (#3170) per group, in a single trailer AFTER every content row — actionable,
+ * then quality, then project — so the labels never read as describing only
+ * the tier rendered directly above them (round 2, #3196: project rows were
+ * pushed after the trailer, so a file with both cache and project-diagnostics
+ * rows rendered its labels ahead of the project rows instead of trailing all
+ * of them). The actionable tier's stale row wins the label when present (it
+ * is processed first), the quality tier's only when actionable had none —
+ * matching the precedence #3168 F10 fixed, but as a fact recorded on the
+ * group instead of a prediction about which loop renders first.
+ */
+interface DeltaFileGroup {
+	readonly rel: string;
+	readonly actionableLines: string[];
+	readonly qualityLines: string[];
+	readonly projectLines: string[];
+	staleRow?: { staleAsOf: string | undefined };
+	incomplete: boolean;
+}
+
+function getDeltaFileGroup(
+	groups: Map<string, DeltaFileGroup>,
+	cwd: string,
+	filePath: string,
+): DeltaFileGroup {
+	const rel = path.relative(cwd, filePath);
+	let group = groups.get(rel);
+	if (!group) {
+		group = {
+			rel,
+			actionableLines: [],
+			qualityLines: [],
+			projectLines: [],
+			incomplete: false,
+		};
+		groups.set(rel, group);
+	}
+	return group;
 }
 
 // @delivery-surface: lens-diagnostics:mode-delta
@@ -881,6 +1153,17 @@ function formatDeltaMode(
 		"code-quality-warnings",
 		cwd,
 	);
+	// #3170: files whose re-verify pass could not complete inside its budget —
+	// their rows render as carried, plus this explicit gap label (never a
+	// false clean). Computed from the RAW actionable-warnings cache entries
+	// because the freshness pipeline below rebuilds the file shape. The
+	// re-verify only ever writes the actionable-warnings cache — the quality
+	// report's file shape carries no such marker.
+	const reverifyIncompletePaths = new Set(
+		(actionableEntry?.data?.files ?? [])
+			.filter((file) => file.reVerifyIncomplete)
+			.map((file) => normalizeMapKey(file.filePath)),
+	);
 	const actionable = actionableEntry?.data;
 	const quality = qualityEntry?.data;
 	// Project rule policy (`.dm-lens.json` `rules.<id>.disable` /
@@ -895,9 +1178,7 @@ function formatDeltaMode(
 		cwd,
 		policyMap,
 	);
-	const ignoreFile = createCurrentIgnoreFilter(cwd);
-	const includeFile = (filePath: string) =>
-		ignoreFile(filePath) && (!pathsScope || pathsScope.includeFile(filePath));
+	const includeFile = createScopedFileFilter(cwd, pathsScope);
 	// #755: delta re-serves the actionable/quality caches verbatim, but those
 	// were filtered at DISPATCH time — before any lens_diagnostic_mark. Re-apply
 	// dispositions here so a mark converges immediately, not only on the next
@@ -920,6 +1201,7 @@ function formatDeltaMode(
 				warnings: applyRulePolicy(
 					applyCachedDispositions(file.warnings ?? [], cwd, file.filePath),
 					policyMap,
+					{ root: cwd, filePath: file.filePath },
 				),
 			}))
 			.filter((file) => file.warnings.length > 0);
@@ -933,46 +1215,105 @@ function formatDeltaMode(
 		cwd,
 		quality?.generatedAt,
 	);
+	const matchingWarnings = <W extends { severity: string }>(warnings: W[]) =>
+		warnings.filter((warning) =>
+			matchesRecordSeverity(warning.severity, severity),
+		);
+	const filteredActionableFiles = actionableFiles
+		.map((file) => ({
+			...file,
+			warnings: matchingWarnings(file.warnings),
+		}))
+		.filter((file) => file.warnings.length > 0);
+	const filteredQualityFiles = qualityFiles
+		.map((file) => ({
+			...file,
+			warnings: matchingWarnings(file.warnings),
+		}))
+		.filter((file) => file.warnings.length > 0);
 
-	const lines: string[] = [];
+	// #3196: one grouping pass keyed by file — every tier below appends into
+	// the SAME per-file group (see `DeltaFileGroup`/`getDeltaFileGroup`), so a
+	// file present in more than one report always renders its rows under its
+	// own header, wherever that header ends up in the final buffer.
+	const groups = new Map<string, DeltaFileGroup>();
 
-	// Fixable warnings from actionable-warnings
-	if (severity !== "error") {
-		for (const file of actionableFiles) {
-			const rel = path.relative(cwd, file.filePath);
-			lines.push(`${rel}`);
+	// Fixable warnings from actionable-warnings and quality cache entries retain
+	// their own severity tier. Apply the same threshold semantics as the LSP path.
+	// F5/F10 (#3168): at most ONE label group (age and/or #3170's re-verify
+	// gap) per file. The actionable tier is folded first, so its stale row (if
+	// any) wins the group's age label; the quality tier only supplies one when
+	// the actionable tier had none for that file (#3168 F10(c)'s quality-only
+	// shape). The `(re-verify incomplete)` flag is a fact about the file (from
+	// the raw actionable cache, independent of which tier's rows happen to
+	// render it), so it is recorded on the group the first time either tier
+	// touches that file and never predicted.
+	if (filteredActionableFiles.length > 0) {
+		for (const file of filteredActionableFiles) {
+			const group = getDeltaFileGroup(groups, cwd, file.filePath);
 			for (const w of file.warnings) {
 				const where = w.stale ? STALE_LINE_MARKER : `L${w.line ?? "?"}`;
-				lines.push(`  ⚠ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
+				group.actionableLines.push(
+					`  ⚠ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
+				);
+			}
+			const key = normalizeMapKey(file.filePath);
+			if (reverifyIncompletePaths.has(key)) group.incomplete = true;
+			if (!group.staleRow) {
+				const staleWarning = file.warnings.find((w) => w.stale);
+				if (staleWarning)
+					group.staleRow = { staleAsOf: staleWarning.staleAsOf };
 			}
 		}
 	}
 
 	// Quality issues
-	if (severity !== "error") {
-		for (const file of qualityFiles) {
-			const rel = path.relative(cwd, file.filePath);
-			if (!lines.includes(rel)) lines.push(rel);
+	if (filteredQualityFiles.length > 0) {
+		for (const file of filteredQualityFiles) {
+			const group = getDeltaFileGroup(groups, cwd, file.filePath);
 			for (const w of file.warnings) {
 				const where = w.stale ? STALE_LINE_MARKER : `L${w.line ?? "?"}`;
-				lines.push(`  ℹ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
+				group.qualityLines.push(
+					`  ℹ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
+				);
+			}
+			const key = normalizeMapKey(file.filePath);
+			if (reverifyIncompletePaths.has(key)) group.incomplete = true;
+			if (!group.staleRow) {
+				const staleWarning = file.warnings.find((w) => w.stale);
+				if (staleWarning)
+					group.staleRow = { staleAsOf: staleWarning.staleAsOf };
 			}
 		}
 	}
 
 	const projectDeltaCount = appendProjectDiagnosticsDeltaLines(
-		lines,
+		groups,
 		cwd,
 		projectDelta,
 		severity,
 		includeFile,
 	);
 
-	const aw = actionableFiles.reduce(
+	const lines: string[] = [];
+	for (const group of groups.values()) {
+		lines.push(group.rel);
+		lines.push(...group.actionableLines);
+		lines.push(...group.qualityLines);
+		lines.push(...group.projectLines);
+		if (group.staleRow) {
+			lines.push(`  (${formatCacheAgeLabel(group.staleRow.staleAsOf)})`);
+		}
+		if (group.incomplete) lines.push("  (re-verify incomplete)");
+	}
+
+	const selectedActionableFiles = filteredActionableFiles;
+	const selectedQualityFiles = filteredQualityFiles;
+	const aw = selectedActionableFiles.reduce(
 		(count, file) => count + file.warnings.length,
 		0,
 	);
-	const cq = qualityFiles.reduce(
+	const cq = selectedQualityFiles.reduce(
 		(count, file) => count + file.warnings.length,
 		0,
 	);
@@ -989,6 +1330,7 @@ function formatDeltaMode(
 				diagnostics: applyRulePolicy(
 					applyCachedDispositions(f.diagnostics, cwd, f.filePath),
 					policyMap,
+					{ root: cwd, filePath: f.filePath },
 				),
 			}))
 			.filter((f) => f.diagnostics.length > 0);
@@ -1045,6 +1387,8 @@ function createCurrentIgnoreFilter(cwd: string): (filePath: string) => boolean {
 interface PathsScope {
 	/** True when the file (or a directory prefix of it) was requested. */
 	includeFile: (filePath: string) => boolean;
+	/** True only when the exact file was explicitly named by the caller. */
+	includeExplicitFile: (filePath: string) => boolean;
 	/** Absolute paths of requested entries that don't exist on disk. */
 	missing: string[];
 	/**
@@ -1120,6 +1464,8 @@ function resolvePathsScope(
 	const fileKeys = new Set(fileEntries.map((f) => normalizeFilePath(f)));
 	const dirPrefixes = dirEntries.map((d) => normalizeFilePath(d));
 
+	const includeExplicitFile = (filePath: string): boolean =>
+		fileKeys.has(normalizeFilePath(path.resolve(filePath)));
 	const includeFile = (filePath: string): boolean => {
 		const key = normalizeFilePath(path.resolve(filePath));
 		if (fileKeys.has(key)) return true;
@@ -1130,6 +1476,7 @@ function resolvePathsScope(
 
 	return {
 		includeFile,
+		includeExplicitFile,
 		missing,
 		existingEntries,
 		hasDirectoryEntries: dirEntries.length > 0,
@@ -1155,6 +1502,18 @@ function pathsScopeMissingNote(scope: PathsScope | undefined): string {
 			? ` (+${scope.missing.length - shown.length} more)`
 			: "";
 	return `\n\n⚠ Skipped ${scope.missing.length} path(s) not found on disk: ${shown.join(", ")}${more}`;
+}
+
+function createScopedFileFilter(
+	cwd: string,
+	pathsScope?: PathsScope,
+): (filePath: string) => boolean {
+	const ignoreFile = createCurrentIgnoreFilter(cwd);
+	return (filePath: string) => {
+		if (!pathsScope) return ignoreFile(filePath);
+		if (!pathsScope.includeFile(filePath)) return false;
+		return pathsScope.includeExplicitFile(filePath) || ignoreFile(filePath);
+	};
 }
 
 function filterProjectDiagnosticsSnapshot(
@@ -1191,11 +1550,15 @@ function filterProjectDiagnosticsDeltaReport(
 function applyProjectRulePolicy<T extends { diagnostics: ProjectDiagnostic[] }>(
 	value: T | undefined,
 	policyMap: ReturnType<typeof rulePolicyMapFromConfig>,
+	root: string,
 ): T | undefined {
 	if (!value) return undefined;
 	return {
 		...value,
-		diagnostics: applyRulePolicy(value.diagnostics, policyMap),
+		diagnostics: applyRulePolicy(value.diagnostics, policyMap, {
+			root,
+			filePath: value.diagnostics[0]?.filePath ?? root,
+		}),
 	};
 }
 
@@ -1208,8 +1571,34 @@ function isErrorLike(d: WidgetDiagnostic): boolean {
 }
 
 function matchesSeverity(d: WidgetDiagnostic, severity: string): boolean {
-	if (severity === "error") return isErrorLike(d);
-	if (severity === "warning") return !isErrorLike(d);
+	return matchesRecordSeverity(isErrorLike(d) ? "error" : d.severity, severity);
+}
+
+function matchesRecordSeverity(
+	recordSeverity: string | undefined,
+	requested: string,
+): boolean {
+	if (requested === "all") return true;
+	if (requested === "error") return recordSeverity === "error";
+	if (requested === "warning")
+		return recordSeverity === "error" || recordSeverity === "warning";
+	if (requested === "information")
+		return (
+			recordSeverity === "error" ||
+			recordSeverity === "warning" ||
+			recordSeverity === "info" ||
+			recordSeverity === "note" ||
+			recordSeverity === "help"
+		);
+	if (requested === "hint")
+		return (
+			recordSeverity === "error" ||
+			recordSeverity === "warning" ||
+			recordSeverity === "info" ||
+			recordSeverity === "note" ||
+			recordSeverity === "help" ||
+			recordSeverity === "hint"
+		);
 	return true;
 }
 
@@ -1249,7 +1638,13 @@ function lspDiagnosticToWidget(diagnostic: LSPDiagnostic): WidgetDiagnostic {
 		line: diagnostic.range.start.line + 1,
 		col: diagnostic.range.start.character + 1,
 		rule,
-		tool: "lsp",
+		// #3041: keep auxiliary provenance. The footer-reconcile loop above already
+		// gives a swept aux finding its real tool id via `retagAuxiliaryDiagnostics`
+		// (#692); this second conversion of the SAME raw diagnostics did not, and
+		// dispositions are anchored by `tool` — so a `false-positive`/`suppress`
+		// mark recorded against the per-edit `ast-grep` finding never matched the
+		// `lsp`-labelled copy mode=full renders.
+		tool: findAuxiliaryProfileForSource(diagnostic.source)?.tool ?? "lsp",
 	};
 }
 
@@ -1266,6 +1661,13 @@ function projectDiagnosticToWidget(
 		rule: diagnostic.rule ?? diagnostic.code,
 		tool: diagnostic.runner || diagnostic.tool,
 		uri: widgetDiagnosticUri(filePath, diagnostic.line, diagnostic.column),
+		// #3600: carry the analyzer's own read stamp through the #1888
+		// correlated commit, which otherwise re-stamps the row with the project
+		// scan's `scannedAt` or the fold's `Date.now()`. Absent for the cheap
+		// scan's rows, whose freshness is settled by a content fingerprint.
+		...(diagnostic.observedAt !== undefined && {
+			observedAt: diagnostic.observedAt,
+		}),
 	};
 }
 
@@ -1286,6 +1688,58 @@ function diagnosticDedupKey(
 ): string {
 	const ruleId = normalizeRuleId(diagnostic.rule ?? diagnostic.tool ?? "");
 	return [path.resolve(filePath), diagnostic.line ?? "?", ruleId].join(":");
+}
+
+/**
+ * Which project runner produced a retained row (#2154). ONE derivation, used by
+ * both the retirement filter and the record that counts what it retired — v2's
+ * N2 was two verbatim copies of this expression drifting apart.
+ */
+function runnerIdOf(diagnostic: WidgetDiagnostic): string {
+	return diagnostic.tool ?? diagnostic.rule?.split(":", 1)[0] ?? "";
+}
+
+type RunnerRetirementDecision = "retire" | "keep";
+
+/**
+ * The one project-runner retirement decision. Coverage is authoritative when
+ * present for the runner; the older id-only arm is used only when the runner
+ * declared no coverage at all.
+ *
+ * #2962: an entry with an EMPTY file set is a declaration, not a missing one —
+ * "this producer analysed the root and proved zero files". Selecting it out by
+ * its own size (the pre-#2962 `entry.files.size > 0` filter) dropped it into the
+ * whole-root id-only arm, so one complete opengrep report with
+ * `paths.scanned: []` retired every retained opengrep finding in the tree even
+ * though no file had been scanned. The id-only arm is unchanged for the eight
+ * runners that declare no coverage.
+ */
+export function runnerRetirementDecision(
+	diagnostic: WidgetDiagnostic,
+	filePath: string,
+	authoritativeRunnerIds: ReadonlySet<string> | undefined,
+	authoritativeCoverage: readonly ProjectRunnerCoverage[] | undefined,
+): RunnerRetirementDecision {
+	const runnerId = runnerIdOf(diagnostic);
+	const coverage = (authoritativeCoverage ?? []).filter(
+		(entry) => entry.runnerId === runnerId,
+	);
+	if (coverage.length === 0) {
+		return authoritativeRunnerIds?.has(runnerId) ? "retire" : "keep";
+	}
+	const realFilePath = realpathOrResolve(filePath);
+	for (const entry of coverage) {
+		const root = entry.root;
+		const relative = path.relative(root, realFilePath);
+		const underRoot =
+			relative === "" ||
+			(!relative.startsWith("..") && !path.isAbsolute(relative));
+		if (!underRoot) continue;
+		if (entry.files.has(realFilePath)) {
+			return "retire";
+		}
+	}
+	return "keep";
 }
 
 function summarizeDiagnostics(
@@ -1505,14 +1959,14 @@ function tallyLspPrimaryVsAuxiliary(results: WorkspaceLspDiagnosticResult[]): {
 	for (const result of results) {
 		const primaryId = primaryServerId(result.filePath);
 		for (const diagnostic of result.diagnostics ?? []) {
-			if (diagnostic.source === primaryId) primary += 1;
+			if (diagnostic.serverId === primaryId) primary += 1;
 			else auxiliary += 1;
 		}
 	}
 	return { primary, auxiliary };
 }
 
-export function mergeDiagnosticsWithWidgetSummaries(
+function mergeDiagnosticsWithWidgetSummaries(
 	widgetSummaries: FileDiagnosticSummary[],
 	lspResults: WorkspaceLspDiagnosticResult[],
 	projectSnapshot?: ProjectDiagnosticsSnapshot,
@@ -1527,6 +1981,8 @@ export function mergeDiagnosticsWithWidgetSummaries(
 	 * widget state they did not actually re-check).
 	 */
 	authoritativeLspFiles?: ReadonlySet<string>,
+	authoritativeRunnerIds?: ReadonlySet<string>,
+	authoritativeRunnerCoverage?: readonly ProjectRunnerCoverage[],
 ): FileDiagnosticSummary[] {
 	const byFile = new Map<string, FileDiagnosticSummary>();
 	const seen = new Set<string>();
@@ -1540,8 +1996,32 @@ export function mergeDiagnosticsWithWidgetSummaries(
 		// practice; inline dm-lens-ignore comments are the primary
 		// suppression mechanism.
 		if (authoritativeLspFiles?.has(filePath)) continue;
-		const diagnostics = (summary.diagnostics ?? []).map((d) => ({ ...d }));
-		byFile.set(filePath, { ...summary, filePath, diagnostics });
+		const retained = summary.diagnostics ?? [];
+		const diagnostics = retained
+			.filter(
+				(diagnostic) =>
+					runnerRetirementDecision(
+						diagnostic,
+						filePath,
+						authoritativeRunnerIds,
+						authoritativeRunnerCoverage,
+					) !== "retire",
+			)
+			.map((d) => ({ ...d }));
+		byFile.set(
+			filePath,
+			// #2154 v4: when the filter retires rows, the stored tallies describe
+			// diagnostics that are no longer delivered — full mode rendered
+			// `main.go 1W … 1 warning` with no row under it. Recompute from what
+			// survived, and only then (an untouched file keeps its own counts).
+			diagnostics.length === retained.length
+				? { ...summary, filePath, diagnostics }
+				: summarizeDiagnostics(
+						filePath,
+						diagnostics,
+						summary.hasFinalSnapshot ?? true,
+					),
+		);
 		for (const diagnostic of diagnostics) {
 			seen.add(diagnosticDedupKey(filePath, diagnostic));
 		}
@@ -1570,21 +2050,45 @@ export function mergeDiagnosticsWithWidgetSummaries(
 	for (const result of lspResults) {
 		const filePath = path.resolve(result.filePath);
 		for (const diagnostic of result.diagnostics ?? []) {
-			addDiagnostic(filePath, lspDiagnosticToWidget(diagnostic));
+			// #3573: the row keeps its sweep read stamp through the correlated
+			// commit, which otherwise stamps it with the project scan's time or now.
+			// Absent only for a service double that predates the field.
+			addDiagnostic(filePath, {
+				...lspDiagnosticToWidget(diagnostic),
+				...(result.observedAt !== undefined && {
+					observedAt: result.observedAt,
+				}),
+			});
 		}
 	}
 
+	// #3600: the delta report's own `generatedAt`, never the fold's `now`. A row
+	// that already carries its own `observedAt` keeps it; the report stamp is
+	// only a fallback for rows the delta writer did not stamp. An unparseable
+	// `generatedAt` is recorded rather than silently widened to `Date.now()`.
+	const deltaDiagnostics = projectDelta?.diagnostics ?? [];
+	const deltaObservedAt = parseScannedAtMs(projectDelta?.generatedAt);
+	if (deltaDiagnostics.length > 0 && deltaObservedAt === undefined) {
+		recordDegradationOnce({
+			kind: "project-delta-generatedat-unparseable",
+			subject: String(projectDelta?.generatedAt),
+			reason:
+				"projectDelta rows fell back to the fold time because generatedAt could not be parsed",
+		});
+	}
 	for (const diagnostic of projectSnapshot?.diagnostics ?? []) {
 		addDiagnostic(
 			path.resolve(diagnostic.filePath),
 			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
 		);
 	}
-	for (const diagnostic of projectDelta?.diagnostics ?? []) {
-		addDiagnostic(
-			path.resolve(diagnostic.filePath),
-			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
-		);
+	for (const diagnostic of deltaDiagnostics) {
+		const widget = projectDiagnosticToWidget(diagnostic, diagnostic.filePath);
+		const observedAt = widget.observedAt ?? deltaObservedAt;
+		addDiagnostic(path.resolve(diagnostic.filePath), {
+			...widget,
+			...(observedAt !== undefined && { observedAt }),
+		});
 	}
 
 	return [...byFile.values()];
@@ -1620,7 +2124,10 @@ async function applyInlineSuppressionsToSummaries(
 				// Inline suppression/disposition remains fail-open when the file cannot
 				// be read, but project policy does not depend on content and must still
 				// be applied so a fresh full-mode result cannot bypass `disable`/`select`.
-				const policyKept = applyRulePolicy(summary.diagnostics, policyMap);
+				const policyKept = applyRulePolicy(summary.diagnostics, policyMap, {
+					root: cwd,
+					filePath: summary.filePath,
+				});
 				return policyKept.length === summary.diagnostics.length
 					? summary
 					: summarizeDiagnostics(
@@ -1629,22 +2136,20 @@ async function applyInlineSuppressionsToSummaries(
 							summary.hasFinalSnapshot,
 						);
 			}
-			const inlineKept = applyInlineSuppressions(summary.diagnostics, content);
-			// #690: same false-positive/suppress/defer disposition filter the
-			// per-edit dispatch path applies (dispatcher.ts) — mode=full merges in
-			// diagnostics from a fresh LSP sweep/project scan that never went
-			// through that path, so without this a disposed finding reappears here.
-			const kept = applyDispositions(
-				inlineKept,
+			// #690/#3088: inline `dm-lens-ignore` → the same false-positive/
+			// suppress/defer disposition filter the per-edit dispatch path applies
+			// (dispatcher.ts) → the project's `.dm-lens.json` rule policy. mode=full
+			// merges in diagnostics from a fresh LSP sweep/project scan that never
+			// went through the dispatch path, so without this a disposed finding
+			// reappears here. #3088 folded the three calls onto the shared
+			// `applyFindingPolicy` seam, which the `source=lsp` probe lane now calls
+			// too — one stack, one order, for every model-facing surface.
+			const { kept: policyKept } = applyFindingPolicy(summary.diagnostics, {
 				cwd,
-				summary.filePath,
+				filePath: summary.filePath,
 				content,
-			);
-			// Project rule policy (`.dm-lens.json` `rules.<id>.disable`/`select`).
-			// Applied after inline suppression / disposition so the policy's
-			// output-only filtering affects the same surface the per-edit path
-			// produces (no double-counting, no leftover policy-rejected findings).
-			const policyKept = applyRulePolicy(kept, policyMap);
+				policyMap,
+			});
 			// Tag `flagged` diagnostics for the render loop (formatAllMode). Content
 			// is already in hand here (unlike mode=all/delta's cache-only path), so
 			// this is the one place the tag can be computed without adding I/O to
@@ -1727,8 +2232,9 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 		includeGenerated?: boolean;
 	},
 ): Promise<ProjectDiagnosticsSnapshot | undefined> {
+	let loaded: ProjectDiagnosticsSnapshot | undefined;
 	if (shouldRefreshProjectDiagnostics(options.refreshRunners)) {
-		return scanProjectDiagnostics({
+		loaded = await scanProjectDiagnostics({
 			cwd,
 			tier: "cheap",
 			maxFiles: options.maxProjectFiles,
@@ -1736,17 +2242,44 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 			files: options.files,
 			includeGenerated: options.includeGenerated,
 		});
-	}
-	if (shouldUseCachedProjectDiagnostics(options.refreshRunners)) {
+	} else if (shouldUseCachedProjectDiagnostics(options.refreshRunners)) {
 		// The cached snapshot is a cross-session cache; drop diagnostics for files
-		// edited/deleted since the scan so a stale entry isn't replayed (#298). A
-		// fresh scan (above) is current by construction and needs no reconcile.
-		const cached = loadProjectDiagnosticsSnapshot(cwd);
-		return cached
-			? reconcileProjectDiagnosticsSnapshot(cached).snapshot
-			: undefined;
+		// edited/deleted since the scan so a stale entry isn't replayed (#298).
+		loaded = loadProjectDiagnosticsSnapshot(cwd);
 	}
-	return undefined;
+	if (!loaded) return undefined;
+	// #3573: a fresh scan is reconciled too. Its `scannedAt` is taken after the
+	// whole file loop, and it becomes the widget row's `observedAt`, so a file
+	// rewritten while the scan was still running reads as older than its row and
+	// no widget gate would ever drop it. The fingerprint of the bytes the rules
+	// read settles it before the rows reach the widget.
+	const reconciled = reconcileProjectDiagnosticsSnapshot(loaded);
+	// #2154: what this gate DROPS was invisible — the count was computed and
+	// thrown away, so a session that silently retired another session's rows
+	// (the whole point of the content axis added this round) left no record
+	// of having done so. Bounded by construction: at most one row per
+	// mode=full call, and only when rows were actually retired — the shape
+	// `lsp_authoritative_widget_retire` uses for the sibling arm.
+	if (reconciled.staleDropped > 0) {
+		logLatency({
+			type: "phase",
+			toolName: "lens_diagnostics",
+			filePath: cwd,
+			phase: "project_snapshot_rows_retired",
+			durationMs: 0,
+			metadata: {
+				files: reconciled.staleDropped,
+				rows:
+					loaded.diagnostics.length - reconciled.snapshot.diagnostics.length,
+				scannedAt: loaded.scannedAt,
+				// #3573: which arm retired them, now that both are reconciled.
+				arm: shouldRefreshProjectDiagnostics(options.refreshRunners)
+					? "fresh"
+					: "cached",
+			},
+		});
+	}
+	return reconciled.snapshot;
 }
 
 // @delivery-surface: lens-diagnostics:mode-full
@@ -1772,8 +2305,15 @@ async function formatFullMode(
 		 * points a user at. Default false.
 		 */
 		includeGenerated?: boolean;
+		analysisRoot?: string;
+		/** Delivery adapter whose callable tool names appear in advisories. */
+		host?: LensToolHost;
 	} = {},
-): Promise<{ content: [{ type: "text"; text: string }]; details: object }> {
+): Promise<{
+	content: [{ type: "text"; text: string }];
+	isError?: boolean;
+	details: object;
+}> {
 	const runWorkspaceDiagnostics = lspService.runWorkspaceDiagnostics;
 	if (typeof runWorkspaceDiagnostics !== "function") {
 		return {
@@ -1787,9 +2327,10 @@ async function formatFullMode(
 		};
 	}
 	const { signal, pathsScope, nextWriteIndex } = options;
-	const ignoreFile = createCurrentIgnoreFilter(cwd);
-	const includeFile = (filePath: string) =>
-		ignoreFile(filePath) && (!pathsScope || pathsScope.includeFile(filePath));
+	// #2535: advisories name the delivery host's callable tools; pi callers
+	// omit host and keep the pi spelling.
+	const host = options.host ?? "pi";
+	const includeFile = createScopedFileFilter(cwd, pathsScope);
 	// `paths` (#461): route the active scans at exactly the requested files
 	// instead of walking the whole project. Three cases:
 	// - files only → pass them as the explicit list (skips the walk). An EMPTY
@@ -1821,11 +2362,14 @@ async function formatFullMode(
 		? loadBootstrapClients().then((clients) =>
 				fetchFreshProjectDiagnostics(cacheManager, cwd, clients, signal, {
 					runtime: options.runtime,
+					analysisRoot: options.analysisRoot,
 				}),
 			)
 		: Promise.resolve<FreshProjectDiagnosticsResult>({
 				diagnostics: [],
 				runners: [],
+				analyzed: [],
+				authoritativeCoverage: [],
 				// #1623: every heavyweight analyzer is ELIGIBLE for this project but
 				// this call never asked for it (refreshRunners wasn't cheap/all/
 				// cached) — the expensive fetch below deliberately never runs in
@@ -1836,7 +2380,7 @@ async function formatFullMode(
 				// hand-listing ids here.
 				cold: [...ANALYZER_IDS],
 				coldReasons: Object.fromEntries(
-					ANALYZER_IDS.map((id) => [id, NOT_REQUESTED_REASON]),
+					ANALYZER_IDS.map((id) => [id, notRequestedReason(host)]),
 				),
 				failed: [],
 				timings: {},
@@ -1856,6 +2400,17 @@ async function formatFullMode(
 		}),
 		analyzersPromise,
 	]);
+	if (extracted.analysisRootError) {
+		return {
+			content: [{ type: "text" as const, text: extracted.analysisRootError }],
+			isError: true,
+			details: {
+				mode: "full",
+				analysisRootError: extracted.analysisRootError,
+				analysisRootValidation: extracted.analysisRootValidation,
+			},
+		};
+	}
 	const aborted = signal?.aborted ?? false;
 	// #1640: before ANY consumer sees them — the footer reconcile, the widget
 	// merge, the rendered counts — demote TypeScript errors on files tsserver
@@ -1900,6 +2455,8 @@ async function formatFullMode(
 		(result) =>
 			result.timedOut || result.error || mismatchedLspResults.has(result),
 	);
+	const authoritativeLspFiles = new Set<string>();
+	const unreconciledFiles = new Set<string>();
 	// #571: reconcile this scan's fresh, CONFIRMED per-file results into the
 	// footer cache. A footer write is never allowed to fail the tool call, so
 	// any unexpected throw is swallowed.
@@ -1929,23 +2486,45 @@ async function formatFullMode(
 				"",
 				{ cwd, fileRole: detectFileRole(result.filePath) },
 			);
-			reconcileScanDiagnostics(
+			const retired = reconcileScanDiagnostics(
 				result.filePath,
 				retagged,
 				true,
 				// The service reserves this token when the file enters the scan. The
 				// fallback preserves compatibility with older test doubles/services.
 				result.writeIndex ?? nextWriteIndex?.(),
-				// #1093: `observedAt` is set only when this result was served from
-				// the workspace-diagnostics cache (a replay of an older scan) —
-				// stamp `touchedAt` with when it was scanned, not now(), so a
-				// mode=full that only re-serves the cache can't keep a resolved
-				// finding on screen by re-arming the mtime gate. Undefined for
-				// freshly-touched results (observed now).
+				// #1093: for a result served from the workspace-diagnostics cache,
+				// `observedAt` is when it was scanned, not now(), so a mode=full
+				// that only re-serves the cache can't keep a resolved finding on
+				// screen by re-arming the mtime gate. #3573: for a fresh result it
+				// is the sweep's read of the file.
 				result.observedAt,
 			);
+			// A result rejected by the shared ordering guard is not authoritative
+			// for delivery. Otherwise full mode hides the old widget row while
+			// mode=all still serves it, creating a false clean/full disagreement.
+			// Strict `=== true`: `undefined` (a double that predates the boolean
+			// return) takes the unreconciled arm, never the retiring one.
+			if (retired === true) {
+				authoritativeLspFiles.add(path.resolve(result.filePath));
+			} else {
+				unreconciledFiles.add(path.resolve(result.filePath));
+				recordDegradationOnce({
+					kind: "diagnostic-retained-unreconciled",
+					subject: `${path.resolve(result.filePath)}:lsp`,
+					reason:
+						"confirmed diagnostic result could not replace retained widget state",
+				});
+			}
 		} catch {
 			// Never let a footer-reconciliation hiccup fail the scan itself.
+			unreconciledFiles.add(path.resolve(result.filePath));
+			recordDegradationOnce({
+				kind: "diagnostic-retained-unreconciled",
+				subject: `${path.resolve(result.filePath)}:lsp`,
+				reason:
+					"confirmed diagnostic result failed during widget reconciliation",
+			});
 		}
 	}
 	// Project rule policy (`.dm-lens.json` `rules.<id>.disable`/`select`) —
@@ -1976,14 +2555,24 @@ async function formatFullMode(
 	// computed above, in the SAME `Promise.all` as the LSP sweep (#613) — only
 	// when the caller opted into project-runner state (otherwise it's the
 	// `Promise.resolve({...})` stub from `analyzersPromise` above).
+	// #2154: only ids whose client said it parsed a scan of this root this call
+	// (`FreshProjectDiagnosticsResult.analyzed`). Every exclusion — a skipped
+	// runner, a crash that still reported success, the cache-read test-runner
+	// lane — is decided at the record site in fresh-fetch.ts, not re-derived
+	// here; a second list of "which ids don't count" would be the mirror this
+	// repo's single-source-of-truth rule forbids.
+	const authoritativeRunnerIds = new Set(extracted.analyzed ?? []);
+	const authoritativeRunnerCoverage = extracted.authoritativeCoverage ?? [];
+	const foldedProjectSnapshot = foldExtraDiagnosticsIntoSnapshot(
+		scannedSnapshot,
+		extracted.diagnostics.filter((d) => includeFile(d.filePath)),
+		extracted.runners,
+		cwd,
+	);
 	const projectSnapshot = applyProjectRulePolicy(
-		foldExtraDiagnosticsIntoSnapshot(
-			scannedSnapshot,
-			extracted.diagnostics.filter((d) => includeFile(d.filePath)),
-			extracted.runners,
-			cwd,
-		),
+		foldedProjectSnapshot,
 		policyMap,
+		cwd,
 	);
 	const projectDelta = applyProjectRulePolicy(
 		filterProjectDiagnosticsDeltaReport(
@@ -1991,6 +2580,7 @@ async function formatFullMode(
 			includeFile,
 		),
 		policyMap,
+		cwd,
 	);
 	// #630: only the CONFIRMED LSP results contribute diagnostics to the merge
 	// — an unconfirmed (timed-out/errored) file's placeholder `[]` must not be
@@ -2000,9 +2590,6 @@ async function formatFullMode(
 	// #1993: files with a CONFIRMED, fully-covered LSP result are authoritative
 	// - the fresh sweep replaces their widget-store state instead of merging
 	// additively beside it.
-	const authoritativeLspFiles = new Set(
-		fullyCoveredLspResults.map((result) => path.resolve(result.filePath)),
-	);
 	// #1993 review: retirement must be observable - if a future regression
 	// makes the set falsely authoritative, findings would vanish silently.
 	const authoritativeRetiredCount = getFileDiagnosticSummaries().filter(
@@ -2020,7 +2607,75 @@ async function formatFullMode(
 			metadata: { files: authoritativeRetiredCount },
 		});
 	}
-	const summaries = await applyInlineSuppressionsToSummaries(
+	// #2154 v4 F2: the same rule for the runner arm, in the same shape as its
+	// LSP sibling above — a retirement nobody can see is how a regression
+	// deletes findings silently. Bounded by construction: at most one row per
+	// mode=full call, and only when rows were actually retired.
+	const retiredRunnerCounts = new Map<string, number>();
+	const runnerRetiredRows = getFileDiagnosticSummaries()
+		.filter((summary) => includeFile(summary.filePath))
+		.reduce(
+			(total, summary) =>
+				total +
+				(summary.diagnostics ?? []).filter((diagnostic) => {
+					const retired =
+						runnerRetirementDecision(
+							diagnostic,
+							summary.filePath,
+							authoritativeRunnerIds,
+							authoritativeRunnerCoverage,
+						) === "retire";
+					if (retired) {
+						const runnerId = runnerIdOf(diagnostic);
+						retiredRunnerCounts.set(
+							runnerId,
+							(retiredRunnerCounts.get(runnerId) ?? 0) + 1,
+						);
+					}
+					return retired;
+				}).length,
+			0,
+		);
+	if (runnerRetiredRows > 0) {
+		logLatency({
+			type: "phase",
+			phase: "runner_authoritative_widget_retire",
+			filePath: "",
+			durationMs: 0,
+			metadata: {
+				rows: runnerRetiredRows,
+				runners: [...retiredRunnerCounts.keys()].join(","),
+				coverage: authoritativeRunnerCoverage.map((entry) => ({
+					runnerId: entry.runnerId,
+					root: entry.root,
+					files: entry.files.size,
+				})),
+			},
+		});
+	}
+	for (const entry of authoritativeRunnerCoverage) {
+		// #2962: a zero-file declaration retires nothing, so it must neither
+		// write this row (a `runner_coverage_retired` row with count 0 would
+		// report the opposite of what happened) nor BURN the once-per-session
+		// claim — the session's first real coverage row would then be suppressed
+		// by the call that proved no coverage. Its own observation is the
+		// `runner-coverage-empty` ledger row raised at the fresh-fetch seam.
+		if (entry.files.size === 0) continue;
+		if (!claimPhaseOncePerSession("runner_coverage_retired", entry.runnerId)) {
+			continue;
+		}
+		logLatency({
+			type: "phase",
+			phase: "runner_coverage_retired",
+			filePath: "",
+			durationMs: 0,
+			metadata: {
+				runnerId: entry.runnerId,
+				count: retiredRunnerCounts.get(entry.runnerId) ?? 0,
+			},
+		});
+	}
+	let summaries = await applyInlineSuppressionsToSummaries(
 		mergeDiagnosticsWithWidgetSummaries(
 			getFileDiagnosticSummaries().filter((summary) =>
 				includeFile(summary.filePath),
@@ -2029,10 +2684,23 @@ async function formatFullMode(
 			projectSnapshot,
 			projectDelta,
 			authoritativeLspFiles,
+			authoritativeRunnerIds,
+			authoritativeRunnerCoverage,
 		),
 		cwd,
 		policyMap,
 	);
+	if (unreconciledFiles.size > 0) {
+		summaries = summaries.map((summary) =>
+			unreconciledFiles.has(path.resolve(summary.filePath))
+				? summarizeDiagnostics(
+						summary.filePath,
+						markUnreconciledFindings(summary.diagnostics),
+						summary.hasFinalSnapshot,
+					)
+				: summary,
+		);
+	}
 	// #1888: the full-mode summary above is the first seam where every
 	// producing lane is correlated. The earlier footer loop intentionally writes
 	// only CONFIRMED LSP results, so an ast-grep backpressure failure left
@@ -2055,28 +2723,35 @@ async function formatFullMode(
 			projectScanObservedAt,
 		);
 	}
-	const result = formatAllMode(cwd, severity, summaries, {
-		mode: "full",
-		lspFilesChecked: rawLspResults.length,
-		partial: aborted,
-		projectDiagnostics:
-			projectSnapshot === undefined
-				? undefined
-				: {
-						tier: projectSnapshot.tier,
-						filesScanned: projectSnapshot.filesScanned,
-						diagnostics: projectSnapshot.diagnostics.length,
-						runners: projectSnapshot.runners,
-					},
-		projectDiagnosticsDelta:
-			projectDelta === undefined
-				? undefined
-				: {
-						diagnostics: projectDelta.diagnostics.length,
-						sources: projectDelta.sources,
-						turnIndex: projectDelta.turnIndex,
-					},
-	});
+	const result = await formatAllMode(
+		cwd,
+		severity,
+		summaries,
+		{
+			mode: "full",
+			lspFilesChecked: rawLspResults.length,
+			partial: aborted,
+			projectDiagnostics:
+				projectSnapshot === undefined
+					? undefined
+					: {
+							tier: projectSnapshot.tier,
+							filesScanned: projectSnapshot.filesScanned,
+							diagnostics: projectSnapshot.diagnostics.length,
+							runners: projectSnapshot.runners,
+						},
+			projectDiagnosticsDelta:
+				projectDelta === undefined
+					? undefined
+					: {
+							diagnostics: projectDelta.diagnostics.length,
+							sources: projectDelta.sources,
+							turnIndex: projectDelta.turnIndex,
+						},
+		},
+		0,
+		pathsScope,
+	);
 	const missingNote = pathsScopeMissingNote(pathsScope);
 	// #630: mirrors `tools/lsp-diagnostics.ts`'s `unconfirmedReasonClause`/
 	// `tallyConfirmation` semantic guarantee (never silently render
@@ -2140,6 +2815,31 @@ async function formatFullMode(
 	// so a page of ast-grep/opengrep/marksman noise never buries whether the
 	// real language server itself found anything in this sweep.
 	const lspPrimaryVsAuxiliary = tallyLspPrimaryVsAuxiliary(confirmedLspResults);
+	logExtension({
+		subsystem: "lsp-diagnostics",
+		message: "lens_diagnostics verdict",
+		metadata: {
+			server: [
+				...new Set(
+					confirmedLspResults.map(
+						(result) => primaryServerId(result.filePath) ?? "unknown",
+					),
+				),
+			].join(","),
+			primary: lspPrimaryVsAuxiliary.primary,
+			auxiliary: lspPrimaryVsAuxiliary.auxiliary,
+			total: lspPrimaryVsAuxiliary.primary + lspPrimaryVsAuxiliary.auxiliary,
+			sources: [
+				...new Set(
+					confirmedLspResults.flatMap((result) =>
+						(result.diagnostics ?? []).map(
+							(diagnostic) => diagnostic.source ?? "unknown",
+						),
+					),
+				),
+			].slice(0, 5),
+		},
+	});
 	const lspPrimaryVsAuxiliaryNote =
 		lspPrimaryVsAuxiliary.primary + lspPrimaryVsAuxiliary.auxiliary > 0
 			? `\n\nLSP sweep findings: ${lspPrimaryVsAuxiliary.primary} primary (language server), ` +
@@ -2162,6 +2862,7 @@ async function formatFullMode(
 	// isn't (a re-run may well complete for that analyzer).
 	const abortedIds = new Set(extracted.abortedIds ?? []);
 	const genuinelyColdIds = extracted.cold.filter((id) => !abortedIds.has(id));
+	const partialIds = extracted.partial ?? [];
 	// #747: an unsafe analysis root (cwd at/above $HOME) skips ALL heavyweight
 	// analyzers before anything spawns — rendering that as the per-analyzer
 	// "not applicable / unavailable" list would send the caller chasing seven
@@ -2173,7 +2874,7 @@ async function formatFullMode(
 	// shape). Single formatter (extractors.ts) so this note's wording can't
 	// drift from any other caller that renders the same `cold` list.
 	// #1623 fix-round F5: the "not requested" (quick-mode) batch shares ONE
-	// reason (`NOT_REQUESTED_REASON`) across every id — `formatNotRunEntry`
+	// reason (`notRequestedReason`) across every id — `formatNotRunEntry`
 	// repeating that same ~130-char sentence per id makes the note nearly
 	// unreadable, and the "not applicable / unavailable this run" header
 	// below is a dishonest label for it: these lanes ARE applicable and
@@ -2183,16 +2884,29 @@ async function formatFullMode(
 	// id's reason really does differ (not a git repo vs binary unavailable
 	// vs retry cooldown, ...).
 	const coldNote = extracted.unsafeRoot
-		? `\n\nheavyweight analyzers skipped: the working directory resolves at or above the home directory, so a fresh knip/jscpd/madge/gitleaks/govulncheck/trivy/dead-code scan would walk every unrelated tree under it. Re-run from inside a project directory. Absence of their findings is NOT a clean verdict.`
-		: !projectRunnersRequested && genuinelyColdIds.length > 0
-			? `\n\nnot run this call (quick mode): ${genuinelyColdIds.join(", ")}. ${NOT_REQUESTED_REASON}. Absence of their findings is NOT a clean verdict.`
-			: genuinelyColdIds.length > 0
-				? `\n\ncold (not applicable / unavailable this run): ${genuinelyColdIds
-						.map((id) => formatNotRunEntry(id, extracted.coldReasons))
-						.join(
-							", ",
-						)}. These analyzers have not contributed to this result — absence of their findings is NOT a clean verdict.`
-				: "";
+		? `\n\nheavyweight analyzers skipped: the analysis root resolves at or above the home directory, so a fresh knip/jscpd/madge/gitleaks/govulncheck/trivy/dead-code scan would walk every unrelated tree under it. Supply a project directory below the home ceiling. Absence of their findings is NOT a clean verdict.`
+		: extracted.analysisRootError
+			? `\n\nheavyweight analyzers skipped: ${extracted.analysisRootError}. Supply an existing project directory below the home ceiling. Absence of their findings is NOT a clean verdict.`
+			: !projectRunnersRequested && genuinelyColdIds.length > 0
+				? `\n\nnot run this call (quick mode): ${genuinelyColdIds.join(", ")}. ${notRequestedReason(host)}. Absence of their findings is NOT a clean verdict.`
+				: genuinelyColdIds.length > 0
+					? `\n\ncold (not applicable / unavailable this run): ${genuinelyColdIds
+							.map((id) => formatNotRunEntry(id, extracted.coldReasons))
+							.join(
+								", ",
+							)}. These analyzers have not contributed to this result — absence of their findings is NOT a clean verdict.`
+					: "";
+	const partialNote =
+		partialIds.length > 0
+			? `\n\n⚠ partial coverage (findings included): ${partialIds
+					.map(
+						(id) =>
+							`${id} — ${extracted.partialReasons?.[id] ?? "coverage is incomplete"}`,
+					)
+					.join(
+						", ",
+					)}. Coverage is incomplete, so absence of findings is NOT a clean verdict.`
+			: "";
 	// #1004: unlike every other analyzer above (knip/jscpd/madge/gitleaks/
 	// govulncheck/opengrep/trivy/dead-code all run a FRESH whole-project scan
 	// per the fresh-fetch.ts header, so "clean" there really does mean "the
@@ -2262,7 +2976,7 @@ async function formatFullMode(
 	// #1107 phase 2: same "reached the seam, nothing rendered it" gap as #784
 	// above, for the generated-name/dir skip counters.
 	const generatedSkipNoticeText = projectSnapshot
-		? generatedSkipNotice(projectSnapshot)
+		? generatedSkipNotice(projectSnapshot, host)
 		: undefined;
 	const generatedSkipNote = generatedSkipNoticeText
 		? `\n\n${generatedSkipNoticeText}`
@@ -2283,7 +2997,7 @@ async function formatFullMode(
 		? Date.parse(rawProjectSnapshot.scannedAt)
 		: undefined;
 	const cheapScanStatusNote = !projectRunnersRequested
-		? `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): not run this call (${NOT_REQUESTED_REASON}).`
+		? `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): not run this call (${notRequestedReason(host)}).`
 		: options.refreshRunners === "cached"
 			? cheapScanScannedAtMs !== undefined &&
 				Number.isFinite(cheapScanScannedAtMs)
@@ -2337,6 +3051,7 @@ async function formatFullMode(
 		details: {
 			...result.details,
 			coldRunners: extracted.cold,
+			partialRunners: partialIds,
 			// #1623: the specific reason each cold id was skipped (single source
 			// of truth: extractors.ts's `formatNotRunEntry` renders the same map
 			// into the text note above) — lets a caller check WHY without parsing
@@ -2355,7 +3070,12 @@ async function formatFullMode(
 			// #747: true when the fresh fetch refused an at-or-above-$HOME root —
 			// lets a caller distinguish "skipped for safety" from per-analyzer
 			// cold reasons without parsing the text note.
-			analyzersUnsafeRoot: extracted.unsafeRoot ?? false,
+			// This is the fetch seam's explicit-root policy. The cwd walk below is
+			// intentionally separate: it answers a different root question.
+			analyzersUnsafeRoot:
+				extracted.analysisRootValidation?.state === "unsafe" ||
+				extracted.unsafeRoot === true,
+			analysisRootValidation: extracted.analysisRootValidation,
 			// #747: true when the cwd resolved at/above $HOME so the cheap project
 			// scan and the LSP workspace sweep both refused to walk — lets a caller
 			// distinguish "walked nothing for safety" from a genuinely clean sweep.
@@ -2420,6 +3140,7 @@ async function formatFullMode(
 						unconfirmedLspNote +
 						auxiliaryCoverageNote +
 						lspPrimaryVsAuxiliaryNote +
+						partialNote +
 						coldNote +
 						testRunnerEditScopedNote +
 						failedNote +
@@ -2440,6 +3161,7 @@ async function formatFullMode(
 	if (
 		missingNote ||
 		coldNote ||
+		partialNote ||
 		testRunnerEditScopedNote ||
 		failedNote ||
 		dispositionSuppressedNote ||
@@ -2463,6 +3185,7 @@ async function formatFullMode(
 						unconfirmedLspNote +
 						auxiliaryCoverageNote +
 						lspPrimaryVsAuxiliaryNote +
+						partialNote +
 						coldNote +
 						testRunnerEditScopedNote +
 						failedNote +
@@ -2483,8 +3206,24 @@ async function formatFullMode(
 	return resultWithCold;
 }
 
+async function projectResolvedCwd(
+	summary: FileDiagnosticSummary,
+	cwd: string,
+): Promise<FileDiagnosticSummary> {
+	// #2777 O1: the whole three-way lookup lives on the LSP seam now. A file
+	// with no primary LSP server is `undefined` here by construction, and
+	// formatAllMode renders that row without a cwd term (N1) — the literal
+	// `cwd=undefined` cannot be produced.
+	const resolvedCwd = await resolveLspCwdForFile(summary.filePath, cwd);
+	return {
+		...summary,
+		...(resolvedCwd === undefined ? {} : { resolvedCwd }),
+		diagnostics: summary.diagnostics ?? [],
+	};
+}
+
 // @delivery-surface: lens-diagnostics:mode-all
-function formatAllMode(
+async function formatAllMode(
 	cwd: string,
 	severity: string,
 	summaries: FileDiagnosticSummary[] = getFileDiagnosticSummaries(),
@@ -2492,7 +3231,7 @@ function formatAllMode(
 	staleDropped = 0,
 	pathsScope?: PathsScope,
 	dependencyDemoted = 0,
-): { content: [{ type: "text"; text: string }]; details: object } {
+): Promise<{ content: [{ type: "text"; text: string }]; details: object }> {
 	// #2275 review F2: the widget footer stops DRAWING a dependency-drift
 	// demotion once it hits `DEPENDENCY_DRIFT_MAX_DELIVERIES` unconfirmed
 	// deliveries, but the record stays here (dropping it would make an
@@ -2523,9 +3262,7 @@ function formatAllMode(
 	// to delta/all, which is why this is gated on detailOverrides.mode !== "full".
 	const isFullMode = (detailOverrides as { mode?: string }).mode === "full";
 
-	const ignoreFile = createCurrentIgnoreFilter(cwd);
-	const includeFile = (filePath: string) =>
-		ignoreFile(filePath) && (!pathsScope || pathsScope.includeFile(filePath));
+	const includeFile = createScopedFileFilter(cwd, pathsScope);
 	// Cached summaries predate marks. Every cache-only surface re-applies
 	// dispositions through the shared applyCachedDispositions seam — strict
 	// false-positive anchors against current content when the file is
@@ -2536,7 +3273,10 @@ function formatAllMode(
 		: summaries.map((s) => {
 				const diagnostics = s.diagnostics ?? [];
 				const kept = applyCachedDispositions(diagnostics, cwd, s.filePath);
-				const policyKept = applyRulePolicy(kept, policyMap);
+				const policyKept = applyRulePolicy(kept, policyMap, {
+					root: cwd,
+					filePath: s.filePath,
+				});
 				if (
 					policyKept.length === kept.length &&
 					kept.length === diagnostics.length
@@ -2576,7 +3316,8 @@ function formatAllMode(
 		if (severity === "error") return s.blocking > 0 || s.errors > 0;
 		// #2414: a "warning" filter must not admit hint/info — that is exactly
 		// the "present hints as warnings" defect this issue exists to close.
-		if (severity === "warning") return s.warnings > 0;
+		if (severity === "warning")
+			return s.blocking > 0 || s.errors > 0 || s.warnings > 0;
 		// severity: "all" — a hint/info-only file (`advisories > 0`,
 		// warnings === 0) must still surface here, or the #2414 fix that stops
 		// hints inflating `warnings` would silently drop that file from the
@@ -2614,6 +3355,13 @@ function formatAllMode(
 		(a, b) =>
 			b.blocking - a.blocking || b.errors - a.errors || b.warnings - a.warnings,
 	);
+	// #2777 O2: only rendered rows resolve their root. The projection sits
+	// below the withIssues filter, so a 500-file session pays the cwd
+	// resolution for the handful of rows listed here, not for every summary
+	// the cache holds.
+	const rendered = await Promise.all(
+		sorted.map((summary) => projectResolvedCwd(summary, cwd)),
+	);
 
 	const lines: string[] = [];
 	let totalBlocking = 0;
@@ -2621,7 +3369,7 @@ function formatAllMode(
 	let totalWarnings = 0;
 	let totalAdvisories = 0;
 
-	for (const s of sorted) {
+	for (const s of rendered) {
 		const rel = path.relative(cwd, s.filePath);
 		const parts: string[] = [];
 		if (s.blocking > 0) parts.push(`🔴 ${s.blocking} blocking`);
@@ -2637,6 +3385,9 @@ function formatAllMode(
 		if (staleCount > 0) {
 			parts.push(`${staleCount} stale — re-run to confirm`);
 		}
+		// #2777 N1: files with no primary LSP server have no resolvedCwd —
+		// omit the term rather than rendering the literal `cwd=undefined`.
+		if (s.resolvedCwd !== undefined) parts.push(`cwd=${s.resolvedCwd}`);
 		lines.push(`${rel}  ${parts.join("  ")}`);
 
 		// List the actual diagnostics (not just counts) so the agent can act on

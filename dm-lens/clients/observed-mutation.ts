@@ -121,6 +121,7 @@ import { getProcessSingleton } from "./process-singletons.js";
 import { bounded } from "./deadline-utils.js";
 import type { LedgerHookKey } from "./hook-budgets.js";
 import { lineContentHash } from "./read-guard.js";
+import type { LineageHandle } from "./session-scope.js";
 
 /**
  * Wall-clock CEILING for the ARM capture — not its cost.
@@ -131,7 +132,7 @@ import { lineContentHash } from "./read-guard.js";
  * must not turn every first observation into a timeout, which is the least
  * useful possible outcome.
  */
-export const OBSERVED_CAPTURE_BUDGET_MS = 200;
+const OBSERVED_CAPTURE_BUDGET_MS = 200;
 
 /**
  * Cumulative ceiling for every ARMED capture in one turn. A turn that calls
@@ -155,7 +156,16 @@ export const OBSERVED_TURN_BUDGET_MS = 600;
  * holds regardless of the clock. What it CAN cut is a directory target's tail,
  * and that is reported as `stoppedEarly` rather than scored as clean.
  */
-export const OBSERVED_SETTLE_DEADLINE_MS = 50;
+const OBSERVED_SETTLE_DEADLINE_MS = 50;
+
+/**
+ * Test-only overrides of the two wall-clock bounds a directory observation
+ * passes through (the arm's capture timeout and the settle's per-entry
+ * deadline). A test that asserts on WHAT an observation saw — not on how fast
+ * the machine is — widens them, and restores them with `{}` when it finishes.
+ */
+let captureBudgetOverrideMs: number | undefined;
+let settleDeadlineOverrideMs: number | undefined;
 
 /**
  * Entries taken from a DIRECTORY-shaped target path, non-recursively.
@@ -192,7 +202,7 @@ export const OBSERVED_TRACKED_MAX_FILES = 400;
  * closes it as soon as anything moves the size or the tick, and the armed
  * observation (which hashes the target unconditionally) never depended on it.
  */
-export const OBSERVED_LEDGER_SETTLE_MS = 150;
+const OBSERVED_LEDGER_SETTLE_MS = 150;
 
 /**
  * Path keys the "dm-lens already recorded this" set may hold.
@@ -218,25 +228,25 @@ export const OBSERVED_HANDLED_MAX = 1000;
 export const OBSERVED_SWEEP_STAT_WINDOW = 128;
 
 /** Cumulative content-hash budget for ONE capture. */
-export const OBSERVED_HASH_BUDGET_BYTES = 2 * 1024 * 1024;
+const OBSERVED_HASH_BUDGET_BYTES = 2 * 1024 * 1024;
 
 /** Cumulative bytes ONE settled sweep may read to seed or verify a hash. */
 export const OBSERVED_SWEEP_HASH_BUDGET_BYTES = 2 * 1024 * 1024;
 
 /** Cumulative bytes ONE settled sweep may read to derive edit RANGES. */
-export const OBSERVED_SWEEP_RANGE_BUDGET_BYTES = 1024 * 1024;
+const OBSERVED_SWEEP_RANGE_BUDGET_BYTES = 1024 * 1024;
 
 /** Largest file whose per-line hashes are captured for range derivation. */
-export const OBSERVED_LINE_HASH_MAX_BYTES = 512 * 1024;
+const OBSERVED_LINE_HASH_MAX_BYTES = 512 * 1024;
 
 /** Ranges reported per file before they collapse to one bounding box. */
-export const OBSERVED_MAX_EDIT_RANGES = 32;
+const OBSERVED_MAX_EDIT_RANGES = 32;
 
 /** Pending baselines held between `tool_call` and `tool_result`. */
-export const OBSERVED_PENDING_MAX = 32;
+const OBSERVED_PENDING_MAX = 32;
 
 /** Files remembered by the settled-sweep content ledger. */
-export const OBSERVED_LEDGER_MAX = 1000;
+const OBSERVED_LEDGER_MAX = 1000;
 
 /** The replay payload, structurally identical to `MutationBridgeEntry`. */
 export interface ObservedReplayEntry {
@@ -246,10 +256,21 @@ export interface ObservedReplayEntry {
 	editRanges?: [number, number][];
 	consumer?: string;
 	provenance?: "observed" | "settled-sweep";
+	/**
+	 * #4187 R4-1: the call whose `tool_call` licensed these paths
+	 * (`ReadGuard.noteCheckedPaths`), so the replay's authorship advance is
+	 * judged against the set that call actually checked. The settled sweep
+	 * replays with no call of its own and names none.
+	 */
+	toolCallId?: string;
+	/** #3521: see `BridgeMutationEntry.readGuardBranchEpoch`. */
+	readGuardBranchEpoch?: number;
+	/** #3620: see `BridgeMutationEntry.lineage`. */
+	lineage?: LineageHandle;
 }
 
 /** How a caller hands an observed change back to the pipeline. */
-export type ObservedReplayRecorder = (entry: ObservedReplayEntry) => boolean;
+type ObservedReplayRecorder = (entry: ObservedReplayEntry) => boolean;
 
 interface PendingObservation {
 	toolName: string;
@@ -315,12 +336,20 @@ interface ObservedNetState {
 	handled: BoundedSet<string>;
 	turnIndex: number;
 	turnSpentMs: number;
+	/**
+	 * #3613 F2: the spend of recent turns other than `turnIndex`. Two sessions'
+	 * turns interleave on this one net (a subagent's beside the primary's), so
+	 * a switch parks the spend instead of resetting it. Bounded at
+	 * `OBSERVED_PARKED_TURNS_MAX`, oldest key first.
+	 */
+	parkedSpendMs: Map<number, number>;
 	/** Where the next settled sweep resumes its rotation over the tracked set. */
 	sweepCursor: number;
 }
 
 const OBSERVED_FAMILY = "observed-mutation-net";
-const OBSERVED_VERSION = 3;
+const OBSERVED_VERSION = 4;
+const OBSERVED_PARKED_TURNS_MAX = 8;
 
 function state(): ObservedNetState {
 	return getProcessSingleton<ObservedNetState>(
@@ -332,6 +361,7 @@ function state(): ObservedNetState {
 			handled: new BoundedSet(OBSERVED_HANDLED_MAX),
 			turnIndex: -1,
 			turnSpentMs: 0,
+			parkedSpendMs: new Map(),
 			sweepCursor: 0,
 		}),
 	);
@@ -350,7 +380,17 @@ export function resetObservedMutationNet(): void {
 	current.handled.clear();
 	current.turnIndex = -1;
 	current.turnSpentMs = 0;
+	current.parkedSpendMs.clear();
 	current.sweepCursor = 0;
+}
+
+/** Test seam: widen the arm/settle time bounds; see the overrides' doc. */
+export function _setObservedTimeBoundsForTests(bounds: {
+	captureMs?: number;
+	settleMs?: number;
+}): void {
+	captureBudgetOverrideMs = bounds.captureMs;
+	settleDeadlineOverrideMs = bounds.settleMs;
 }
 
 /** Test seam: the net's live state, as plain data. */
@@ -358,6 +398,7 @@ export function _observedMutationStateForTests(): {
 	pending: string[];
 	ledger: string[];
 	handled: string[];
+	turnIndex: number;
 	turnSpentMs: number;
 	sweepCursor: number;
 } {
@@ -366,6 +407,7 @@ export function _observedMutationStateForTests(): {
 		pending: [...current.pending.keys()],
 		ledger: [...current.ledger.keys()],
 		handled: [...current.handled],
+		turnIndex: current.turnIndex,
 		turnSpentMs: current.turnSpentMs,
 		sweepCursor: current.sweepCursor,
 	};
@@ -432,22 +474,47 @@ export function hasPendingObservation(toolCallId: string | undefined): boolean {
 	return toolCallId !== undefined && state().pending.has(toolCallId);
 }
 
-function remainingTurnBudgetMs(turnIndex: number): number {
+/** The net's state with `turnIndex`'s spend in the budget slot. */
+function budgetFor(
+	turnIndex: number,
+	isLiveTurn: (turnIndex: number) => boolean = () => false,
+): ObservedNetState {
 	const current = state();
 	if (current.turnIndex !== turnIndex) {
+		const parked = current.parkedSpendMs;
+		if (current.turnIndex !== -1)
+			parked.set(current.turnIndex, current.turnSpentMs);
+		current.turnSpentMs = parked.get(turnIndex) ?? 0;
+		parked.delete(turnIndex);
 		current.turnIndex = turnIndex;
-		current.turnSpentMs = 0;
+		while (parked.size > OBSERVED_PARKED_TURNS_MAX) {
+			// Oldest dead turn first; the oldest live one only when all are live.
+			let victim: number | undefined;
+			for (const key of parked.keys())
+				if (!isLiveTurn(key) && (victim === undefined || key < victim))
+					victim = key;
+			parked.delete(victim ?? Math.min(...parked.keys()));
+		}
 	}
-	return Math.max(0, OBSERVED_TURN_BUDGET_MS - current.turnSpentMs);
+	return current;
 }
 
-function chargeTurnBudget(turnIndex: number, spentMs: number): void {
-	const current = state();
-	if (current.turnIndex !== turnIndex) {
-		current.turnIndex = turnIndex;
-		current.turnSpentMs = 0;
-	}
-	current.turnSpentMs += Math.max(0, spentMs);
+function remainingTurnBudgetMs(
+	turnIndex: number,
+	isLiveTurn?: (turnIndex: number) => boolean,
+): number {
+	return Math.max(
+		0,
+		OBSERVED_TURN_BUDGET_MS - budgetFor(turnIndex, isLiveTurn).turnSpentMs,
+	);
+}
+
+function chargeTurnBudget(
+	turnIndex: number,
+	spentMs: number,
+	isLiveTurn?: (turnIndex: number) => boolean,
+): void {
+	budgetFor(turnIndex, isLiveTurn).turnSpentMs += Math.max(0, spentMs);
 }
 
 /** Test seam: force the per-turn budget to a known state. */
@@ -455,9 +522,7 @@ export function _setObservedTurnBudgetForTests(
 	turnIndex: number,
 	spentMs: number,
 ): void {
-	const current = state();
-	current.turnIndex = turnIndex;
-	current.turnSpentMs = spentMs;
+	budgetFor(turnIndex).turnSpentMs = spentMs;
 }
 
 type BoundedOutcome<T> =
@@ -710,6 +775,19 @@ export interface ArmObservationArgs {
 	cwd: string | undefined;
 	sessionGeneration: number;
 	turnIndex: number;
+	/**
+	 * #3613 G2: whether a turn key is a live session turn (the primary's, or
+	 * a live subagent's current one). Parking evicts dead turns first, so a
+	 * subagent's run cannot push out the primary's spent turn. Omitted, every
+	 * parked turn counts as dead.
+	 */
+	isLiveTurn?: (turnIndex: number) => boolean;
+	/**
+	 * #4131 (#4187 R2-3): handed every file the observation will replay, before
+	 * the tool runs. A directory target replays its entries, not the path the
+	 * input named, so the caller's pre-write check must see them.
+	 */
+	onUniverse?: (paths: readonly string[]) => void;
 	signal?: AbortSignal;
 	dbg?: (msg: string) => void;
 }
@@ -741,7 +819,7 @@ export async function armObservedMutation(
 		return { armed: false, reason: "not-eligible" };
 	if (!args.toolCallId) return { armed: false, reason: "no-tool-call-id" };
 
-	const remaining = remainingTurnBudgetMs(args.turnIndex);
+	const remaining = remainingTurnBudgetMs(args.turnIndex, args.isLiveTurn);
 	if (remaining <= 0) {
 		emitBounded(
 			"observed_mutation_budget_exhausted",
@@ -761,10 +839,14 @@ export async function armObservedMutation(
 	}
 
 	const started = Date.now();
-	const timeoutMs = Math.min(remaining, OBSERVED_CAPTURE_BUDGET_MS);
+	const timeoutMs = Math.min(
+		remaining,
+		captureBudgetOverrideMs ?? OBSERVED_CAPTURE_BUDGET_MS,
+	);
 	const outcome = await withBounds(
 		async () => {
 			const universe = await collectObservationUniverse(args.targetPath);
+			args.onUniverse?.(universe.paths);
 			const captured = await captureFileStatsForPaths(universe.paths, {
 				withHashes: true,
 				hashBudgetBytes: OBSERVED_HASH_BUDGET_BYTES,
@@ -792,7 +874,7 @@ export async function armObservedMutation(
 		// blown capture budget is attributable.
 		{ hook: "tool_call", label: "armObservedMutation" },
 	);
-	chargeTurnBudget(args.turnIndex, Date.now() - started);
+	chargeTurnBudget(args.turnIndex, Date.now() - started, args.isLiveTurn);
 
 	if (!outcome.ok) {
 		emitBounded(
@@ -918,6 +1000,8 @@ export interface SettleObservationArgs {
 export interface SettleObservationResult {
 	settled: boolean;
 	changedPaths: string[];
+	/** Entries whose stats moved or remained equal without enough hash evidence. */
+	unverifiablePaths: string[];
 	replayed: number;
 	/** Entries actually re-captured. Short of the baseline means a cut capture. */
 	scanned: number;
@@ -964,6 +1048,7 @@ export async function settleObservedMutation(
 		return {
 			settled: false,
 			changedPaths: [],
+			unverifiablePaths: [],
 			replayed: 0,
 			scanned: 0,
 			stoppedEarly: false,
@@ -977,6 +1062,7 @@ export async function settleObservedMutation(
 		return {
 			settled: false,
 			changedPaths: [],
+			unverifiablePaths: [],
 			replayed: 0,
 			scanned: 0,
 			stoppedEarly: false,
@@ -991,6 +1077,7 @@ export async function settleObservedMutation(
 		return {
 			settled: false,
 			changedPaths: [],
+			unverifiablePaths: [],
 			replayed: 0,
 			scanned: 0,
 			stoppedEarly: false,
@@ -999,6 +1086,8 @@ export async function settleObservedMutation(
 	}
 
 	const started = Date.now();
+	const settleDeadlineMs =
+		settleDeadlineOverrideMs ?? OBSERVED_SETTLE_DEADLINE_MS;
 	// The target is `paths[0]` for a file target and the whole (already capped)
 	// entry list for a directory one. The deadline can only ever cut a directory
 	// target's tail — `captureFileStatsForPaths` always runs its first entry.
@@ -1010,13 +1099,16 @@ export async function settleObservedMutation(
 			captureFileStatsForPaths(pending.paths, {
 				withHashes: true,
 				hashBudgetBytes: OBSERVED_HASH_BUDGET_BYTES,
-				deadlineMs: started + OBSERVED_SETTLE_DEADLINE_MS,
+				deadlineMs: started + settleDeadlineMs,
 				signal: args.signal,
 			}),
-		OBSERVED_SETTLE_DEADLINE_MS * 4,
+		settleDeadlineMs * 4,
 		args.signal,
 		{ hook: "tool_result_edit", label: "settleObservedMutation" },
 	);
+	// No liveness here: a settle switches only to its own arm's turn, which
+	// it takes back out of the parked set, so it grows that set (and evicts)
+	// only when that turn was already evicted.
 	chargeTurnBudget(args.turnIndex, Date.now() - started);
 	if (!capture.ok) {
 		// A wedged filesystem call. There is no diff to report and, critically,
@@ -1025,6 +1117,7 @@ export async function settleObservedMutation(
 		return {
 			settled: false,
 			changedPaths: [],
+			unverifiablePaths: [],
 			replayed: 0,
 			scanned: 0,
 			stoppedEarly: true,
@@ -1034,7 +1127,11 @@ export async function settleObservedMutation(
 	const captured = capture.value;
 
 	seedLedger(captured.snapshot);
-	const changed = diffFileStats(pending.stats, captured.snapshot).filter(
+	const diff = diffObservedStats(pending.stats, captured.snapshot);
+	const changed = diff.changed.filter(
+		(candidate) => args.isRecordable?.(candidate) !== false,
+	);
+	const unverifiablePaths = diff.unverifiable.filter(
 		(candidate) => args.isRecordable?.(candidate) !== false,
 	);
 	// Two different ways the observation can fall short of what the tool named:
@@ -1047,16 +1144,30 @@ export async function settleObservedMutation(
 		: captured.stoppedEarly
 			? "capture-cut-short"
 			: undefined;
+	if (unverifiablePaths.length > 0) {
+		// Hashless evidence is a bounded coverage gap, not a mutation. Keep it
+		// visible through the existing degradation record without replaying it.
+		noteObservedUnverifiable(args.toolName);
+		logLatency({
+			type: "phase",
+			toolName: args.toolName,
+			phase: "observed_mutation_coverage_unknown",
+			filePath: unverifiablePaths.slice(0, 5).join(","),
+			durationMs: Date.now() - started,
+			result: `unverifiable:${unverifiablePaths.length}`,
+		});
+	}
 	if (changed.length === 0) {
 		// An INCOMPLETE observation is not evidence of cleanliness — it is
 		// evidence we stopped looking. Advancing the clean latch on it would
 		// teach dm-lens to stop watching a tool it never finished watching, and
 		// with a directory wider than the cap that is every single call.
 		if (truncated) noteObservedUnverifiable(args.toolName);
-		else noteObservedClean(args.toolName);
+		else if (unverifiablePaths.length === 0) noteObservedClean(args.toolName);
 		return {
 			settled: true,
 			changedPaths: [],
+			unverifiablePaths,
 			replayed: 0,
 			scanned: captured.snapshot.size,
 			stoppedEarly: truncated,
@@ -1085,6 +1196,9 @@ export async function settleObservedMutation(
 			editRanges: editRanges && editRanges.length > 1 ? editRanges : undefined,
 			consumer: args.toolName,
 			provenance: "observed",
+			// #4187 R4-1: the armed call licensed the universe it collected, so
+			// its replay may advance exactly those paths and no other.
+			...(args.toolCallId !== undefined && { toolCallId: args.toolCallId }),
 		});
 		if (accepted) {
 			replayed += 1;
@@ -1122,11 +1236,33 @@ export async function settleObservedMutation(
 	return {
 		settled: true,
 		changedPaths: changed,
+		unverifiablePaths,
 		replayed,
 		scanned: captured.snapshot.size,
 		stoppedEarly: truncated,
 		reason: cutReason,
 	};
+}
+
+/**
+ * The observational net asks whether to look harder. An absent content hash
+ * therefore remains unverifiable even when cheap stat fields report a change.
+ * #2984: stat-only evidence must not grant ownership or replay a mutation.
+ */
+function diffObservedStats(
+	before: FileStatsSnapshot,
+	after: FileStatsSnapshot,
+): { changed: string[]; unverifiable: string[] } {
+	const changed = new Set(diffFileStats(before, after));
+	const unverifiable = new Set<string>();
+	for (const [key, stat] of after) {
+		const previous = before.get(key);
+		if (previous && (previous.hash === undefined || stat.hash === undefined)) {
+			changed.delete(key);
+			unverifiable.add(key);
+		}
+	}
+	return { changed: [...changed], unverifiable: [...unverifiable] };
 }
 
 export interface SettledSweepArgs {

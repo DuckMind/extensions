@@ -41,11 +41,13 @@ import {
 	vendoredGrammarRefusal,
 	vendoredGrammarsDir,
 } from "./grammar-source.js";
-import { resolvePackagePath } from "./package-root.js";
+import { getPackageRoot, resolvePackagePath } from "./package-root.js";
+import { resolveWebTreeSitterPackageDir } from "../scripts/lib/web-tree-sitter-dir.mjs";
 import {
 	assertInstallAllowed,
 	getProjectTrustGeneration,
 } from "./project-trust.js";
+import { escapeRegExp } from "./string-utils.js";
 import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
 import { notifyUserDegradation } from "./user-notify.js";
 
@@ -59,6 +61,14 @@ import {
 	type TreeCacheStats,
 } from "./tree-sitter-cache.js";
 import { TreeSitterNavigator } from "./tree-sitter-navigator.js";
+import {
+	isProvenSqlAlchemySessionReceiver,
+	isSafePsycopgIdentifierComposition,
+	isSqlAlchemyEntityQueryArgument,
+	isSqlAlchemyStatementArgument,
+	PYTHON_SQLALCHEMY_RECEIVER_NAMES,
+	PYTHON_SQLALCHEMY_STATEMENT_BUILDERS,
+} from "./python-provenance.js";
 import {
 	type TreeSitterQuery,
 	TreeSitterQueryLoader,
@@ -80,6 +90,27 @@ const QUERY_BATCH_MAX_LOAD_FAILURES = 3;
 // must not stall the batched query walk; the filter fails open when this cap
 // is reached so unrelated diagnostics and the current match are preserved.
 const NO_NESTED_ANCHOR_VISIT_CAP = 10_000;
+// The execute-style Python DB-API/ORM methods this rule treats as SQL sinks.
+// Hoisted so the post-filter does not rebuild the set per match.
+const PYTHON_SQL_SINK_METHODS: ReadonlySet<string> = new Set([
+	"execute",
+	"executemany",
+	"query",
+	"raw",
+]);
+
+const TYPESCRIPT_SQL_KNOWN_PACKAGES: ReadonlySet<string> = new Set([
+	"pg",
+	"mysql2",
+	"better-sqlite3",
+	"knex",
+	"@prisma/client",
+]);
+
+const TYPESCRIPT_SQL_IMPORTS = new WeakMap<
+	TreeSitterNode,
+	ReadonlySet<string>
+>();
 
 // --- Type Declarations (local, no import needed) ---
 
@@ -122,12 +153,6 @@ export interface StructuralMatch {
 	captures: Record<string, string>;
 }
 
-export interface SearchPattern {
-	pattern: string;
-	language: string;
-	metavars: string[];
-}
-
 export interface TreeSitterParserCounters {
 	parserInvocations: number;
 	parserDurationMs: number;
@@ -142,10 +167,40 @@ type ParseCacheMeasurement = TreeCacheCounters & TreeSitterParserCounters;
 /**
  * Result of a cache-safe parse. `parsed: false` means the grammar/parse was
  * unavailable — distinct from a consumer that legitimately returned null.
+ * `wasmTrap` (#3605) means a web-tree-sitter trap cost this input its parse:
+ * `retry` after the input's first trap, `charged` once it has trapped twice
+ * and is skipped until its content changes.
  */
 export type ParsedTreeOutcome<T> =
 	| { parsed: true; value: T }
-	| { parsed: false };
+	| { parsed: false; wasmTrap?: WasmTrapState };
+
+export type WasmTrapState = "retry" | "charged";
+
+/** What a trap is charged to (#3605): a file's language and content, or a
+ * query's cache key. `key` is its hash, computed on first need.
+ *
+ * `caller` names who is acting on the input: a consumer of the parsed tree,
+ * or none for the parse itself and a query compile. It is not part of the
+ * key, so every caller of one content shares one entry and one budget unit
+ * (#3678 F5, F6). It only decides which success may decay the entry (F2). */
+export interface WasmInput {
+	languageId: string;
+	source: string;
+	key?: string;
+	caller?: string;
+}
+
+/**
+ * The trap-map input a compiled query is charged to (#3605; #3678 F-C). The
+ * client's own compile paths and the symbol extractor share this key path, so
+ * one always-trapping query source is charged to itself instead of spending
+ * the process budget at every extractor init and poisoning the runtime on the
+ * fourth (#3678).
+ */
+export function wasmQueryInput(queryKey: string): WasmInput {
+	return { languageId: "query", source: queryKey };
+}
 
 const NOT_PARSED: ParsedTreeOutcome<never> = { parsed: false };
 
@@ -162,11 +217,39 @@ interface QueryBatch {
 	entries: QueryBatchEntry[];
 	/** patternIndex → index into `entries`. */
 	ownerOfPattern: number[];
+	/** The batch cache key: the rule set's identity for trap decay (#3678 F4). */
+	key: string;
+	/** Active scans keep the native query alive after cache invalidation. */
+	users: number;
+	retired: boolean;
+	disposed: boolean;
+}
+
+/**
+ * Consumer leases counted for one in-flight combined build (#4207 F9). A
+ * consumer counts here when it joins, because the batch it will scan does not
+ * exist yet; the build's publication section moves the count onto `users` in
+ * the same synchronous step that makes the batch visible.
+ */
+interface QueryBatchLease {
+	/** Consumers counted at join and not yet moved onto a batch. */
+	count: number;
+	/** The decided batch, `undefined` until the publication section runs. */
+	batch: QueryBatch | null | undefined;
+}
+
+/** One registered in-flight combined build per batch cache key. */
+interface QueryBatchBuild {
+	promise: Promise<QueryBatch | null>;
+	lease: QueryBatchLease;
 }
 
 interface GrammarDirResolutionDeps {
 	resolveAsset: (asset: string) => string | undefined;
 	resolvePackage: (specifier: string) => string;
+	/** dm-lens's own installed package root — the rung that survives pi's
+	 *  temp-dir compile (#20), and the one a hoisted install misses (#3409). */
+	packageRoot: () => string;
 	cwd: () => string;
 }
 
@@ -176,6 +259,37 @@ function createParserCounters(): TreeSitterParserCounters {
 		parserDurationMs: 0,
 		parserFailures: 0,
 	};
+}
+
+/**
+ * Where a runtime grammar fetch failed (#3409). Reported in the durable
+ * `tree-sitter.log` record and used to pick the remedy the user is given:
+ * "nowhere to write" and "cannot write there" are neither download failures
+ * nor package-manager build-script gaps, which is all the message used to name.
+ */
+type GrammarFetchFailureCause =
+	| "write-dir-unresolvable"
+	| "write-dir-unwritable"
+	| "download-failed";
+
+/**
+ * The errno that blocks writing into `dir`, or undefined when a write can be
+ * attempted (#3409). The directory itself need not exist yet — the lazy fetch
+ * creates it — so the nearest EXISTING ancestor is what gets probed.
+ */
+function grammarWriteBlockedReason(dir: string): string | undefined {
+	let probe = dir;
+	while (!fs.existsSync(probe)) {
+		const parent = path.dirname(probe);
+		if (parent === probe) return "ENOENT";
+		probe = parent;
+	}
+	try {
+		fs.accessSync(probe, fs.constants.W_OK);
+		return undefined;
+	} catch (err) {
+		return (err as { code?: string })?.code ?? "EACCES";
+	}
 }
 
 /**
@@ -193,10 +307,67 @@ function grammarFileStamp(filePath: string): string | undefined {
 	}
 }
 
-export function isTreeSitterWasmAbortError(error: unknown): boolean {
-	const message = error instanceof Error ? error.message : String(error);
-	return message.includes("Aborted") || message.includes("abort()");
+/** The loader's unresolved-import stub error (#3996); see the classifier. */
+const UNRESOLVED_IMPORT_MESSAGE = "resolved is not a function";
+
+/**
+ * V8's messages for the three traps the #3605 log shows, as a fallback for
+ * one rewrapped on a plain `Error`. The `instanceof` check below is the
+ * primary test: any other trap (`unreachable`, `divide by zero`, ...) is
+ * classified only while it is still a `WebAssembly.RuntimeError`.
+ */
+const WASM_TRAP_MESSAGES = [
+	"memory access out of bounds",
+	"table index is out of bounds",
+	"null function or function signature mismatch",
+];
+
+/**
+ * The one classification seam for a failure thrown out of web-tree-sitter
+ * (#3605). `abort`: Emscripten `abort()` — the runtime is dead. It is also a
+ * `WebAssembly.RuntimeError`, so the message is tested first. `trap`: a wasm
+ * runtime trap — the runtime lives on, but its heap may be damaged.
+ * `undefined`: not a wasm failure.
+ */
+export function classifyTreeSitterWasmError(
+	thrown: unknown,
+): "abort" | "trap" | undefined {
+	const message = thrown instanceof Error ? thrown.message : String(thrown);
+	if (message.includes("Aborted") || message.includes("abort()")) {
+		return "abort";
+	}
+	// `WebAssembly` is a runtime global the build's `lib` does not declare.
+	// SAFETY: every supported Node runtime defines `WebAssembly` with a
+	// `RuntimeError` constructor; the cast only names that global for the
+	// `instanceof` check below and reads nothing else from it.
+	const { WebAssembly } = globalThis as unknown as {
+		WebAssembly: { RuntimeError: new () => Error };
+	};
+	if (thrown instanceof WebAssembly.RuntimeError) return "trap";
+	// #3996: a grammar that imports a libc symbol web-tree-sitter's main module
+	// does not export (the tree-sitter-wasms@0.1.13 bash wasm imports
+	// `isalpha`) gets an unresolved-import stub from the emscripten loader
+	// (`resolved(...args)` in tree-sitter.js `resolveSymbol`). Calling it throws
+	// a plain TypeError out of wasm mid-call, with the same damage as a trap.
+	// Exact message and class only: a bare "is not a function" is a JS bug.
+	if (thrown instanceof TypeError && message === UNRESOLVED_IMPORT_MESSAGE) {
+		return "trap";
+	}
+	return WASM_TRAP_MESSAGES.some((trap) => message.includes(trap))
+		? "trap"
+		: undefined;
 }
+
+/**
+ * Traps a process absorbs before it is treated as an abort (#3605). A trap
+ * recycles the parsers and the tree cache. Web-tree-sitter keeps one wasm
+ * instance per process, so nothing short of a restart resets its heap; a trap
+ * that keeps recurring means that heap is damaged.
+ */
+export const WASM_TRAP_BUDGET = 3;
+
+/** Distinct scanner traps before retiring one grammar (#4010). */
+export const GRAMMAR_TRAP_LATCH_THRESHOLD = WASM_TRAP_BUDGET - 1;
 
 /**
  * Positively-identified RESOLUTION-failure codes for a dynamic `import()`:
@@ -416,6 +587,12 @@ export class TreeSitterClient {
 	private queryBatchCache = new BoundedFifoMap<string, QueryBatch | null>(
 		TreeSitterClient.QUERY_BATCH_CACHE_MAX_ENTRIES,
 	);
+	/** Concurrent callers share one native batch build per cache key. */
+	private queryBatchBuilds = new Map<string, QueryBatchBuild>();
+	/** Advances whenever a successful query input heal can invalidate a build. */
+	private queryBatchHealEpoch = 0;
+	/** Raw and batch cache keys represented by each bounded entry (#3834). */
+	private queryBatchInputs = new Map<string, Set<string>>();
 	private queryCacheCap(): number {
 		const value = Number.parseInt(
 			process.env.DM_LENS_TREE_SITTER_QUERY_CACHE_CAP ?? "",
@@ -449,13 +626,71 @@ export class TreeSitterClient {
 		for (const [, dropped] of evicted) dropped?.query?.delete?.();
 	}
 
-	private cacheQueryBatch(key: string, value: QueryBatch | null): void {
+	private cacheQueryBatch(
+		key: string,
+		value: QueryBatch | null,
+		inputKeys: Iterable<string> = [],
+	): void {
+		const replaced = this.queryBatchCache.get(key);
 		this.queryBatchCache.delete(key);
+		if (replaced) this.retireQueryBatch(replaced);
 		const evicted = this.queryBatchCache.setMaxEntries(
 			this.queryBatchCacheCap(),
 		);
 		evicted.push(...this.queryBatchCache.set(key, value));
-		for (const [, dropped] of evicted) dropped?.query?.delete?.();
+		for (const [evictedKey] of evicted)
+			this.queryBatchInputs.delete(evictedKey);
+		this.queryBatchInputs.set(key, new Set(inputKeys));
+		for (const [, dropped] of evicted) this.retireQueryBatch(dropped);
+	}
+
+	private disposeQueryBatch(batch: QueryBatch): void {
+		if (batch.disposed) return;
+		batch.disposed = true;
+		batch.query?.delete?.();
+	}
+
+	private retireQueryBatch(batch: QueryBatch | null): void {
+		if (!batch) return;
+		batch.retired = true;
+		if (batch.users === 0) {
+			this.disposeQueryBatch(batch);
+		} else {
+			incrementDegradationCount({
+				kind: "wasm-query-batch-disposal-deferred",
+				subject: "web-tree-sitter",
+				reason: "deferred batch disposal while a scan is active",
+			});
+		}
+	}
+
+	private retainQueryBatch(batch: QueryBatch): void {
+		batch.users++;
+	}
+
+	private releaseQueryBatch(batch: QueryBatch): void {
+		batch.users--;
+		if (batch.retired && batch.users === 0) this.disposeQueryBatch(batch);
+	}
+
+	/**
+	 * Move the leases counted at join onto the batch they were built for, and
+	 * mark the build decided (#4207 F9). Runs in the same synchronous section
+	 * that publishes the batch, so a batch is never visible to a heal without
+	 * its consumers' leases: the heal then defers disposal to the last release
+	 * instead of deleting the native Query under scans that are about to run it
+	 * and silently report zero findings. A later joiner reads `lease.batch` and
+	 * retains directly, because the counter is drained.
+	 */
+	private takeQueryBatchLeases(
+		lease: QueryBatchLease,
+		batch: QueryBatch | null,
+	): QueryBatch | null {
+		lease.batch = batch;
+		if (!batch) return null;
+		batch.users += lease.count;
+		lease.count = 0;
+		return batch;
 	}
 	/** Consecutive grammar-load failures per batch key — bounds load retries (#889). */
 	private queryBatchLoadFailures = new Map<string, number>();
@@ -467,6 +702,30 @@ export class TreeSitterClient {
 	private activeMeasurements = 0;
 	private onWasmAbort: (() => void) | undefined;
 	private wasmAborted = false;
+	/** Traps absorbed so far. Process-lifetime like `wasmAborted`: the heap
+	 * outlives sessions, so no session reset may re-arm it (#3605). */
+	private wasmTraps = 0;
+	/** Traps already counted, so one that passes two report sites (the
+	 * extractor's `queryMatches`, then `parseFileAndUse`) costs one unit. */
+	private reportedTraps = new WeakSet<object>();
+	/** Traps per input (#3605). An input's first trap spends budget; its second
+	 * charges the input, which is then skipped until its content changes. Only
+	 * a trap that spends budget (or escalates) adds an entry, so the map never
+	 * holds more than `WASM_TRAP_BUDGET + 1`. */
+	private trappedInputs = new Map<
+		string,
+		{ traps: number; by: string | undefined; source?: string | undefined }
+	>();
+	/** Distinct input keys that trapped (first trap) and have not healed, by
+	 * language. Process-lifetime. A key enters only on a trap, a first trap
+	 * spends budget, and the budget aborts the process after `WASM_TRAP_BUDGET + 1`
+	 * of them, so at most that many keys exist across all languages. */
+	private grammarTrapInputs = new Map<string, Set<string>>();
+	/** Grammars retired for the process after repeated scanner traps. */
+	private retiredGrammars = new Map<string, string>();
+	/** The input `parseFileAndUse` is consuming. That region is synchronous, so
+	 * a report nested in it (the extractor's `queryMatches`) is charged to it. */
+	private activeWasmInput: WasmInput | undefined;
 	private readonly grammarDirResolutionDeps: GrammarDirResolutionDeps;
 
 	constructor(
@@ -477,6 +736,7 @@ export class TreeSitterClient {
 		this.grammarDirResolutionDeps = grammarDirResolutionDeps ?? {
 			resolveAsset: (asset) => this.resolveWebTreeSitterAsset(asset),
 			resolvePackage: (specifier) => _require.resolve(specifier),
+			packageRoot: () => getPackageRoot(import.meta.url),
 			cwd: () => process.cwd(),
 		};
 		this.grammarsDir = this.findGrammarsDir();
@@ -503,18 +763,158 @@ export class TreeSitterClient {
 		if (measurement) measurement[key] += amount;
 	}
 
-	reportWasmAbort(error: unknown): boolean {
-		if (!isTreeSitterWasmAbortError(error)) return false;
+	/**
+	 * True when the wasm runtime is dead: `error` is an abort, or the trap past
+	 * {@link WASM_TRAP_BUDGET}. Either poisons the process. A trap within the
+	 * budget recycles the parsers and the tree cache, is counted, and returns
+	 * false, so each caller keeps its own non-fatal path (#3605). A trap on an
+	 * `input` that has trapped before is charged to that input instead: no
+	 * budget, no recycle.
+	 */
+	reportWasmAbort(
+		thrown: unknown,
+		input: WasmInput | undefined = this.activeWasmInput,
+	): boolean {
+		const failure = classifyTreeSitterWasmError(thrown);
+		if (!failure) return false;
+		const message = thrown instanceof Error ? thrown.message : String(thrown);
+		if (failure === "trap") {
+			if (typeof thrown === "object" && thrown !== null) {
+				if (this.reportedTraps.has(thrown)) return this.wasmAborted;
+				this.reportedTraps.add(thrown);
+			}
+			if (input) {
+				const key = this.wasmInputKey(input);
+				this.countGrammarTrapInput(input.languageId, key);
+				const entry = this.trappedInputs.get(key);
+				if (entry) {
+					entry.traps++;
+					// A second trap on one input is that input's fault, not the
+					// heap's: charge it, and spend no budget (#3605).
+					incrementDegradationCount({
+						kind: "wasm-trap",
+						subject: "web-tree-sitter",
+						reason: `input charged: ${message}`,
+					});
+					return false;
+				}
+				this.trappedInputs.set(key, {
+					traps: 1,
+					by: input.caller,
+					source: input.languageId === "query" ? input.source : undefined,
+				});
+			}
+			if (++this.wasmTraps <= WASM_TRAP_BUDGET) {
+				incrementDegradationCount({
+					kind: "wasm-trap",
+					subject: "web-tree-sitter",
+					reason: message,
+				});
+				// Dropped, not deleted: a caller may hold a parser across the await
+				// in `parseFileAndUse`. The leak is at most one parser per language
+				// per trap, and the budget caps the traps.
+				this.parsers.clear();
+				this.treeCache.clear();
+				return false;
+			}
+		}
 		if (!this.wasmAborted) {
 			this.wasmAborted = true;
 			recordDegradation({
 				kind: "wasm-abort",
 				subject: "web-tree-sitter",
-				reason: error instanceof Error ? error.message : String(error),
+				reason:
+					failure === "trap"
+						? `${WASM_TRAP_BUDGET} wasm traps absorbed, next one: ${message}`
+						: message,
 			});
 			this.onWasmAbort?.();
 		}
 		return true;
+	}
+
+	/**
+	 * Count `key` as a distinct trapping input of `languageId`'s grammar and
+	 * retire the grammar at {@link GRAMMAR_TRAP_LATCH_THRESHOLD} of them (#4010).
+	 * The first trap of an input is what counts: most surfaces parse fresh bytes
+	 * per edit, so waiting for a retry would let distinct bad files spend the
+	 * whole budget first. A repeat trap of one input adds nothing (set), and
+	 * `clearWasmInput` removes the key when the trapper's own parse succeeds.
+	 */
+	private countGrammarTrapInput(languageId: string, key: string): void {
+		const grammarFile = LANGUAGE_TO_GRAMMAR[languageId];
+		if (!grammarFile) return;
+		let inputs = this.grammarTrapInputs.get(languageId);
+		if (!inputs) this.grammarTrapInputs.set(languageId, (inputs = new Set()));
+		inputs.add(key);
+		if (inputs.size >= GRAMMAR_TRAP_LATCH_THRESHOLD) {
+			this.retiredGrammars.set(languageId, grammarFile);
+			this.recordGrammarBlocked(grammarFile);
+		}
+	}
+
+	private wasmInputKey(input: WasmInput): string {
+		input.key ??= crypto
+			.createHash("sha256")
+			.update(input.languageId)
+			.update("\0")
+			.update(input.source)
+			.digest("hex");
+		return input.key;
+	}
+
+	/** Traps charged to `input` so far; no hash while nothing has trapped. */
+	private wasmInputTraps(input: WasmInput | undefined): number {
+		if (!input || this.trappedInputs.size === 0) return 0;
+		return this.trappedInputs.get(this.wasmInputKey(input))?.traps ?? 0;
+	}
+
+	/**
+	 * Forget `input`'s trap entry after it parsed or compiled successfully
+	 * (#3678 F-A). A trap can be a one-off on an otherwise healthy input, so a
+	 * stale entry would let the next one-off trap charge the input and skip it
+	 * for the rest of the process. The hash is already computed on this path,
+	 * and the map is non-empty; the process budget still bounds trap absorption.
+	 * Only a success by the entry's first trapper decays it (#3678 F2, F4): a
+	 * healthy consumer says nothing about another consumer's trap.
+	 */
+	clearWasmInput(
+		input: WasmInput | undefined,
+		internalBatchHeal = false,
+	): void {
+		if (!input || this.trappedInputs.size === 0) return;
+		const key = this.wasmInputKey(input);
+		const entry = this.trappedInputs.get(key);
+		const source = entry?.source;
+		if (entry?.by === input.caller) {
+			this.trappedInputs.delete(key);
+			this.grammarTrapInputs.get(input.languageId)?.delete(key);
+			if (!internalBatchHeal) this.queryBatchHealEpoch++;
+			// A batch that skipped this input (or cached null after it was charged)
+			// is no longer equivalent to a clean rebuild. Invalidate it before the
+			// healed entry becomes observable (#3834).
+			for (const [batchKey, batch] of this.queryBatchCache) {
+				const inputs = this.queryBatchInputs.get(batchKey);
+				if (!source || !inputs?.has(source)) continue;
+				this.queryBatchCache.delete(batchKey);
+				this.queryBatchInputs.delete(batchKey);
+				this.retireQueryBatch(batch);
+			}
+		}
+	}
+
+	/** The not-parsed outcome for `thrown` on `input` (#3605). */
+	private notParsed(
+		thrown: unknown,
+		input: WasmInput | undefined,
+	): ParsedTreeOutcome<never> {
+		if (!input || classifyTreeSitterWasmError(thrown) !== "trap") {
+			return NOT_PARSED;
+		}
+		return {
+			parsed: false,
+			wasmTrap: this.wasmInputTraps(input) > 1 ? "charged" : "retry",
+		};
 	}
 
 	/**
@@ -619,45 +1019,44 @@ export class TreeSitterClient {
 	}
 
 	/**
-	 * Resolve a web-tree-sitter asset path using multiple strategies:
-	 * 1. Node module resolution via createRequire (handles hoisted installs — issue #20)
-	 * 2. Package-root walk from import.meta.url (handles on-the-fly TS compilation by pi)
-	 * 3. process.cwd() fallback
+	 * web-tree-sitter's installed package directory, through the one shared
+	 * ladder in `scripts/lib/web-tree-sitter-dir.mjs` (#3409). Routed through
+	 * `grammarDirResolutionDeps` so the resolver context — the thing that
+	 * differs on a compiled host — stays the injected seam (#2112/#2136).
+	 */
+	private webTreeSitterPackageDir(): string | undefined {
+		return resolveWebTreeSitterPackageDir({
+			resolve: (specifier) =>
+				this.grammarDirResolutionDeps.resolvePackage(specifier),
+			packageRoot: () => this.grammarDirResolutionDeps.packageRoot(),
+			cwd: () => this.grammarDirResolutionDeps.cwd(),
+		});
+	}
+
+	/**
+	 * Resolve a web-tree-sitter asset path:
+	 * 1. the asset's own subpath, authoritative when the package `exports` it
+	 *    (`tree-sitter.wasm` is exported; `grammars` is NOT in 0.25.10, so this
+	 *    rung is dead for the grammars dir — #3409's second symptom);
+	 * 2. the asset inside the package directory the shared ladder resolves. That
+	 *    ladder's own last two rungs are the package-root walk (#20, for pi's
+	 *    temp-dir compile) and the cwd fallback this method used to spell out.
 	 */
 	private resolveWebTreeSitterAsset(asset: string): string | undefined {
-		// Strategy 1: Node module resolution (hoisted installs, pnpm workspaces)
 		try {
-			const resolved = _require.resolve(`web-tree-sitter/${asset}`);
+			const resolved = this.grammarDirResolutionDeps.resolvePackage(
+				`web-tree-sitter/${asset}`,
+			);
 			if (fs.existsSync(resolved)) return resolved;
 		} catch {
 			/* fall through */
 		}
 
-		// Strategy 2: Walk up from this module to find package.json, then into node_modules.
-		// This is required when pi compiles TS on-the-fly to a temp directory —
-		// createRequire(import.meta.url) resolves from the temp dir and can't find
-		// web-tree-sitter, but the package root (where package.json lives) still has
-		// the correct node_modules layout.
-		try {
-			const candidate = resolvePackagePath(
-				import.meta.url,
-				"node_modules",
-				"web-tree-sitter",
-				asset,
-			);
+		const pkgDir = this.webTreeSitterPackageDir();
+		if (pkgDir) {
+			const candidate = path.join(pkgDir, asset);
 			if (fs.existsSync(candidate)) return candidate;
-		} catch {
-			/* fall through */
 		}
-
-		// Strategy 3: cwd fallback
-		const cwdCandidate = path.join(
-			process.cwd(),
-			"node_modules",
-			"web-tree-sitter",
-			asset,
-		);
-		if (fs.existsSync(cwdCandidate)) return cwdCandidate;
 
 		return undefined;
 	}
@@ -778,6 +1177,19 @@ export class TreeSitterClient {
 		this.grammarLastNotifiedDelayMs.clear();
 		this.poisonedGrammarPaths.clear();
 		this.staleReportedGrammarPaths.clear();
+		for (const grammarFile of this.retiredGrammars.values()) {
+			this.recordGrammarBlocked(grammarFile);
+		}
+	}
+
+	private recordGrammarBlocked(grammarFile: string): void {
+		recordDegradationOnce({
+			kind: "grammar-blocked",
+			subject: grammarFile,
+			reason:
+				`grammar retired after ${GRAMMAR_TRAP_LATCH_THRESHOLD} distinct WASM traps; ` +
+				"structural analysis is unavailable for this language until restart",
+		});
 	}
 
 	/**
@@ -944,23 +1356,16 @@ export class TreeSitterClient {
 	 * whether or not it exists yet — so we can create + populate it when the
 	 * postinstall download was skipped (pnpm/bun). Returns undefined if
 	 * web-tree-sitter itself can't be located.
+	 *
+	 * #3409: this used to resolve the BARE `web-tree-sitter` specifier and
+	 * nothing else, which throws MODULE_NOT_FOUND inside the `bun
+	 * build --compile` binary pi ships — so on every such host it returned
+	 * undefined and NO non-core grammar could ever be fetched. It now shares the
+	 * read path's ladder, whose first rung is a subpath that does resolve there.
 	 */
 	private grammarsWriteDir(): string | undefined {
-		try {
-			let dir = path.dirname(_require.resolve("web-tree-sitter"));
-			while (
-				path.basename(dir) !== "web-tree-sitter" &&
-				dir !== path.dirname(dir)
-			) {
-				dir = path.dirname(dir);
-			}
-			if (path.basename(dir) === "web-tree-sitter") {
-				return path.join(dir, "grammars");
-			}
-		} catch {
-			/* fall through */
-		}
-		return undefined;
+		const pkgDir = this.webTreeSitterPackageDir();
+		return pkgDir ? path.join(pkgDir, "grammars") : undefined;
 	}
 
 	/**
@@ -1033,6 +1438,7 @@ export class TreeSitterClient {
 					grammarFile,
 					`The runtime grammar fetch threw an unexpected error (${message}).`,
 					/* retryable */ true,
+					"download-failed",
 				);
 				return false;
 			}
@@ -1090,17 +1496,38 @@ export class TreeSitterClient {
 				? this.grammarsDir
 				: this.grammarsWriteDir();
 		if (!dir) {
-			// No writable grammars directory could be located (e.g. pi compiled
-			// this module to a temp dir and web-tree-sitter isn't resolvable
-			// from there yet). This is an environment condition, not a CDN
-			// verdict — #1536 review F2: it must get the same cooldown +
-			// notification treatment as a download failure, not a silent
-			// unmemoized `false` that re-does the same failing resolution
-			// sweep on every single demand.
+			// Nothing to write into: web-tree-sitter is not locatable by ANY rung
+			// of the shared ladder (this runtime's resolver, dm-lens's own package
+			// root, the working directory), so the package is missing from this
+			// install. Still an environment condition, not a CDN verdict — #1536
+			// review F2: it gets the same cooldown + notification treatment as a
+			// download failure rather than a silent unmemoized `false` that re-does
+			// the same failing resolution sweep on every demand.
+			//
+			// #3409: before the shared ladder, this arm ALSO caught every host
+			// whose runtime cannot resolve a bare specifier — where the package was
+			// present and the wasm downloadable — and told the user to approve
+			// build scripts or restore network access. Hence the cause.
 			this.recordGrammarFailure(
 				grammarFile,
-				"No writable grammars directory could be located for the runtime fetch.",
+				"No grammars directory could be resolved for the runtime fetch: the web-tree-sitter package is not locatable from this runtime, from dm-lens's own package root, or from the working directory.",
 				/* retryable */ true,
+				"write-dir-unresolvable",
+			);
+			return false;
+		}
+		// A destination that cannot be written to is not a download problem
+		// either (#3409): a root-owned `node_modules` under a global install
+		// reaches `downloadGrammarDetailed`'s catch-all, which reports no reason
+		// at all, so the user was sent to inspect their package manager and
+		// network for an EACCES.
+		const writeBlock = grammarWriteBlockedReason(dir);
+		if (writeBlock) {
+			this.recordGrammarFailure(
+				grammarFile,
+				`The grammars directory ${dir} cannot be written to (${writeBlock}), so the runtime fetch has nowhere to land.`,
+				/* retryable */ true,
+				"write-dir-unwritable",
 			);
 			return false;
 		}
@@ -1139,6 +1566,7 @@ export class TreeSitterClient {
 				reason ??
 					"The package manager skipped install scripts and the runtime download failed.",
 				retryable,
+				"download-failed",
 			);
 		}
 		return ok;
@@ -1151,11 +1579,18 @@ export class TreeSitterClient {
 	 * by the "no writable directory" and "download failed" arms of
 	 * `ensureGrammar` — both are failures of the SAME ensure attempt, just
 	 * with a different point of failure.
+	 *
+	 * `cause` is that point of failure (#3409). It picks the REMEDY the user is
+	 * told and lands in the durable record, so `~/.dm-lens` forensics can tell
+	 * "this host has nowhere to write" from "this download failed" — the two
+	 * were one string, and the one it carried named build scripts and the
+	 * network for a cause that is neither.
 	 */
 	private recordGrammarFailure(
 		grammarFile: string,
 		detail: string,
 		retryable: boolean,
+		cause?: GrammarFetchFailureCause,
 	): void {
 		const attempts = (this.grammarFailureAttempts.get(grammarFile) ?? 0) + 1;
 		this.grammarFailureAttempts.set(grammarFile, attempts);
@@ -1172,17 +1607,31 @@ export class TreeSitterClient {
 				: Date.now() + retryDelayMs,
 		);
 
-		const unavailable = retryable
-			? `tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
-				`module reports and structural rules for this language will be degraded. ` +
-				`${detail} dm-lens will retry automatically in ${Math.round((retryDelayMs as number) / 1000)}s; ` +
-				`if the problem persists, allow the package manager's build scripts ` +
-				`(pnpm approve-builds / bun trustedDependencies) or restore network access.`
-			: `tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
-				`module reports and structural rules for this language will be degraded. ` +
-				`${detail} The grammar source reports it does not exist (not a network problem), so this will not ` +
-				`resolve on retry. Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
-				`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
+		// The remedy the user is given, keyed to WHERE the attempt failed. The
+		// last two arms are the pre-existing strings, byte for byte; the first
+		// two exist because sending someone to `pnpm approve-builds` and their
+		// network for a resolution or permission fault is the #3409 complaint.
+		const remedy =
+			cause === "write-dir-unresolvable"
+				? `This is a packaging/module-resolution fault, not a download problem: reinstall dm-lens so its ` +
+					`web-tree-sitter dependency is present, or drop the wasm into dm-lens's own grammars/ directory.`
+				: cause === "write-dir-unwritable"
+					? `This is a filesystem-permission fault, not a download problem: make that directory writable ` +
+						`for the user dm-lens runs as, or reinstall dm-lens as that user.`
+					: retryable
+						? `if the problem persists, allow the package manager's build scripts ` +
+							`(pnpm approve-builds / bun trustedDependencies) or restore network access.`
+						: `Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
+							`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
+		const unavailable =
+			`tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
+			`module reports and structural rules for this language will be degraded. ` +
+			`${detail} ` +
+			(retryable
+				? `dm-lens will retry automatically in ${Math.round((retryDelayMs as number) / 1000)}s; `
+				: `The grammar source reports it does not exist (not a network problem), so this will not ` +
+					`resolve on retry. `) +
+			remedy;
 
 		logTreeSitterDiagnostic({
 			subsystem: "tree-sitter-client",
@@ -1193,6 +1642,12 @@ export class TreeSitterClient {
 				retryable,
 				retryDelayMs,
 				attempts,
+				// Omitted, not defaulted, for the arms that are neither a fetch
+				// destination nor a download verdict (a vendored grammar is never
+				// downloaded; a decode failure happened AFTER a successful one), so
+				// those records keep their pre-#3409 shape rather than carrying a
+				// cause that is not true of them.
+				...(cause ? { cause } : {}),
 			},
 		});
 		// #1536 review F1: incrementDegradationCount keeps ONE ring-buffer slot
@@ -1371,6 +1826,7 @@ export class TreeSitterClient {
 	 */
 	resetLoadStateForSession(): void {
 		this.webTreeSitterLoadFailed = false;
+		this.refreshGrammarSessionLatches();
 	}
 
 	/** Load language grammar */
@@ -1379,6 +1835,7 @@ export class TreeSitterClient {
 	): Promise<TreeSitterLanguage | null> {
 		if (this.wasmAborted) return null;
 		this.dbg(`Loading language: ${languageId}`);
+		if (this.retiredGrammars.has(languageId)) return null;
 
 		if (this.languages.has(languageId)) {
 			this.dbg(`Language ${languageId} already loaded`);
@@ -1450,8 +1907,13 @@ export class TreeSitterClient {
 			// vouched for — e.g. "Code section extends past end of the module" on
 			// a truncated-but-magic-valid download. That is evidence the file
 			// itself is bad, not the runtime, so record it and stop vouching for
-			// this exact file so the next demand can re-fetch it.
-			if (!this.reportWasmAbort(err)) {
+			// this exact file so the next demand can re-fetch it. A trap here
+			// runs in the grammar's own module code, so it is charged to the
+			// file too, not to the trap budget: one bad grammar must not
+			// poison every language (#3605).
+			if (classifyTreeSitterWasmError(err) === "abort") {
+				this.reportWasmAbort(err);
+			} else {
 				this.recordGrammarLoadFailure(grammarPath, grammarFile, err);
 			}
 			this.dbg(`Language load error: ${err}`);
@@ -1492,6 +1954,7 @@ export class TreeSitterClient {
 			languageId,
 			contentOverride,
 			(tree) => tree,
+			"parseFile",
 		);
 		return outcome.parsed ? outcome.value : null;
 	}
@@ -1501,8 +1964,15 @@ export class TreeSitterClient {
 		languageId: string,
 		contentOverride: string | undefined,
 		consume: (tree: TreeSitterTree) => T,
+		caller = "withParsedTree",
 	): Promise<ParsedTreeOutcome<T>> {
-		return this.parseFileAndUse(filePath, languageId, contentOverride, consume);
+		return this.parseFileAndUse(
+			filePath,
+			languageId,
+			contentOverride,
+			consume,
+			caller,
+		);
 	}
 
 	private async parseFileAndUse<T>(
@@ -1510,6 +1980,7 @@ export class TreeSitterClient {
 		languageId: string,
 		contentOverride: string | undefined,
 		consume: (tree: TreeSitterTree) => T,
+		caller: string,
 	): Promise<ParsedTreeOutcome<T>> {
 		this.dbg(`Parsing ${filePath} with language ${languageId}`);
 		const parser = await this.getParser(languageId);
@@ -1519,9 +1990,16 @@ export class TreeSitterClient {
 		}
 
 		let tree: TreeSitterTree;
+		let input: WasmInput | undefined;
 		try {
 			const content = contentOverride ?? fs.readFileSync(filePath, "utf-8");
 			this.dbg(`File content length: ${content.length}`);
+			// #3678 F5: the parse carries no caller; the content traps it for all.
+			input = { languageId, source: content };
+			// #3605: an input that trapped twice is not parsed again.
+			if (this.wasmInputTraps(input) > 1) {
+				return { parsed: false, wasmTrap: "charged" };
+			}
 
 			const cachedTree = this.treeCache.get(filePath, content, languageId);
 			if (cachedTree) {
@@ -1545,15 +2023,39 @@ export class TreeSitterClient {
 				this.treeCache.set(filePath, content, languageId, tree);
 			}
 		} catch (err) {
-			this.reportWasmAbort(err);
+			this.reportWasmAbort(err, input);
 			this.dbg(`Parse error: ${err}`);
-			return NOT_PARSED;
+			return this.notParsed(err, input);
 		}
+		// #3678 F-A: a clean parse heals a parse-phase entry, whoever asked.
+		this.clearWasmInput(input);
+		// The consumer shares the parse's entry and key; its identity decides
+		// only which of its own successes may decay that entry (#3678 F2, F4).
+		input = { ...input, caller };
 		try {
-			return { parsed: true, value: consume(tree) };
-		} catch (error) {
-			this.reportWasmAbort(error);
-			throw error;
+			this.activeWasmInput = input;
+			// #3678 F1: an entry a trap sets inside `consume` must survive the
+			// success path. A swallowing consumer returns normally after it
+			// reports the trap, so snapshot the count and clear only when this
+			// call did not charge the input itself.
+			const trapsBefore = this.wasmInputTraps(input);
+			const value = consume(tree);
+			if (this.wasmInputTraps(input) <= trapsBefore) {
+				// #3678 F-A: a healthy consume by the consumer that trapped drops
+				// its entry, so a later one-off trap starts from `retry`.
+				this.clearWasmInput(input);
+			}
+			return { parsed: true, value };
+		} catch (thrown) {
+			// #3605: a wasm abort or trap while querying the tree degrades this
+			// file alone, like a failed parse; any other error is a bug.
+			this.reportWasmAbort(thrown);
+			if (classifyTreeSitterWasmError(thrown)) {
+				return this.notParsed(thrown, input);
+			}
+			throw thrown;
+		} finally {
+			this.activeWasmInput = undefined;
 		}
 	}
 
@@ -1641,7 +2143,7 @@ export class TreeSitterClient {
 
 	/** Get loaded language for symbol extraction */
 	getLanguage(languageId: string): TreeSitterLanguage | null {
-		if (this.wasmAborted) return null;
+		if (this.wasmAborted || this.retiredGrammars.has(languageId)) return null;
 		return this.languages.get(languageId) || null;
 	}
 
@@ -1748,7 +2250,7 @@ export class TreeSitterClient {
 			compiled.query,
 			compiled.metavars,
 			languageId,
-			queryDef.id,
+			`${queryDef.id}\0${queryDef.query}`,
 			compiled.postFilter,
 			compiled.postFilterParams,
 			contentOverride,
@@ -1784,7 +2286,7 @@ export class TreeSitterClient {
 		}
 		const maxResults = options.maxResults ?? 50;
 
-		const batch = await this.compileQueryBatch(queryDefs, languageId);
+		const batch = await this.compileQueryBatch(queryDefs, languageId, true);
 		if (!batch) {
 			// Fallback: one walk per rule, preserving rule order.
 			const results: Array<{
@@ -1803,7 +2305,6 @@ export class TreeSitterClient {
 			}
 			return results;
 		}
-
 		const perQuery = new Map<number, StructuralMatch[]>();
 		await this.parseFileAndUse(
 			filePath,
@@ -1811,7 +2312,8 @@ export class TreeSitterClient {
 			contentOverride,
 			(tree) => {
 				try {
-					for (const match of batch.query.matches(tree.rootNode)) {
+					const rootNode = tree.rootNode;
+					for (const match of batch.query.matches(rootNode)) {
 						const owner = batch.ownerOfPattern[match.patternIndex];
 						if (owner === undefined) continue;
 						const bucket = perQuery.get(owner) ?? [];
@@ -1830,7 +2332,7 @@ export class TreeSitterClient {
 								entry.postFilter,
 								entry.postFilterParams,
 								captures,
-								tree.rootNode,
+								rootNode,
 							)
 						) {
 							continue;
@@ -1856,7 +2358,10 @@ export class TreeSitterClient {
 					this.dbg(`Batched query matching error: ${err}`);
 				}
 			},
-		);
+			// #3678 F4: the scanner and the dispatch runner run different rule
+			// sets under this one call site.
+			`runQueriesOnFile\0${batch.key}`,
+		).finally(() => this.releaseQueryBatch(batch));
 
 		const results: Array<{
 			queryDef: TreeSitterQuery;
@@ -1877,6 +2382,54 @@ export class TreeSitterClient {
 	private async compileQueryBatch(
 		queryDefs: TreeSitterQuery[],
 		languageId: string,
+		retain = false,
+	): Promise<QueryBatch | null> {
+		const identity = crypto
+			.createHash("sha256")
+			.update(JSON.stringify(queryDefs))
+			.digest("hex");
+		const cacheKey = this.getQueryCacheKey(`batch:${identity}`, languageId);
+		const cached = this.queryBatchCache.get(cacheKey);
+		if (cached !== undefined) {
+			this.queryBatchCache.delete(cacheKey);
+			this.queryBatchCache.set(cacheKey, cached);
+			if (retain && cached) this.retainQueryBatch(cached);
+			return cached;
+		}
+		const inFlight = this.queryBatchBuilds.get(cacheKey);
+		if (inFlight) {
+			// Lease rule (#4207 F9): a waiter counts its lease when it joins, not
+			// when the shared build resolves — a heal that lands between the
+			// publication and a late retain would otherwise dispose the native
+			// Query under every coalesced scan. A build that has already decided
+			// drained its counter, so the lease goes onto the batch directly.
+			if (retain) {
+				const decided = inFlight.lease.batch;
+				if (decided === undefined) inFlight.lease.count++;
+				else if (decided) this.retainQueryBatch(decided);
+			}
+			return inFlight.promise;
+		}
+
+		const lease: QueryBatchLease = { count: retain ? 1 : 0, batch: undefined };
+		const promise = this.compileQueryBatchOnce(queryDefs, languageId, lease);
+		const build: QueryBatchBuild = { promise, lease };
+		this.queryBatchBuilds.set(cacheKey, build);
+		try {
+			// The owner's lease is already counted in `lease`; the publication
+			// section moves it onto the batch, so no retain happens here.
+			return await promise;
+		} finally {
+			if (this.queryBatchBuilds.get(cacheKey) === build) {
+				this.queryBatchBuilds.delete(cacheKey);
+			}
+		}
+	}
+
+	private async compileQueryBatchOnce(
+		queryDefs: TreeSitterQuery[],
+		languageId: string,
+		lease: QueryBatchLease,
 	): Promise<QueryBatch | null> {
 		// Key on rule CONTENT, not just ids: the batch stores each queryDef (its
 		// message reaches diagnostics) and the compiled patterns. Rule ids are
@@ -1889,12 +2442,26 @@ export class TreeSitterClient {
 			.update(JSON.stringify(queryDefs))
 			.digest("hex");
 		const cacheKey = this.getQueryCacheKey(`batch:${identity}`, languageId);
+		const inputKeys = [
+			cacheKey,
+			...queryDefs.map((queryDef) =>
+				this.getQueryCacheKey(
+					`raw:${queryDef.id}:${queryDef.query}`,
+					languageId,
+				),
+			),
+		];
 		const cached = this.queryBatchCache.get(cacheKey);
 		if (cached !== undefined) {
 			this.queryBatchCache.delete(cacheKey);
 			this.queryBatchCache.set(cacheKey, cached);
-			return cached;
+			// Defensive: the caller checked this key in the same synchronous
+			// section, so nothing can have published in between. Settled anyway,
+			// because a counted lease that no batch receives would be released
+			// against another consumer's count (#4207 F9).
+			return this.takeQueryBatchLeases(lease, cached);
 		}
+		const healEpoch = this.queryBatchHealEpoch;
 
 		// A loadLanguage() failure is transient (offline lazy grammar fetch,
 		// transient mid-scan load error) — do NOT cache null for it, or every
@@ -1909,15 +2476,26 @@ export class TreeSitterClient {
 					`Batch: grammar for ${languageId} failed to load ${failures} times — caching miss`,
 				);
 				this.queryBatchLoadFailures.delete(cacheKey);
-				this.cacheQueryBatch(cacheKey, null);
+				this.cacheQueryBatch(cacheKey, null, inputKeys);
 			} else {
 				this.queryBatchLoadFailures.set(cacheKey, failures);
 			}
-			return null;
+			return this.takeQueryBatchLeases(lease, null);
 		}
 		this.queryBatchLoadFailures.delete(cacheKey);
 
+		// #3707: a compile that trapped this build makes the result degraded (a
+		// rule skipped, or the batch nulled). A transient trap must not stay
+		// cached for the process, so such a build is not cached below.
+		let trapped = false;
+		// One entry per query source (#3605): the combined compile is charged to
+		// the batch key, each probe to the rule's raw-query key, which
+		// `compileRawQuery` shares. A charged key is never compiled again, so
+		// its cached result is permanent either way.
+		const batchInput = wasmQueryInput(cacheKey);
+
 		const build = async (): Promise<QueryBatch | null> => {
+			if (this.wasmInputTraps(batchInput) > 1) return null;
 			const Query = (await loadWebTreeSitter()).Query;
 
 			const entries: QueryBatchEntry[] = [];
@@ -1925,13 +2503,25 @@ export class TreeSitterClient {
 			const ownerOfPattern: number[] = [];
 			for (const queryDef of queryDefs) {
 				let patternCount: number;
+				const probeInput = wasmQueryInput(
+					this.getQueryCacheKey(
+						`raw:${queryDef.id}:${queryDef.query}`,
+						languageId,
+					),
+				);
+				if (this.wasmInputTraps(probeInput) > 1) {
+					this.dbg(`Batch: skipping ${queryDef.id}, its compile trapped twice`);
+					continue;
+				}
 				try {
 					// biome-ignore lint/suspicious/noExplicitAny: Language type compatibility
 					const probe = new Query(language as any, queryDef.query);
 					patternCount = probe.patternCount();
 					probe.delete?.();
+					this.clearWasmInput(probeInput, true);
 				} catch (err) {
-					if (this.reportWasmAbort(err)) return null;
+					if (this.reportWasmAbort(err, probeInput)) return null;
+					if (classifyTreeSitterWasmError(err) === "trap") trapped = true;
 					// A rule that can't compile against THIS grammar is simply not
 					// applicable here (e.g. a `type_annotation` pattern on javascript).
 					this.dbg(`Batch: skipping ${queryDef.id} for ${languageId}: ${err}`);
@@ -1959,16 +2549,40 @@ export class TreeSitterClient {
 					);
 					return null;
 				}
-				return { query, entries, ownerOfPattern };
+				this.clearWasmInput(batchInput, true);
+				return {
+					query,
+					entries,
+					ownerOfPattern,
+					key: cacheKey,
+					users: 0,
+					retired: false,
+					disposed: false,
+				};
 			} catch (err) {
-				if (this.reportWasmAbort(err)) return null;
+				if (this.reportWasmAbort(err, batchInput)) return null;
+				if (classifyTreeSitterWasmError(err) === "trap") trapped = true;
 				this.dbg(`Batch compile failed for ${languageId}: ${err}`);
 				return null;
 			}
 		};
 
 		const batch = await build();
-		this.cacheQueryBatch(cacheKey, batch);
+		const published = !trapped && this.queryBatchHealEpoch === healEpoch;
+		// Lease rule (#4207 F9): the consumers counted at join take their leases
+		// before the batch becomes visible, in the same synchronous section that
+		// publishes it.
+		this.takeQueryBatchLeases(lease, batch);
+		if (published) {
+			this.cacheQueryBatch(cacheKey, batch, inputKeys);
+		} else {
+			// Disposal rule (#4207 F10): a batch this build does not publish is
+			// unreachable through the cache, so retire it here and let the last
+			// consumer's release free the native Query. Without this, every
+			// epoch-skipped or trapped build leaks one Query for the process
+			// lifetime, and nothing the process reclaims bounds the count.
+			this.retireQueryBatch(batch);
+		}
 		return batch;
 	}
 
@@ -2121,6 +2735,10 @@ export class TreeSitterClient {
 			return cached;
 		}
 
+		// #3605: a query whose compile trapped twice is not compiled again.
+		const input = wasmQueryInput(cacheKey);
+		if (this.wasmInputTraps(input) > 1) return null;
+
 		const language = await this.loadLanguage(languageId);
 		if (!language) {
 			this.dbg(`Could not load language ${languageId}`);
@@ -2143,11 +2761,13 @@ export class TreeSitterClient {
 			this.dbg(`Query compiled with ${query.patternCount()} patterns`);
 
 			const result = { query, metavars, postFilter, postFilterParams };
+			// #3678 F-A: a successful compile drops this query source's entry.
+			this.clearWasmInput(input);
 			// Cache the compiled query
 			this.cacheQuery(cacheKey, result);
 			return result;
 		} catch (err) {
-			this.reportWasmAbort(err);
+			this.reportWasmAbort(err, input);
 			this.dbg(`Query compilation failed: ${err}`);
 			return null;
 		}
@@ -2179,6 +2799,10 @@ export class TreeSitterClient {
 			return cached;
 		}
 
+		// #3605: a query whose compile trapped twice is not compiled again.
+		const input = wasmQueryInput(cacheKey);
+		if (this.wasmInputTraps(input) > 1) return null;
+
 		const language = await this.loadLanguage(languageId);
 		if (!language) return null;
 
@@ -2188,10 +2812,12 @@ export class TreeSitterClient {
 			// biome-ignore lint/suspicious/noExplicitAny: Language type compatibility
 			const query = new Query(language as any, queryStr);
 			const result = { query, metavars, postFilter, postFilterParams };
+			// #3678 F-A: a successful compile drops this query source's entry.
+			this.clearWasmInput(input);
 			this.cacheQuery(cacheKey, result);
 			return result;
 		} catch (err) {
-			this.reportWasmAbort(err);
+			this.reportWasmAbort(err, input);
 			this.dbg(`Raw query compilation failed (${queryId}): ${err}`);
 			this.reportQueryCompileFailure(queryId, languageId, err);
 			return null;
@@ -2291,14 +2917,16 @@ export class TreeSitterClient {
 		return false;
 	}
 
+	/**
+	 * SQLAlchemy sessions are conventionally bound to one of a handful of
+	 * receiver names. Structural provenance (`python-provenance.ts`) proves the
+	 * annotated case; this name check keeps the far more common unannotated
+	 * `session.execute(stmt)` quiet, as it has been since the exemption was
+	 * added. Removing it regresses every codebase that never annotates.
+	 */
 	private isLikelySqlAlchemyReceiver(text: string): boolean {
 		const tail = text.split(".").pop() ?? text;
-		return new Set([
-			"session",
-			"db_session",
-			"async_session",
-			"sync_session",
-		]).has(tail.toLowerCase());
+		return PYTHON_SQLALCHEMY_RECEIVER_NAMES.has(tail.toLowerCase());
 	}
 
 	/**
@@ -2901,13 +3529,18 @@ export class TreeSitterClient {
 		return object.text;
 	}
 
+	/**
+	 * `session.execute(select(...))` and friends pass a statement OBJECT, not a
+	 * SQL string: parameterized by construction, and far too noisy as blockers.
+	 */
 	private isSafeSqlAlchemyExpressionCall(node: TreeSitterNode): boolean {
 		if (node.type !== "call") return false;
 		const callee = node.children?.[0]?.text ?? "";
 		const expression = node.text;
-		return ["select", "insert", "update", "delete"].some(
-			(name) => callee === name || expression.startsWith(`${name}(`),
-		);
+		for (const name of PYTHON_SQLALCHEMY_STATEMENT_BUILDERS) {
+			if (callee === name || expression.startsWith(`${name}(`)) return true;
+		}
+		return false;
 	}
 
 	/**
@@ -2972,16 +3605,6 @@ export class TreeSitterClient {
 				break; // first __slots__ wins
 			}
 			return slots;
-		}
-
-		/**
-		 * Escape a string for safe interpolation into a `RegExp` source —
-		 * needed anywhere an identifier's raw text is combined with regex
-		 * metacharacters like `\b` word boundaries (see
-		 * "not_closed_or_try_with_resources" below; #1089 P2).
-		 */
-		function escapeRegExp(s: string): string {
-			return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		}
 
 		switch (postFilter) {
@@ -3913,6 +4536,123 @@ export class TreeSitterClient {
 					captures.MOD?.text === "child_process" &&
 					/^(exec|execSync)$/.test(captures.FN?.text ?? "")
 				);
+			case "ts_sql_injection_sink": {
+				const template = captures.TEMPLATE?.text ?? "";
+				// Inspect only the template's raw prefix. Leading SQL comments are
+				// ignored; comments and unrelated strings elsewhere cannot satisfy it.
+				const rawPrefix = template
+					.replace(/^`/, "")
+					.replace(/`$/, "")
+					.replace(/^(?:\s|\/\*[\s\S]*?\*\/|--[^\n]*(?:\n|$))*/, "");
+				if (
+					/^(?:SELECT[\s\S]*(?:\bFROM\b|\$\{)|INSERT\s+INTO\b|UPDATE\s+[\s\S]*\bSET\b|DELETE\s+FROM\b|CREATE\s+(?:OR\s+REPLACE\s+|TEMP(?:ORARY)?\s+|UNIQUE\s+|MATERIALIZED\s+)*(?:TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|PROCEDURE|SEQUENCE|TYPE|EXTENSION)\b|DROP\s+(?:OR\s+REPLACE\s+|TEMP(?:ORARY)?\s+|UNIQUE\s+|MATERIALIZED\s+)*(?:TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|PROCEDURE|SEQUENCE|TYPE|EXTENSION)\b|ALTER\s+(?:OR\s+REPLACE\s+|TEMP(?:ORARY)?\s+|UNIQUE\s+|MATERIALIZED\s+)*(?:TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|PROCEDURE|SEQUENCE|TYPE|EXTENSION)\b|GRANT\b|REVOKE\b|WITH[\s\S]*\bSELECT\b|MERGE\s+INTO\b|TRUNCATE\s+TABLE\b|REPLACE\s+INTO\b)/i.test(
+						rawPrefix,
+					)
+				)
+					return true;
+
+				if (!rootNode || !captures.OBJ) return false;
+				let imported = TYPESCRIPT_SQL_IMPORTS.get(rootNode);
+				if (!imported) {
+					const names = new Set<string>();
+					const stack = [rootNode];
+					while (stack.length > 0) {
+						const node = stack.pop();
+						if (!node) continue;
+						if (node.type === "import_statement") {
+							const source = node.childForFieldName?.("source")?.text ?? "";
+							const packageName = source.replace(/^['"]|['"]$/g, "");
+							const isKnown = [...TYPESCRIPT_SQL_KNOWN_PACKAGES].some(
+								(pkg) =>
+									packageName === pkg || packageName.startsWith(`${pkg}/`),
+							);
+							if (isKnown) {
+								const importStack = [node];
+								while (importStack.length > 0) {
+									const importNode = importStack.pop();
+									if (!importNode) continue;
+									if (
+										importNode.type === "identifier" ||
+										importNode.type === "import_specifier"
+									) {
+										names.add(importNode.text);
+									}
+									importStack.push(...importNode.children);
+								}
+							}
+						}
+						stack.push(...node.children);
+					}
+					const declarations = new Map<string, TreeSitterNode>();
+					const declarationStack = [rootNode];
+					while (declarationStack.length > 0) {
+						const node = declarationStack.pop();
+						if (!node) continue;
+						if (node.type === "variable_declarator") {
+							const name = node.childForFieldName?.("name")?.text;
+							const value = node.childForFieldName?.("value");
+							if (name && value) declarations.set(name, value);
+						}
+						declarationStack.push(...node.children);
+					}
+					const resolvesKnownValue = (
+						node: TreeSitterNode,
+						seen = new Set<string>(),
+					): boolean => {
+						if (node.type === "identifier") {
+							if (names.has(node.text)) return true;
+							if (seen.has(node.text)) return false;
+							const value = declarations.get(node.text);
+							if (!value) return false;
+							seen.add(node.text);
+							return resolvesKnownValue(value, seen);
+						}
+						if (node.type === "await_expression") {
+							const value = node.children.find((child) => child.isNamed);
+							return value ? resolvesKnownValue(value, seen) : false;
+						}
+						if (node.type === "new_expression") {
+							const ctor = node.childForFieldName?.("constructor");
+							return ctor ? resolvesKnownValue(ctor, seen) : false;
+						}
+						if (node.type === "call_expression") {
+							const fn = node.childForFieldName?.("function");
+							return fn ? resolvesKnownValue(fn, seen) : false;
+						}
+						return false;
+					};
+					let changed = true;
+					while (changed) {
+						changed = false;
+						for (const [name, value] of declarations) {
+							if (!names.has(name) && resolvesKnownValue(value)) {
+								names.add(name);
+								changed = true;
+							}
+						}
+					}
+					imported = names;
+					TYPESCRIPT_SQL_IMPORTS.set(rootNode, imported);
+				}
+
+				const resolvesToKnownClient = (node: TreeSitterNode): boolean => {
+					if (node.type === "identifier") return imported.has(node.text);
+					if (node.type === "await_expression") {
+						const value = node.children.find((child) => child.isNamed);
+						return value ? resolvesToKnownClient(value) : false;
+					}
+					if (node.type === "new_expression") {
+						const ctor = node.childForFieldName?.("constructor");
+						return ctor ? resolvesToKnownClient(ctor) : false;
+					}
+					if (node.type === "call_expression") {
+						const fn = node.childForFieldName?.("function");
+						return fn ? resolvesToKnownClient(fn) : false;
+					}
+					return false;
+				};
+				return resolvesToKnownClient(captures.OBJ);
+			}
 			case "ts_ssrf_sink": {
 				const fn = captures.FN?.text ?? "";
 				const obj = captures.OBJ?.text ?? "";
@@ -4097,23 +4837,48 @@ export class TreeSitterClient {
 				);
 			case "py_sql_injection_sink": {
 				const fn = captures.FN?.text ?? "";
-				if (!new Set(["execute", "executemany", "query", "raw"]).has(fn)) {
-					return false;
-				}
+				if (!PYTHON_SQL_SINK_METHODS.has(fn)) return false;
 
 				const sqlNode = captures.SQL;
-				const receiver = captures.OBJ?.text ?? "";
+				const receiver = captures.OBJ;
 
-				// SQLAlchemy ORM sessions execute expression objects, not raw SQL
-				// strings. `session.execute(stmt)` and `session.execute(select(...))`
-				// are parameterized by construction and were too noisy as blockers.
-				if (fn === "execute" && this.isLikelySqlAlchemyReceiver(receiver)) {
+				// Pre-existing exemptions — kept verbatim so no current user
+				// regresses (#2577 review): an unannotated session receiver, and a
+				// statement-builder call in argument position.
+				if (
+					fn === "execute" &&
+					this.isLikelySqlAlchemyReceiver(receiver?.text ?? "")
+				) {
 					return false;
 				}
 				if (sqlNode && this.isSafeSqlAlchemyExpressionCall(sqlNode)) {
 					return false;
 				}
 
+				// #2576: a receiver PROVEN to be a sqlalchemy Session/AsyncSession.
+				// `Session.query` takes entity classes and `Session.execute` a
+				// statement object (a builder call, or a name bound to one —
+				// `stmt = select(User)`, which the check above cannot see). Neither
+				// suppression may swallow composed SQL text (#2577 review F1/F2).
+				if (isProvenSqlAlchemySessionReceiver(receiver, rootNode)) {
+					if (
+						fn === "query" &&
+						isSqlAlchemyEntityQueryArgument(sqlNode, rootNode)
+					) {
+						return false;
+					}
+					if (
+						fn === "execute" &&
+						isSqlAlchemyStatementArgument(sqlNode, rootNode)
+					) {
+						return false;
+					}
+				}
+
+				// #2576: psycopg `sql.SQL("...").format(sql.Identifier(...))`.
+				if (isSafePsycopgIdentifierComposition(sqlNode, rootNode)) {
+					return false;
+				}
 				return true;
 			}
 			case "go_sql_injection_sink":
@@ -4433,7 +5198,7 @@ export class TreeSitterClient {
 		query: any,
 		metavars: string[],
 		languageId: string,
-		_originalPattern?: string,
+		queryKey: string,
 		postFilter?: string,
 		// biome-ignore lint/suspicious/noExplicitAny: Post filter params
 		postFilterParams?: any,
@@ -4447,7 +5212,8 @@ export class TreeSitterClient {
 			contentOverride,
 			(tree) => {
 				try {
-					const queryMatches = query.matches(tree.rootNode);
+					const rootNode = tree.rootNode;
+					const queryMatches = query.matches(rootNode);
 
 					for (const match of queryMatches) {
 						const captures: Record<string, TreeSitterNode> = {};
@@ -4471,7 +5237,7 @@ export class TreeSitterClient {
 								postFilter,
 								postFilterParams,
 								captures,
-								tree.rootNode,
+								rootNode,
 							)
 						) {
 							continue;
@@ -4504,6 +5270,8 @@ export class TreeSitterClient {
 					this.dbg(`Query matching error: ${err}`);
 				}
 			},
+			// #3678 F4: every rule and pattern searched here is its own consumer.
+			`runQueryOnFile\0${queryKey}`,
 		);
 
 		return matches;
@@ -4571,63 +5339,3 @@ export class TreeSitterClient {
 }
 
 // --- Simplified Pattern Search (regex fallback) ---
-
-/**
- * Fallback structural search using regex when tree-sitter unavailable
- * Less accurate but works without WASM dependencies
- */
-export function regexStructuralSearch(
-	pattern: string,
-	files: string[],
-	options: { maxResults?: number } = {},
-): StructuralMatch[] {
-	const matches: StructuralMatch[] = [];
-	const maxResults = options.maxResults ?? 50;
-
-	// Extract pattern structure for regex
-	// "console.log($MSG)" -> /console\.log\(([^)]+)\)/
-	const regexPattern = pattern
-		.replace(/\\/g, "\\\\")
-		.replace(/\./g, "\\.")
-		.replace(/\$\$\$[A-Z_][A-Z0-9_]*/g, "(.*?)") // variadic - non-greedy
-		.replace(/\$[A-Z_][A-Z0-9_]*/g, "([^,)]+)"); // single - capture group
-
-	try {
-		const regex = new RegExp(regexPattern, "g");
-
-		for (const file of files) {
-			if (matches.length >= maxResults) break;
-
-			try {
-				const content = fs.readFileSync(file, "utf-8");
-				const lines = content.split("\n");
-
-				for (let i = 0; i < lines.length; i++) {
-					regex.lastIndex = 0;
-					const match = regex.exec(lines[i]);
-					if (match) {
-						const captures: Record<string, string> = {};
-						// Extract captures
-						for (let j = 1; j < match.length; j++) {
-							captures[`$${j}`] = match[j];
-						}
-
-						matches.push({
-							file,
-							line: i + 1,
-							column: match.index + 1,
-							matchedText: match[0],
-							captures,
-						});
-
-						if (matches.length >= maxResults) break;
-					}
-				}
-			} catch {}
-		}
-	} catch {
-		// Invalid regex
-	}
-
-	return matches;
-}

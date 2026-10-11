@@ -8,6 +8,17 @@ import { test } from "node:test";
 
 const extractModuleUrl = new URL("../github-extract.ts", import.meta.url).href;
 
+const heldCloneSource = `
+	const { existsSync } = await import("node:fs");
+	const { writeFile } = await import("node:fs/promises");
+	const { dirname } = await import("node:path");
+	const { extractGitHub } = await import(${JSON.stringify(extractModuleUrl)});
+	const result = await extractGitHub("https://github.com/owner/repo", undefined, true);
+	const localPath = result?.content.match(/^Repository cloned to: (.+)$/m)?.[1] ?? null;
+	await writeFile(process.env.RUNTIME_READY_FILE, JSON.stringify({ runtimePath: localPath ? dirname(localPath) : null }));
+	while (!existsSync(process.env.RUNTIME_RELEASE_FILE)) await new Promise((resolve) => setTimeout(resolve, 10));
+`;
+
 async function writeFakeExecutable(binDir, name, source) {
 	const executable = join(binDir, name);
 	await writeFile(executable, `#!/usr/bin/env node\n${source}\n`, { mode: 0o755 });
@@ -214,6 +225,48 @@ test("clearCloneCache removes only its runtime directory", { skip: process.platf
 	assert.equal(result.existsAfterClear, false);
 	assert.equal(result.secondExistsAfterClear, false);
 	assert.equal(await readFile(sibling, "utf8"), "preserve");
+});
+
+test("releaseClonesUnusedSince removes only clones no fetch returned since then", { skip: process.platform === "win32" }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "dm-web-access-github-release-"));
+	const agentDir = join(root, "agent-dir");
+	const binDir = join(root, "bin");
+	await mkdir(agentDir, { recursive: true });
+	await mkdir(binDir, { recursive: true });
+	await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ githubClone: { clonePath: join(root, "repos") } }), "utf8");
+	await writeFakeExecutable(binDir, "gh", "process.exit(1);");
+	await writeFakeExecutable(binDir, "git", `
+		const { mkdirSync, writeFileSync } = require("node:fs");
+		const { join } = require("node:path");
+		const destination = process.argv.at(-1);
+		mkdirSync(destination, { recursive: true });
+		writeFileSync(join(destination, "README.md"), "fixture");
+	`);
+
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+			const { existsSync } = await import("node:fs");
+			const { clearCloneCache, extractGitHub, releaseClonesUnusedSince } = await import(${JSON.stringify(extractModuleUrl)});
+			const pathOf = (result) => result?.content.match(/^Repository cloned to: (.+)$/m)?.[1] ?? null;
+			const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+			const old = pathOf(await extractGitHub("https://github.com/owner/old", undefined, true));
+			const reused = pathOf(await extractGitHub("https://github.com/owner/reused", undefined, true));
+			await sleep(5);
+			const since = Date.now();
+			await sleep(5);
+			// A fetch after the cut-off keeps its clone, even though the clone itself is older.
+			await extractGitHub("https://github.com/owner/reused", undefined, true);
+			releaseClonesUnusedSince(since);
+			const result = { oldExists: existsSync(old), reusedExists: existsSync(reused) };
+			clearCloneCache();
+			console.log(JSON.stringify(result));
+		`,
+		encoding: "utf8",
+		env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH || ""}`, DM_CODING_AGENT_DIR: agentDir },
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout), { oldExists: false, reusedExists: true });
 });
 
 test("clone cleanup unlinks a direct-child symlink without deleting its target", { skip: process.platform === "win32" }, async () => {
@@ -429,79 +482,6 @@ test("runtime cache reuse and cleanup stay isolated across processes", { skip: p
 	}
 });
 
-test("clone runtime initialization removes a dead runtime after unrelated entries", { skip: process.platform === "win32" }, async () => {
-	const root = await mkdtemp(join(tmpdir(), "dm-web-access-github-runtime-stale-"));
-	const agentDir = join(root, "agent-dir");
-	const binDir = join(root, "bin");
-	const clonePath = join(root, "repos");
-	const staleReady = join(root, "stale-ready.json");
-	const staleRelease = join(root, "stale-release");
-	const currentReady = join(root, "current-ready.json");
-	const currentRelease = join(root, "current-release");
-	await mkdir(agentDir, { recursive: true });
-	await mkdir(binDir, { recursive: true });
-	await mkdir(clonePath, { recursive: true });
-	for (let i = 0; i < 1024; i++) {
-		await writeFile(join(clonePath, `unrelated-${String(i).padStart(4, "0")}`), "preserve", "utf8");
-	}
-	await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ githubClone: { clonePath } }), "utf8");
-	await writeControlledGh(binDir);
-
-	const commonEnv = {
-		...process.env,
-		PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
-		DM_CODING_AGENT_DIR: agentDir,
-	};
-	let stale;
-	let current;
-	try {
-		stale = spawnModule(`
-			const { existsSync } = await import("node:fs");
-			const { writeFile } = await import("node:fs/promises");
-			const { dirname } = await import("node:path");
-			const { extractGitHub } = await import(${JSON.stringify(extractModuleUrl)});
-			const result = await extractGitHub("https://github.com/owner/repo", undefined, true);
-			const localPath = result?.content.match(/^Repository cloned to: (.+)$/m)?.[1] ?? null;
-			await writeFile(process.env.RUNTIME_READY_FILE, JSON.stringify({ runtimePath: localPath ? dirname(localPath) : null }));
-			while (!existsSync(process.env.RUNTIME_RELEASE_FILE)) await new Promise((resolve) => setTimeout(resolve, 10));
-		`, {
-			...commonEnv,
-			RUNTIME_READY_FILE: staleReady,
-			RUNTIME_RELEASE_FILE: staleRelease,
-		});
-		const staleState = await readJsonWhenReady(staleReady);
-		assert.ok(staleState.runtimePath);
-		assert.equal(existsSync(staleState.runtimePath), true);
-
-		stale.child.kill("SIGKILL");
-		await stale.completed;
-
-		current = spawnModule(`
-			const { existsSync } = await import("node:fs");
-			const { writeFile } = await import("node:fs/promises");
-			const { dirname } = await import("node:path");
-			const { extractGitHub } = await import(${JSON.stringify(extractModuleUrl)});
-			const result = await extractGitHub("https://github.com/owner/repo", undefined, true);
-			const localPath = result?.content.match(/^Repository cloned to: (.+)$/m)?.[1] ?? null;
-			await writeFile(process.env.RUNTIME_READY_FILE, JSON.stringify({ runtimePath: localPath ? dirname(localPath) : null }));
-			while (!existsSync(process.env.RUNTIME_RELEASE_FILE)) await new Promise((resolve) => setTimeout(resolve, 10));
-		`, {
-			...commonEnv,
-			RUNTIME_READY_FILE: currentReady,
-			RUNTIME_RELEASE_FILE: currentRelease,
-		});
-		const currentState = await readJsonWhenReady(currentReady);
-		assert.ok(currentState.runtimePath);
-		assert.notEqual(currentState.runtimePath, staleState.runtimePath);
-		await waitForCondition(() => !existsSync(staleState.runtimePath), "dead runtime cleanup");
-		assert.equal(existsSync(currentState.runtimePath), true);
-	} finally {
-		await Promise.allSettled([writeFile(staleRelease, "release"), writeFile(currentRelease, "release")]);
-		if (stale?.child.exitCode === null) stale.child.kill("SIGKILL");
-		if (current?.child.exitCode === null) current.child.kill("SIGKILL");
-	}
-});
-
 test("clone runtime creation proceeds while background cleanup is gated", { skip: process.platform === "win32" }, async () => {
 	const root = await mkdtemp(join(tmpdir(), "dm-web-access-github-runtime-background-"));
 	const agentDir = join(root, "agent-dir");
@@ -568,7 +548,7 @@ test("clone runtime creation proceeds while background cleanup is gated", { skip
 	}
 });
 
-test("background cleanup eventually removes multiple late dead runtimes", { skip: process.platform === "win32" }, async () => {
+test("background cleanup removes dead runtimes after unrelated files and ownerless directories", { skip: process.platform === "win32" }, async () => {
 	const root = await mkdtemp(join(tmpdir(), "dm-web-access-github-runtime-background-late-"));
 	const agentDir = join(root, "agent-dir");
 	const binDir = join(root, "bin");
@@ -582,6 +562,9 @@ test("background cleanup eventually removes multiple late dead runtimes", { skip
 	await mkdir(clonePath, { recursive: true });
 	for (let i = 0; i < 512; i++) {
 		await mkdir(join(clonePath, `runtime-preserved-${String(i).padStart(3, "0")}`), { recursive: true });
+	}
+	for (let i = 0; i < 1024; i++) {
+		await writeFile(join(clonePath, `unrelated-${String(i).padStart(4, "0")}`), "preserve", "utf8");
 	}
 	await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ githubClone: { clonePath } }), "utf8");
 	await writeControlledGh(binDir);
@@ -621,26 +604,21 @@ test("background cleanup eventually removes multiple late dead runtimes", { skip
 		});
 		const staleState = await readJsonWhenReady(staleReady);
 		assert.ok(staleState.stalePaths?.length === 3);
+		assert.ok(staleState.runtimePath);
+		assert.equal(existsSync(staleState.runtimePath), true);
 		stale.child.kill("SIGKILL");
 		await stale.completed;
 
-		current = spawnModule(`
-			const { existsSync } = await import("node:fs");
-			const { writeFile } = await import("node:fs/promises");
-			const { dirname } = await import("node:path");
-			const { extractGitHub } = await import(${JSON.stringify(extractModuleUrl)});
-			const result = await extractGitHub("https://github.com/owner/repo", undefined, true);
-			const localPath = result?.content.match(/^Repository cloned to: (.+)$/m)?.[1] ?? null;
-			await writeFile(process.env.RUNTIME_READY_FILE, JSON.stringify({ runtimePath: localPath ? dirname(localPath) : null }));
-			while (!existsSync(process.env.RUNTIME_RELEASE_FILE)) await new Promise((resolve) => setTimeout(resolve, 10));
-		`, {
+		current = spawnModule(heldCloneSource, {
 			...commonEnv,
 			RUNTIME_READY_FILE: currentReady,
 			RUNTIME_RELEASE_FILE: currentRelease,
 		});
 		const currentState = await readJsonWhenReady(currentReady);
 		assert.ok(currentState.runtimePath);
-		await waitForCondition(() => staleState.stalePaths.every((path) => !existsSync(path)), "late dead runtime cleanup");
+		assert.notEqual(currentState.runtimePath, staleState.runtimePath);
+		await waitForCondition(() => [staleState.runtimePath, ...staleState.stalePaths].every((path) => !existsSync(path)), "dead runtime cleanup");
+		assert.equal(existsSync(currentState.runtimePath), true);
 		assert.equal(existsSync(join(clonePath, "runtime-preserved-000")), true);
 		assert.equal(existsSync(join(clonePath, "runtime-preserved-511")), true);
 		await writeFile(currentRelease, "release");
@@ -738,16 +716,7 @@ test("clone runtime initialization preserves live, unknown, and symlink runtimes
 	let live;
 	let current;
 	try {
-		live = spawnModule(`
-			const { existsSync } = await import("node:fs");
-			const { writeFile } = await import("node:fs/promises");
-			const { dirname } = await import("node:path");
-			const { extractGitHub } = await import(${JSON.stringify(extractModuleUrl)});
-			const result = await extractGitHub("https://github.com/owner/repo", undefined, true);
-			const localPath = result?.content.match(/^Repository cloned to: (.+)$/m)?.[1] ?? null;
-			await writeFile(process.env.RUNTIME_READY_FILE, JSON.stringify({ runtimePath: localPath ? dirname(localPath) : null }));
-			while (!existsSync(process.env.RUNTIME_RELEASE_FILE)) await new Promise((resolve) => setTimeout(resolve, 10));
-		`, {
+		live = spawnModule(heldCloneSource, {
 			...commonEnv,
 			RUNTIME_READY_FILE: liveReady,
 			RUNTIME_RELEASE_FILE: liveRelease,
@@ -875,7 +844,9 @@ test("GitHub clones disable interactive credential prompts", { skip: process.pla
 	await mkdir(binDir, { recursive: true });
 	await writeFile(
 		join(agentDir, "web-search.json"),
-		JSON.stringify({ githubClone: { clonePath, cloneTimeoutSeconds: 1 } }),
+		// Not a timeout test: the fake git (a Node shim) must *finish* its fake
+		// clone. Give it room for a cold Node boot on a slow CI host.
+		JSON.stringify({ githubClone: { clonePath, cloneTimeoutSeconds: 4 } }),
 		"utf8",
 	);
 	await writeFakeExecutable(binDir, "gh", "process.exit(1);");
@@ -903,7 +874,9 @@ test("GitHub clones disable interactive credential prompts", { skip: process.pla
 			console.log(JSON.stringify(result !== null));
 		`,
 		encoding: "utf8",
-		timeout: 5000,
+		// Outer budget must cover child Node boot + fake gh probe boot + fake git boot
+		// + the 4 s clone ceiling with real margin (each shim boot is ~1 s on a loaded host).
+		timeout: 15_000,
 		env: {
 			...process.env,
 			CLONE_ENV_FILE: envFile,
@@ -930,7 +903,10 @@ test("GitHub clone timeout force-kills the SIGTERM-resistant process group", { s
 	await mkdir(binDir, { recursive: true });
 	await writeFile(
 		join(agentDir, "web-search.json"),
-		JSON.stringify({ githubClone: { clonePath: join(root, "repos"), cloneTimeoutSeconds: 0.5 } }),
+		// The fake git is a "#!/usr/bin/env node" shim: the timeout must outlast a
+		// cold Node boot on a slow CI host, or the tree is killed before the shim
+		// has recorded its pids (ENOENT below). 3 s is still a fast test.
+		JSON.stringify({ githubClone: { clonePath: join(root, "repos"), cloneTimeoutSeconds: 3 } }),
 		"utf8",
 	);
 	await writeFakeExecutable(binDir, "gh", "process.exit(1);");
@@ -939,17 +915,20 @@ test("GitHub clone timeout force-kills the SIGTERM-resistant process group", { s
 		"git",
 		`
 			const { spawn } = require("node:child_process");
+			const { writeFileSync } = require("node:fs");
 			process.on("SIGTERM", () => {});
 			const helperSource = ${JSON.stringify(`
-				const { writeFileSync } = require("node:fs");
 				process.on("SIGTERM", () => {});
-				writeFileSync(process.env.CLONE_PROCESS_PID_FILE, JSON.stringify({
-					rootPid: process.ppid,
-					helperPid: process.pid,
-				}));
 				setInterval(() => {}, 1000);
 			`)};
-			spawn(process.execPath, ["-e", helperSource], { stdio: "ignore" });
+			const helper = spawn(process.execPath, ["-e", helperSource], { stdio: "ignore" });
+			// Record both pids from the parent, synchronously after spawn: the helper's
+			// pid exists before its Node runtime boots, so the pid file is guaranteed to
+			// be present even if the clone timeout fires before the helper is ready.
+			writeFileSync(process.env.CLONE_PROCESS_PID_FILE, JSON.stringify({
+				rootPid: process.pid,
+				helperPid: helper.pid,
+			}));
 			setInterval(() => {}, 1000);
 		`,
 	);
@@ -961,7 +940,8 @@ test("GitHub clone timeout force-kills the SIGTERM-resistant process group", { s
 			console.log(JSON.stringify(result));
 		`,
 		encoding: "utf8",
-		timeout: 10000,
+		// Allow the clone timeout, kill grace, and cold Node/fake gh startups.
+		timeout: 15_000,
 		env: {
 			...process.env,
 			CLONE_PROCESS_PID_FILE: processPidFile,

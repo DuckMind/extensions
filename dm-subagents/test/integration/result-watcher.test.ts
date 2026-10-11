@@ -7,6 +7,8 @@ import { describe, it } from "node:test";
 import type { ExtensionContext } from "@duckmind/dm-coding-agent";
 import { buildCompletionKey } from "../../src/runs/background/completion-dedupe.ts";
 import { createResultWatcher as createRawResultWatcher } from "../../src/runs/background/result-watcher.ts";
+import { collectWaitCompletions } from "../../src/runs/background/wait-completions.ts";
+import registerSubagentNotify from "../../src/runs/background/notify.ts";
 import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
@@ -14,7 +16,8 @@ import { createScheduledRunManager, scheduledRunStorePath } from "../../src/runs
 import { prepareMissionLaunch, writeMissionAsyncBinding } from "../../src/missions/lifecycle.ts";
 import { readMission, updateMission } from "../../src/missions/store.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
-import type { SubagentState } from "../../src/shared/types.ts";
+import { SUBAGENT_ASYNC_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
+import type { AsyncRunSummary } from "../../src/runs/background/async-status.ts";
 
 const COMPLETION_OWNER_ID = "completion-owner-default";
 
@@ -67,6 +70,31 @@ async function waitForPredicate(predicate: () => boolean, timeoutMs = 2_500): Pr
 }
 
 describe("result watcher", () => {
+	it("keeps running workflow launch receipts nonterminal in notifications and completion events", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-dispatch-"));
+		const state = createState();
+		state.currentSessionId = "session-1";
+		const delivered: unknown[] = [], completed: unknown[] = [];
+		const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event, value) { if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) completed.push(value); } } }, state, resultsDir, 60_000, {
+			notifier: { async deliver(value) { delivered.push(value); return true; } },
+		});
+		try {
+			watcher.startResultWatcher();
+			writeIndexedResult(path.join(resultsDir, "dispatch.json"), { id: "dispatch", runId: "dispatch", mode: "workflow", state: "complete", success: true, sessionId: "session-1",
+				results: [{ workflowKey: "child", runId: "child-run", state: "running", output: "", outputState: "absent" }],
+			});
+			assert.equal(await waitForPredicate(() => completed.length === 1), true);
+			for (const value of [...delivered, ...completed]) {
+				assert.equal(value.results[0].status, "running");
+				assert.equal(value.results[0].success, undefined);
+				assert.equal(value.results[0].outputState, "absent");
+				assert.equal(value.results[0].artifactPath, undefined);
+			}
+		} finally {
+			watcher.stopResultWatcher();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
 	it("does not create Darwin native watchers or idle timers", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-darwin-idle-"));
 		try {
@@ -169,6 +197,33 @@ describe("result watcher", () => {
 
 			assert.equal(emitted.filter((entry) => entry.event === "subagent:async-complete").length, 1);
 			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("records an id-alias result when runId is empty", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-id-alias-"));
+		try {
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const resultPath = path.join(resultsDir, "alias-run.json");
+			writeIndexedResult(resultPath, {
+				id: "alias-run",
+				runId: "",
+				sessionId: "session-current",
+				success: true,
+				summary: "done",
+			});
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000);
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+			assert.equal(state.completedResults?.get("alias-run")?.sessionId, "session-current");
+			assert.equal(state.completedResults?.get("alias-run")?.completion.runId, "alias-run");
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
@@ -505,6 +560,56 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("delivers and cleans up completion when artifact verification reports I/O failure", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-artifact-verify-"));
+		const artifactPath = path.join(resultsDir, "retained-output.md");
+		const resultPath = path.join(resultsDir, "artifact-verify.json");
+		const originalStatSync = fsDefault.statSync;
+		const sent: string[] = [];
+		let observations = 0;
+		try {
+			fs.writeFileSync(artifactPath, "retained");
+			writeIndexedResult(resultPath, {
+				id: "artifact-verify", runId: "artifact-verify", mode: "workflow", agent: "workflow",
+				sessionId: "session-current", success: true, summary: "done",
+				results: [{ workflowKey: "worker", runId: "child-1", success: true, output: "x".repeat(5_000), artifactPaths: { outputPath: artifactPath } }],
+			});
+			fsDefault.statSync = ((candidate, ...args) => {
+				if (String(candidate) === artifactPath) throw Object.assign(new Error("storage temporarily unavailable"), { code: "EIO" });
+				return originalStatSync(candidate, ...args);
+			}) as typeof fsDefault.statSync;
+			syncBuiltinESMExports();
+
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const dm = {
+				events: { on: () => () => {}, emit(event: string) { if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) observations += 1; } },
+				isHeld: () => false,
+				sendMessage(message: { content?: string }) { sent.push(message.content ?? ""); },
+			};
+			const notifier = registerSubagentNotify(dm as never, state, { batchConfig: { enabled: false } });
+			const watcher = createResultWatcher(dm, state, resultsDir, 60_000, { notifier });
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+				watcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			} finally {
+				watcher.stopResultWatcher();
+				notifier.dispose();
+			}
+
+			assert.equal(observations, 1);
+			assert.equal(sent.length, 1);
+			assert.match(sent[0]!, /Output artifact verification failed: stat EIO/);
+			assert.match(sent[0]!, /Full output unavailable/);
+		} finally {
+			fsDefault.statSync = originalStatSync;
+			syncBuiltinESMExports();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not redeliver user notification after reload while observer retry is pending", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-observer-reload-"));
 		const originalError = console.error;
@@ -551,6 +656,56 @@ describe("result watcher", () => {
 			assert.equal(observerCalls, 2);
 			assert.equal(deliveries, 1);
 			assert.equal(emitted, 1);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("retains a readable result reference until failed completion replay persistence recovers", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-replay-failure-"));
+		const originalError = console.error;
+		try {
+			console.error = () => {};
+			const runId = "replay-failure";
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			const archiveDir = path.join(resultsDir, "output-archives");
+			fs.writeFileSync(archiveDir, "blocks archive persistence");
+			writeIndexedResult(resultPath, {
+				id: runId, runId, sessionId: "session-current", success: true,
+				summary: "READABLE_FINDING",
+			});
+			let deliveries = 0;
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				notifier: { deliver: async () => { deliveries += 1; return true; } },
+			});
+			const terminal = [{ id: runId, sessionId: "session-current" }] as AsyncRunSummary[];
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => {
+					if (deliveries !== 1 || !fs.existsSync(resultPath)) return false;
+					return typeof (JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { notificationDeliveredAt?: unknown }).notificationDeliveredAt === "number";
+				}), true);
+				const beforeReferences: string[] = [];
+				assert.equal(collectWaitCompletions(terminal, state, resultsDir, (text) => beforeReferences.push(text))?.[0]?.runId, runId);
+				assert.deepEqual(beforeReferences, [`Result [${runId}]: ${resultPath}`]);
+				assert.match(fs.readFileSync(resultPath, "utf-8"), /READABLE_FINDING/);
+
+				fs.rmSync(archiveDir);
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+				const afterReferences: string[] = [];
+				const completion = collectWaitCompletions(terminal, state, resultsDir, (text) => afterReferences.push(text))?.[0];
+				assert.equal(completion?.runId, runId);
+				assert.equal(typeof completion?.archivePath, "string");
+				assert.deepEqual(afterReferences, [`Result [${runId}]: ${completion!.archivePath}`]);
+				assert.match(fs.readFileSync(completion!.archivePath!, "utf-8"), /READABLE_FINDING/);
+				assert.equal(deliveries, 1);
+			} finally {
+				watcher.stopResultWatcher();
+			}
 		} finally {
 			console.error = originalError;
 			fs.rmSync(resultsDir, { recursive: true, force: true });
@@ -613,6 +768,82 @@ describe("result watcher", () => {
 		} finally {
 			manager.stop();
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("delivers the final result that replaced a paused result while the paused one was being delivered", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-replaced-"));
+		try {
+			const resultPath = path.join(resultsDir, "replaced-run.json");
+			// The runner's paused result has no tool-call id and its final result adds one; state and timestamp can match.
+			const common = { id: "replaced-run", sessionId: "session-current", completionOwnerId: COMPLETION_OWNER_ID, state: "paused", timestamp: 1_000 };
+			writePendingAsyncResultFile(resultPath, { ...common, runId: "replaced-run", summary: "paused result" });
+			const delivered: string[] = [];
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				notifier: {
+					deliver: async (result) => {
+						delivered.push(String(result.summary));
+						if (delivered.length === 1) writeAsyncResultFile(resultPath, { ...common, toolCallId: "call-a", summary: "final result" });
+						return true;
+					},
+				},
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => delivered.includes("final result") && !fs.existsSync(resultPath)), true, `delivered: ${delivered.join(", ")}`);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+			assert.deepEqual(delivered, ["paused result", "final result"]);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("delivers a final result once when its promotion is denied and the older paused result stays public", async (t) => {
+		for (const finalState of ["paused", "complete"]) {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-result-watcher-stale-public-"));
+			const resultPath = path.join(resultsDir, "stale-public.json");
+			const originalRenameSync = fsDefault.renameSync;
+			const originalError = console.error;
+			try {
+				console.error = () => {};
+				const common = { id: "stale-public", sessionId: "session-current", completionOwnerId: COMPLETION_OWNER_ID, timestamp: 1_000 };
+				writeAsyncResultFile(resultPath, { ...common, runId: "stale-public", state: "paused", summary: "paused result" });
+				t.mock.method(fsDefault, "renameSync", (source: fs.PathLike, target: fs.PathLike) => {
+					if (String(target) === resultPath) throw Object.assign(new Error("denied"), { code: "EPERM" });
+					return originalRenameSync(source, target);
+				});
+				syncBuiltinESMExports();
+				writeAsyncResultFile(resultPath, { ...common, toolCallId: "call-a", state: finalState, summary: "final result" });
+				const delivered: string[] = [];
+				let completions = 0;
+				const state = createState();
+				state.currentSessionId = "session-current";
+				const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) { if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) completions += 1; } } }, state, resultsDir, 60_000, {
+					deliverIntercomResults: false,
+					notifier: { deliver: async (result) => { delivered.push(String(result.summary)); return true; } },
+				});
+				try {
+					watcher.primeExistingResults();
+					assert.equal(await waitForPredicate(() => completions > 0 && !fs.existsSync(resultPath)), true, `${finalState}: delivered ${delivered.length}`);
+					watcher.primeExistingResults();
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				} finally {
+					watcher.stopResultWatcher();
+				}
+				assert.deepEqual(delivered, ["final result"], finalState);
+				assert.equal(completions, 1, finalState);
+				assert.deepEqual(fs.readdirSync(path.join(resultsDir, "result-pending"), { recursive: true }).filter((entry) => String(entry).endsWith(".json")), [], finalState);
+			} finally {
+				console.error = originalError;
+				t.mock.restoreAll();
+				syncBuiltinESMExports();
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
 		}
 	});
 
@@ -1314,7 +1545,7 @@ describe("result watcher", () => {
 				assert.equal(state.watcher, null);
 				assert.notEqual(state.watcherRestartTimer, null);
 
-				writeIndexedResult(path.join(resultsDir, "done.json"), { sessionId: "session-1", summary: "done" });
+				writeIndexedResult(path.join(resultsDir, "done.json"), { id: "done", sessionId: "session-1", summary: "done" });
 				poll?.();
 				await new Promise((resolve) => setTimeout(resolve, 10));
 			} finally {
@@ -1392,7 +1623,7 @@ describe("result watcher", () => {
 			assert.equal(eventData.status, "failed");
 			assert.equal(eventData.parallelHandoff?.path, "/tmp/async-1/handoff.json");
 			const message = String(eventData.message ?? "");
-			assert.match(message, /Revive child: subagent\(\{ action: "resume", id: "async-1", index: 0, message: "\.\.\." \}\)/);
+			assert.match(message, /Revive child: subagent\(\{ action: "resume", id: "async-1", message: "\.\.\.", options: \{ index: 0 \} \}\)/);
 			assert.ok(message.includes(`Session: ${firstSession}`));
 			assert.match(message, /Parallel handoff: \/tmp\/async-1\/handoff\.json/);
 			assert.match(message, /Outputs: 2 present \(semantic adequacy unassessed\)/);
@@ -1443,7 +1674,7 @@ describe("result watcher", () => {
 					summary: "Stopped by user",
 					results: [
 						{ agent: "a", output: "Result from a", outputState: "present", success: true },
-						{ agent: "b", output: "Subagent stopped by user.", outputState: "absent", success: false, stopped: true, state: "stopped" },
+						{ agent: "b", output: "Subagent stopped.", outputState: "absent", success: false, stopped: true, state: "stopped" },
 					],
 					sessionId: "session-1",
 					intercomTarget: "subagent-chat-main",
@@ -2190,7 +2421,7 @@ describe("result watcher", () => {
 			const emitted: string[] = [];
 			const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) { emitted.push(event); } } }, state, resultsDir, 60_000);
 			const resultFile = "expired.json";
-			const result = { sessionId: "session-1", agent: "worker", success: true, summary: "new result", timestamp: 123 };
+			const result = { id: "expired", sessionId: "session-1", agent: "worker", success: true, summary: "new result", timestamp: 123 };
 			const resultPath = path.join(resultsDir, resultFile);
 			writeIndexedResult(resultPath, result);
 			state.completionSeen.set(buildCompletionKey(result, `result:${resultFile}`), Date.now() - 61_000);

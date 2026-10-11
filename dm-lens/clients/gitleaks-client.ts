@@ -45,17 +45,18 @@
  * module doc for why blanket gitignore-respect is wrong for a secrets scanner
  * (an untracked `.env` with a real credential is exactly the case gitleaks
  * exists to catch, and `.env` is commonly gitignored). `classifyAndFilterFindings`
- * backstops the config with a TS-side re-classification: a finding under the
- * secrets-lane scratch tier is DEMOTED (not deleted) to `severity: "info"`,
- * `semantic: "none"`, `pathStatus: "scratch"` — visible for an audit read,
- * but it can never surface as a blocking "leaked secret" alarm. Every other
- * finding gets `pathStatus` from git's tracked/ignored view.
+ * backstops the config with a TS-side re-classification. Findings under the
+ * secrets-lane scratch tier, in gitignored files, or inside nested repositories
+ * are DEMOTED (not deleted) to `severity: "info"` / `semantic: "none"` by the
+ * project-diagnostics adapter. They remain visible for an explicit audit but
+ * can never surface as blocking "leaked secret" alarms or automatic turn
+ * context. Tracked and ordinary untracked files remain blocking.
  *
  * Refs: #130, #1562
  */
 
+import type { AnalysedRootSignal } from "./analysed-root.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
 import {
@@ -64,11 +65,14 @@ import {
 } from "./git-tracked-ignore.js";
 import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 import {
 	getSecretsLaneAllowlistPaths,
 	isUnderSecretsLaneScratchTree,
+	nestedWorktreeOffsets,
 } from "./scratch-tree-policy.js";
+import { escapeRegExp } from "./string-utils.js";
 
 // --- Types ---
 
@@ -106,14 +110,23 @@ export interface GitleaksFinding {
 	 *     can never surface as a blocking "leaked secret" alarm, while still
 	 *     being present for an audit read.
 	 *   - "tracked": committed to git.
-	 *   - "ignored": untracked AND matched by `.gitignore`.
+	 *   - "ignored": untracked AND matched by `.gitignore`; retained for
+	 *     explicit audit only, never delivered as blocking turn context.
+	 *   - "nested-repository": belongs to a separate git repository below the
+	 *     analysis root (for example a submodule); that repository must assess
+	 *     the finding in its own git context.
 	 *   - "untracked": untracked and NOT gitignored — the operational case
 	 *     (e.g. a fresh `.env`) gitleaks exists to catch.
 	 */
-	pathStatus?: "scratch" | "tracked" | "ignored" | "untracked";
+	pathStatus?:
+		| "scratch"
+		| "tracked"
+		| "ignored"
+		| "nested-repository"
+		| "untracked";
 }
 
-export interface GitleaksResult {
+export interface GitleaksResult extends AnalysedRootSignal {
 	success: boolean;
 	findings: GitleaksFinding[];
 	scannedAt: string;
@@ -173,11 +186,25 @@ export const PLACEHOLDER_SECRET_REGEXES = [
 ];
 
 /**
+ * `[allowlist] paths` regex for one linked worktree (#4132). gitleaks matches
+ * it against the path it walked, which is `--source` as given plus the rest,
+ * so the entry is the worktree's whole path in that spelling, anchored at both
+ * ends; either separator is accepted for the same reason as the name entries.
+ */
+function worktreeAllowlistPath(worktree: string): string {
+	const segments = worktree.split(/[/\\]/).map(escapeRegExp);
+	return `^${segments.join("[/\\\\]")}(?:[/\\\\].*)?$`;
+}
+
+/**
  * Build a temp gitleaks config that EXTENDS the project's own config (if any,
  * else gitleaks's built-in defaults) with two additions:
  *   1. `[allowlist] paths` — the NARROW secrets-lane scratch exclusion
  *      (`scratch-tree-policy.ts`'s `getSecretsLaneAllowlistPaths`, NOT the
- *      broader walker-parity `EXCLUDED_DIRS` list — #1562 review-round F1).
+ *      broader walker-parity `EXCLUDED_DIRS` list — #1562 review-round F1),
+ *      plus one anchored entry per linked worktree nested under `cwd`, found
+ *      by discovery rather than by name (#4132). A finding that still comes
+ *      back from one is labelled `nested-repository` below.
  *   2. `[allowlist] regexes` — the placeholder-secret class above.
  *
  * An `[allowlist]` entry is a POST-DETECTION filter (#1562 review-round F4):
@@ -197,7 +224,12 @@ export function writeScopedGitleaksConfig(outDir: string, cwd: string): string {
 	const extendLine = localConfig
 		? `path = ${JSON.stringify(localConfig)}`
 		: "useDefault = true";
-	const pathPatterns = getSecretsLaneAllowlistPaths()
+	const pathPatterns = [
+		...getSecretsLaneAllowlistPaths(),
+		...nestedWorktreeOffsets(cwd).map((offset) =>
+			worktreeAllowlistPath(path.join(cwd, offset)),
+		),
+	]
 		.map((p) => `    ${JSON.stringify(p)},`)
 		.join("\n");
 	const regexPatterns = PLACEHOLDER_SECRET_REGEXES.map(
@@ -367,7 +399,9 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 	private async runScan(cwd: string): Promise<GitleaksResult> {
 		const scannedAt = new Date().toISOString();
 		const bin = this.binaryPath ?? "gitleaks";
-		const outDir = mkdtempSync(path.join(os.tmpdir(), "dm-lens-gitleaks-"));
+		const outDir = mkdtempSync(
+			path.join(scannerReportParentDir(), "dm-lens-gitleaks-"),
+		);
 		const reportPath = path.join(outDir, "gitleaks-report.json");
 		try {
 			const configPath = writeScopedGitleaksConfig(outDir, cwd);
@@ -417,8 +451,10 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
 				fs.readFileSync(reportPath, "utf-8"),
 			);
 			const findings = await classifyAndFilterFindings(rawFindings, cwd);
+			// #2154: the one gitleaks site that parsed a scan of this root.
 			return {
 				success: true,
+				analyzed: true,
 				findings,
 				scannedAt,
 			};
@@ -458,7 +494,10 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
  *      assert the config we hand it, so this backstop guarantees the demotion
  *      even if the generated regex ever mismatches gitleaks's own path
  *      normalization.
- *   2. Every OTHER finding gets `pathStatus` set from git's tracked/ignored
+ *   2. A finding below a nested git boundary is labelled
+ *      `nested-repository`. Parent scans must not claim ownership of a
+ *      submodule's or nested repository's files.
+ *   3. Every OTHER finding gets `pathStatus` set from git's tracked/ignored
  *      view, so a future false-positive triage is a log read.
  *
  * `collectTrackedFiles`/`collectUntrackedIgnoredIds` degrade to `undefined`
@@ -466,6 +505,33 @@ export class GitleaksClient extends SecurityScanClient<GitleaksResult> {
  * keep `pathStatus: undefined` rather than a guessed value (fail-open,
  * matching `git-tracked-ignore.ts`'s own contract). Exported for unit tests.
  */
+function isInsideNestedGitRepository(file: string, cwd: string): boolean {
+	const root = path.resolve(cwd);
+	const absoluteFile = path.isAbsolute(file)
+		? path.resolve(file)
+		: path.resolve(root, file);
+	const relative = path.relative(root, absoluteFile);
+	if (
+		relative === ".." ||
+		relative.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relative)
+	)
+		return false;
+
+	let directory = path.dirname(absoluteFile);
+	while (directory !== root) {
+		try {
+			if (fs.existsSync(path.join(directory, ".git"))) return true;
+		} catch {
+			return false;
+		}
+		const parent = path.dirname(directory);
+		if (parent === directory) return false;
+		directory = parent;
+	}
+	return false;
+}
+
 export async function classifyAndFilterFindings(
 	findings: GitleaksFinding[],
 	cwd: string,
@@ -483,10 +549,13 @@ export async function classifyAndFilterFindings(
 			classified.push({ ...finding, pathStatus: "scratch" });
 			continue;
 		}
-
 		const absPath = path.isAbsolute(finding.file)
 			? finding.file
 			: path.resolve(cwd, finding.file);
+		if (isInsideNestedGitRepository(absPath, cwd)) {
+			classified.push({ ...finding, pathStatus: "nested-repository" });
+			continue;
+		}
 
 		let pathStatus: GitleaksFinding["pathStatus"];
 		if (trackedIds?.has(normalizeEphemeralMapKey(absPath))) {

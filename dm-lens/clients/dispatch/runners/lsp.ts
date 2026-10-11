@@ -14,8 +14,9 @@
 
 import { logExtension } from "../../extension-log.js";
 import { getLspCapableKinds } from "../../language-policy.js";
+import { exceedsLspSyncLimits } from "../../lsp/content-limits.js";
 import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
-import { getLSPService } from "../../lsp/index.js";
+import { getLSPService } from "../../lsp/capabilities.js";
 import { LSP_SERVERS } from "../../lsp/server.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
 import { PRIORITY } from "../priorities.js";
@@ -26,6 +27,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
 import { demoteInferredProjectDiagnostics } from "../../lsp/inferred-project.js";
 import {
@@ -39,8 +41,6 @@ import {
 } from "../../warm-attach.js";
 import { contentHash, WARM_CODE_ACTION_LOOKUP_LIMIT } from "../../mcp/ipc.js";
 
-const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
-const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
 const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 
 // Diagnostics-wait cap for the dispatch lsp-runner. Bounded so a slow LSP
@@ -154,6 +154,7 @@ const lspRunner: RunnerDefinition = {
 		// one spawned server) — an empty `lspDiags` in that case is NOT a
 		// confirmed clean result and must not be reported as one (#570).
 		let diagnosticsInconclusive = false;
+		let inconclusiveServerIds: readonly string[] = [];
 		// #1470/#1493: server ids the touch carries no evidence for — an auxiliary
 		// whose push wait our aux grace timer cut off (#1470), or one that stayed
 		// silent with no stored publication for this content (#1493). The touch is
@@ -161,16 +162,21 @@ const lspRunner: RunnerDefinition = {
 		// so this is tracked separately: the only claim it invalidates is "0
 		// diagnostics means clean".
 		let unconfirmedServerIds: readonly string[] = [];
+		let deferredServerIds: readonly string[] = [];
 		let usedWarmAttach = false;
 		let failureReason = "";
+		// #3481: when the synced bytes were read, for the notify queue's order.
+		const readStamp = performance.now();
 		const content = readFileContent(ctx.filePath);
 		if (!content) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const sizeBytes = Buffer.byteLength(content, "utf-8");
-		const lineCount = content.split("\n").length;
-		if (sizeBytes > LSP_MAX_FILE_BYTES || lineCount > LSP_MAX_FILE_LINES) {
+		// #3405 r2: was an inline second copy of the pipeline's byte/line
+		// predicate. One module owns the bound now (M3406-1's root cause was that
+		// a third writer could be added with neither copy); the SKIP is still this
+		// runner's own policy.
+		if (exceedsLspSyncLimits(content).tooLarge) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -216,13 +222,43 @@ const lspRunner: RunnerDefinition = {
 						maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
 						maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
 						source: "dispatch-lsp-runner",
+						readStamp,
 					});
 			if (touched === undefined) {
 				lspClientReady = false;
 			} else {
 				lspDiags = touched.diags;
 				diagnosticsInconclusive = touched.inconclusive === true;
-				unconfirmedServerIds = touchCoverageGap(touched);
+				inconclusiveServerIds = touched.inconclusiveServerIds ?? [];
+				unconfirmedServerIds = [
+					...new Set([
+						...touchCoverageGap(touched),
+						...(diagnosticsInconclusive ? inconclusiveServerIds : []),
+					]),
+				];
+				deferredServerIds = touched.deferredServerIds ?? [];
+				if (
+					diagnosticsInconclusive &&
+					touched.binding?.boundToCurrentDisk === false
+				) {
+					// #4231: an inconclusive primary may contribute its last-known
+					// diagnostics while the current notify/diagnostics wait is wedged.
+					// The service already attributes each diagnostic and names the
+					// unconfirmed servers; retain only answered contributors. Without
+					// both pieces of provenance, fail closed rather than publish a
+					// stale blocking finding from the aggregate binding.
+					const unconfirmed = new Set(unconfirmedServerIds);
+					const currentContentDiags: typeof lspDiags = [];
+					for (const diagnostic of lspDiags) {
+						if (
+							diagnostic.serverId !== undefined &&
+							!unconfirmed.has(diagnostic.serverId)
+						) {
+							currentContentDiags.push(diagnostic);
+						}
+					}
+					lspDiags = currentContentDiags;
+				}
 			}
 		} catch (err) {
 			serverFailed = true;
@@ -271,20 +307,24 @@ const lspRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		if (diagnosticsInconclusive) {
+		if (diagnosticsInconclusive && lspDiags.length === 0) {
 			// The touch ran and a client was ready, but the notify write and/or
-			// diagnostics wait hit their deadline before the server confirmed
-			// completion — `lspDiags` (even if non-empty) is not a trustworthy
-			// merged result. Same treatment as `!lspClientReady`: report
-			// "skipped" rather than "succeeded" with a possibly-incomplete
-			// diagnostics list, so the coverage notice flags the gap instead of
-			// the footer reading this as a confirmed clean/partial result (#570).
-			// Diagnostics that do arrive late still land in the client cache and
-			// surface on the next edit.
+			// diagnostics wait hit their deadline without any collected findings.
+			// With no answered diagnostics, report "skipped" so the coverage notice
+			// flags the gap instead of reading this as a confirmed clean result (#570).
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
 		if (lspDiags.length === 0) {
+			if (deferredServerIds.length > 0) {
+				return {
+					status: "deferred",
+					diagnostics: [],
+					semantic: "none",
+					unconfirmedServerIds: [...unconfirmedServerIds],
+					deferredServerIds: [...deferredServerIds],
+				};
+			}
 			if (unconfirmedServerIds.length > 0) {
 				// #1470/#1493: an auxiliary never reported — cut off by the aux grace
 				// timer, or silent with nothing published for this content — so this
@@ -422,14 +462,21 @@ const lspRunner: RunnerDefinition = {
 				: "none";
 
 		return {
-			status: hasErrors ? "failed" : "succeeded",
 			// "failed" here means the file has blocking type errors — the check ran
-			// fine. Tag it so the smell analyzer doesn't read it as a runner crash.
-			failureKind: hasErrors ? "blocking_diagnostics" : undefined,
-			diagnostics: keptDiagnostics,
-			semantic: resultSemantic,
+			// fine; findingsResult tags it so it never reads as a runner crash.
+			...findingsResult(keptDiagnostics, {
+				status: hasErrors
+					? "failed"
+					: deferredServerIds.length > 0
+						? "deferred"
+						: "succeeded",
+				semantic: resultSemantic,
+			}),
 			...(unconfirmedServerIds.length > 0 && {
 				unconfirmedServerIds: [...unconfirmedServerIds],
+			}),
+			...(deferredServerIds.length > 0 && {
+				deferredServerIds: [...deferredServerIds],
 			}),
 		};
 	},
