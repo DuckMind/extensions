@@ -3,10 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
-function browser() {
+function browser(storage = new Map<string, string>()) {
 	let layoutReads = 0;
 	const elements = new Map<string, any>();
-	for (const id of ["#token", "#connect", "#disconnect", "#state", "#session-menu", "#tabs", "#session-create", "#session-name", "#session-backend", "#session-refresh", "#session-add", "#terminal", "#command", "#command-form", "#command-preview", "#command-before", "#command-selection", "#command-after", "#command-caret", "#accessory", "#ctrl", "#alt", "#more", "#primary-key-strip", "#primary-key-row", "#function-keys", "#extra-key-row", "#history", "#history-panel", "#history-text", "#select-output", "#copy-output", "#history-select", "#history-copy", "#copy-status"]) {
+	for (const id of ["#token", "#save-token", "#clear-token", "#token-status", "#connect", "#disconnect", "#state", "#session-menu", "#tabs", "#tab-order", "#session-create", "#session-name", "#session-backend", "#session-refresh", "#session-add", "#terminal", "#command", "#command-form", "#command-preview", "#command-before", "#command-selection", "#command-after", "#command-caret", "#accessory", "#ctrl", "#alt", "#more", "#primary-key-strip", "#primary-key-row", "#function-keys", "#extra-key-row", "#history", "#history-panel", "#history-text", "#history-lines", "#history-copy", "#copy-status"]) {
 		elements.set(id, {
 			value: "", disabled: false, dataset: {}, style: {}, hidden: false, scrollHeight: 20, listeners: new Map(),
 			addEventListener(name: string, callback: (event: any) => void) { this.listeners.set(name, callback); },
@@ -114,7 +114,12 @@ function browser() {
 		navigator: { get clipboard() { return clipboard.api; } },
 		Terminal: class { constructor() { return term; } },
 		FitAddon: { FitAddon: class { fit() {} } },
-		ResizeObserver: class { observe() {} },
+			ResizeObserver: class { observe() {} },
+			localStorage: {
+				getItem: (key: string) => storage.get(key) ?? null,
+				setItem: (key: string, value: string) => { storage.set(key, value); },
+				removeItem: (key: string) => { storage.delete(key); },
+			},
 		WebSocket: FakeSocket,
 		location: { protocol: "http:", host: "127.0.0.1:8765" },
 		window: { addEventListener(name: string, fn: () => void) { windowListeners.set(name, fn); } },
@@ -125,7 +130,7 @@ function browser() {
 	const token = elements.get("#token");
 	const command = elements.get("#command");
 	const form = elements.get("#command-form");
-	token.value = "private-test-token";
+	if (!token.value) token.value = "private-test-token";
 	elements.get("#connect").onclick();
 	socket.onopen();
 	const ready = (running = true, sessions = [{ id: "shell", label: "New shell", backend: "shell" }]) => {
@@ -766,6 +771,62 @@ test("session tabs stay compact and select only authenticated terminal sessions"
 	assert.deepEqual(sent.at(-1), { v: 1, type: "select", sessionId: "tmux:work" });
 });
 
+test("tab ordering follows arrow controls, survives refresh, and drops closed tabs", () => {
+	const { elements, ready, socket, sent } = browser();
+	const shell = { id: "shell", label: "Shell", backend: "shell" };
+	const work = { id: "tmux:work", label: "Work", backend: "tmux" };
+	const demo = { id: "screen:demo", label: "Demo", backend: "screen" };
+	const order = elements.get("#tab-order");
+	const tabs = elements.get("#tabs");
+	const replacement = { dataset: { moveId: encodeURIComponent(demo.id), direction: "-1" }, disabled: false, focused: false,
+		focus() { this.focused = true; } };
+	order.querySelectorAll = () => [replacement];
+	const move = (id: string, direction: number, disabled = false) => order.listeners.get("click")({
+		target: { closest: () => ({ dataset: { moveId: encodeURIComponent(id), direction: String(direction) }, disabled }) },
+	});
+	ready(true, [shell, work, demo]);
+	move(demo.id, -1);
+	assert.equal(replacement.focused, true, "arrow focus survives rendering for keyboard reordering");
+	move(demo.id, -1);
+	assert.ok(tabs.innerHTML.indexOf("Demo") < tabs.innerHTML.indexOf("Shell"));
+	assert.ok(tabs.innerHTML.indexOf("Shell") < tabs.innerHTML.indexOf("Work"));
+	assert.equal(sent.filter((message) => message.type === "select").length, 0, "reordering must not switch PTYs");
+	socket().onmessage({ data: JSON.stringify({ type: "sessions", sessions: [work, shell, demo], activeSession: shell }) });
+	assert.ok(tabs.innerHTML.indexOf("Demo") < tabs.innerHTML.indexOf("Shell"), "server refresh preserves local order");
+	socket().onmessage({ data: JSON.stringify({ type: "sessions", sessions: [shell, demo], activeSession: shell }) });
+	assert.doesNotMatch(order.innerHTML, /Work/);
+	move(demo.id, -1, true);
+	assert.ok(tabs.innerHTML.indexOf("Demo") < tabs.innerHTML.indexOf("Shell"));
+	socket().onclose({ code: 1000 });
+	assert.equal(tabs.innerHTML, "");
+	assert.equal(order.innerHTML, "");
+});
+
+test("access token persists only on Save and Clear removes both stored and entered tokens", () => {
+	const storage = new Map<string, string>();
+	const { elements, ready, socket } = browser(storage);
+	const token = elements.get("#token");
+	const save = elements.get("#save-token");
+	const clear = elements.get("#clear-token");
+	const key = "dm-tty-access-token";
+	assert.equal(storage.size, 0, "connecting alone must not persist credentials");
+	ready();
+	assert.equal(storage.size, 0);
+	token.value = "opt-in-token";
+	save.listeners.get("click")({});
+	assert.equal(storage.get(key), "opt-in-token");
+	token.value = "new-unsaved-token";
+	socket().onclose({ code: 1000 });
+	assert.equal(storage.get(key), "opt-in-token", "typing or disconnect must not update storage");
+	clear.listeners.get("click")({});
+	assert.equal(storage.has(key), false);
+	assert.equal(token.value, "");
+	assert.equal(browser(storage).elements.get("#token").value, "private-test-token", "no saved credential loads on a new page");
+	const saved = browser(new Map([[key, "previously-saved"]]));
+	assert.equal(saved.elements.get("#token").value, "previously-saved");
+	assert.equal(saved.sent[0].token, "previously-saved");
+});
+
 test("TTY keeps the terminal keyboard-first with controls behind overflow", () => {
 	const html = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
 	const css = readFileSync(new URL("../web/style.css", import.meta.url), "utf8");
@@ -778,6 +839,11 @@ test("TTY keeps the terminal keyboard-first with controls behind overflow", () =
 	assert.match(css, /#accessory\s*\{[^}]*bottom:\s*0/);
 	assert.match(css, /#key-row|\.key-row\s*\{[^}]*overflow-x:\s*auto/);
 	assert.match(css, /#tabs\s*\{[^}]*overflow-x:\s*auto/);
+	assert.match(html, /id="tab-order"/);
+	assert.match(html, /id="history-lines"[^>]*min="1"[^>]*max="2000"/);
+	assert.match(html, /id="save-token"/);
+	assert.match(html, /id="clear-token"/);
+	assert.doesNotMatch(html, /Select all output|Copy all output|id="history-select"/);
 });
 
 test("switching tabs cancels pending submission, gates raw input and preserves independent drafts", () => {
@@ -868,17 +934,47 @@ test("screen and tmux history is scrollable, isolated per tab and survives repla
 	assert.equal(panel.hidden, true);
 });
 
-test("all tabs expose selectable output and copy every retained row without sending a draft", async () => {
+test("displayed history line limit clamps and updates live without sending terminal input", () => {
+	const { elements, ready, socket, sent, selection } = browser();
+	ready();
+	const output = (data: string) => socket().onmessage({ data: JSON.stringify({ type: "output", data }) });
+	const history = elements.get("#history");
+	const lines = elements.get("#history-lines");
+	const text = elements.get("#history-text");
+	output("first\nsecond\nthird\n");
+	history.listeners.get("click")({});
+	lines.value = "2";
+	const before = sent.length;
+	lines.listeners.get("change")({});
+	assert.equal(text.textContent, "second\nthird");
+	output("fourth\n");
+	assert.equal(text.textContent, "third\nfourth");
+	elements.get("#history-panel").listeners.get("keydown")({ key: "a", ctrlKey: true, preventDefault() {} });
+	assert.equal(selection.toString(), "third\nfourth");
+	lines.value = "1";
+	lines.listeners.get("change")({});
+	assert.equal(text.textContent, "fourth");
+	assert.equal(selection.toString(), "");
+	for (const [value, expected] of [["0", "1"], ["5000", "2000"], ["", "2000"]] as const) {
+		lines.value = value;
+		lines.listeners.get("change")({});
+		assert.equal(lines.value, expected);
+	}
+	assert.equal(text.textContent, "first\nsecond\nthird\nfourth\n");
+	assert.equal(sent.length, before);
+});
+
+test("all tabs expose selectable history and copy every displayed row without sending a draft", async () => {
 	for (const backend of ["shell", "tmux", "screen"]) {
 		const { elements, ready, socket, sent, command, submit, flush, selection, clipboard } = browser();
-		assert.equal(elements.get("#copy-output").disabled, true);
 		ready(true, [{ id: `${backend}:test`, label: "Test", backend }]);
 		const output = "offscreen first row\nCộng hòa xã hội chủ nghĩa Việt Nam\n<tag>last row</tag>";
 		socket().onmessage({ data: JSON.stringify({ type: "output", data: output }) });
 		command.value = "must stay local";
 		submit();
 		const before = sent.length;
-		elements.get("#select-output").listeners.get("click")({});
+		elements.get("#history").listeners.get("click")({});
+		elements.get("#history-panel").listeners.get("keydown")({ key: "a", ctrlKey: true, preventDefault() {} });
 		flush();
 		assert.equal(elements.get("#history-panel").hidden, false);
 		assert.equal(selection.toString(), output);
@@ -916,7 +1012,7 @@ test("native partial selection survives new output and Copy uses only the select
 	assert.equal(text.textContent, "first\nsecond\nthird", "live output continues to be retained during selection");
 });
 
-test("copy all supports async clipboard, denied permission fallback, and honest manual-copy failure", async () => {
+test("History Copy supports async clipboard, denied permission fallback, and honest manual-copy failure", async () => {
 	for (const mode of ["secure", "denied", "manual"]) {
 		const { elements, ready, socket, clipboard, selection } = browser();
 		ready();
@@ -926,7 +1022,9 @@ test("copy all supports async clipboard, denied permission fallback, and honest 
 			clipboard.writes.push(text);
 		} };
 		clipboard.fallbackWorks = mode !== "manual";
-		await elements.get("#copy-output").listeners.get("click")({});
+		elements.get("#history").listeners.get("click")({});
+		elements.get("#history-panel").listeners.get("keydown")({ key: "a", ctrlKey: true, preventDefault() {} });
+		await elements.get("#history-copy").listeners.get("click")({});
 		if (mode === "secure") {
 			assert.deepEqual(clipboard.writes, ["tiếng Việt\nall output"]);
 			assert.deepEqual(clipboard.fallback, []);
@@ -966,11 +1064,11 @@ test("copy state clears on auth/session changes and ignores stale async completi
 	socket().onmessage({ data: JSON.stringify({ type: "output", data: "old private output" }) });
 	let resolve!: () => void;
 	clipboard.api = { writeText: () => new Promise<void>((done) => { resolve = done; }) };
-	const pending = elements.get("#copy-output").listeners.get("click")({});
+	const pending = elements.get("#history-copy").listeners.get("click")({});
 	socket().onclose({ code: 1000 });
 	assert.equal(selection.toString(), "");
 	assert.equal(elements.get("#history-text").textContent, "");
-	assert.equal(elements.get("#copy-output").disabled, true);
+	assert.equal(elements.get("#history").hidden, true);
 	resolve();
 	await pending;
 	assert.equal(elements.get("#copy-status").textContent, "", "late clipboard result cannot overwrite a new controller's state");

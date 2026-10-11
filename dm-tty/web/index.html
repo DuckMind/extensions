@@ -25,19 +25,22 @@
           <button id="disconnect" type="button" disabled>Disconnect</button>
         </div>
         <div class="menu-actions">
-          <button id="select-output" type="button" disabled>Select all output</button>
-          <button id="copy-output" type="button" disabled>Copy all output</button>
+          <button id="save-token" type="button">Save Access Token</button>
+          <button id="clear-token" type="button">Clear saved token</button>
         </div>
-        <span id="copy-status" role="status" aria-live="polite"></span>
+        <span id="token-status" role="status" aria-live="polite"></span>
+        <p class="security-note">Saving is optional. A saved token is readable by scripts on this origin; use HTTPS remotely and avoid shared browsers.</p>
         <details id="session-panel">
           <summary>Sessions</summary>
           <p>Open a running tmux or screen session by selecting its tab. Switching tabs does not stop the session.</p>
           <button id="session-refresh" type="button" disabled>Refresh tabs</button>
+          <p>Tab order (this page only): use the arrows to move tabs left or right.</p>
+          <div id="tab-order" aria-label="Reorder terminal tabs"></div>
           <form id="session-create" autocomplete="off">
             <label for="session-backend">New session</label>
             <select id="session-backend" aria-label="Session backend"><option value="tmux">tmux</option><option value="screen">screen</option></select>
             <label for="session-name">Name</label>
-            <input id="session-name" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="work" required>
+            <input id="session-name" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" placeholder="work" required>
             <button id="session-add" type="submit" disabled>Create and open</button>
           </form>
         </details>
@@ -49,10 +52,12 @@
   <main id="terminal" aria-label="Remote shell terminal">
     <section id="history-panel" aria-label="Recent session output" tabindex="0" hidden>
       <div class="history-actions">
-        <p>Recent stream · up to 2,000 lines / 65,536 characters · terminal redraws may repeat text</p>
-        <button id="history-select" type="button">Select all</button>
+        <p>Recent stream · retains up to 2,000 lines / 65,536 characters · terminal redraws may repeat text</p>
+        <label for="history-lines">Show lines</label>
+        <input id="history-lines" type="number" min="1" max="2000" step="1" value="2000" inputmode="numeric">
         <button id="history-copy" type="button">Copy</button>
       </div>
+      <span id="copy-status" role="status" aria-live="polite"></span>
       <pre id="history-text"></pre>
     </section>
     <form id="command-form" autocomplete="off" hidden>

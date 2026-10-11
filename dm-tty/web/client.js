@@ -1,10 +1,14 @@
-/* Browser-only: token stays in memory, never in URLs or persistent storage. */
+/* Browser-only: token is persisted only on an explicit Save click. */
 const token = document.querySelector("#token");
+const saveToken = document.querySelector("#save-token");
+const clearToken = document.querySelector("#clear-token");
+const tokenStatus = document.querySelector("#token-status");
 const connect = document.querySelector("#connect");
 const disconnect = document.querySelector("#disconnect");
 const state = document.querySelector("#state");
 const sessionMenu = document.querySelector("#session-menu");
 const tabs = document.querySelector("#tabs");
+const tabOrder = document.querySelector("#tab-order");
 const sessionCreate = document.querySelector("#session-create");
 const sessionName = document.querySelector("#session-name");
 const sessionBackend = document.querySelector("#session-backend");
@@ -21,9 +25,7 @@ const terminalContainer = document.querySelector("#terminal");
 const historyButton = document.querySelector("#history");
 const historyPanel = document.querySelector("#history-panel");
 const historyText = document.querySelector("#history-text");
-const selectOutput = document.querySelector("#select-output");
-const copyOutput = document.querySelector("#copy-output");
-const historySelect = document.querySelector("#history-select");
+const historyLines = document.querySelector("#history-lines");
 const historyCopy = document.querySelector("#history-copy");
 const copyStatus = document.querySelector("#copy-status");
 const accessory = document.querySelector("#accessory");
@@ -88,6 +90,8 @@ let accessoryTimer;
 let consumedPointerClick;
 let activeSessionId = "shell";
 let pendingSessionId = null;
+let sessionOrder = [];
+let currentSessions = [];
 const drafts = new Map();
 let modifierInput = null;
 const graphemes = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
@@ -97,6 +101,44 @@ let streamHistory = "";
 let historyEscape = "text";
 let historyFrozen = false;
 let selectedForCopy = null;
+let displayedHistoryLines = MAX_HISTORY_LINES;
+const TOKEN_STORAGE_KEY = "dm-tty-access-token";
+try {
+	token.value = localStorage.getItem(TOKEN_STORAGE_KEY) ?? "";
+} catch { /* Storage may be blocked; manual entry still works. */ }
+saveToken.addEventListener("click", () => {
+	if (!token.value) { tokenStatus.textContent = "Enter an access token before saving"; return; }
+	try {
+		localStorage.setItem(TOKEN_STORAGE_KEY, token.value);
+		tokenStatus.textContent = "Access token saved in this browser";
+	} catch { tokenStatus.textContent = "Browser storage unavailable; token was not saved"; }
+});
+clearToken.addEventListener("click", () => {
+	token.value = "";
+	try {
+		localStorage.removeItem(TOKEN_STORAGE_KEY);
+		tokenStatus.textContent = "Saved token and input cleared";
+	} catch { tokenStatus.textContent = "Input cleared; browser storage unavailable, saved token may remain"; }
+});
+function visibleHistory() {
+	if (displayedHistoryLines === MAX_HISTORY_LINES) return streamHistory;
+	const lines = streamHistory.split("\n");
+	if (lines.at(-1) === "") lines.pop();
+	return lines.slice(-displayedHistoryLines).join("\n");
+}
+function refreshHistory() {
+	clearOutputSelection();
+	historyFrozen = false;
+	historyText.textContent = visibleHistory();
+	historyPanel.scrollTop = historyPanel.scrollHeight;
+}
+historyLines.addEventListener("change", () => {
+	const count = Number(historyLines.value);
+	displayedHistoryLines = historyLines.value.trim() && Number.isFinite(count)
+		? Math.max(1, Math.min(MAX_HISTORY_LINES, Math.trunc(count))) : MAX_HISTORY_LINES;
+	historyLines.value = String(displayedHistoryLines);
+	if (!historyPanel.hidden) refreshHistory();
+});
 
 function outputSelection() {
 	const selection = document.getSelection?.();
@@ -158,13 +200,12 @@ function appendHistory(data) {
 	if (lines.length > MAX_HISTORY_LINES) streamHistory = lines.slice(-MAX_HISTORY_LINES).join("\n");
 	if (!historyPanel.hidden && !historyFrozen) {
 		const atBottom = historyPanel.scrollTop + historyPanel.clientHeight >= historyPanel.scrollHeight - 2;
-		historyText.textContent = streamHistory;
+		historyText.textContent = visibleHistory();
 		if (atBottom) historyPanel.scrollTop = historyPanel.scrollHeight;
 	}
 }
 historyPanel.hidden = true;
 historyButton.hidden = true;
-selectOutput.disabled = copyOutput.disabled = true;
 function openHistory() {
 	if (!authenticated || pendingSessionId || historyButton.hidden) return false;
 	if (!historyPanel.hidden) return true;
@@ -172,7 +213,7 @@ function openHistory() {
 	pendingCommandSubmit = false;
 	historyPanel.hidden = false;
 	historyFrozen = false;
-	historyText.textContent = streamHistory;
+	historyText.textContent = visibleHistory();
 	historyPanel.scrollTop = historyPanel.scrollHeight;
 	historyButton.setAttribute("aria-expanded", "true");
 	historyButton.textContent = "Live";
@@ -189,10 +230,9 @@ function selectAllOutput() {
 	selection.addRange(range);
 	return true;
 }
-async function copyOutputText(all = false, selectedText = null) {
+async function copyOutputText(selectedText = null) {
 	if (!openHistory()) return;
-	if (all && !selectAllOutput()) return;
-	const text = all ? historyText.textContent : selectedText || outputSelection() || historyText.textContent;
+	const text = selectedText || outputSelection() || historyText.textContent;
 	if (!text) { copyStatus.textContent = "No output to copy"; return; }
 	const generation = connectionGeneration;
 	historyFrozen = true;
@@ -204,8 +244,9 @@ async function copyOutputText(all = false, selectedText = null) {
 		}
 	} catch { /* HTTP, insecure contexts and denied permission can use native Copy. */ }
 	if (!copied && generation === connectionGeneration && authenticated) {
-		if (!outputSelection() || outputSelection() !== text) selectAllOutput();
-		try { copied = document.execCommand("copy"); } catch { /* Leave text selected for the browser Copy menu. */ }
+		if (outputSelection() === text || (!selectedText && selectAllOutput())) {
+			try { copied = document.execCommand("copy"); } catch { /* Leave text selected for the browser Copy menu. */ }
+		}
 	}
 	if (generation === connectionGeneration && authenticated) {
 		copyStatus.textContent = copied ? "Copied output" : "Select text and use the browser Copy menu";
@@ -225,14 +266,11 @@ historyButton.addEventListener("click", () => {
 	if (historyPanel.hidden) openHistory();
 	else { closeHistory(); focusCommand(); }
 });
-selectOutput.addEventListener("click", () => { sessionMenu.open = false; selectAllOutput(); });
-copyOutput.addEventListener("click", () => { sessionMenu.open = false; return copyOutputText(true); });
-historySelect.addEventListener("click", selectAllOutput);
 historyCopy.addEventListener("pointerdown", () => { selectedForCopy = outputSelection(); });
 historyCopy.addEventListener("click", () => {
 	const selected = selectedForCopy || outputSelection();
 	selectedForCopy = null;
-	return copyOutputText(false, selected);
+	return copyOutputText(selected);
 });
 
 function updateModifiers() {
@@ -273,23 +311,48 @@ function escapeHtml(text) {
 }
 function renderSessions(sessions = [], active) {
 	historyButton.hidden = !authenticated;
-	selectOutput.disabled = copyOutput.disabled = !authenticated;
 	if (historyButton.hidden) closeHistory();
 	if (!Array.isArray(sessions) || !sessions.length) {
 		tabs.hidden = true;
 		tabs.innerHTML = "";
+		tabOrder.innerHTML = "";
+		currentSessions = [];
+		sessionOrder = [];
 		return;
 	}
+	currentSessions = sessions.filter((session) => session && typeof session.id === "string");
+	const ids = new Set(currentSessions.map((session) => session.id));
+	sessionOrder = [...sessionOrder.filter((id) => ids.has(id)), ...currentSessions.map((session) => session.id).filter((id) => !sessionOrder.includes(id))];
+	const ordered = sessionOrder.map((id) => currentSessions.find((session) => session.id === id));
 	activeSessionId = typeof active?.id === "string" ? active.id : activeSessionId;
-	tabs.innerHTML = sessions.map((session) => {
+	tabs.innerHTML = ordered.map((session) => {
 		if (!session || typeof session.id !== "string") return "";
 		const id = encodeURIComponent(session.id);
 		const label = escapeHtml(typeof session.label === "string" ? session.label : session.id);
 		const selected = session.id === activeSessionId;
 		return `<button type="button" role="tab" data-session-id="${escapeHtml(id)}" aria-selected="${selected}" data-attached="${session.attached === true}">${label}</button>`;
 	}).join("");
-	tabs.hidden = sessions.length < 2;
+	tabOrder.innerHTML = ordered.map((session, index) => {
+		const id = escapeHtml(encodeURIComponent(session.id));
+		const label = escapeHtml(typeof session.label === "string" ? session.label : session.id);
+		return `<div class="tab-order-row"><span title="${label}">${label}</span><button type="button" data-move-id="${id}" data-direction="-1" aria-label="Move ${label} left" ${index === 0 ? "disabled" : ""}>←</button><button type="button" data-move-id="${id}" data-direction="1" aria-label="Move ${label} right" ${index === ordered.length - 1 ? "disabled" : ""}>→</button></div>`;
+	}).join("");
+	tabs.hidden = ordered.length < 2;
 }
+tabOrder.addEventListener("click", (event) => {
+	const button = event.target?.closest?.("button[data-move-id]");
+	if (!button || button.disabled || !authenticated) return;
+	const id = decodeURIComponent(button.dataset.moveId ?? "");
+	const index = sessionOrder.indexOf(id);
+	const next = index + Number(button.dataset.direction);
+	if (index < 0 || next < 0 || next >= sessionOrder.length || Math.abs(next - index) !== 1) return;
+	[sessionOrder[index], sessionOrder[next]] = [sessionOrder[next], sessionOrder[index]];
+	renderSessions(currentSessions, { id: activeSessionId });
+	// Replacing the row also replaces the clicked button; keep keyboard reordering usable.
+	const replacement = [...tabOrder.querySelectorAll("button[data-move-id]")].find((candidate) =>
+		candidate.dataset.moveId === button.dataset.moveId && candidate.dataset.direction === button.dataset.direction);
+	if (replacement && !replacement.disabled) replacement.focus();
+});
 
 function saveDraft() {
 	drafts.set(activeSessionId, {
@@ -810,11 +873,13 @@ connect.onclick = () => {
 	saveDraft();
 	resetHistory();
 	historyButton.hidden = true;
+	tabs.hidden = true;
+	tabs.innerHTML = "";
+	tabOrder.innerHTML = "";
 	socket?.close();
 	const current = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/terminal`);
 	socket = current;
 	authenticated = false;
-	selectOutput.disabled = copyOutput.disabled = true;
 	pendingSessionId = null;
 	remoteEditing = false;
 	speechDraft = false;
@@ -883,10 +948,10 @@ connect.onclick = () => {
 		if (socket !== current) return;
 		socket = undefined;
 		authenticated = false;
-		selectOutput.disabled = copyOutput.disabled = true;
 		pendingSessionId = null;
 		resetHistory();
 		historyButton.hidden = true;
+		renderSessions([]);
 		commandForm.hidden = true;
 		setState(event.code === 1008 ? "Authentication or protocol rejected" : event.code === 1012 ? "Another browser took control" : "Disconnected — reconnect to resume");
 	};
