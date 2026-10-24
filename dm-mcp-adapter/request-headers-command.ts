@@ -269,7 +269,7 @@ async function invokeRequestHeadersCommand(
       try {
         cleanupOnce();
       } catch (error) {
-        finishAfterKill({ status: "error", error: error instanceof Error ? error : new Error(String(error)) });
+        finish({ status: "error", error: error instanceof Error ? error : new Error(String(error)) });
       }
     });
     child.on("close", code => {

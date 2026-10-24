@@ -243,6 +243,20 @@ setTimeout(() => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  it.skipIf(process.platform === "win32")("does not wait for a helper that inherited stdout", async () => {
+    const helper = commandScript("setInterval(() => {}, 1000);\n");
+    const script = commandScript(`
+import { spawn } from "node:child_process";
+spawn(process.execPath, [${JSON.stringify(helper)}], { stdio: ["ignore", 1, "ignore"] }).unref();
+process.stdout.write("{}");
+`);
+    const fetch = createRequestHeadersCommandFetch(
+      { command: process.execPath, args: [script], timeoutMs: 1500 },
+      async () => new Response("ok"),
+    );
+    await expect(fetch("https://mcp.example.test/mcp")).resolves.toBeInstanceOf(Response);
+  });
+
   it.skipIf(process.platform === "win32")("kills helpers when the command returns malformed output", async () => {
     const marker = join(mkdtempSync(join(tmpdir(), "pi-mcp-request-headers-")), "marker");
     const helper = commandScript(`
