@@ -134,8 +134,6 @@
     "semantic-search.ts",
     "examples/jev-semantic-filter.mjs",
     "examples/jev-accessibility-loop.mjs",
-    "examples/interactive-visualizer/dist/app.html",
-    "examples/interactive-visualizer/dist/server.js",
     "mcp-keyring-helper.cjs",
     "mcp-oauth-provider.ts",
     "mcp-callback-server.ts",
@@ -156,6 +154,8 @@
     "CHANGELOG.md",
     "LICENSE",
     "dist",
+    "examples/interactive-visualizer/dist/app.html",
+    "examples/interactive-visualizer/dist/server.js",
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {

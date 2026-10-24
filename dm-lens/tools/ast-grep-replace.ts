@@ -29,7 +29,7 @@ function errorTextWithHint(raw: string): string {
 	const hint = astGrepRemediationHint(classifyAstGrepError(raw));
 	return hint ? `Error: ${raw}\n\n${hint}` : `Error: ${raw}`;
 }
-import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
+import { readAstGrepLang, resolveAstGrepPaths } from "./shared.js";
 
 function lineCount(value: string): number {
 	if (!value) return 0;
@@ -77,40 +77,34 @@ export function createAstGrepReplaceTool(
 				description: "Replacement using meta-variables from pattern",
 			}),
 			lang: Type.String({
-				enum: [...LANGUAGES] as string[],
-				description: "Target language",
+				description: "Language id, e.g. typescript, tsx, python, go.",
 			}),
 			paths: Type.Optional(
 				Type.Array(Type.String(), { description: "Specific files/folders" }),
 			),
 			insideKind: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes inside an ancestor of this AST node kind. Synthesizes a YAML rule.",
+					description: "Ancestor AST node kind filter.",
 				}),
 			),
 			hasKind: Type.Optional(
 				Type.String({
-					description:
-						'Restrict matches to nodes whose immediate child has this AST node kind (ast-grep default stopBy: neighbor). Example: `hasKind: "await_expression"`.',
+					description: "Immediate child AST node kind filter.",
 				}),
 			),
 			hasDescendantKind: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes containing this AST node kind anywhere in their descendants. Explicit recursive form (`stopBy: end`); use this instead of `hasKind` when nesting is not immediate.",
+					description: "Recursive descendant AST node kind filter.",
 				}),
 			),
 			follows: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes that immediately follow a sibling matching this pattern.",
+					description: "Preceding sibling pattern filter.",
 				}),
 			),
 			precedes: Type.Optional(
 				Type.String({
-					description:
-						"Restrict matches to nodes that immediately precede a sibling matching this pattern.",
+					description: "Following sibling pattern filter.",
 				}),
 			),
 			apply: Type.Optional(
@@ -119,8 +113,7 @@ export function createAstGrepReplaceTool(
 			strictness: Type.Optional(
 				Type.String({
 					enum: ["smart", "relaxed", "ast", "cst", "signature", "template"],
-					description:
-						"Pattern matching strictness. 'smart' (default) ignores comments and whitespace. 'relaxed' also ignores unnamed nodes like punctuation. 'ast' ignores all whitespace.",
+					description: "Match strictness; default smart.",
 				}),
 			),
 		}),
@@ -157,9 +150,9 @@ export function createAstGrepReplaceTool(
 				follows?: string;
 				precedes?: string;
 			};
-			const lang = ((params as { lang: string }).lang ?? "").replace(
-				/^"|"$/g,
-				"",
+			const { lang, refusal: langError } = readAstGrepLang(
+				(params as { lang?: unknown }).lang,
+				true,
 			);
 			const pathsCount = paths?.length ?? 1;
 			const applyFlag = apply ?? false;
@@ -200,6 +193,14 @@ export function createAstGrepReplaceTool(
 				}
 			}
 
+			if (langError) {
+				logOutcome("error", { errorRaw: langError });
+				return {
+					content: [{ type: "text" as const, text: `Error: ${langError}` }],
+					isError: true,
+					details: {},
+				};
+			}
 			if (!(await astGrepClient.ensureAvailable())) {
 				logOutcome("error", { errorRaw: "ast-grep CLI not found" });
 				return {

@@ -22,7 +22,7 @@ function arg(name: string): string | undefined {
 }
 
 async function main(): Promise<void> {
-	// #4300: this process runs outside pi; its caller owns workspace trust.
+	// #4300: this process runs outside DM; its caller owns workspace trust.
 	setProjectTrustState("trusted");
 	logExtension({
 		subsystem: "project-trust",

@@ -158,11 +158,6 @@ export function hasLombokJavaAgent(jvmArgs: string | undefined): boolean {
 	);
 }
 
-function appendJvmArg(existing: string | undefined, next: string): string {
-	const trimmed = existing?.trim();
-	return trimmed ? `${trimmed} ${next}` : next;
-}
-
 function resolveLombokJavaAgentArg(
 	root: string,
 	baseEnv: NodeJS.ProcessEnv = process.env,
@@ -183,16 +178,4 @@ export function createLombokJdtlsArgs(
 ): string[] {
 	const javaAgent = resolveLombokJavaAgentArg(root, baseEnv);
 	return javaAgent ? [`--jvm-arg=${javaAgent}`] : [];
-}
-
-export function createLombokJdtlsEnv(
-	root: string,
-	baseEnv: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv | undefined {
-	const javaAgent = resolveLombokJavaAgentArg(root, baseEnv);
-	if (!javaAgent) return undefined;
-	return {
-		...baseEnv,
-		JDTLS_JVM_ARGS: appendJvmArg(baseEnv.JDTLS_JVM_ARGS, javaAgent),
-	};
 }

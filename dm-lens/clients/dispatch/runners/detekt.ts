@@ -102,7 +102,11 @@ export function findDetektConfig(cwd: string): string | undefined {
 	return undefined;
 }
 
-// detekt text output: /path/file.kt:10:5: error: Message [RuleId]
+// detekt text output: /path/file.kt:10:5: Message [RuleId] — no severity token
+//
+// The level is therefore optional, and a finding that carries none is a warning
+// (#4522). The comment here is the one place the shape is stated; the captured
+// replay (`detekt/real`) is what proves it.
 function parseDetektOutput(
 	raw: string,
 	filePath: string,
@@ -110,7 +114,7 @@ function parseDetektOutput(
 ): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	const pattern =
-		/^(.+?):(\d+):(\d+): (error|warning): (.+?)(?:\s+\[([^\]]+)\])?$/gm;
+		/^(.+?):(\d+):(\d+): (?:(error|warning): )?(.+?)(?:\s+\[([^\]]+)\])?$/gm;
 
 	const absTarget = path.resolve(cwd, filePath);
 	for (const match of raw.matchAll(pattern)) {
@@ -185,7 +189,9 @@ const detektRunner: RunnerDefinition = {
 			{
 				result,
 				output: raw,
-				// EXIT TABLE (detekt 1.23 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				// EXIT TABLE (detekt 1.23.8 captured fixture): 0 clean; 2 findings on stdout with empty stderr.
+				// Exit 1 is admitted but unmeasured: with no parseable line it reads clean (#4522 remainder).
+				// Any other nonzero exit is rejected.
 				exitCodes: { ran: [1, 2] },
 			},
 			(out) => parseDetektOutput(out, ctx.filePath, cwd),

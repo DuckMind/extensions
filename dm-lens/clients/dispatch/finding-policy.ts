@@ -30,6 +30,7 @@ import type { LSPDiagnostic } from "../lsp/client.js";
 import type { ProjectDiagnostic } from "../project-diagnostics/types.js";
 import { retagAuxiliaryDiagnostics } from "./auxiliary-lsp.js";
 import { applyInlineSuppressions } from "./inline-suppressions.js";
+import { readFileContent } from "./runners/utils.js";
 import {
 	applyRulePolicy,
 	resolvedRulePolicyMap,
@@ -78,6 +79,13 @@ export interface FindingPolicyResult<T> {
 	 * would keep a finding hidden long after its mark was removed.
 	 */
 	inlineKept: T[];
+	/**
+	 * Survivors of inline suppression AND the disposition filter, before the
+	 * rule policy: `inlineKept` minus `disposed` is what marks hid. mode=full
+	 * states that count (#1634), so the rule policy's own drops never read as
+	 * "suppressed by disposition".
+	 */
+	disposed: T[];
 }
 
 /**
@@ -99,6 +107,7 @@ export function applyFindingPolicy<
 			filePath: options.filePath,
 		}),
 		inlineKept,
+		disposed,
 	};
 }
 
@@ -291,6 +300,41 @@ export function applyPushedFindingPolicy<
 		identities: renderedRuleIdentities,
 	});
 	return { kept, suppressed: findings.length - kept.length };
+}
+
+/**
+ * {@link applyPushedFindingPolicy} over findings from several files: grouped by
+ * `filePath` in first-seen order, one content read per file, one summed
+ * suppressed count. `kept` keeps that grouping (each file's survivors in input
+ * order), which is the order the turn-end code-quality advisory has always
+ * rendered.
+ */
+export function applyPushedFindingPolicyByFile<
+	T extends DispositionCandidate & {
+		filePath: string;
+		rule?: string;
+		code?: string;
+		id?: string;
+	},
+>(findings: readonly T[], cwd: string): { kept: T[]; suppressed: number } {
+	const byFile = new Map<string, T[]>();
+	for (const finding of findings) {
+		const group = byFile.get(finding.filePath);
+		if (group) group.push(finding);
+		else byFile.set(finding.filePath, [finding]);
+	}
+	const kept: T[] = [];
+	let suppressed = 0;
+	for (const [filePath, group] of byFile) {
+		const policy = applyPushedFindingPolicy(group, {
+			cwd,
+			filePath,
+			content: readFileContent(filePath),
+		});
+		kept.push(...policy.kept);
+		suppressed += policy.suppressed;
+	}
+	return { kept, suppressed };
 }
 
 /** Every rendered `(tool, rule)` spelling plus the `tool`-omitted form of

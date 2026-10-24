@@ -28,8 +28,7 @@
  *     so it is strictly opt-in and documented here as a debug-only expense,
  *     never installed unless the flag was on before this module first loads.
  *
- * Bounded tracker (the one-axis-rule, AGENTS.md "resource bounded along one
- * axis but unbounded along another"): the creation-site map is capped at
+ * Bounded tracker (the one-axis-rule, docs/engineering-principles.md "Design shared state once, at design time"): the creation-site map is capped at
  * `TRACKER_MAX_ENTRIES` before adding a new entry past the cap — never
  * unbounded growth even in a pathological timer-storm session. Eviction
  * protects the first `TRACKER_PROTECTED_COUNT` insertion-order entries and

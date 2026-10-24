@@ -47,8 +47,9 @@ export interface LensFlagSpec {
 	/** Env var that forces the flag on when set to `"1"`. Outranks the CLI. */
 	env?: string;
 	/**
-	 * Escape hatch for the one flag whose config key is not a boolean
-	 * (`format.mode`). Returns undefined when the key is absent.
+	 * Escape hatch for a flag whose config key is not a plain boolean
+	 * (`format.mode`, and `tools.lazy`'s `"auto"`). Returns undefined when the
+	 * key is absent. The global loader parses such a key itself.
 	 */
 	readGlobal?: (config: Record<string, unknown>) => boolean | undefined;
 }
@@ -166,7 +167,7 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 	{
 		name: "no-opengrep",
 		description:
-			"Disable the Opengrep security scanner (a default-on auxiliary LSP; auto-installs, uses repo rules if present else the login-free 'auto' ruleset). Also via opengrep.enabled=false in ~/.dm-lens/config.json.",
+			"Disable the Opengrep security scanner (a default-on auxiliary LSP; auto-installs, uses repo rules if present, else the registry pack dm-lens refreshes into its cache, else the login-free 'auto' ruleset). Also via opengrep.enabled=false in ~/.dm-lens/config.json.",
 		configKey: "opengrep.enabled",
 		negated: true,
 		default: false,
@@ -190,6 +191,15 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 		default: false,
 		scope: "global",
 		env: "DM_LENS_NO_CONTEXT_INJECTION",
+	},
+	{
+		name: "lens-retain-injections",
+		description:
+			"Opt-in (#4743): re-send each request's injected findings unchanged, at the same place, in every later request of the session, so an exact-prefix prompt cache (a local llama.cpp or Qwen server) keeps the whole conversation. Each retained block is labelled a snapshot; findings are still delivered once. Default off. Also via contextInjection.retain=true in ~/.dm-lens/config.json.",
+		configKey: "contextInjection.retain",
+		negated: false,
+		default: false,
+		scope: "global",
 	},
 	{
 		name: "lens-turn-summary",
@@ -259,11 +269,17 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 	{
 		name: "no-lazy-tools",
 		description:
-			"Keep all dm-lens tools active to avoid tool-list cache changes. Also via tools.lazy=false in ~/.dm-lens/config.json.",
+			'Keep every dm-lens tool active for the whole session. Same as tools.lazy=false in ~/.dm-lens/config.json; the default tools.lazy=true starts the situational tools inactive on every model, and tools.lazy="auto" only on models that support mid-conversation system messages.',
 		configKey: "tools.lazy",
 		negated: true,
 		default: false,
 		scope: "global",
+		// #4687: `tools.lazy` takes a third value, "auto", which leaves this flag
+		// at its default (off); only the two booleans decide it.
+		readGlobal: (config) => {
+			const setting = readLazyToolsSetting(config);
+			return typeof setting === "boolean" ? setting : undefined;
+		},
 	},
 	{
 		name: "lens-turn-end-madge",
@@ -472,6 +488,20 @@ function asConfigObject(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
+}
+
+/** `tools.lazy` (#4687 item 7): the one registry key with a third value. */
+export type LazyToolsSetting = boolean | "auto";
+
+/**
+ * The `tools.lazy` value a config document sets, or undefined when it sets
+ * none or an invalid one. The global loader reports the invalid case.
+ */
+export function readLazyToolsSetting(
+	config: unknown,
+): LazyToolsSetting | undefined {
+	const lazy = asConfigObject(asConfigObject(config)?.tools)?.lazy;
+	return lazy === true || lazy === false || lazy === "auto" ? lazy : undefined;
 }
 
 interface FlagConfigPath {

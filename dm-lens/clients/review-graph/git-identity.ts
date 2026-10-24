@@ -72,6 +72,8 @@ function readCommonDir(gitDir: string): string {
 /**
  * Walk up from `cwd` looking for a `.git` entry. Returns null when none is
  * found (not a git repo) or the entry is malformed in a way we can't resolve.
+ * A `.git` directory with no `HEAD` is not a repository: git skips it and
+ * keeps looking, so the walk does too (#4508).
  */
 function resolveGitDir(cwd: string): ResolvedGitDir | null {
 	for (const dir of walkUpDirs(cwd)) {
@@ -83,6 +85,10 @@ function resolveGitDir(cwd: string): ResolvedGitDir | null {
 			continue;
 		}
 		if (stat.isDirectory()) {
+			// `existsSync` would turn an unreadable HEAD into "absent" and pick an
+			// enclosing repository; a throw here reaches `getResolvedGitDir` as null.
+			if (!fs.statSync(path.join(gitPath, "HEAD"), { throwIfNoEntry: false }))
+				continue;
 			return {
 				gitDir: gitPath,
 				commonDir: readCommonDir(gitPath),
@@ -171,6 +177,26 @@ export function resolveGitCheckout(startPath: string): GitCheckout | null {
 }
 
 /**
+ * The same-checkout-different-root rule, asked of two RESOLVED checkouts. One
+ * rule, two callers: {@link resolveLinkedWorktreeOwner} decides which checkout
+ * owns an edit (a file's directory), and `isSessionBookkeepingRoot`
+ * (`clients/analysis-root.ts`) decides whether a ROOT may receive session
+ * bookkeeping (#4532 round 4, NITPICK-1 — the second spelling dropped the
+ * `pathsEqual` the first one uses). Equality is `pathsEqual`, never `===`: one
+ * checkout can be spelled with another case or through a symlink.
+ */
+export function sameCheckoutOtherRoot(
+	session: GitCheckout,
+	other: GitCheckout | null,
+): boolean {
+	return (
+		other !== null &&
+		!pathsEqual(other.root, session.root) &&
+		pathsEqual(other.commonDir, session.commonDir)
+	);
+}
+
+/**
  * The linked worktree of `session`'s repository that owns `absoluteFile`, or
  * `null` when the session checkout owns it, its owner is a different
  * repository (a submodule, a nested clone), or no owner can be resolved (#3871,
@@ -183,11 +209,7 @@ export function resolveLinkedWorktreeOwner(
 	absoluteFile: string,
 ): GitCheckout | null {
 	const owner = resolveGitCheckout(dirname(absoluteFile));
-	return owner !== null &&
-		!pathsEqual(owner.root, session.root) &&
-		pathsEqual(owner.commonDir, session.commonDir)
-		? owner
-		: null;
+	return sameCheckoutOtherRoot(session, owner) ? owner : null;
 }
 
 /**

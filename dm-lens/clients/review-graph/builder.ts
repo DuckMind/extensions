@@ -5,6 +5,11 @@ import { Worker } from "node:worker_threads";
 import { constants as zlibConstants, gunzipSync, gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { writeFileAtomic } from "../atomic-write.js";
+import {
+	type GzipStageWorkerResult,
+	readGzipStageWorkerResult,
+	reapStageFile,
+} from "../gzip-stage-write.js";
 import type { CallGraphEvidenceCoverage } from "../call-graph.js";
 import { FactStore, type ReadonlyFactStore } from "../dispatch/fact-store.js";
 import { fileContentProvider } from "../dispatch/facts/file-content.js";
@@ -40,6 +45,8 @@ import { getReviewGraphMaxFilesDerived } from "../project-scale.js";
 import { compareOrdinal, escapeRegExp } from "../string-utils.js";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
+	fileAnswerNames,
+	importSourceNameParts,
 	jsTsCandidatePaths,
 	resolveAliasedImport,
 	resolveImportToFiles,
@@ -91,11 +98,9 @@ import type {
 	ReviewGraphPersistCoverage,
 } from "./types.js";
 import type { SymbolKind, SymbolRef } from "../symbol-types.js";
-import type {
-	ReviewGraphPersistWorkerRequest,
-	ReviewGraphPersistWorkerResult,
-} from "./persist-worker.js";
+import type { ReviewGraphPersistWorkerRequest } from "./persist-worker.js";
 import {
+	notePersistWorkerMessageFault,
 	readWorkerHeapStatistics,
 	type PersistWorkerHeapStatistics,
 } from "../persist-worker-stats.js";
@@ -1601,6 +1606,13 @@ interface GraphSourceFilesResult {
 	/** Per-build file cap captured before the asynchronous walk begins. */
 	maxFileCount: number;
 	entryBudgetExceeded: boolean;
+	/** Directory entries the source walk touched (#1979); absent when not counted. */
+	entriesVisited: number | undefined;
+	/**
+	 * Wall time of the source collection (#1979): the tracked-file index prime and
+	 * ignore-config build plus the directory walk, not the walk alone.
+	 */
+	walkMs: number;
 }
 
 // Test-only override so the entry-budget propagation contract can be exercised
@@ -1637,19 +1649,24 @@ export async function getGraphSourceFiles(
 	// tree with few source files among a huge pile of non-source files can trip the
 	// entry budget first. That result is a useful partial graph, but its lower-bound
 	// count MUST travel with the graph and persistence metadata; it is never clean.
-	const { files: collected, entryBudgetExceeded } =
-		await collectProjectSourceFilesWithBudgetAsync(cwd, {
-			// Only walk graph-relevant extensions so the cap counts what the graph
-			// keeps (post-filter), not JSON/YAML/MD noise it would discard anyway.
-			extensions: MAIN_KIND_EXTENSIONS,
-			maxFiles: maxGraphFiles + 1,
-			...(_reviewGraphEntryBudgetForTests === undefined
-				? {}
-				: { maxScanEntries: _reviewGraphEntryBudgetForTests }),
-			...(_reviewGraphEntryCounterForTests === undefined
-				? {}
-				: { onEntryVisited: _reviewGraphEntryCounterForTests }),
-		});
+	const walkStartedAt = Date.now();
+	const {
+		files: collected,
+		entryBudgetExceeded,
+		entriesVisited,
+	} = await collectProjectSourceFilesWithBudgetAsync(cwd, {
+		// Only walk graph-relevant extensions so the cap counts what the graph
+		// keeps (post-filter), not JSON/YAML/MD noise it would discard anyway.
+		extensions: MAIN_KIND_EXTENSIONS,
+		maxFiles: maxGraphFiles + 1,
+		...(_reviewGraphEntryBudgetForTests === undefined
+			? {}
+			: { maxScanEntries: _reviewGraphEntryBudgetForTests }),
+		...(_reviewGraphEntryCounterForTests === undefined
+			? {}
+			: { onEntryVisited: _reviewGraphEntryCounterForTests }),
+	});
+	const walkMs = Date.now() - walkStartedAt;
 	if (entryBudgetExceeded) {
 		logLatency({
 			type: "phase",
@@ -1669,6 +1686,8 @@ export async function getGraphSourceFiles(
 			sourceFileCount: collected.length,
 			maxFileCount: maxGraphFiles,
 			entryBudgetExceeded,
+			entriesVisited,
+			walkMs,
 		};
 	}
 	const result: string[] = [];
@@ -1700,6 +1719,8 @@ export async function getGraphSourceFiles(
 		sourceFileCount: result.length,
 		maxFileCount: maxGraphFiles,
 		entryBudgetExceeded,
+		entriesVisited,
+		walkMs,
 	};
 }
 
@@ -2087,7 +2108,7 @@ const _persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const _persistGenerations = new Map<string, number>();
 const _workerRequests = new Map<
 	number,
-	{ key: string; pending: PendingPersist }
+	{ key: string; pending: PendingPersist; stagePath: string }
 >();
 let _persistWorker: Worker | undefined;
 let _persistWorkerRequestId = 0;
@@ -2465,7 +2486,26 @@ function writePendingOnMainThread(
 	}
 }
 
-function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
+/**
+ * The persist worker's `message` listener (#4402). The message is wire data
+ * (#4400): it passes the shape check or is dropped and counted, and a throw
+ * below is counted here instead of leaving the listener, which would end the
+ * host.
+ */
+function handleWorkerMessage(message: unknown): void {
+	try {
+		const result = readGzipStageWorkerResult(message);
+		if (typeof result === "string") {
+			notePersistWorkerMessageFault("review-graph", "rejected", result);
+			return;
+		}
+		handleWorkerResult(result);
+	} catch (err) {
+		notePersistWorkerMessageFault("review-graph", "threw", err);
+	}
+}
+
+function handleWorkerResult(result: GzipStageWorkerResult): void {
 	// Checkpoint offloads share this worker but promote to a different target;
 	// route them out before the authoritative-persist path (disjoint id space,
 	// so a checkpoint id is never also an authoritative one).
@@ -2476,10 +2516,16 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 	}
 	const request = _workerRequests.get(result.id);
 	if (!request) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		// Late result for a request the host no longer tracks: the echoed path is
+		// the only name left, and it is wire data (#4400).
+		if (typeof result.stagePath === "string") {
+			fs.rm(result.stagePath, { force: true }, () => {});
+		}
 		return;
 	}
 	_workerRequests.delete(result.id);
+	// #4400: the host sent `request.stagePath` (and `cp.stagePath` for a
+	// checkpoint), so cleanup and promotion use that record, never the echo.
 	const { key, pending } = request;
 	const currentGeneration = _persistGenerations.get(key);
 	if (currentGeneration !== result.generation) {
@@ -2488,11 +2534,11 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 		// also means its stage namespace is clean (#1318). Caught (#1361 review):
 		// force suppresses ENOENT but not EBUSY/EPERM (Windows AV/backup can
 		// briefly hold the handle) -- a failed reap must never abort this
-		// callback, or the WINNING generation's completion is lost with it. The
-		// startup sweep reclaims anything a failed unlink leaves behind.
-		try {
-			fs.rmSync(result.stagePath, { force: true });
-		} catch (reapErr) {
+		// callback, or the WINNING generation's completion is lost with it. A
+		// failed unlink stays until a later process's startup sweep: the sweep
+		// skips this live pid's own stage files.
+		const reapErr = reapStageFile(request.stagePath);
+		if (reapErr !== undefined) {
 			logReviewGraph({
 				cwd: key,
 				phase: "persist_failed",
@@ -2521,7 +2567,7 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 		result.writeMs === undefined ||
 		result.durationMs === undefined
 	) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rm(request.stagePath, { force: true }, () => {});
 		writePendingOnMainThread(
 			key,
 			pending,
@@ -2535,7 +2581,7 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 		return;
 	}
 	try {
-		fs.renameSync(result.stagePath, pending.cachePath);
+		fs.renameSync(request.stagePath, pending.cachePath);
 		fs.rmSync(path.join(pending.cacheDir, LEGACY_GRAPH_CACHE_FILENAME), {
 			force: true,
 		});
@@ -2553,7 +2599,7 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 			{ started: true, completed: true },
 		);
 	} catch (err) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rm(request.stagePath, { force: true }, () => {});
 		writePendingOnMainThread(
 			key,
 			pending,
@@ -2569,7 +2615,7 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 
 function handleCheckpointWorkerResult(
 	cp: PendingCheckpointWrite,
-	result: ReviewGraphPersistWorkerResult,
+	result: GzipStageWorkerResult,
 ): void {
 	_checkpointWorkerRequests.delete(result.id);
 	// Best-effort: a failed offload just means no checkpoint for this stride —
@@ -2583,7 +2629,7 @@ function handleCheckpointWorkerResult(
 			reason: "worker_error",
 			error: result.error ?? "worker returned no gz metrics",
 		});
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rm(cp.stagePath, { force: true }, () => {});
 		return;
 	}
 	// Generation gate: a newer checkpoint stride, or build completion / a
@@ -2591,11 +2637,11 @@ function handleCheckpointWorkerResult(
 	// removing the file), supersedes this write — discard the stale stage rather
 	// than resurrect a checkpoint over a fresher one or a completed build.
 	if (_checkpointGenerations.get(cp.cwd) !== cp.generation) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rm(cp.stagePath, { force: true }, () => {});
 		return;
 	}
 	try {
-		fs.renameSync(result.stagePath, cp.checkpointPath);
+		fs.renameSync(cp.stagePath, cp.checkpointPath);
 		logReviewGraph({
 			cwd: cp.cwd,
 			phase: "checkpoint_written",
@@ -2612,7 +2658,7 @@ function handleCheckpointWorkerResult(
 			reason: "promote_failed",
 			error: err instanceof Error ? err.message : String(err),
 		});
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rm(cp.stagePath, { force: true }, () => {});
 	}
 }
 
@@ -2695,7 +2741,7 @@ function getPersistWorker(): Worker | undefined {
 			return undefined;
 		}
 		const worker = new Worker(workerPath);
-		worker.on("message", handleWorkerResult);
+		worker.on("message", handleWorkerMessage);
 		worker.on("error", (err: Error) => handleWorkerDeath(err.message));
 		worker.on("exit", (code) => {
 			if (_persistWorker !== worker) return;
@@ -2760,7 +2806,7 @@ function writePending(key: string): void {
 				? Number(process.env.DM_LENS_TEST_PERSIST_WORKER_DELAY_MS) || undefined
 				: undefined,
 	};
-	_workerRequests.set(id, { key, pending });
+	_workerRequests.set(id, { key, pending, stagePath });
 	worker.postMessage(request);
 }
 
@@ -4824,12 +4870,16 @@ async function addFileToGraph(
  * removing edges; batching keeps a high-fan-in bucket linear instead of
  * rescanning its prefix for every edge. They are the count-based signal the
  * issue asks for, because wall time on this hardware is IO-noisy (#1920).
+ * #4346: `createdImportResolutions` counts the imports `importersResolvingTo`
+ * resolves after a creation; its name filter keeps that to the imports that
+ * name a created file's stem or directory, not every import in the graph.
  */
 const _rebuildCounters = {
 	restoreComparisons: 0,
 	importTargetEdgeScans: 0,
 	removeOwnedEdgeVisits: 0,
 	removeOwnedEdgePositions: 0,
+	createdImportResolutions: 0,
 };
 
 export function _getReviewGraphRebuildCountersForTests(): {
@@ -4837,6 +4887,7 @@ export function _getReviewGraphRebuildCountersForTests(): {
 	importTargetEdgeScans: number;
 	removeOwnedEdgeVisits: number;
 	removeOwnedEdgePositions: number;
+	createdImportResolutions: number;
 } {
 	return { ..._rebuildCounters };
 }
@@ -4846,6 +4897,7 @@ export function _resetReviewGraphRebuildCountersForTests(): void {
 	_rebuildCounters.importTargetEdgeScans = 0;
 	_rebuildCounters.removeOwnedEdgeVisits = 0;
 	_rebuildCounters.removeOwnedEdgePositions = 0;
+	_rebuildCounters.createdImportResolutions = 0;
 }
 
 /**
@@ -4970,6 +5022,60 @@ function importTargetsForFile(graph: ReviewGraph, filePath: string): string[] {
 	return [...targets].sort((a, b) => compareOrdinal(a, b));
 }
 
+/**
+ * #4346: the graph's importers whose unresolved import (an `imports` edge to a
+ * `module:` or `external:` placeholder) now resolves to a file in `created`,
+ * through the resolver a full build uses for the importer's language. A cheap
+ * name test runs first: a placeholder is resolved only when a part of its
+ * source equals a created file's stem or its directory's name, so a new
+ * `os.py` resolves the placeholders that name `os`, never every external.
+ * C and C++ includes leave no placeholder, so they are not found here.
+ */
+function importersResolvingTo(
+	graph: ReviewGraph,
+	cwd: string,
+	created: ReadonlySet<string>,
+	ignoredIds?: ReadonlySet<string>,
+): string[] {
+	const names = new Set([...created].flatMap(fileAnswerNames));
+	const importers = new Set<string>();
+	for (const node of graph.nodes.values()) {
+		if (node.kind !== "module" && node.kind !== "external") continue;
+		const source = node.metadata?.source;
+		if (typeof source !== "string") continue;
+		if (!importSourceNameParts(source).some((part) => names.has(part))) {
+			continue;
+		}
+		for (const edge of graph.edgesByTo.get(node.id) ?? []) {
+			if (edge.kind !== "imports") continue;
+			const importer = graph.nodes.get(edge.from);
+			const importerPath = importer?.filePath;
+			if (!importer || !importerPath || importers.has(importerPath)) continue;
+			_rebuildCounters.createdImportResolutions++;
+			const targets =
+				importer.language === "jsts"
+					? [localImportToFile(cwd, importerPath, source, ignoredIds)]
+					: resolveImportToFiles(
+							cwd,
+							importerPath,
+							importer.language ?? "",
+							source,
+						);
+			if (
+				targets.some(
+					(target) =>
+						target !== undefined &&
+						!ignoredIds?.has(target) &&
+						created.has(normalizeMapKey(target)),
+				)
+			) {
+				importers.add(importerPath);
+			}
+		}
+	}
+	return [...importers];
+}
+
 async function updateGraphFiles(
 	graph: ReviewGraph,
 	cwd: string,
@@ -5003,6 +5109,37 @@ async function updateGraphFiles(
 			...removeFileOwnedGraphData(graph, file, removedEdges),
 		);
 		await addFileToGraph(graph, cwd, file, ignoredIds);
+	}
+	// #4346: a file new to the graph can resolve an import another file left
+	// unresolved, and only that importer's own parse adds the edge a full build
+	// has. Reparse each such importer in this same pass, so the returned delta
+	// (and the reverse-dependency index patched from it) carries the edge.
+	const created = new Set(
+		prior
+			.filter((entry) => !entry.existedBefore)
+			.map((entry) => entry.filePath)
+			.filter((file) => graph.fileNodes.has(file)),
+	);
+	if (created.size > 0) {
+		const batch = new Set(prior.map((entry) => entry.filePath));
+		for (const importer of importersResolvingTo(
+			graph,
+			cwd,
+			created,
+			ignoredIds,
+		)) {
+			if (batch.has(importer)) continue;
+			batch.add(importer);
+			prior.push({
+				filePath: importer,
+				existedBefore: true,
+				priorTargets: importTargetsForFile(graph, importer),
+			});
+			preservedIncoming.push(
+				...removeFileOwnedGraphData(graph, importer, removedEdges),
+			);
+			await addFileToGraph(graph, cwd, importer, ignoredIds);
+		}
 	}
 	if (removedEdges.size > 0) {
 		unindexEdges(graph, removedEdges);
@@ -5657,6 +5794,10 @@ async function _doBuildGraph(
 				maxFileCount: maxGraphFiles,
 				sourceFileCountLabel: `more than ${maxGraphFiles} files`,
 				sourceFileCountTruncated: true,
+				// #1979: the walk's interior, so a slow over-cap first build reads as
+				// many ms per entry (cold filesystem) or many entries (big tree).
+				entriesVisited: sourceCollection.entriesVisited,
+				walkMs: sourceCollection.walkMs,
 			},
 		});
 		if (isReviewGraphSizeNearMiss(sourceFileCount, maxGraphFiles)) {

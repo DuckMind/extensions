@@ -7,6 +7,17 @@ export type AstGrepNapi = typeof import("@ast-grep/napi");
 
 const fallbackRequire = createRequire(import.meta.url);
 
+export function loadAstGrepNapiSync(): AstGrepNapi | undefined {
+	const bundled = getDmHostModule<AstGrepNapi>("@ast-grep/napi");
+	if (bundled) return bundled;
+	try {
+		return fallbackRequire(getDmHostModulePath("@ast-grep/napi") ?? "@ast-grep/napi") as AstGrepNapi;
+	} catch {
+		// The implicit-scope reader treats an unavailable native addon as unknown.
+		return undefined;
+	}
+}
+
 export function loadAstGrepNapi(): Promise<AstGrepNapi> {
 	const bundled = getDmHostModule<AstGrepNapi>("@ast-grep/napi");
 	if (bundled) return Promise.resolve(bundled);

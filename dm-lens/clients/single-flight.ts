@@ -88,6 +88,13 @@ export interface SingleFlight<T> {
 	run(key: string, fn: () => Promise<T>): Promise<T>;
 	/** Is a flight currently running for `key`? Test and diagnostic use. */
 	has(key: string): boolean;
+	/**
+	 * Does the running flight of `key` owe a trailing pass (a caller arrived
+	 * mid-flight with `coalesceTrailing`)? Test and diagnostic use: a join is
+	 * otherwise silent — the joining caller's own closure never runs — so this is
+	 * the only way to observe one before the flight settles (#4612 r4).
+	 */
+	hasPendingRerun(key: string): boolean;
 	/** How many flights are running. Test and diagnostic use. */
 	size(): number;
 	/**
@@ -231,6 +238,7 @@ export function createSingleFlight<T>(
 	return {
 		run,
 		has: (key) => flights.has(key),
+		hasPendingRerun: (key) => flights.get(key)?.rerunRequested ?? false,
 		size: () => flights.size,
 		clear: () => flights.clear(),
 	};

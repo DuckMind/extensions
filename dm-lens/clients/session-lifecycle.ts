@@ -29,7 +29,10 @@
  * `subagent-mode.ts` / `runtime-config.ts`).
  */
 
-import { recordDegradationOnce } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { normalizeFilePath } from "./path-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
 
@@ -130,6 +133,113 @@ function successorPendingTtlMs(): number {
 /** The stable id of the currently registered primary session, if known. */
 export function getActiveSessionId(): string | undefined {
 	return state().activeSessionId;
+}
+
+/** Whether a primary registration is held (the `hasPrior` of a start). */
+export function hasPrimaryRegistration(): boolean {
+	const s = state();
+	return s.activeCtx !== undefined || s.activeSessionId !== undefined;
+}
+
+/**
+ * Whether `ctx` is the context the registered primary was admitted with: the
+ * ownership identity of the registration, not its stable session id, since a
+ * reload can re-register that id in another activation (#4554 r5).
+ */
+export function isPrimarySessionOwner(ctx: unknown): boolean {
+	return state().activeCtx === ctx;
+}
+
+/** One live-session record as `index.ts` keeps it: its start's context. */
+interface LiveSessionMember {
+	readonly ctx: unknown;
+}
+
+const LIVE_SESSION_LISTS_FAMILY = "session-lifecycle.live-session-lists";
+const LIVE_SESSION_LISTS_VERSION = 1;
+
+/**
+ * #4704: every dm-lens activation's live-session member list, so the shared
+ * teardown can ask the PROCESS, not one activation, whether a session is still
+ * live. pi 1.3.0 runs the factory once per session load, so an in-process
+ * subagent is another activation; reading only the leaving activation's list
+ * tore the shared infra down under a live sibling.
+ *
+ * Membership stays owned by each activation (its records carry the role, the
+ * scope and the start's context, and its own leave edits them); this set only
+ * lets one activation read the others. Bounded by live activations: a list
+ * with no live member is dropped at the next read and re-added by its
+ * activation's next start.
+ */
+function liveSessionLists(): Set<ReadonlyArray<LiveSessionMember>> {
+	return getProcessSingleton(
+		LIVE_SESSION_LISTS_FAMILY,
+		LIVE_SESSION_LISTS_VERSION,
+		() => new Set<ReadonlyArray<LiveSessionMember>>(),
+	);
+}
+
+/** Make an activation's member list readable process-wide (idempotent). */
+export function trackLiveSessionMembers(
+	members: ReadonlyArray<LiveSessionMember>,
+): void {
+	liveSessionLists().add(members);
+}
+
+/**
+ * Whether any activation in this process still holds a live session (#4704).
+ *
+ * A recorded member is live until its own leave removes it, except when pi has
+ * POSITIVELY invalidated its context (`probeCtxActive` returns `false`): pi's
+ * `AgentSession.dispose()` invalidates the session's contexts and emits no
+ * `session_shutdown`, so a subagent its runner disposed never leaves and must
+ * not hold the shared infra forever (the #472 orphan class). An inconclusive
+ * probe stays live, since nothing proves that session ended.
+ *
+ * `except` is a starting session asking whether ANOTHER session is live: it
+ * is not counted, and its own list is kept even when it is that list's only
+ * member.
+ */
+export function hasLiveSessionInProcess(except?: LiveSessionMember): boolean {
+	const lists = liveSessionLists();
+	let live = false;
+	for (const members of lists) {
+		if (
+			members.some((member) => member !== except && isLiveSessionMember(member))
+		)
+			live = true;
+		else if (!members.some((member) => member === except)) {
+			lists.delete(members);
+			// Each member still listed never left: pi disposed it without a
+			// shutdown, so its end-of-session work did not run either. Counted
+			// per member, so the ledger's tally is the number of such sessions.
+			for (const _member of members)
+				incrementDegradationCount({
+					kind: "session-member-disposed",
+					subject: "no-shutdown",
+					reason:
+						"a live session's context was invalidated with no session_shutdown (pi's AgentSession.dispose); it no longer holds the shared teardown, and its own end-of-session work did not run",
+				});
+		}
+	}
+	return live;
+}
+
+/**
+ * The one liveness predicate for a recorded member (#4704): live unless pi
+ * POSITIVELY invalidated its context. The process read above and an
+ * activation's own scope retirement both use it, so the two cannot disagree
+ * about a session pi disposed without a shutdown.
+ */
+export function isLiveSessionMember(member: LiveSessionMember): boolean {
+	return probeCtxActive(member.ctx) !== false;
+}
+
+/** How many activations' member lists the process still tracks (#4704): a
+ *  list leaves at the first read that finds none of its members live, so a
+ *  process with no live session holds none. */
+export function _trackedLiveSessionListCountForTests(): number {
+	return liveSessionLists().size;
 }
 
 /**
@@ -398,12 +508,18 @@ function normalizeRootForCompare(root: string | undefined): string | undefined {
  * primary, never a full start, no re-arm.
  *
  * This is the catalog's process-lifetime-latch shape (state that must re-arm at
- * a session boundary must not outlive it). `session_shutdown`'s primary path is
- * that boundary. Deliberately NOT called on a secondary's shutdown — that path
- * returns before the shared teardown precisely because the primary is still
- * live.
+ * a session boundary must not outlive it). The primary's own `session_shutdown`
+ * is that boundary, whatever else is live (#4704): the registration is per
+ * primary. Holding it past the primary's leave declined a cross-root
+ * successor (`/resume`) as `secondary-root` for its whole life, since root
+ * identity makes a held, dead registration decisive. The process's shared
+ * infra is per process: only a leave that leaves the PROCESS with no live
+ * session tears it down ({@link hasLiveSessionInProcess}), and a repeat of
+ * that teardown with nothing live is a no-op. That last leave also releases a
+ * registration still held by a session that can no longer leave (pi disposed
+ * it without a shutdown).
  *
- * A concurrent secondary that outlives the primary now classifies `primary` on
+ * A concurrent secondary that outlives a released primary classifies `primary` on
  * its later emissions rather than `concurrent-secondary`. That is the fail-safe
  * direction this module has always taken (run the handler), and it is correct
  * here: with the primary gone there is no live sibling to protect.
@@ -645,6 +761,7 @@ export function _resetSessionLifecycleForTests(): void {
 	s.secondarySessionCount = 0;
 	s.successorPendingSince = undefined;
 	s.successorNamed = undefined;
+	liveSessionLists().clear();
 }
 
 export interface SessionStartGuardDecision {

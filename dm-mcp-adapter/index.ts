@@ -9,7 +9,7 @@ import { isServerDisabled, type DirectToolSpec, type McpAdapterOptions, type Mcp
 import type { McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { Type } from "typebox";
 import type { TSchema } from "typebox";
-import { cloneMcpConfig, discoverConfiguredClaudePluginSkills, getLegacyMcpMigrationNotices, getPiGlobalConfigPath, getPiMcpAuthPath, getProjectConfigPath, loadMcpConfig, resolveConfiguredClaudePluginMcp, setPiMcpConfigEnabled, translatePiMcpServer, writeProjectServerDisabledOverride, writeSharedServerEntry } from "./config.ts";
+import { cloneMcpConfig, discoverConfiguredClaudePluginSkills, getLegacyMcpMigrationNotices, getPiGlobalConfigPath, getProjectConfigPath, loadMcpConfig, resolveConfiguredClaudePluginMcp, setPiMcpConfigEnabled, translatePiMcpServer, writeProjectServerDisabledOverride, writeSharedServerEntry } from "./config.ts";
 import { approveProjectServer, excludeProjectServersAtLoadTime, hasProjectServerDefinitions } from "./project-server-trust.ts";
 import { buildProxyDescription, getLargeDirectToolsAdvisory, getMissingConfiguredDirectToolServers, prepareDirectToolArguments, resolveDirectTools } from "./direct-tool-surface.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
@@ -220,7 +220,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   const sessionConfig = options.config !== undefined ? cloneMcpConfig(options.config) : undefined;
   const programmaticConfig = sessionConfig !== undefined;
   // Before the first config load, so every load in this process agrees.
-  if (!programmaticConfig) setPiMcpConfigEnabled(piSupportsMcp(pi));
+  if (!programmaticConfig) setPiMcpConfigEnabled(typeof (pi as Partial<McpHostApi>).registerMcpServer === "function");
   let state: McpExtensionState | null = null;
   let sessionCtx: ExtensionContext | null = null;
   let initPromise: Promise<McpExtensionState> | null = null;
@@ -1362,12 +1362,12 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       void import("./pi-builtin-mcp.ts")
         .then(({ turnOffPiBuiltinMcp }) => turnOffPiBuiltinMcp())
         .then((turnedOff) => {
-          if (turnedOff) report("Turned off the host's built-in MCP so it doesn't run next to dm-mcp-adapter. If you remove the adapter, turn it back on in the host's extension settings.", "info");
+          if (turnedOff) report("Turned off the host's built-in MCP so it doesn't run next to dm-mcp-adapter. If you remove the adapter, turn it back on in `dm config` → Built-in.", "info");
         })
         .catch((error) => report(`MCP: could not turn off DM's built-in MCP: ${formatTerminalError(error)}`, "warning"));
     }
     // Before any connection, so an imported sign-in is used from the first connect.
-    if (ctx.hasUI && !programmaticConfig && existsSync(getPiMcpAuthPath())) {
+    if (ctx.hasUI && !programmaticConfig && existsSync(getAgentPath("mcp-auth.json"))) {
       try {
         const { offerPiSignInImports } = await import("./pi-signin-import.ts");
         await offerPiSignInImports(ctx, excludeProjectServersAtLoadTime(loadMcpConfig(earlyConfigPath, ctx.cwd)), owner.signal);

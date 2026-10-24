@@ -102,7 +102,9 @@ import {
 	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
 
-const helm = createAvailabilityChecker("helm", ".exe");
+// helm 4 has no --version flag ("Error: unknown flag: --version", exit 1);
+// the version lives under a subcommand.
+const helm = createAvailabilityChecker("helm", ".exe", ["version", "--short"]);
 const trivy = createAvailabilityChecker("trivy", ".exe");
 
 const inFlightByChartRoot = new PathKeyedMap<Promise<RunnerResult>>(

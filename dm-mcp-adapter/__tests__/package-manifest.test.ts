@@ -76,8 +76,8 @@ describe("package.json files", () => {
 
     expect(packageJson.scripts?.prepare).toBeUndefined();
     expect(packageJson.scripts?.prepack).toContain("examples/interactive-visualizer run build");
-    expect(packageJson.files).toContain("examples/interactive-visualizer/dist/app.html");
     expect(packageJson.files).toContain("examples/interactive-visualizer/dist/server.js");
+    expect(packageJson.files).toContain("examples/interactive-visualizer/dist/app.html");
     expect(publishedFiles.has("dist")).toBe(true);
     for (const entry of Object.values(packageJson.exports ?? {})) {
       if (!entry || typeof entry !== "object") continue;
@@ -161,7 +161,7 @@ describe("package.json dependency policy", () => {
     for (const [name, versions] of Object.entries(hostPeerPackages)) {
       const specifier = `["']${name}(?:/[^"']*)?["']`;
       const runtimeImport = new RegExp([
-        `^[ \\t]*(?:import|export)[ \\t]+(?!type\\b)[^;\\n]*?from[ \\t]+${specifier}`,
+        `^\\s*(?:import|export)\\s+(?!type\\s)[^;]*?from\\s+${specifier}`,
         `^\\s*import\\s+${specifier}`,
         `\\b(?:import|require)\\(\\s*${specifier}\\s*\\)`,
       ].join("|"), "m");
@@ -169,11 +169,18 @@ describe("package.json dependency policy", () => {
     }
   });
 
-  it("tests extension APIs against the local authoritative DM host", () => {
+  it("tests extension APIs against DM 1.0.0", () => {
     expect(packageJson.devDependencies?.["@duckmind/dm-coding-agent"]).toBe("file:../../dm-mono/packages/coding-agent");
   });
 
-  it("declares modular SDK v2 packages without directly depending on the legacy monolith", () => {
+  it("uses the stable modular SDK v2 client/core packages without the legacy monolithic SDK", () => {
+    const packageLock = JSON.parse(readFileSync(join(repoRoot, "package-lock.json"), "utf-8")) as {
+      packages: Record<string, { dev?: boolean }>;
+    };
+    const productionLegacySdk = Object.keys(packageLock.packages).filter(
+      (path) => path.endsWith("node_modules/@modelcontextprotocol/sdk") && !packageLock.packages[path]?.dev
+    );
+    expect(productionLegacySdk).toEqual([]);
     expect(packageJson.dependencies?.["@modelcontextprotocol/sdk"]).toBeUndefined();
     expect(packageJson.dependencies?.["@modelcontextprotocol/client"]).toBe("2.3.1");
     expect(packageJson.dependencies?.["@modelcontextprotocol/core"]).toBe("2.3.1");

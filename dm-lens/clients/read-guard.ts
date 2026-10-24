@@ -10,17 +10,16 @@
  * Falls back safely when LSP is unavailable.
  */
 
-import { createHash } from "node:crypto";
+import { constants as bufferConstants } from "node:buffer";
 import * as fs from "node:fs";
-import { BoundedSet } from "./bounded-cache.js";
-import { incrementDegradationCount } from "./degradation-ledger.js";
-import { createFileTime, type FileTime } from "./file-time.js";
-import { hashDiagnosticContent } from "./lsp/diagnostic-binding.js";
+import { BoundedFifoMap, BoundedSet } from "./bounded-cache.js";
 import {
-	normalizeEphemeralMapKey,
-	normalizeFilePath,
-	realpathOrResolve,
-} from "./path-utils.js";
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
+import { createFileTime, type FileTime } from "./file-time.js";
+import { hashContentBytes, hashFileBytes } from "./content-stamp.js";
+import { normalizeEphemeralMapKey, normalizeFilePath } from "./path-utils.js";
 import {
 	logReadGuardEvent,
 	sanitizeCorrelationId,
@@ -259,10 +258,6 @@ const READ_HASH_MAX_LINES = Math.max(
  * synchronous disk read so bridge registration never hashes an unbounded file.
  */
 const READ_BINDING_MAX_BYTES = 4 * 1024 * 1024;
-
-function hashFileBytes(filePath: string): string {
-	return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
-}
 
 /** `size` of an authorship credited while the file could not be read. */
 const ABSENT_SIZE = -1;
@@ -528,7 +523,7 @@ export function captureReadContentBinding(
 		const lines = splitLinesThrough(content, READ_HASH_MAX_LINES + 1);
 		if (lines.length <= READ_HASH_MAX_LINES) {
 			return {
-				hash: hashDiagnosticContent(content),
+				hash: hashContentBytes(Buffer.from(content, "utf8")),
 				fullFile: true,
 				offset: 1,
 				limit: lines.length,
@@ -545,7 +540,7 @@ export function captureReadContentBinding(
 			.slice(scopedOffset - 1, scopedOffset - 1 + scopedLimit)
 			.join("\n");
 		return {
-			hash: hashDiagnosticContent(scopedContent),
+			hash: hashContentBytes(Buffer.from(scopedContent, "utf8")),
 			fullFile: false,
 			offset: scopedOffset,
 			limit: scopedLimit,
@@ -566,7 +561,7 @@ export function _currentContentMatchesBindingForTests(
 			: splitLines(content)
 					.slice(binding.offset - 1, binding.offset - 1 + binding.limit)
 					.join("\n");
-		return hashDiagnosticContent(boundContent) === binding.hash;
+		return hashContentBytes(Buffer.from(boundContent, "utf8")) === binding.hash;
 	} catch {
 		return false;
 	}
@@ -681,20 +676,185 @@ function hashLines(
 	return lines.length > 0 ? hashes : undefined;
 }
 
-function captureLineHashes(
-	filePath: string,
+/**
+ * #1649: bytes {@link scanFileLines} reads at a time. A scan holds one chunk
+ * plus the lines its ranges want, whatever the file's size.
+ */
+const SCAN_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * #1649: the byte gate, checked on the open file before any byte is read.
+ * Past V8's string limit the `readFileSync(path, "utf-8")` this scan replaced
+ * threw (`ERR_STRING_TOO_LONG`, or `ERR_FS_FILE_TOO_LARGE` past 2 GiB), so
+ * every read-accounting caller took its failure answer: a line count of 1 and
+ * no hashes. The gate gives that answer without reading the file.
+ */
+const SCAN_MAX_BYTES = bufferConstants.MAX_STRING_LENGTH;
+
+/** The lines a read of `[offset, offset + limit - 1]` hashes, if any. */
+function hashedWindow(
 	offset: number,
 	limit: number,
-): Record<number, string> | undefined {
+): [number, number] | undefined {
 	if (limit <= 0 || limit > READ_HASH_MAX_LINES) return undefined;
+	const first = Math.max(1, offset);
+	const last = offset + limit - 1;
+	return last < first ? undefined : [first, last];
+}
+
+/** One pass of {@link scanFileLines}. */
+export interface FileLineScan {
+	/**
+	 * `text.split(/\r?\n/).length` of the file's UTF-8 text (1 for an empty
+	 * file). Undefined when the scan was asked not to count.
+	 */
+	readonly totalLines: number | undefined;
+	/**
+	 * The read-time line hashes of `[offset, offset + limit - 1]`, clipped at
+	 * the end of the file: undefined when `limit` is outside
+	 * `1..READ_HASH_MAX_LINES` or no line of the range exists. The range must
+	 * lie inside one the scan was given, and a range keeps at most
+	 * `READ_HASH_MAX_LINES` lines from its offset, so a scan of
+	 * `{ offset, limit: L }` answers `hashes(offset, l)` for every `l <= L`.
+	 */
+	hashes(offset: number, limit: number): Record<number, string> | undefined;
+}
+
+/**
+ * #1649: the read-accounting pass. One bounded read of the file gives its
+ * line count and the text of the lines `ranges` will hash; no other line is
+ * decoded or kept. The file is read in {@link SCAN_CHUNK_BYTES} chunks after
+ * the {@link SCAN_MAX_BYTES} gate on its size, and `count: false` stops at the
+ * end of the last range. Lines end at `\n`, so the count and the hashes are
+ * those of `split(/\r?\n/)` over the decoded text: byte 0x0A never occurs
+ * inside a UTF-8 sequence, so a line decoded alone is the text the whole-file
+ * decode gave it. Undefined when the file cannot be read (a directory
+ * included) or is over the gate.
+ */
+export function scanFileLines(
+	filePath: string,
+	ranges: ReadonlyArray<{ offset: number; limit: number }>,
+	opts: { count: boolean },
+): FileLineScan | undefined {
+	// A range keeps at most READ_HASH_MAX_LINES lines from its offset: a read
+	// whose length waits on the count (an unbounded limit, or one the end of
+	// the file clips) is hashed from them.
+	const windows = ranges
+		.flatMap((r) => {
+			const window = hashedWindow(
+				r.offset,
+				Math.min(r.limit, READ_HASH_MAX_LINES),
+			);
+			return window ? [window] : [];
+		})
+		.sort((a, b) => a[0] - b[0]);
+	// Lines arrive in order, so a cursor skips every window that ended before
+	// the line; the next one by start covers it if any does.
+	let cursor = 0;
+	const wanted = (lineNo: number) => {
+		let window = windows[cursor];
+		while (window && window[1] < lineNo) {
+			cursor += 1;
+			window = windows[cursor];
+		}
+		return window !== undefined && window[0] <= lineNo;
+	};
+	const lastWanted = windows.reduce((max, [, last]) => Math.max(max, last), 0);
+	const done = (lineNo: number) => !opts.count && lineNo > lastWanted;
+	const lines = new Map<number, string>();
+	let fd: number | undefined;
 	try {
-		const lines = splitLines(fs.readFileSync(filePath, "utf-8"));
-		const start = Math.max(1, offset);
-		const end = Math.min(lines.length, offset + limit - 1);
-		return hashLines(lines.slice(start - 1, end), start);
+		fd = fs.openSync(filePath, "r");
+		const size = fs.fstatSync(fd).size;
+		if (size > SCAN_MAX_BYTES) return overByteGate(filePath, size);
+		// readFileSync read `size` bytes of a regular file, and read to EOF
+		// only when the size was unknown (0: a procfs file, a pipe).
+		const byteBudget = size > 0 ? size : SCAN_MAX_BYTES + 1;
+		const chunk = Buffer.allocUnsafe(Math.min(SCAN_CHUNK_BYTES, byteBudget));
+		let consumed = 0;
+		let lineNo = 1;
+		let keep = wanted(lineNo);
+		let parts: Buffer[] = [];
+		// A `\r` before the `\n` stays on the line: `lineContentHash` drops
+		// whitespace, so the hash is the one the released `split(/\r?\n/)` gave.
+		const keepLine = () =>
+			lines.set(lineNo, Buffer.concat(parts).toString("utf8"));
+		while (consumed < byteBudget && !done(lineNo)) {
+			const n = fs.readSync(
+				fd,
+				chunk,
+				0,
+				Math.min(chunk.length, byteBudget - consumed),
+				null,
+			);
+			if (n === 0) break;
+			consumed += n;
+			if (consumed > SCAN_MAX_BYTES) return overByteGate(filePath, consumed);
+			let start = 0;
+			// Wanted lines that start and end inside this chunk are decoded as
+			// one run and split at "\n", which gives each the text it decodes to
+			// alone (0x0A ends any partial sequence before it).
+			let runStart = -1;
+			let runLine = 0;
+			const flushRun = (end: number) => {
+				if (runStart < 0) return;
+				chunk
+					.toString("utf8", runStart, end)
+					.split("\n")
+					.forEach((text, i) => lines.set(runLine + i, text));
+				runStart = -1;
+			};
+			while (!done(lineNo)) {
+				const newline = chunk.indexOf(0x0a, start);
+				if (newline === -1 || newline >= n) {
+					if (keep) parts.push(Buffer.from(chunk.subarray(start, n)));
+					break;
+				}
+				if (!keep) flushRun(start - 1);
+				else if (parts.length > 0) {
+					parts.push(chunk.subarray(start, newline));
+					keepLine();
+					parts = [];
+				} else if (runStart < 0) {
+					runStart = start;
+					runLine = lineNo;
+				}
+				lineNo += 1;
+				keep = wanted(lineNo);
+				start = newline + 1;
+			}
+			// The chunk is refilled next: decode the open run first.
+			flushRun(start - 1);
+		}
+		// The text after the last newline is the last line ("" after a trailing
+		// newline).
+		if (keep && !done(lineNo)) keepLine();
+		return {
+			totalLines: opts.count ? lineNo : undefined,
+			hashes(offset, limit) {
+				const window = hashedWindow(offset, limit);
+				if (!window) return undefined;
+				const shown: string[] = [];
+				for (let n = window[0]; n <= window[1] && lines.has(n); n += 1)
+					shown.push(lines.get(n) as string);
+				return hashLines(shown, window[0]);
+			},
+		};
 	} catch {
 		return undefined;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
 	}
+}
+
+/** The scan's answer for a file over the byte gate, recorded once per file. */
+function overByteGate(filePath: string, bytes: number): undefined {
+	recordDegradationOnce({
+		kind: "read-guard-scan-byte-gate",
+		subject: filePath,
+		reason: `${bytes} bytes is over the ${SCAN_MAX_BYTES}-byte read-accounting gate: one line counted, no line hashes`,
+	});
+	return undefined;
 }
 
 /**
@@ -803,10 +963,13 @@ export class ReadGuard {
 	// in its own call's set, because the set a tool NAMES at `tool_call` can be
 	// narrower than the set it WRITES: a rename's importers, an ast-grep folder
 	// or its project default, a server-initiated `workspace/applyEdit` that has
-	// no call at all. Bounded by READ_GUARD_MAX_CHECKED_CALLS; session state,
-	// so it dies with the guard every session start replaces, and a branch move
-	// clears it with the authorship it licenses.
-	private readonly checkedPathsByCall = new Map<string, Set<string>>();
+	// no call at all. Bounded by READ_GUARD_MAX_CHECKED_CALLS (the cap lives in
+	// the map's own `set`, #4570); session state, so it dies with the guard
+	// every session start replaces, and a branch move clears it with the
+	// authorship it licenses.
+	private readonly checkedPathsByCall = new BoundedFifoMap<string, Set<string>>(
+		READ_GUARD_MAX_CHECKED_CALLS,
+	);
 	// Files whose write record idle-expired (#3520): `evictFile` drops the
 	// authorship with the rest of the file's state, and a later zero-read edit
 	// must say so instead of "you have not read" (false for a file the agent
@@ -817,9 +980,9 @@ export class ReadGuard {
 	// Existence-independent index for hasKnownPath/forgetPath (#1668 review
 	// F1). `this.key()` (normalizeFilePath) branches on whether `filePath`
 	// currently exists on disk, on EVERY platform since #3098 — an existing
-	// file resolves to its on-disk casing (win32: `realpathSync.native`;
-	// POSIX: the on-disk casing of the trailing segments), a missing one to a
-	// lowercased tail on win32 and to the caller's own spelling on POSIX.
+	// file resolves to its path identity (`realpathSync.native` on both, #4689
+	// on POSIX), a missing one to its nearest existing ancestor's identity
+	// plus a lowercased tail on win32 and the caller's own tail on POSIX.
 	// recordRead/recordWritten always key while the file is still on disk
 	// (real casing); hasKnownPath/forgetPath are queried AFTER an external
 	// delete already landed, when the path no longer exists — recomputing
@@ -875,21 +1038,15 @@ export class ReadGuard {
 	 * Keying the reads/edits/exemptions maps on the raw path made a read recorded
 	 * under one form invisible to an edit checked under another, producing a false
 	 * `zero_read` block despite the file having been read. `normalizeFilePath`
-	 * folds separators and Windows casing to one key, so record and lookup always
-	 * agree. Every map access in this class MUST key through here.
+	 * folds separators and Windows casing to one key and, for an absolute path,
+	 * answers its path identity (#4689), so a read through a link credits an
+	 * edit of its target and the reverse. Every map access in this class MUST
+	 * key through here, the tool_call license included: before #4689 the
+	 * license had its own realpath key (`licenseKey`) while the read credit kept
+	 * the spelling, so one class held two identities for one file.
 	 */
 	private key(filePath: string): string {
 		return normalizeFilePath(filePath);
-	}
-
-	/**
-	 * License keys compare paths independently resolved by the tool_call and
-	 * the writer. Unlike the general map key, this identity must collapse a
-	 * symlink spelling to the file it names; missing files retain an absolute
-	 * resolved fallback so the comparison still fails closed.
-	 */
-	private licenseKey(filePath: string): string {
-		return normalizeFilePath(realpathOrResolve(filePath));
 	}
 
 	private idleEvictMs(): number {
@@ -1158,18 +1315,17 @@ export class ReadGuard {
 			normalizeEphemeralMapKey(record.filePath),
 			filePath,
 		);
+		const { effectiveOffset: offset, effectiveLimit: limit } = record;
 		const storedRecord: ReadRecord = {
 			...record,
 			filePath,
 			lineHashes:
 				record.lineHashes ??
-				(opts?.captureLineHashes === false
+				(opts?.captureLineHashes === false || !hashedWindow(offset, limit)
 					? undefined
-					: captureLineHashes(
-							filePath,
-							record.effectiveOffset,
-							record.effectiveLimit,
-						)),
+					: scanFileLines(filePath, [{ offset, limit }], {
+							count: false,
+						})?.hashes(offset, limit)),
 		};
 		const arr = this.reads.get(storedRecord.filePath) ?? [];
 		this.consumedReadFiles.delete(storedRecord.filePath);
@@ -1320,15 +1476,10 @@ export class ReadGuard {
 		if (!checked) {
 			checked = new Set<string>();
 			this.checkedPathsByCall.set(toolCallId, checked);
-			while (this.checkedPathsByCall.size > READ_GUARD_MAX_CHECKED_CALLS) {
-				const oldest = this.checkedPathsByCall.keys().next();
-				if (oldest.done === true) break;
-				this.checkedPathsByCall.delete(oldest.value);
-			}
 		}
 		for (const rawPath of rawPaths) {
 			if (checked.size >= READ_GUARD_MAX_CHECKED_PATHS_PER_CALL) return;
-			checked.add(this.licenseKey(rawPath));
+			checked.add(this.key(rawPath));
 		}
 	}
 
@@ -1344,7 +1495,7 @@ export class ReadGuard {
 		const callId = sanitizeCorrelationId(toolCallId);
 		if (callId === undefined) return false;
 		const checked = this.checkedPathsByCall.get(callId);
-		const licensedPath = this.licenseKey(filePath);
+		const licensedPath = this.key(filePath);
 		if (checked?.has(licensedPath) !== true) return false;
 		checked.delete(licensedPath);
 		if (checked.size === 0) this.checkedPathsByCall.delete(callId);
@@ -1353,19 +1504,15 @@ export class ReadGuard {
 
 	/**
 	 * {@link retireChangedAuthorship} on a key. `writer` names a write that
-	 * ended it after the fact (a bridge write, which no pre-write check
+	 * ended it after the fact (a `bridge` write, which no pre-write check
 	 * guarded), so the record tells the two triggers apart.
 	 */
-	private retireIfChanged(
-		filePath: string,
-		writer?: "bridge",
-		force = false,
-	): boolean {
+	private retireIfChanged(filePath: string, writer?: "bridge"): boolean {
 		const authored = this.writtenThisSession.get(filePath);
 		if (
 			!authored ||
 			authored.retired ||
-			(!force && authoredBytesIntact(filePath, authored))
+			authoredBytesIntact(filePath, authored)
 		)
 			return false;
 		authored.retired = true;
@@ -1373,9 +1520,8 @@ export class ReadGuard {
 		const isRisingEdge = incrementDegradationCount({
 			kind: "read-guard-authorship-retired",
 			subject: filePath,
-			reason: force
-				? "authored range was unknown; the next edit needs a read"
-				: "another writer changed the bytes the conversation wrote; the next edit needs a read",
+			reason:
+				"another writer changed the bytes the conversation wrote; the next edit needs a read",
 		});
 		if (isRisingEdge)
 			logReadGuardEvent({
@@ -1504,8 +1650,7 @@ export class ReadGuard {
 		if (!fileReads || fileReads.length === 0) {
 			// Only a write dm-lens observed (recordWritten, from any producer) is
 			// the agent's own; a newer mtime is any writer's (#3520). It stays the
-			// agent's own while the disk holds the bytes it wrote (#4131). A
-			// synthetic read is injected for it.
+			// agent's own while the disk holds the bytes it wrote (#4131).
 			this.retireChangedAuthorship(filePath);
 			if (this.writtenThisSession.get(filePath)?.retired) {
 				const verdict = this.blockOrWarn(
@@ -1521,6 +1666,14 @@ export class ReadGuard {
 			}
 			const authored = this.writtenThisSession.get(filePath);
 			if (authored && authoredRangeCovers(authored, touchedLines, editRanges)) {
+				// #4387: the bytes were just found intact, so the conversation
+				// holds every line. The authorship vouches from here through a
+				// whole-file read that names its write: a move keeps the read
+				// exactly when it keeps the authorship, and the own edit's
+				// one-line read cannot shadow the rest of the file. A range scope
+				// gets none: it would widen to the whole file (#4210).
+				if (authored.authoredRanges === undefined)
+					this.injectCreationRead(filePath, 0, 0, authored.toolCallId);
 				const verdict = this.allow();
 				this.recordVerdict(filePath, "edit", touchedLines, verdict, {
 					reasonKind: "session_authored",
@@ -2325,35 +2478,51 @@ export class ReadGuard {
 		const existing = this.writtenThisSession.get(filePath);
 		if (!existing && opts?.allowFirstAuthorship === false) return;
 		if (existing?.retired) return;
-		if (opts?.authorship === "unknown") {
-			// F-4210-2: unavailable observed coverage is not a whole-file write.
-			// Retire the prior scope and create no replacement license.
-			if (existing) this.retireIfChanged(filePath, "bridge", true);
-			return;
-		}
 		if (existing && !this.mayAdvanceAuthorship(filePath, opts)) {
 			this.retireIfChanged(filePath, "bridge");
 			return;
 		}
+		// F-4210-2: an UNKNOWN range is no license of its own: no first credit.
+		if (opts?.authorship === "unknown" && !existing) return;
+		// #4387: a scope covers a line only while the conversation holds that
+		// line's bytes, or while a read that a move keeps with the authorship
+		// bounds the file. So the scope after a credit is what the credit holds
+		// (a positional edit: its produced lines; any other credit: nothing) plus
+		// what it may keep. A native write holds the whole file through its
+		// creation read, which a move keeps with the authorship, so its scope is
+		// never consulted. A credit that names the lines it changed keeps the old
+		// scope. An UNKNOWN credit absorbs bytes no check covered, so it keeps
+		// the scope only while a read that names a call bounds it after a move
+		// (S12, S13). No credit widens a scope past the lines it holds (S14 to
+		// S17).
+		const keeps =
+			opts?.authorship !== "unknown" ||
+			(this.reads
+				.get(filePath)
+				?.some((read) => read.toolCallId !== undefined) ??
+				false);
+		const nextRanges = !existing
+			? opts?.authoredRanges
+			: keeps && existing.authoredRanges === undefined
+				? undefined
+				: (opts?.authoredRanges ?? []);
 		const observed = observeAuthoredBytes(
 			filePath,
 			opts?.contentHash,
-			opts?.authoredRanges,
+			nextRanges,
 		);
 		const { authoredRanges: _observedRanges, ...observedWithoutRanges } =
 			observed;
 		const composedRanges =
-			existing?.authoredRanges === undefined
-				? existing
-					? undefined
-					: observed.authoredRanges
-				: opts?.authoredRanges === undefined
-					? undefined
-					: composeAuthoredRanges(
-							existing,
-							opts.authoredRanges,
-							observed.authoredLineCount,
-						);
+			nextRanges !== undefined &&
+			keeps &&
+			existing?.authoredRanges !== undefined
+				? composeAuthoredRanges(
+						existing,
+						nextRanges,
+						observed.authoredLineCount,
+					)
+				: nextRanges;
 		const toolCallId = opts?.toolCallId ?? existing?.toolCallId;
 		// Re-inserted, so the map's order is credit order for the cap.
 		this.writtenThisSession.delete(filePath);

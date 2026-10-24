@@ -14,6 +14,7 @@
 import type { GenerationHandle } from "../generation-guard.js";
 import type { AnalysisRootMode } from "../analysis-root.js";
 import type { ExtensionLogLevel } from "../extension-log.js";
+import type { PrimaryUnavailableCause } from "../lsp/diagnostic-binding.js";
 import type { FileKind } from "../file-kinds.js";
 import type { FileRole } from "../file-role.js";
 import type { GeneratedArtifactEvidence } from "../generated-artifacts.js";
@@ -35,6 +36,22 @@ export type DefectClass =
 export interface ModifiedRange {
 	start: number;
 	end: number;
+}
+
+/**
+ * Whether a finding's 1-based line span `[startLine, endLine]` overlaps the
+ * lines a write changed. A match anchors at its start line, so an edit inside
+ * a multi-line match leaves the anchor unchanged; the whole span is what the
+ * edit can have touched (#4481 r2). Absent or empty `ranges` mean the whole
+ * file (a full-file dispatch, a fresh write).
+ */
+export function spanOverlapsModifiedRanges(
+	startLine: number,
+	endLine: number,
+	ranges: ReadonlyArray<ModifiedRange> | undefined,
+): boolean {
+	if (!ranges || ranges.length === 0) return true;
+	return ranges.some((r) => startLine <= r.end && endLine >= r.start);
 }
 
 // --- API Interface ---
@@ -113,6 +130,57 @@ export interface Diagnostic {
 	 * blocks. Absent on every other diagnostic.
 	 */
 	promotionNote?: string;
+	/**
+	 * #4484 round 2: the dispatcher runner whose run produced this finding,
+	 * stamped by `dispatchForFile`. A recorded blocker leaves the record only
+	 * when a conclusive run of this runner no longer observes it. Never part of
+	 * identity, dedup or suppression.
+	 */
+	runnerId?: string;
+	/**
+	 * #4484 round 2: the language server that published an LSP finding
+	 * (`convertLspDiagnostics`), so a run that names the server unconfirmed
+	 * keeps that server's recorded blockers. Never part of identity.
+	 */
+	serverId?: string;
+	/**
+	 * #4484 round 5: the content hash (`lineContentHash`, as a number) of this
+	 * finding's own line in the bytes it was observed in, stamped when it
+	 * enters the inline-blocker record (`stampLineHashes`). A write with no
+	 * usable position matches a recorded blocker only on a line with this
+	 * text. Never part of identity, dedup or suppression.
+	 */
+	lineHash?: number;
+	/**
+	 * #4509 (N3): a recorded blocker a write kept without placing it in that
+	 * write's bytes (no alignment, or its own line edited). Its `line` is from
+	 * older bytes, so nothing reads it as a position. The carry matches it by
+	 * identity on any line holding its `lineHash` text; the settle matches it
+	 * by identity alone, anywhere in the file, with no line check (it fails
+	 * closed). The record cites no line for it. An observed copy replaces it.
+	 * Never part of identity.
+	 */
+	positionStale?: true;
+}
+
+/**
+ * #4484 round 2: which sources reached no verdict in one dispatch. A recorded
+ * blocker from one of them stays: its absence from the run is not evidence
+ * that it is gone.
+ */
+export interface InconclusiveSources {
+	/** Runners whose whole run reached no verdict (failed without findings, an
+	 *  unanswered or unavailable language server, a collect-later run still in
+	 *  flight). */
+	runnerIds: readonly string[];
+	/** Language servers a run named unconfirmed (`unconfirmedServerIds`). */
+	serverIds: readonly string[];
+	/**
+	 * #4484 round 3: the subset of `runnerIds` still in flight (collect-later).
+	 * Their settled run answers for the write on its own, so the next write
+	 * owes them no lines.
+	 */
+	collectLaterRunnerIds: readonly string[];
 }
 
 export interface DispatchResult {
@@ -136,6 +204,64 @@ export interface DispatchResult {
 	blockerOutput: string;
 	/** Whether any blockers were found */
 	hasBlockers: boolean;
+	/**
+	 * #4484: the blocking findings this observation still holds that the delta
+	 * did not call new (it saw their ids before). Not rendered as a STOP, but
+	 * the file's current blocking set is `blockers` plus these: the record, the
+	 * store and the commit gate read both, so an empty delta never clears a
+	 * blocker that is still there. Absent when there are none.
+	 */
+	heldBackBlockers?: Diagnostic[];
+	/**
+	 * #4483: blocking linter findings the file already held before its first
+	 * edit this session (the pre-edit seed, clients/dispatch/pre-edit-seed.ts).
+	 * They are in neither `blockers` nor `heldBackBlockers`: they never STOP,
+	 * never enter the inline-blocker record or the commit gate, and the write
+	 * reports them on one line. Absent when there are none.
+	 */
+	preExisting?: Diagnostic[];
+	/**
+	 * #4484 round 2: findings this observation still holds that neither
+	 * deliver nor enter the record on their own: a blocking finding an
+	 * edit-range gate withheld because the edit did not touch its lines, and an
+	 * unused value the delta held back (promoted, as when it was new). Each
+	 * keeps a recorded blocker of the same identity pending. Absent when none.
+	 */
+	stillObserved?: Diagnostic[];
+	/**
+	 * #4484 round 6: runners whose verdict covers only the edit's ranges
+	 * (`RunnerResult.editScopedVerdict`). Absent when none.
+	 */
+	editScopedRunnerIds?: string[];
+	/** #4484 round 2: the runners and servers that reached no verdict. */
+	inconclusiveSources?: InconclusiveSources;
+	/**
+	 * #4403: why the file's primary group did not check it. Set whenever the
+	 * coverage notice's rule finds no coverage, whether or not the once-only
+	 * latch shows the notice, so a write the latch silences still does not
+	 * read as clean: the write-time all-clear line gives this instead.
+	 */
+	unconfirmedStatus?: string;
+	/**
+	 * #4733 r2 (from #4734's review): the coverage rule's positive answer for
+	 * these bytes, set only where it found the file checked: `primary` (a
+	 * runner of the primary group reached a verdict), `in_flight` (a
+	 * collect-later primary whose answer reaches this session's blocker map at
+	 * turn end), `fallback` (a fallback linter the rule accepts in its place),
+	 * or `unconfigured` (this mode defines no primary group for the file, as in
+	 * a `--no-lsp` TypeScript write). Unset otherwise, including where an unset
+	 * `unconfirmedStatus` hides that no runner of a defined primary group ran.
+	 */
+	coverage?: "primary" | "in_flight" | "fallback" | "unconfigured";
+	/**
+	 * #4734 r3: the primary group's language server (its `lsp` runner) reached
+	 * a usable result for these bytes, with no server left unconfirmed. Absent
+	 * otherwise: no kind or primary group, `--no-lsp`, a CLI primary or a
+	 * fallback linter standing in, a primary deferred or still in flight, and a
+	 * partial notice the session latch withheld. The clean advisory's evidence
+	 * that a language server answered (`PipelineResult.checkedClean`).
+	 */
+	primaryLspChecked?: true;
 }
 
 // --- Runner Definition ---
@@ -238,6 +364,52 @@ export interface RunnerResult {
 	 * the rest of that set has no delivery path and reads as silent.
 	 */
 	deferredServerIds?: readonly string[];
+	/**
+	 * #4484 round 6: the verdict covers only the edit's ranges. napi's Gate B
+	 * skip sets it: the ast-grep server answers for the file, but its gate
+	 * withholds a blocking finding outside the edit (`outOfEditScope`) under
+	 * another identity, so it says nothing about napi's findings there.
+	 */
+	editScopedVerdict?: boolean;
+	/**
+	 * #4484 round 7: the lane a `covered-by-primary` skip defers to. The skip
+	 * is a verdict only when that runner reached one and that server (when
+	 * named) confirmed; otherwise the dispatcher reads it as no verdict, and a
+	 * settled skip retires nothing. #4509: a run that read the bytes while
+	 * that lane covers the file names it too. Its verdict is its own; when the
+	 * lane answered, the lane's copy stands for the run's finding on each line
+	 * the lane flagged, and the run's other findings deliver.
+	 */
+	coveredBy?: { runnerId: string; serverId?: string };
+	/**
+	 * #4403: why no primary language server answered, when the runner knows:
+	 * the operator disabled it, it could not be started (or was still
+	 * starting), or both. The coverage notice and the status line name it.
+	 */
+	primaryUnavailableCause?: PrimaryUnavailableCause;
+	/** #4403: the disabled primaries, which get one note per server per session. */
+	disabledPrimaryServerIds?: readonly string[];
+	/**
+	 * #4484 round 2: blocking findings the runner's edit-range gate withheld
+	 * from delivery because the edit did not touch their span
+	 * (`spanOverlapsModifiedRanges`). They are still observed: they keep a
+	 * recorded blocker pending, and never deliver or enter the record alone.
+	 */
+	outOfEditScope?: Diagnostic[];
+	/**
+	 * #4638 r3 (N2): one bounded sentence naming findings the runner withheld
+	 * from `diagnostics` on purpose (a project's declared syntax level outranks
+	 * jedi's `compile` verdict). A drop only the ledger knows about reads as a
+	 * clean edit, so the dispatcher renders this inline beside the blocker output.
+	 */
+	withheldNotice?: string;
+	/**
+	 * #4484 round 2: the run reached no verdict although it returned no
+	 * failure kind (the language server's diagnostics wait hit its deadline
+	 * with nothing collected, or a query run threw part way). What it did not
+	 * report is not evidence of a clean file.
+	 */
+	inconclusive?: boolean;
 }
 
 /**
@@ -299,6 +471,85 @@ export function hasUsableResult(result: {
 	);
 }
 
+/**
+ * Whether a runner's whole run reached no verdict about the file (#4484). The
+ * other side of {@link hasUsableResult}: a run has a verdict only when it read
+ * the file and finished (R1 in PR #4491's round-3 table). That is a
+ * `succeeded` run not flagged `inconclusive`, a `failed` run with its own
+ * findings, or a skip that states a not-applicable reason from
+ * {@link RUNNER_SKIP_REASONS}. Every other outcome has none: a `failed` run
+ * without findings (timeout, spawn or server failure), a `deferred` one, a
+ * run flagged `inconclusive`, and any skip without a stated reason, since a
+ * skip that never read the file (a size or line cap, an aborted WASM runtime,
+ * a grammar or server that is unavailable) says nothing about it. Unknown
+ * skip forms therefore fail closed. A run that answered names its unconfirmed
+ * servers, which the dispatcher adds to `InconclusiveSources.serverIds`, so
+ * the rest of the run still counts.
+ */
+export function reachedNoVerdict(
+	result: Pick<
+		RunnerResult,
+		"status" | "failureKind" | "inconclusive" | "skipReason"
+	>,
+): boolean {
+	if (result.inconclusive === true) return true;
+	switch (result.status) {
+		case "failed":
+			return !hasUsableResult(result);
+		case "deferred":
+			return true;
+		case "skipped":
+			return !isRunnerSkipReason(result.skipReason);
+		default:
+			return false;
+	}
+}
+
+/**
+ * #4733 r1 F2: whether one dispatch checked the whole file, as far as this
+ * checkout can. The commit gate's record lets a clean write drop another
+ * session's blocker section for the file only on such a run, since another
+ * session's section names no runner a per-runner carry could judge it by.
+ *
+ * Admitted: no language server went unanswered (`serverIds`), the coverage
+ * rule found the file checked (`coverage`; #4733 r2: an unset
+ * `unconfirmedStatus` also holds when a defined primary group never ran),
+ * no verdict covers only the
+ * edit (`editScopedRunnerIds`), at least one runner ran and answered, and
+ * every runner that reached no verdict either skipped or is a collect-later
+ * run still in flight (its answer joins this session's own blocker map when
+ * it settles). Refused: everything else, a runner that failed or broke part
+ * way above all, and a no-verdict runner with no latency row. A skip carries
+ * no marker of why it skipped, so one that could not read the file (a size
+ * cap, an aborted WASM runtime) is admitted with the not-configured ones.
+ */
+export function checkedWholeFile(
+	result: Pick<
+		DispatchResult,
+		"coverage" | "editScopedRunnerIds" | "inconclusiveSources" | "latencyReport"
+	>,
+): boolean {
+	if (
+		result.coverage === undefined ||
+		result.editScopedRunnerIds !== undefined ||
+		(result.inconclusiveSources?.serverIds.length ?? 0) > 0
+	) {
+		return false;
+	}
+	const noVerdict = new Set(result.inconclusiveSources?.runnerIds);
+	const runners = result.latencyReport?.runners ?? [];
+	const outcomeOf = new Map(
+		runners.map((runner) => [runner.runnerId, runner.status]),
+	);
+	const skippedOrInFlight = new Set<string | undefined>(["skipped", "pending"]);
+	return (
+		[...outcomeOf.values()].includes("succeeded") &&
+		[...noVerdict].every((runnerId) =>
+			skippedOrInFlight.has(outcomeOf.get(runnerId)),
+		)
+	);
+}
+
 // --- Dispatch Context ---
 
 /**
@@ -355,6 +606,26 @@ export interface DispatchContext {
 	/** Only run blocking rules (severity: error) - used for fast feedback on file write */
 	readonly blockingOnly?: boolean;
 	readonly modifiedRanges?: ModifiedRange[];
+	/**
+	 * #4484 round 3 (R4): per runner, the lines an earlier write owed it
+	 * because it reached no verdict there. They join that runner's
+	 * `modifiedRanges` (`runnerDispatchContext`), so a blocker first written
+	 * while it had no verdict is in range when it next answers.
+	 */
+	readonly owedRanges?: ReadonlyMap<string, readonly ModifiedRange[]>;
+	/**
+	 * #4483: this dispatch is the `tool_call` capture of a file's bytes before
+	 * its first edit (`capturePreEditLinterFindings`). Its runner counts never
+	 * reach the widget, and its log rows say so.
+	 */
+	readonly preEditCapture?: true;
+	/**
+	 * #4509: the runners that hold a recorded blocker on this file when the
+	 * dispatch starts. A recorded blocker is judged only by a run of its own
+	 * runner, so a runner that would defer to a covering lane runs instead
+	 * (napi's Gate B).
+	 */
+	readonly recordedRunnerIds?: ReadonlySet<string>;
 	/** Ordered per-file pipeline token used by widget reconciliation (#1198). */
 	readonly writeIndex?: number;
 	/**

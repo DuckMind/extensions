@@ -24,6 +24,7 @@
  */
 
 import { logLatency } from "../../../latency-logger.js";
+import { getProjectTrustGeneration } from "../../../project-trust.js";
 
 export type AvailabilityOutcome =
 	| "success"
@@ -498,6 +499,11 @@ export function classifyProbeFailure(
 	if (result.spawnFailure?.kind === "tool-not-found") {
 		return { outcome: "missing", cause: "not-found", evidence };
 	}
+	// #4515: trust declined a project binary; the managed install still repairs
+	// the tool, so it is missing by policy, not a binary that rejected a probe.
+	if (result.spawnFailure?.kind === "trust-refused") {
+		return { outcome: "missing", cause: "policy-denied", evidence };
+	}
 	if (
 		result.failure === "timeout" ||
 		result.failure === "aborted" ||
@@ -667,6 +673,18 @@ export function createAvailabilityLatch(
 	let provisional = false;
 	const maxCooldownMs = options.maxCooldownMs ?? TRANSIENT_MAX_COOLDOWN_MS;
 	let installGeneration = installRetryGeneration;
+	// #4530: a verdict answers for the project trust it was written under. A
+	// lookup's search path, and the bytes it may answer with, change when pi's
+	// trust answer changes, so a verdict from another trust generation is
+	// dropped at the next read and the caller probes again: a tool refused
+	// while the project was untrusted is found once it is trusted, and an
+	// answer found while trusted is not served after trust is withdrawn.
+	let verdictTrustGeneration = getProjectTrustGeneration();
+	// #4776: the trust generation of the first `read()` that returned `null`
+	// since the last note, so a probe in flight across a trust change (a
+	// caller's shared in-flight probe joined by a later read, say) still
+	// answers for the trust it started under. `null` while nothing is owed.
+	let owedTrustGeneration: number | null = null;
 
 	function clearVerdict(): void {
 		available = null;
@@ -703,21 +721,52 @@ export function createAvailabilityLatch(
 		return Math.max(retryAtMs, installRetryAtMs);
 	}
 
+	/** Answer for `generation` from here on, dropping a verdict from another. */
+	function settleTrustGeneration(generation: number): void {
+		if (verdictTrustGeneration === generation) return;
+		verdictTrustGeneration = generation;
+		clearVerdict();
+	}
+
+	/**
+	 * Stamp the verdict a note is about to write with the trust generation its
+	 * probe ran under (#4776): that of the first `read()` that owed a probe
+	 * since the last note, which no probe still in flight is younger than, or
+	 * the latch's own when nothing was owed. A note never stamps the CURRENT
+	 * generation on its own: a probe started before a trust change and settled
+	 * after it answered for the old trust (a miss through the old, scoped
+	 * search path, say), and stamping it current would serve that answer for
+	 * the new trust until its cooldown, or for the session. Stamped with its
+	 * own generation, the next `read()` drops it and the caller probes again.
+	 */
+	function settleNote(): void {
+		const generation = owedTrustGeneration ?? verdictTrustGeneration;
+		owedTrustGeneration = null;
+		settleTrustGeneration(generation);
+	}
+
+	function owe(answer: boolean | null): boolean | null {
+		if (answer === null) owedTrustGeneration ??= verdictTrustGeneration;
+		return answer;
+	}
+
 	return {
 		read(): boolean | null {
+			settleTrustGeneration(getProjectTrustGeneration());
 			syncInstallGeneration();
 			// A provisional `true` expires exactly like a transient `false`: the
 			// answer was served, the sweep is still owed (#1568).
 			if (available === true) {
-				if (provisional && Date.now() >= effectiveRetryAtMs()) return null;
+				if (provisional && Date.now() >= effectiveRetryAtMs()) return owe(null);
 				return true;
 			}
-			if (available !== false) return available;
+			if (available !== false) return owe(available);
 			if (installExhausted) return false;
 			if (outcome !== "transient") return false;
-			return Date.now() >= effectiveRetryAtMs() ? null : false;
+			return Date.now() >= effectiveRetryAtMs() ? owe(null) : false;
 		},
 		noteAvailable(nextCause: AvailabilityCause = "ok"): void {
+			settleNote();
 			installGeneration = installRetryGeneration;
 			available = true;
 			outcome = "success";
@@ -730,6 +779,7 @@ export function createAvailabilityLatch(
 			provisional = false;
 		},
 		noteProvisionallyAvailable(transientCause: AvailabilityCause): number {
+			settleNote();
 			syncInstallGeneration();
 			available = true;
 			outcome = "success";
@@ -757,6 +807,7 @@ export function createAvailabilityLatch(
 			nextCause: AvailabilityCause,
 			opts?: { operationClass?: "probe" | "install" },
 		): number {
+			settleNote();
 			syncInstallGeneration();
 			available = false;
 			outcome = nextOutcome;
@@ -799,6 +850,8 @@ export function createAvailabilityLatch(
 		},
 		reset(): void {
 			installGeneration = installRetryGeneration;
+			verdictTrustGeneration = getProjectTrustGeneration();
+			owedTrustGeneration = null;
 			clearVerdict();
 		},
 		getOutcome: () => outcome,

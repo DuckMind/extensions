@@ -12,7 +12,7 @@ import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
 import { fitLine } from "./tui-fit.js";
 import { WriteOrderingGuard } from "./write-ordering-guard.js";
 import { collectForwardImportMtimes } from "./blocker-freshness.js";
-import { normalizeMessage } from "./finding-identity.js";
+import { findingIdentity } from "./finding-identity.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
@@ -468,6 +468,11 @@ export function reconcileWidgetDisposition(
 		!diagnosticsWriteGuard.shouldWrite(fileMapKey(target.filePath), writeIndex)
 	)
 		return;
+	// A mark re-tags the rows the record already holds; it says nothing about
+	// whether the file was analysed again. An unfinished record (one the stale
+	// sweep kept, #4625, or one a runner has begun on) therefore stays unfinished
+	// and keeps its clock, or the mark would turn it into a final clean snapshot.
+	const { hasFinalDiagnosticsSnapshot, touchedAt } = rec;
 	commitDiagnostics(
 		rec,
 		target.filePath,
@@ -476,6 +481,10 @@ export function reconcileWidgetDisposition(
 		fileMapKey(target.filePath),
 		false,
 	);
+	if (!hasFinalDiagnosticsSnapshot) {
+		rec.hasFinalDiagnosticsSnapshot = false;
+		rec.touchedAt = touchedAt;
+	}
 }
 
 /** Reserve a widget write for a producer that has no runtime write index. */
@@ -991,13 +1000,7 @@ function normalizeDiagnostics(
  * finding. That test, not this one, is what keeps the round-2 F2 case above
  * closed — the marked line's TEXT moved, so its span still matches.
  */
-function retentionIdentity(d: WidgetDiagnostic): string {
-	return JSON.stringify([
-		d.tool ?? "",
-		d.rule ?? "",
-		normalizeMessage(d.message),
-	]);
-}
+const retentionIdentity: (d: WidgetDiagnostic) => string = findingIdentity;
 
 /** `filePath`'s current content, or `undefined` when it cannot be read. */
 function readContentOrUndefined(filePath: string): string | undefined {
@@ -1097,7 +1100,7 @@ function retainSuppressedRows(
 	});
 	if (retained.length > MAX_RETAINED_SUPPRESSED_PER_FILE) {
 		// Freshest observations win the cap. One record per FILE, never one per
-		// dropped row (AGENTS.md "bounded observability"): the chip under-counts
+		// dropped row (docs/engineering-principles.md "Every new failure path gets bounded observability"): the chip under-counts
 		// by exactly `dropped` for this file until its content changes.
 		retained.sort((a, b) => (b.observedAt ?? 0) - (a.observedAt ?? 0));
 		recordDegradationOnce({
@@ -1461,16 +1464,36 @@ export function reconcileCorrelatedScanDiagnostics(
 }
 
 /**
- * Drop widget entries whose file changed on disk after dm-lens last recorded
- * them (`mtimeMs > touchedAt` → the recorded diagnostics predate the current
- * content → stale) or that no longer exist. Keeps `lens_diagnostics` from
- * surfacing findings the agent already fixed (or that an external edit
- * invalidated). Async with concurrent stats — call on read, never on the typing
- * path. Returns how many entries were dropped (so callers can tell the agent
- * those files changed and need a `mode=full` rescan rather than reading as
- * clean).
+ * Shed the widget evidence a file's current bytes outlived: entries whose file
+ * changed on disk after dm-lens observed them (`mtimeMs` past the observation →
+ * the recorded diagnostics predate the current content → stale). Keeps
+ * `lens_diagnostics` from surfacing findings the agent already fixed (or that an
+ * external edit invalidated). Async with concurrent stats — call on read, never
+ * on the typing path.
+ *
+ * A stale record is RETAINED as unfinished evidence, not deleted: only its
+ * surviving (fresher) entries stay, `hasFinalDiagnosticsSnapshot` goes false,
+ * and `touchedAt` moves to the sweep so the next sweep keeps it. Deleting it
+ * left nothing that remembered the file's evidence was invalid, so the first
+ * read after the sweep disclosed it and every later read, or any read after the
+ * footer's observer-less sweep, read the siblings' clean (#4620). The unfinished
+ * flag is the mark every reader already honours (`getFileDiagnosticSummaries`'
+ * `hasFinalSnapshot`, the footer's pending test), and the next final snapshot
+ * (`commitDiagnostics`) replaces it. Retired by that snapshot, by the file's
+ * deletion, or by the store's idle eviction while the record holds no errors or
+ * warnings: a record that still holds some stays and is drawn, as a final
+ * snapshot's are (`holdsDrawableFindings`). A file that no longer exists has no
+ * evidence left to disclose, so a missing file still drops.
+ *
+ * Returns how many records changed (so callers can tell the agent those files
+ * changed and need an active check rather than reading as clean).
+ * `onStaleFile` receives each changed or dropped display path, so
+ * request-scoped callers can disclose the affected files without re-deriving
+ * this store's freshness rule. The numeric return remains session-wide.
  */
-export async function reconcileStaleWidgetFiles(): Promise<number> {
+export async function reconcileStaleWidgetFiles(
+	onStaleFile?: (filePath: string) => void,
+): Promise<number> {
 	const entries = [...files.entries()];
 	const verdicts = await Promise.all(
 		// `mapKey` is the normalized `files` key (used for deletion); stat the
@@ -1480,7 +1503,7 @@ export async function reconcileStaleWidgetFiles(): Promise<number> {
 			try {
 				mtimeMs = (await stat(rec.filePath)).mtimeMs;
 			} catch {
-				return { mapKey, action: "drop" as const }; // deleted / unreadable → drop
+				return { mapKey, action: "missing" as const }; // deleted / unreadable → drop
 			}
 			// A clean record (no findings) has no per-entry stamps to consult —
 			// gate it on the record's own `touchedAt` exactly as before, so a ✓
@@ -1498,7 +1521,12 @@ export async function reconcileStaleWidgetFiles(): Promise<number> {
 			if (rec.allDiagnostics.length === 0) {
 				return freshnessFromMtime({ mtimeMs, referenceMs: rec.touchedAt })
 					.verdict === "stale"
-					? { mapKey, action: "drop" as const }
+					? {
+							mapKey,
+							action: "stale" as const,
+							mtimeMs,
+							survivors: [] as WidgetDiagnostic[],
+						}
 					: { mapKey, action: "keep" as const };
 			}
 			// #1186 per-ENTRY gate: drop only the entries observed BEFORE the file's
@@ -1534,41 +1562,43 @@ export async function reconcileStaleWidgetFiles(): Promise<number> {
 			if (survivors.length === rec.allDiagnostics.length) {
 				return { mapKey, action: "keep" as const }; // nothing stale
 			}
-			if (survivors.length === 0) {
-				return { mapKey, action: "drop" as const }; // every entry stale → drop record
-			}
-			return { mapKey, action: "prune" as const, survivors };
+			// Every entry stale leaves no survivor; some stale leaves the fresher ones.
+			return { mapKey, action: "stale" as const, mtimeMs, survivors };
 		}),
 	);
-	let dropped = 0;
+	let changed = 0;
 	for (const v of verdicts) {
 		if (v.action === "keep") continue;
-		if (v.action === "drop") {
+		const rec = files.get(v.mapKey);
+		if (rec) onStaleFile?.(rec.filePath);
+		changed += 1;
+		if (v.action === "missing") {
 			files.delete(v.mapKey);
-			dropped += 1;
 			continue;
 		}
-		// prune: the file changed and shed its stale entries but retains fresher
-		// ones — keep the record, recompute counts/cap from the survivors, and
-		// still count it as a changed file so the agent is told to rescan.
-		const rec = files.get(v.mapKey);
-		if (rec) {
-			rec.allDiagnostics = v.survivors;
-			rec.diagnostics = capStoredDiagnostics(v.survivors);
-			rec.diagnosticCounts = countDiagnostics(v.survivors);
-		}
-		dropped += 1;
+		if (!rec) continue;
+		// stale: the file changed and shed its stale entries (every one, or all but
+		// the fresher survivors). Keep the record as UNFINISHED evidence: recount
+		// and cap from the survivors, clear the final flag so every reader treats
+		// it as pending, and move `touchedAt` to the sweep (never before the
+		// mtime) so the empty-record gate above keeps it on the next sweep.
+		rec.allDiagnostics = v.survivors;
+		rec.diagnostics = capStoredDiagnostics(v.survivors);
+		rec.diagnosticCounts = countDiagnostics(v.survivors);
+		rec.hasFinalDiagnosticsSnapshot = false;
+		rec.touchedAt = Math.max(Date.now(), v.mtimeMs);
 	}
-	if (dropped > 0) requestRenderFn?.();
-	return dropped;
+	if (changed > 0) requestRenderFn?.();
+	return changed;
 }
 
 /**
  * Dependency-axis freshness gate for the session diagnostics store that feeds
  * `lens_diagnostics mode=all` (and the footer widget) — the second #1631 surface.
  *
- * `reconcileStaleWidgetFiles` (above) already drops a record whose OWN file changed
- * on disk after the diagnostic was observed. It cannot see the cross-file case: the
+ * `reconcileStaleWidgetFiles` (above) already sheds the evidence of a record whose
+ * OWN file changed on disk after the diagnostic was observed. It cannot see the
+ * cross-file case: the
  * diagnosed file is untouched, but a dependency it imports was fixed out-of-band, so
  * the recorded blocker is stale yet replays on every `mode=all`. This reconcile
  * resolves each blocking record's forward imports and, when one drifted after a
@@ -1850,7 +1880,7 @@ export function retireWidgetDependencyDriftBlockers(filePath: string): boolean {
 }
 
 /**
- * Keep the TUI honest (#298 follow-up). `reconcileStaleWidgetFiles` drops
+ * Keep the TUI honest (#298 follow-up). `reconcileStaleWidgetFiles` sheds the
  * widget entries whose file changed on disk after they were last recorded
  * (i.e. diagnostics the agent already fixed) — but it was only ever wired
  * into the `lens_diagnostics` tool, so the widget rendered cached diagnostics
@@ -1858,6 +1888,8 @@ export function retireWidgetDependencyDriftBlockers(filePath: string): boolean {
  * hand. This debounced scheduler fires it from the widget render path (see
  * `mountLensWidget` in index.ts) so stale entries self-correct. The debounce
  * collapses the burst of renders that accompany a save into a single sweep.
+ * The sweep has no observer, so the record it sheds stays as unfinished
+ * evidence (#4620): the next `lens_diagnostics` read still reports the file.
  */
 let staleReconcileTimer: ReturnType<typeof setTimeout> | null = null;
 export const STALE_RECONCILE_DEBOUNCE_MS = 1500;
@@ -1936,6 +1968,21 @@ export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
 			diagnostics: live.map((d) => ({ ...d })),
 		};
 	});
+}
+
+/**
+ * #1634: copies of the disposition-tagged rows {@link getFileDiagnosticSummaries}
+ * leaves out of a file's projection — the rows the footer's `suppressed: N`
+ * chip counts — so a cache-only report can say how many findings a mark is
+ * hiding instead of reading clean.
+ */
+export function getSuppressedDiagnostics(filePath: string): WidgetDiagnostic[] {
+	const rec = files.get(fileMapKey(filePath));
+	const rows: WidgetDiagnostic[] = [];
+	for (const d of rec?.allDiagnostics ?? []) {
+		if (d.disposition !== undefined) rows.push({ ...d });
+	}
+	return rows;
 }
 
 /**
@@ -2075,7 +2122,15 @@ export function renderWidget(
 
 	// Header — counts from deduplicated files only
 	const deduped = dedupeByBasename([...files.values()]);
-	const recencySorted = deduped.filter(shouldRenderFile).slice(0, 5);
+	// The five row slots go to the highest tiers first (#4625 round 3): a retained
+	// record's `touchedAt` is its sweep time, so capping by recency alone let it
+	// take a slot from a blocking file and the header counted a row the frame
+	// never drew. The chosen rows are then drawn in the recency order both
+	// layouts showed before the cap.
+	const renderable = deduped.filter(shouldRenderFile);
+	const recencySorted = sortByTierThenRecency(renderable)
+		.slice(0, 5)
+		.sort((a, b) => b.touchedAt - a.touchedAt);
 	const langStr = sessionLanguages.slice(0, 6).join(" ");
 	const totalBlocking = countBlockingIn(deduped);
 	const totalErrors = countTotalIn("error", deduped);
@@ -2456,17 +2511,35 @@ function hasFailedFormatter(rec: FileRecord): boolean {
 function shouldRenderFile(rec: FileRecord): boolean {
 	return (
 		rec.hasFinalDiagnosticsSnapshot ||
+		holdsDrawableFindings(rec) ||
 		hasChangedFormatter(rec) ||
 		hasFailedFormatter(rec)
 	);
 }
 
-function hasLiveDiagnostic(rec: FileRecord): boolean {
-	return rec.hasFinalDiagnosticsSnapshot && rec.diagnostics.length > 0;
+// Errors or warnings on the record. A row that draws them cannot read as a
+// clean frame, so it needs no final snapshot; only a row with nothing to show
+// waits for one. The header counts every record's findings, so an unfinished
+// record that holds some draws them, and the store's idle eviction keeps them
+// as it keeps a final snapshot's. Two records are unfinished and hold findings:
+// a changed file the stale sweep kept (#4625), and a file whose earlier
+// findings wait for the snapshot of its next run.
+function holdsDrawableFindings(rec: FileRecord): boolean {
+	return classifyFileTier(rec) !== "clean";
 }
 
+function hasLiveDiagnostic(rec: FileRecord): boolean {
+	return (
+		rec.diagnostics.length > 0 &&
+		(rec.hasFinalDiagnosticsSnapshot || holdsDrawableFindings(rec))
+	);
+}
+
+// A record without a final snapshot is unfinished evidence whether or not a
+// runner reported: a stale record the reconcile retained (#4620) carries no
+// runner, and the footer must still withhold `✓ clean` for it.
 function isPendingAnalysis(rec: FileRecord): boolean {
-	return rec.runners.size > 0 && !rec.hasFinalDiagnosticsSnapshot;
+	return !rec.hasFinalDiagnosticsSnapshot;
 }
 
 function capStoredDiagnostics(

@@ -1,4 +1,3 @@
-import * as nodeCrypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import {
@@ -6,15 +5,34 @@ import {
 	queueAgentAdvisory,
 } from "./agent-nudge.js";
 import {
+	addHeadDiscards,
 	captureFileStats,
 	type CaptureOptions,
 	diffFileContent,
 	getOpaqueBaselineStore,
+	headRecordKey,
+	isGitWorktree,
+	listGitHeadDelta,
+	observeGitHead,
 	opaqueBaselineSlot,
+	opaquePrescanRoot,
+	readGitHead,
+	readSameHeadDiscards,
+	recordOpaqueCaptureRefused,
 	recoverOpaqueChangesViaGit,
+	resolveOpaqueRecoveryRoots,
+	serializeHeadLook,
+	shouldRunOpaqueRecovery,
+	takeHeadDiscards,
 } from "./opaque-mutation-scan.js";
-import { normalizeMapKey } from "./path-utils.js";
+import {
+	isUnderDir,
+	normalizeMapKey,
+	realpathOrResolve,
+	resolveToolCallFilePath,
+} from "./path-utils.js";
 import { detectFileKind } from "./file-kinds.js";
+import { isSessionBookkeepingRoot } from "./analysis-root.js";
 import {
 	extractReadPathsFromCommand,
 	extractDeletedPathsFromCommand,
@@ -33,10 +51,15 @@ import {
 	invalidateProjectIgnoreMatcherForPath,
 	isDmLensInternalPath,
 	isPathIgnoredByProject,
+	isRecordableProjectPath,
 } from "./file-utils.js";
 import { invalidateFormatterCacheForPath } from "./formatters.js";
 import { judgeConfirmedDelete } from "./confirmed-delete.js";
-import { deliveredLineEvidence, type ReadGuard } from "./read-guard.js";
+import {
+	deliveredLineEvidence,
+	type ReadGuard,
+	scanFileLines,
+} from "./read-guard.js";
 import {
 	expectationFromToolInput,
 	noteAgentCallEnd,
@@ -55,6 +78,7 @@ import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	classifyMutatingTool,
+	isBashDerivedReplay,
 	readToolResultPathField,
 	DM_LENS_SYNTHETIC_MUTATION_FIELD,
 	type MutatingToolClassification,
@@ -63,6 +87,7 @@ import {
 import {
 	hasPendingObservation,
 	noteMutationHandled,
+	pendingObservationPaths,
 	settleObservedMutation,
 } from "./observed-mutation.js";
 import {
@@ -80,13 +105,12 @@ import {
 	getReadGuardCorrelationId,
 	logReadGuardEvent,
 } from "./read-guard-logger.js";
-import { countFileLines } from "./read-guard-tool-lines.js";
 import type { DmLensFlagSource } from "./lens-config.js";
 import type { EditToolDetails } from "@duckmind/dm-coding-agent";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import {
 	notifyExternalFileChange,
-	resyncGitChangedFiles,
+	peekLSPService,
 } from "./lsp/capabilities.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { type PipelineResult, runPipeline } from "./pipeline.js";
@@ -105,6 +129,7 @@ import type {
 } from "./runtime-coordinator.js";
 import { EXPANSION_LIMIT_LINES } from "./read-expansion.js";
 import { syncGitGuardRecord } from "./git-guard.js";
+import { hashFileBytes } from "./content-stamp.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import { getActiveSessionId } from "./session-lifecycle.js";
@@ -115,6 +140,19 @@ import {
 } from "./session-scope.js";
 import { requestBootstrapClients } from "./bootstrap.js";
 import { bounded } from "./deadline-utils.js";
+import type { DiskChangeRuntime } from "./disk-changes.js";
+import {
+	DISK_CHANGE_MAX_RECORDED_PATHS,
+	publishDiskChangeChunked,
+} from "./disk-changes.js";
+import {
+	BASH_RECOVERY_DRIFT_SOURCE,
+	BASH_WRITE_SOURCE,
+	ensureDiskChangeSubscribers,
+	readHeldDocumentsAnswer,
+	SAME_HEAD_DISCARD_SOURCE,
+} from "./disk-change-subscribers.js";
+import { lookForOutOfBandChanges } from "./out-of-band-changes.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import {
 	incrementDegradationCount,
@@ -122,8 +160,8 @@ import {
 } from "./degradation-ledger.js";
 import {
 	canWriteAnalysisRoot,
+	classifyAnalysisRoot,
 	resolveAnalysisRoot,
-	resolveAnalysisRootPath,
 	type AnalysisRootMode,
 } from "./analysis-root.js";
 
@@ -199,6 +237,316 @@ export function isFailedGitIntegrationCommand(
 }
 
 /**
+ * #4532: client roots one bash `tool_result` looks at for an install, besides
+ * the session's own root. A process serving more roots than this looks at the
+ * first ones and records the cap (a bound that is not disclosed is a silenced
+ * answer). Four covers the shapes the issue measured: a main checkout, a linked
+ * worktree, an adopted sibling root, and one spare.
+ */
+const CLIENT_ROOT_LOOK_CAP = 4;
+
+/**
+ * #4532: the live primary client roots the install look has NOT already
+ * covered — everything except the session's own root, which the head look at
+ * `sessionRoot` just looked at. Read-only: `peekLSPService` spawns nothing, and
+ * a service without the accessor answers no extra roots (today's behaviour).
+ * Roots are de-duplicated by path key, and the cap is enforced here with one
+ * bounded record per session so a many-root process is never silently unbounded.
+ */
+function liveClientRootsApartFrom(
+	sessionRoot: string,
+): Array<{ root: string; spawnedAt: number }> {
+	const service = peekLSPService();
+	const roots = service?.livePrimaryClientRoots?.() ?? [];
+	if (roots.length === 0) return [];
+	const sessionKey = normalizeMapKey(sessionRoot);
+	const seen = new Set<string>([sessionKey]);
+	const out: Array<{ root: string; spawnedAt: number }> = [];
+	for (const entry of roots) {
+		const key = normalizeMapKey(entry.root);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(entry);
+	}
+	if (out.length > CLIENT_ROOT_LOOK_CAP) {
+		recordDegradationOnce({
+			kind: "lsp-client-root-look-capped",
+			subject: "cap",
+			reason: `${out.length} live primary client root(s) outside the session root; the first ${CLIENT_ROOT_LOOK_CAP} got the install look, so an install in the rest is not seen until a tool call names one of their files`,
+		});
+		return out.slice(0, CLIENT_ROOT_LOOK_CAP);
+	}
+	return out;
+}
+
+/**
+ * #4493: when HEAD moved since this session last looked, resync the held
+ * documents in `git diff <old> <new>`.
+ *
+ * A clean-tree move (checkout, reset --hard, a completed rebase or
+ * cherry-pick, or the same outside DM) leaves `git status` empty, so opaque
+ * recovery finds nothing and the server kept the pre-move bytes. The delta is
+ * incoming content, not the agent's: it reaches the LSP resync only, never
+ * mutation bookkeeping, authorship or dispatch. One `opaque_mutation_head_moved`
+ * row per move, none when HEAD did not move.
+ *
+ * The returned promise settles once the PRIMARY servers hold the new bytes;
+ * the auxiliaries catch up after it (see {@link lookAtHead}).
+ *
+ * #4476: the same look first checks the root for a dependency install or a
+ * declaration file changed outside dm-lens (`out-of-band-changes.ts`), in a
+ * git checkout or not, so a restart lands before the resync and both before
+ * the next check.
+ */
+export function resyncHeadMove(args: HeadLook): Promise<void> {
+	// #4612 r4: this call's discard set is handed to the look key BEFORE the
+	// join, because a look that arrives while another of its key is in flight
+	// never runs its own closure (`serializeHeadLook` coalesces it into one
+	// trailing pass of the FIRST caller's closure, which captured that caller's
+	// `discarded`). Synchronous, so a joining caller's paths are in the
+	// accumulator before any drain that could owe them.
+	addHeadDiscards(args.key, args.discarded);
+	return serializeHeadLook(args.key, async () => {
+		try {
+			await lookForOutOfBandChanges(args.root, args.trigger, args.runtime);
+		} finally {
+			await lookAtHead(args);
+		}
+	});
+}
+
+interface HeadLook {
+	root: string;
+	key: string;
+	trigger: "tool_call" | "tool_result";
+	label: string;
+	/**
+	 * Paths a same-HEAD discard reverted in this call (#4502): the working-tree
+	 * paths that were dirty before the command and clean after it. A discard
+	 * (`git stash`, `git checkout .`, `git restore`) moves no HEAD and leaves no
+	 * dirty set, so neither the delta nor the dirty status names these files;
+	 * the bash `tool_result` reads them from the call's own baseline and hands
+	 * them to this look, which publishes them with the move's delta.
+	 *
+	 * {@link resyncHeadMove} adds the set to the look key before it joins, so a
+	 * look that only JOINED another flight's still publishes its own set (#4612
+	 * r4: the closure that runs is the first caller's, and it captured the first
+	 * caller's array).
+	 */
+	discarded?: readonly string[];
+	/**
+	 * The bulk mutation seam the out-of-band look's publish allocates the
+	 * existing project sequence through (#4535). Optional: a look driven
+	 * without a runtime still publishes, it just allocates no sequence.
+	 */
+	runtime?: DiskChangeRuntime;
+}
+
+/**
+ * One look, the only one of its key in flight. A look that joined a flight is
+ * answered by the flight's trailing look, which carries the first caller's
+ * `trigger` and `label` in its row.
+ *
+ * Two phases (review r1 F1). Inside the look, the changed held documents go to
+ * the primary servers only: that is the view the next read or edit's dispatch
+ * reads, and primaries are not paced. After the look, detached, the drift
+ * resync sends them to every holding server (the paced auxiliaries), adds held
+ * importers and stamps the drift records; its end writes the row. The hooks and
+ * every joined look wait for the first phase only, so an auxiliary's pacing
+ * barrier no longer holds back the primary or the next tool call.
+ *
+ * #4535 slice 2: both phases are the disk-change publisher's LSP consumer now.
+ * The look publishes the delta and reads the two answers back out of the
+ * publish, so it names no service and no resync helper.
+ *
+ * #4535 slice 2 round 3: the publish is chunked at
+ * `DISK_CHANGE_MAX_RECORDED_PATHS`, so an over-cap delta keeps its listing (a
+ * single over-cap publish would be reported as `"unknown"`, and the consumer's
+ * only honest reading of that is every held document: the awaited primary send
+ * then leaves the change, probe E's `changedSent 0/65`), and a same-HEAD
+ * discard's population rides the same look (a real discard is a `head-move`
+ * publish whose HEAD never moved, so `sources` names it and `from`/`to` match).
+ */
+async function lookAtHead(args: HeadLook): Promise<void> {
+	// The discards owed to this key: this pass's caller, plus any look that
+	// joined the flight and could not run its own closure (#4612 r4). Drained
+	// before the first await, so a joiner's add lands either before this drain
+	// (taken here) or after it (taken by the trailing pass its join earned).
+	const discarded = takeHeadDiscards(args.key);
+	if (!(await isGitWorktree(args.root))) return;
+	const head = await readGitHead(args.root);
+	if (!head) return;
+	const from = observeGitHead(args.key, head);
+	const moved = from !== undefined;
+	// A look that saw neither a move nor a discard has nothing to publish, and
+	// its row would be a row about no event (the same early return the delta had).
+	if (!moved && discarded.length === 0) return;
+	const started = Date.now();
+	const delta = moved ? await listGitHeadDelta(args.root, from, head) : [];
+	const population: readonly string[] | "unknown" =
+		delta === undefined ? "unknown" : [...new Set([...delta, ...discarded])];
+	ensureDiskChangeSubscribers();
+	const published = await publishDiskChangeChunked(
+		{
+			root: args.root,
+			origin: "head-move",
+			kind: "inferred",
+			...(discarded.length > 0
+				? { sources: ["head-move", SAME_HEAD_DISCARD_SOURCE] }
+				: {}),
+			// An unknown delta (git failed, or the listing was cut) is published
+			// as unenumerable: the consumer then considers every held document,
+			// because the stale views are the harm (shape 48, review r1 F6).
+			paths: population,
+		},
+		// No runtime: a HEAD move's delta records no mutation (#4493). The
+		// publisher's sequence is the consumer path's, and the delta read by
+		// every consumer comes from the record, not from a bump.
+	);
+	const answers = published.map(({ results, failedSubscribers }) =>
+		readHeldDocumentsAnswer(results, args.root, failedSubscribers),
+	);
+	const targets = answers.flatMap((answer) => answer.targets);
+	const primary = answers.reduce((count, answer) => count + answer.primary, 0);
+	const resyncFailed = answers.some((answer) => answer.failed);
+	const drained = answers.every((answer) => answer.drained);
+	const held = answers.reduce((count, answer) => count + answer.held, 0);
+	const drifts = answers.flatMap((answer) =>
+		answer.drift === undefined ? [] : [answer.drift],
+	);
+	const unlistable = published[0]?.change.paths === "unknown";
+	const primaryMs = Date.now() - started;
+	const report = (
+		dispositions: ReadonlyMap<string, string> | undefined,
+		failed: boolean,
+	): void => {
+		const outcomes = [...(dispositions?.values() ?? [])];
+		const count = (kind: string) =>
+			outcomes.filter((outcome) => outcome === kind).length;
+		logLatency({
+			type: "phase",
+			phase: "opaque_mutation_head_moved",
+			filePath: args.label.slice(0, 80),
+			durationMs: Date.now() - started,
+			result: failed
+				? "resync-failed"
+				: delta === undefined
+					? "delta-unknown"
+					: moved
+						? `changed:${population.length}`
+						: `discarded:${population.length}`,
+			metadata: {
+				trigger: args.trigger,
+				from: from?.slice(0, 12) ?? "",
+				to: head.slice(0, 12),
+				changed: delta?.length ?? -1,
+				// #4502: the paths a discard reverted, counted separately from the
+				// move's delta so a discard is visible as one.
+				discarded: discarded.length,
+				held,
+				// On an unlistable delta `held` counts every held document, not the
+				// delta's held subset: the row says which population it counted so
+				// the two are never read as the same number (F5).
+				heldPopulation: unlistable ? "all-held" : "delta-held",
+				current: held - targets.length,
+				primary,
+				primaryMs,
+				drained,
+				resynced: count("resynced"),
+				deferred: count("deferred"),
+				failed: count("failed"),
+			},
+		});
+	};
+	if (targets.length === 0 || resyncFailed || drifts.length === 0) {
+		report(undefined, resyncFailed);
+		return;
+	}
+	void Promise.all(drifts).then(
+		(maps) => report(mergeDispositions(maps), false),
+		() => report(undefined, true),
+	);
+}
+
+/**
+ * #4535 slice 2: the recovered set's detached follow-up, one publish per
+ * `DISK_CHANGE_MAX_RECORDED_PATHS` chunk of the recovered population.
+ *
+ * The spacing matters. A single publish over a longer population is reported
+ * as `paths: "unknown"`, and the consumer's only honest reading of that is
+ * "cannot be enumerated" — which for a detached drift pass means there is
+ * nothing to resync. A code-mod over 65 files then resynced nothing at all
+ * while a 64-file one resynced everything, and only a record about sequence
+ * allocation said so (review round 2, F2). Chunking keeps every publish inside
+ * the cap, so the cap never decides whether the pass runs.
+ *
+ * Each chunk's drift pass is awaited INSIDE this detached chain: the caller
+ * `void`s the whole thing, so the hook still never waits, and the caller needs
+ * exactly one rejection handler for the chain rather than one per chunk. The
+ * chunk loop itself is `publishDiskChangeChunked`'s (#4612 r4): a second loop
+ * over one cap was the same-shape sibling that helper exists to delete.
+ *
+ * A chunk whose drift pass rejects is recorded and the chain goes on to the
+ * next chunk (#4612 r4, CodeRabbit): one failed pass must not leave every later
+ * chunk's documents stale. The record is counted per root, so a service that
+ * rejects every chunk costs one ledger entry whose count says how many, never
+ * one row per chunk (review round 3, p3-3: the base branch dropped the whole
+ * set with a `dbg` line, which for a detached chain is no record at all).
+ */
+async function publishRecoveredDrift(
+	root: string,
+	paths: readonly string[],
+): Promise<void> {
+	await publishDiskChangeChunked(
+		{
+			root,
+			origin: "bash-recovery",
+			sources: [BASH_RECOVERY_DRIFT_SOURCE],
+			// `inferred`, the conservative label: the stat-diff strategy hashed
+			// the bytes, but the git strategy reported a status pair and an mtime
+			// window without reading them. A marker that wants to confirm "not
+			// reproduced" reads the bytes itself; the drift pass does exactly
+			// that.
+			kind: "inferred",
+			paths,
+		},
+		undefined,
+		undefined,
+		async ({ results, failedSubscribers }, { index, total }) => {
+			try {
+				await readHeldDocumentsAnswer(results, root, failedSubscribers).drift;
+			} catch (cause) {
+				// Every chunk before this one was full, so this chunk holds the cap
+				// or the remainder, whichever is smaller.
+				const dropped = Math.min(
+					DISK_CHANGE_MAX_RECORDED_PATHS,
+					paths.length - index * DISK_CHANGE_MAX_RECORDED_PATHS,
+				);
+				incrementDegradationCount({
+					kind: "disk-change-recovered-drift-failed",
+					subject: root,
+					reason: `chunk ${index + 1} of ${total} rejected, so its ${dropped} recovered path(s) were never republished to a server: ${cause instanceof Error ? cause.message : String(cause)}`,
+				});
+			}
+		},
+	);
+}
+
+/**
+ * The drift answers of a chunked publish, as one map. Two chunks never report
+ * the same target (the populations are disjoint), so a plain merge keeps every
+ * disposition.
+ */
+function mergeDispositions(
+	maps: ReadonlyArray<ReadonlyMap<string, string>>,
+): ReadonlyMap<string, string> {
+	const merged = new Map<string, string>();
+	for (const map of maps)
+		for (const [filePath, kind] of map) merged.set(filePath, kind);
+	return merged;
+}
+
+/**
  * The `tool_result` payload dm-lens actually receives.
  *
  * Kept aligned with what pi BUILDS, not with what a payload might plausibly
@@ -230,6 +578,8 @@ interface ToolResultEvent {
 	details?: unknown;
 	content: Array<{ type: string; text?: string }>;
 	structuredContent?: unknown;
+	/** Internal bash-replay marker, set below rather than by the host. */
+	[DM_LENS_SYNTHETIC_MUTATION_FIELD]?: unknown;
 }
 
 interface ToolResultDeps {
@@ -259,6 +609,16 @@ interface ToolResultDeps {
 	sessionId?: string;
 	/** Role of the activation that owns this write. */
 	sessionRole?: "primary" | "secondary";
+	/**
+	 * The host ctx's `cwd` for THIS tool_result — the same per-session field the
+	 * `tool_call` hook reads. The opaque prescan resolves its root through
+	 * `opaquePrescanRoot(deps.cwd, …)` (#4504): a session whose cwd is not the
+	 * coordinator's `projectRoot` (a concurrent secondary in a linked worktree,
+	 * #473/#2129) otherwise wrote its baseline under one root and looked it up
+	 * under another. Absent means the host offered none, and the prescan falls
+	 * back to the same `projectRoot` the `tool_call` side falls back to.
+	 */
+	cwd?: string;
 	/**
 	 * Internal: set when the debounce timer fires to skip re-scheduling.
 	 * Do not pass from external callers.
@@ -292,6 +652,25 @@ interface ToolResultDeps {
 	_sessionGeneration?: LineageHandle;
 	/** Internal (#3525): the debounce re-entry keeps its call's stamp decision. */
 	_ownWriteStamp?: OwnWriteStamp;
+	/**
+	 * Internal (#4577): this event's path is ALREADY the file's identity — a
+	 * bash-derived or opaque-recovered absolute path read back from disk — so
+	 * it must not go through the host-tool resolver again. The resolver applies
+	 * host-argument rules (unicode-space fold, `@` strip, the variant ladder) to
+	 * a spelling the model typed; re-running a name that came FROM the
+	 * filesystem rewrites its bytes (`a\u202Fb.ts` folded to `a b.ts`) and
+	 * dispatches a path that does not exist. The recovery caller knows the
+	 * provenance, so it states it here instead of the handler re-detecting it.
+	 */
+	_pathAlreadyResolved?: boolean;
+	/**
+	 * Internal (#4713 F2): the checkout a synthetic bash-write dispatch belongs
+	 * to. The ignore gate asks THAT checkout's rules, not the session root's: a
+	 * linked worktree nested inside the session root is admitted by its own
+	 * checkout, while the parent's rule for the directory it sits in says
+	 * nothing about the nested tree's files. Absent means the session root.
+	 */
+	_ownerRoot?: string;
 }
 
 /** How the agent's own write/edit moves the read guard (#3524, #3525). */
@@ -696,10 +1075,26 @@ function scheduleDebounced(
 	return promise;
 }
 
+/**
+ * #1649: whether the file's last byte is `\n`, read alone (not the whole file),
+ * so a clipped bash view of a large file pays one byte for it. A file that
+ * cannot be read throws, as the whole-file read it replaced did.
+ */
+function lastByteIsNewline(filePath: string): boolean {
+	const fd = nodeFs.openSync(filePath, "r");
+	try {
+		const size = nodeFs.fstatSync(fd).size;
+		// An empty file reads at position -1, the current one, and gets 0 bytes.
+		const last = Buffer.alloc(1);
+		return nodeFs.readSync(fd, last, 0, 1, size - 1) === 1 && last[0] === 0x0a;
+	} finally {
+		nodeFs.closeSync(fd);
+	}
+}
+
 function getFileStateHash(filePath: string): string {
 	try {
-		const content = nodeFs.readFileSync(filePath);
-		return nodeCrypto.createHash("sha256").update(content).digest("hex");
+		return hashFileBytes(filePath);
 	} catch (err) {
 		const code = (err as { code?: string }).code ?? "unknown";
 		return `unreadable:${code}`;
@@ -901,6 +1296,142 @@ function refreshCachedExports(
 }
 
 /**
+ * #4737 r2: publish one returned dispatch's inline verdict for `filePath` to the
+ * commit gate's state: the inline-blocker map (record or clear, ordered by the
+ * dispatch's token), the analysis anchor, the `--lens-guard` status and the
+ * `turn-end-findings` record. Both callers of `dispatchPipelineAnalysis` run it
+ * on a result that did not crash: the classified chain, and the observed path,
+ * whose blocker otherwise gated a commit only from turn_end (#4732 sends every
+ * tool that is not known read-only there). Every write goes through the
+ * handler's captured `writeSession`.
+ */
+function publishInlineVerdict(args: {
+	runtime: RuntimeCoordinator;
+	cacheManager: CacheManager;
+	filePath: string;
+	result: PipelineResult;
+	writeSession: LineageHandle;
+	writeIndex: number;
+	writeOrderTurn: number;
+	/** #4137: whether this run may retire a record about the bytes it read. */
+	authored: boolean;
+	getFlag: ToolResultDeps["getFlag"];
+	turnStateCwd: string;
+	analysisRootMode: AnalysisRootMode;
+}): void {
+	const {
+		runtime,
+		cacheManager,
+		filePath,
+		result,
+		writeSession,
+		writeIndex,
+		writeOrderTurn,
+		authored,
+		getFlag,
+		turnStateCwd,
+		analysisRootMode,
+	} = args;
+	// #3596: a replaced session's handler latches nothing in the live session.
+	const resultLive = writeSession.guardedWrite(filePath, () => true) === true;
+	// #3507: both verbs are ordered by this dispatch's token, so an older
+	// pipeline that settles after a newer one of the same file changes nothing.
+	let inlineVerdictApplied: boolean;
+	// #4733 r3 F15: this write's clear removed the file's own blocker entry.
+	let ownBlockerRetired = false;
+	const { inlineBlockerSummary } = result;
+	if (inlineBlockerSummary) {
+		// #1561: stamp the verdict with THIS dispatch's write token — the same
+		// counter `lsp_diagnostics`' reconciliation seam draws from — so a later
+		// confirmed-clean result can be ordered against it instead of racing it.
+		inlineVerdictApplied =
+			writeSession.guardedWrite(filePath, () =>
+				runtime.recordInlineBlockers(
+					filePath,
+					inlineBlockerSummary,
+					// #3506: the token of the bytes the pipeline analysed.
+					result.writeIndex ?? writeIndex,
+					result.inlineBlockerSources,
+					result.inlineBlockerLines,
+					result.inlineBlockerFileContent,
+					// #3246: the structured blockers the summary was rendered from, so a
+					// later `lens_diagnostic_mark` can be applied to this record at turn
+					// end instead of replaying pre-mark text.
+					result.inlineBlockerDiagnostics,
+					// #3559: a re-token's own turn.
+					result.orderTurn ?? writeOrderTurn,
+					// #3503: the freshness baseline is the analysis read.
+					result.analysisReadAtMs,
+				),
+			) !== undefined;
+	} else {
+		// `clearInlineBlockers` applies with no entry too, so the entry is read
+		// before it.
+		// Optional: a runtime double without the accessor never retires.
+		const hadOwnBlocker = runtime.hasInlineBlocker?.(filePath) ?? false;
+		inlineVerdictApplied =
+			writeSession.guardedWrite(filePath, () =>
+				runtime.clearInlineBlockers(
+					filePath,
+					result.writeIndex ?? writeIndex,
+					result.orderTurn ?? writeOrderTurn,
+					// #4137 round 3: a run without authorship does not retire a
+					// record about the very bytes it read. The already-analysed latch
+					// is a cost rule, not the record's guard.
+					// #4484: and no run retires a record while its own observation
+					// still holds a blocker.
+					{
+						authored,
+						sha256: result.inlineBlockerFileContent?.sha256,
+						blocking: result.currentBlockerCount ?? 0,
+					},
+				),
+			) ?? false;
+		// An errored run reached no observation, whatever it cleared.
+		ownBlockerRetired =
+			hadOwnBlocker && inlineVerdictApplied && !result.isError;
+	}
+	// #4484 round 3: the anchor follows the record, so it moves only with a
+	// verdict that applied.
+	if (inlineVerdictApplied)
+		runtime.setAnalysisAnchor(filePath, result.analysisAnchor);
+
+	// A superseded verdict must not latch the commit gate either (#3507).
+	if (resultLive) {
+		runtime.updateGitGuardStatus(
+			inlineVerdictApplied && result.hasBlockers,
+			result.output,
+		);
+		if (getFlag("lens-guard")) {
+			// #4733 r1 F2: a clean verdict over the whole file, applied, with no
+			// blocker left in the observation; anything less observes nothing.
+			// #4733 r5 G3: a blocking finding the seed called pre-existing is still
+			// reported, so it is not a clean verdict for another session's section.
+			const wholeFileClean =
+				inlineVerdictApplied &&
+				!result.isError &&
+				!result.hasBlockers &&
+				result.currentBlockerCount === 0 &&
+				(result.preExistingBlockerCount ?? 0) === 0 &&
+				result.fileVerdictComplete === true;
+			syncGitGuardRecord(
+				runtime,
+				cacheManager,
+				turnStateCwd,
+				// #4733 r2 F11: a write speaks for its file's recorded sections only
+				// with that verdict, whichever session wrote them. #4733 r3 F15: or,
+				// for this session's own record, when it retired the file's own
+				// blocker entry (the rule the sibling callers use); without
+				// `wholeFileClean` another session's section stays.
+				wholeFileClean || ownBlockerRetired ? filePath : undefined,
+				analysisRootMode,
+				wholeFileClean,
+			);
+		}
+	}
+}
+
+/**
  * #2464: the pipeline's own lint/diagnostics dispatch, factored out of the
  * block below that ALSO writes `turn-state.json` modified ranges and the
  * attributed change-log receipt (`cacheManager.addModifiedRange` /
@@ -1024,6 +1555,11 @@ async function dispatchPipelineAnalysis(args: {
 			autofixMode,
 			allowAutonomousWriters,
 			modifiedRanges,
+			// #4484 r2: read when the dispatch returns, so a collect-later answer
+			// absorbed meanwhile is part of what the run carries forward.
+			priorInlineBlockers: () => runtime.getInlineBlockerDiagnostics(filePath),
+			// #4484 round 3: what those blockers' lines refer to.
+			priorAnalysisAnchor: () => runtime.getAnalysisAnchor(filePath),
 			telemetry: {
 				model: runtime.telemetryModel,
 				sessionId: runtime.telemetrySessionId,
@@ -1097,7 +1633,12 @@ async function dispatchPipelineAnalysis(args: {
 		result = await pipelinePromise;
 	} catch (pipelineErr) {
 		if (getFlag("lens-guard")) {
-			runtime.markGitGuardCacheUnknown("pipeline_crash");
+			// #4733 r2 F12: about this file, so only its own next dispatch answers it.
+			// #4733 r5 G2: in the session that dispatched it, so a replaced
+			// session's late rejection cannot latch the live one.
+			sessionGeneration.guardedWrite(filePath, () =>
+				runtime.markGitGuardDispatchUnanswered(filePath, "pipeline_crash"),
+			);
 		}
 		dbg(`runPipeline crashed: ${pipelineErr}`);
 		logReadGuardEvent({
@@ -1166,6 +1707,16 @@ async function dispatchPipelineAnalysis(args: {
 		};
 	} finally {
 		releaseInFlightPipeline(filePath, registryKey, registeredPipelines);
+	}
+	// #4733 r2 F12, r5 G1: the dispatch latch is this file's, and both callers
+	// return here, so an errored run sets it and any other returned run answers
+	// it. Fenced like the crash mark above (r5 G2).
+	if (getFlag("lens-guard")) {
+		sessionGeneration.guardedWrite(filePath, () =>
+			result.isError && !result.hasBlockers
+				? runtime.markGitGuardDispatchUnanswered(filePath, "pipeline_error")
+				: runtime.answerGitGuardDispatch(filePath),
+		);
 	}
 
 	if (!isPartialApplyResult) {
@@ -1267,9 +1818,11 @@ async function dispatchPipelineAnalysis(args: {
 			),
 		]);
 		for (const changedFile of changedForReadGuard) {
-			// A native positional edit already credited its own produced lines above.
-			// The pipeline may re-credit ownPath only when it actually rewrote those
-			// bytes; otherwise a whole-file stamp would erase the native scope.
+			// A native edit already credited its own bytes above (a positional
+			// edit with its produced lines, any other with UNKNOWN ones). The
+			// pipeline may re-credit ownPath only when it actually rewrote those
+			// bytes; otherwise a whole-file stamp would erase the native scope or
+			// make a first authorship the edit's credit refused (#4387).
 			if (
 				changedFile === ownPath &&
 				pipelineOwnedWriteHash === undefined &&
@@ -1481,6 +2034,33 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// extension's `tool_result` hook can rewrite to success. Before any return.
 	if (event.isError === true && toolCallId !== undefined)
 		deps.readGuard?.dropProvisionalReadByCall(toolCallId);
+	// #4732: the command text bash's recovery reads its roots and recognized
+	// writes from, and whether this is a call of another tool whose own
+	// `tool_call` recorded an opaque baseline. That record is the decision (the
+	// gate, the structured classifier and the id rule all ran there); this side
+	// follows it instead of re-deriving it (shape 19).
+	const bashCommand =
+		event.toolName === "bash" &&
+		typeof (event.input as { command?: unknown }).command === "string"
+			? (event.input as { command: string }).command
+			: undefined;
+	const opaqueNonBash =
+		event.toolName !== "bash" &&
+		toolCallId !== undefined &&
+		shouldRunOpaqueRecovery(event.toolName, workspaceRoot) &&
+		getOpaqueBaselineStore().has(
+			opaqueBaselineSlot(
+				opaquePrescanRoot(deps.cwd, workspaceRoot),
+				runtime.sessionGeneration,
+			),
+			toolCallId,
+		);
+	// #4732: a captured tool's relative path field that has no attribution
+	// (none is recorded for a tool the classifier does not know) is still
+	// refused as a PATH, but the handler goes on: the diff below recovers the
+	// call's writes, and an observation the #2430 net armed for the call (from
+	// the cwd the call ran in) settles as for an absolute path.
+	let unattributedOpaque = false;
 	const attribution =
 		toolCallId !== undefined
 			? runtime.takeToolCallAttribution(toolCallId)
@@ -1561,12 +2141,15 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			durationMs: 0,
 			metadata: { toolCallId, rawFilePath, guessedPath },
 		});
-		return readNote.length > 0
-			? {
-					content: [...readNote, ...event.content],
-					structuredContent: event.structuredContent,
-				}
-			: undefined;
+		if (!opaqueNonBash)
+			return readNote.length > 0
+				? {
+						content: [...readNote, ...event.content],
+						structuredContent: event.structuredContent,
+					}
+				: undefined;
+		unattributedOpaque = true;
+		resolutionBasis = workspaceRoot;
 	} else {
 		// Either an ABSOLUTE path (bash-synthetic writes always pass one —
 		// unambiguous regardless of any basis, see the bash-write dispatch
@@ -1576,12 +2159,24 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// not a regression introduced by it.
 		resolutionBasis = workspaceRoot;
 	}
-	const filePath = rawFilePath
-		? path.isAbsolute(rawFilePath)
+	// #4576: one host-path resolver for both sides of a call. The `tool_call`
+	// seam already expanded `~`, `file://`, an `@` prefix and the variant
+	// ladder through this exact function; resolving the result's authoritative
+	// path with a bare `path.resolve` turned `~/x` into `<root>/~/x`, a path
+	// that cannot exist, and dispatched runners and analyzers against it.
+	// #4577: a path recovered from disk is already an identity, not a spelling
+	// the model typed — `_pathAlreadyResolved` carries that provenance from the
+	// recovery caller instead of this handler guessing it from the string.
+	const filePath = unattributedOpaque
+		? undefined
+		: rawFilePath && deps._pathAlreadyResolved
 			? rawFilePath
-			: path.resolve(resolutionBasis, rawFilePath)
-		: rawFilePath;
-	const analysisRootMode = resolveAnalysisRoot(filePath ?? "", workspaceRoot);
+			: resolveToolCallFilePath(rawFilePath, resolutionBasis, workspaceRoot)
+					?.path;
+	// The class and its root, answered once: the rows below name the root the
+	// class served, never a second rule's answer (#4734 Sourcery thread 3).
+	const analysisRoot = classifyAnalysisRoot(filePath ?? "", workspaceRoot);
+	const analysisRootMode = analysisRoot.mode;
 	if (filePath) {
 		invalidateProjectIgnoreMatcherForPath(filePath);
 		invalidateFormatterCacheForPath(filePath);
@@ -1614,7 +2209,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			},
 		});
 	}
-	const behaviorWarnings = agentBehaviorRecord(event.toolName, filePath);
+	// The parent bash call is already recorded. Its per-file diagnostic replays
+	// must not push that real call out of the BLIND WRITE knowledge window.
+	const behaviorWarnings = isBashDerivedReplay(event)
+		? []
+		: agentBehaviorRecord(event.toolName, filePath);
 	const syntheticWriteContent: Array<{ type: string; text?: string }> = [];
 	// #1590: one shared authoritative-content budget for every path this bash
 	// command wrote. It is handed DOWN to each synthetic call so the single
@@ -1631,25 +2230,67 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// synthetic `write` event so its diagnostics, fileSeq, and change-log refresh.
 	// Without (2) a `git checkout -- f` restore keeps serving the pre-restore
 	// (e.g. broken-state) warnings on every later lens_diagnostics call.
-	if (
-		event.toolName === "bash" &&
-		typeof (event.input as { command?: unknown }).command === "string"
-	) {
-		const command = (event.input as { command: string }).command;
+	// #4732: the same recovery, publish and dispatch serve every other tool
+	// whose `tool_call` recorded a baseline. It has no command text, so it
+	// recognizes nothing, recovers from the session root only, and every path
+	// it wrote is opaque evidence (unauthored, no blockers).
+	if (bashCommand !== undefined || opaqueNonBash) {
+		const command = bashCommand ?? "";
+		/** What the rows below name the call by: its command, or its tool. */
+		const opaqueLabel = bashCommand ?? event.toolName;
 		const recognized = extractWrittenPathsFromCommand(command, workspaceRoot);
+		// #2050: the trees this command's writes are recovered from. The session
+		// root is where the host ran it; every further root is a checkout the
+		// command ITSELF named and that is a linked worktree of this repository,
+		// so its writes are recovered from that root's own `git status`.
+		// #4504: one derivation from the command text and the session root, which
+		// is the same input the `tool_call` side took its baselines from.
+		const scanRoot = opaquePrescanRoot(deps.cwd, workspaceRoot);
+		const recoveryScopes = resolveOpaqueRecoveryRoots(command, scanRoot);
+		/**
+		 * The most specific recovery root holding `file`, so two roots that
+		 * overlap (a worktree nested under the session root) never both claim it.
+		 * The file is compared by its REAL path (#4713 F3): a `cd` into a symlink
+		 * that points at a linked worktree names that checkout under a different
+		 * spelling, and a lexical match put the file under the session root — the
+		 * root whose observation never saw it.
+		 */
+		const ownerRootOf = (file: string): string | undefined => {
+			const abs = realpathOrResolve(file);
+			let owner: string | undefined;
+			for (const root of recoveryScopes.roots) {
+				if (!isUnderDir(abs, root)) continue;
+				if (owner === undefined || root.length > owner.length) owner = root;
+			}
+			return owner;
+		};
 		// The SURVIVING recognized set: what will actually dispatch. Failure
 		// atomicity (#2000 invariant 5) means opaque recovery must subtract
 		// THIS set, not raw recognized - otherwise a redirect target dropped
 		// by the isError filter would be subtracted from recovery AND
 		// excluded here, attributed nowhere.
+		// #2050 AC4: a recognised operand now resolves against the command's own
+		// `cd`, so a write in a linked worktree is named by ITS path. It is
+		// outside the session ROOT yet inside the session's analysis family
+		// (`canWriteAnalysisRoot("linked-worktree")`), so it is admitted by the
+		// checkout it belongs to and judged against THAT checkout's ignores.
+		const isRecordableBashWrite = (wp: string): boolean => {
+			// #4713 F3: whether a checkout may be written is `analysis-root.ts`'s
+			// rule, not a second derivation here. It resolves the file's real path,
+			// so a worktree reached through a symlinked spelling is admitted exactly
+			// like the real one; the OWNER root still answers which ignores apply.
+			if (!canWriteAnalysisRoot(resolveAnalysisRoot(wp, workspaceRoot)))
+				return false;
+			if (isRecordableProjectPath(wp, workspaceRoot)) return true;
+			const owner = ownerRootOf(wp);
+			return (
+				owner !== undefined &&
+				owner !== scanRoot &&
+				isRecordableProjectPath(wp, owner)
+			);
+		};
 		let recognizedWritten =
-			event.isError !== true
-				? recognized.filter(
-						(wp) =>
-							!isExternalOrVendorFile(wp, workspaceRoot) &&
-							!isPathIgnoredByProject(wp, workspaceRoot, false),
-					)
-				: [];
+			event.isError !== true ? recognized.filter(isRecordableBashWrite) : [];
 		// #2000 phase 2: when the extractor recognizes NOTHING, the command is
 		// opaque-candidate — recover its actual changed set by diffing the pre
 		// snapshot taken at tool_call. Partial writes that landed before a
@@ -1657,152 +2298,531 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// them) — a deliberate divergence from the isError filter above, which
 		// exists for restore semantics where attribution would lie.
 		let opaquePaths: string[] = [];
+		// #4737 r3: the recovered paths the observation answers for: sent with
+		// the call's population, never recorded or dispatched by this half.
+		let observedOpaquePaths: string[] = [];
 		let hadOpaqueRecovery = false;
-		let observedChangedKeys: Set<string> | undefined;
+		/** Each root's own surviving recovery: what git reported AND we claim. */
+		const recoveredByRoot = new Map<string, Set<string>>();
 		let recognizedAuthored: string[] = [];
+		// #4502: the pre-command dirty set, taken from this call's own baseline
+		// and compared with the post-command status below. Held here (not inside
+		// the recovery block) because the head look after it is what publishes it.
+		let dirtyBefore: readonly string[] | undefined;
 		// Recovery runs for EVERY bash command with a pending baseline - not
 		// only recognized-empty ones. A mixed command (`python x.py > out.ts`
 		// plus script-internal writes) previously skipped observation entirely
 		// with zero telemetry; git-first recovery is cheap enough (~60ms) to
 		// close that gap, subtracting already-recognized paths so nothing
 		// double-dispatches.
-		if (workspaceRoot && !getFlag("no-read-guard")) {
-			const scanRoot = workspaceRoot;
+		// #4504: one root for the record and the take. The coordinator's
+		// `projectRoot` is the LIVE PRIMARY's for a concurrent secondary (#473),
+		// so this side has to ask the host's own cwd, exactly as the `tool_call`
+		// side does — never the root it happens to be dispatching against.
+		type RootRecovery =
+			| {
+					root: string;
+					verdict: "observed";
+					keys: string[];
+					excluded: number;
+					unknownPairs: number;
+			  }
+			| { root: string; verdict: "unknown"; reason: string };
+		if (shouldRunOpaqueRecovery(event.toolName, workspaceRoot)) {
 			const started = Date.now();
-			const pending = getOpaqueBaselineStore().take(
-				opaqueBaselineSlot(scanRoot, runtime.sessionGeneration),
-				toolCallId,
-			);
+			const unknownRoots = new Set<string>();
 			let unknownReason: string | undefined;
-			if (!pending && recognized.length > 0) {
-				// Partial coverage without observation: the explicit verdict
-				// invariant 1 demands (never silently imply no change).
-				unknownReason = "partial-recognition-no-baseline";
-			} else if (!pending) {
-				unknownReason = "no-pending-snapshot";
-			} else if (pending.strategy === "git") {
-				// Git-first: no universe cap - works on any repo size.
-				const recovery = await recoverOpaqueChangesViaGit(
-					scanRoot,
-					pending.startedAt,
-					{
-						excludeIndexOnlyWhenUnmerged: isFailedGitIntegrationCommand(
-							command,
-							event.isError,
-						),
-					},
-				);
-				if (recovery.verdict === "recovered") {
-					opaquePaths = recovery.paths.filter(
-						(p) =>
-							!isExternalOrVendorFile(p, scanRoot) &&
-							!isPathIgnoredByProject(p, scanRoot, false),
-					);
-					observedChangedKeys = new Set(opaquePaths);
-				} else if (recovery.verdict === "unknown") {
+			// Every root's baseline is taken BEFORE the first await, so which root
+			// finished first can never decide which baseline a later take finds.
+			const baselines = recoveryScopes.roots.map((root) => ({
+				root,
+				pending: getOpaqueBaselineStore().take(
+					opaqueBaselineSlot(root, runtime.sessionGeneration),
+					toolCallId,
+				),
+			}));
+			// #4502: `undefined` means git could not answer before the command, an
+			// empty array that the tree was clean. Only the second says "no discard".
+			dirtyBefore = baselines.find((entry) => entry.root === scanRoot)?.pending
+				?.dirtyPaths;
+			// The roots recover in PARALLEL. Each is an independent `git status`
+			// (or stat capture), and a bash result the host classed READ-ONLY has a
+			// 500 ms bound, so summing two spawns would spend the budget the
+			// delivery below needs (#2050).
+			const outcomes = await Promise.all(
+				baselines.map(async ({ root, pending }): Promise<RootRecovery> => {
+					if (!pending)
+						// Partial coverage without observation: the explicit verdict
+						// invariant 1 demands (never silently imply no change).
+						return {
+							root,
+							verdict: "unknown",
+							reason:
+								recognized.length > 0
+									? "partial-recognition-no-baseline"
+									: "no-pending-snapshot",
+						};
+					if (pending.strategy === "git") {
+						// Git-first: no universe cap - works on any repo size.
+						const recovery = await recoverOpaqueChangesViaGit(
+							root,
+							pending.startedAt,
+							{
+								excludeIndexOnlyWhenUnmerged: isFailedGitIntegrationCommand(
+									command,
+									event.isError,
+								),
+							},
+						);
+						if (recovery.verdict === "unknown")
+							return {
+								root,
+								verdict: "unknown",
+								reason: recovery.unknownReason ?? "git-failed",
+							};
+						return {
+							root,
+							verdict: "observed",
+							// A clean git verdict is complete evidence that no path changed
+							// IN THIS CHECKOUT; it is not missing evidence. Both branches
+							// therefore record the root as observed, and only the recovered
+							// paths earn authorship.
+							keys:
+								recovery.verdict === "recovered"
+									? recovery.paths.filter((p) =>
+											isRecordableProjectPath(p, root),
+										)
+									: [],
+							excluded: recovery.excludedIncomingCount ?? 0,
+							unknownPairs: recovery.unknownStatusCount ?? 0,
+						};
+					}
+					if (pending.stats) {
+						const outcome = await captureFileStats(root, {
+							withHashes: true,
+							...deps._opaqueCaptureOptions,
+						});
+						if (!outcome.snapshot || outcome.unknownReason)
+							return {
+								root,
+								verdict: "unknown",
+								reason:
+									outcome.unknownReason ??
+									pending.statsUnknownReason ??
+									"walk-failed",
+							};
+						return {
+							root,
+							verdict: "observed",
+							keys: diffFileContent(pending.stats, outcome.snapshot),
+							excluded: 0,
+							unknownPairs: 0,
+						};
+					}
+					return {
+						root,
+						verdict: "unknown",
+						reason: pending.statsUnknownReason ?? "walk-failed",
+					};
+				}),
+			);
+			for (const outcome of outcomes) {
+				if (outcome.verdict === "unknown") {
+					// #4732: bash already says this through its coverage row and its
+					// withheld blockers; another tool's writes simply go unseen.
+					if (bashCommand === undefined)
+						recordOpaqueCaptureRefused(outcome.reason, event.toolName);
 					// #2060: deliberately WIDER than the old `recognized.length > 0`
 					// guard. A fully opaque command whose probe failed is the shape
 					// whose coverage is least knowable, and it used to record
 					// nothing at all.
-					unknownReason = recovery.unknownReason;
-				} else {
-					// A clean git verdict is complete evidence that no path
-					// changed; it is not missing evidence. Keep recognized writes
-					// out of authorship because git found no changed bytes.
-					observedChangedKeys = new Set();
+					unknownRoots.add(outcome.root);
+					unknownReason ??= outcome.reason;
+					continue;
 				}
+				recoveredByRoot.set(outcome.root, new Set(outcome.keys));
 				// #2060: both counts are bounded (one record per tool_result, no
 				// per-path logging) and exist because filtering is invisible in
 				// production otherwise - the dropped paths simply never appear.
-				if ((recovery.excludedIncomingCount ?? 0) > 0) {
+				if (outcome.excluded > 0)
 					logLatency({
 						type: "phase",
 						phase: "opaque_mutation_incoming_excluded",
-						filePath: command.slice(0, 80),
+						filePath: opaqueLabel.slice(0, 80),
 						durationMs: Date.now() - started,
-						result: `excluded:${recovery.excludedIncomingCount}`,
+						result: `excluded:${outcome.excluded}`,
+						metadata: { root: outcome.root },
 					});
-				}
-				if ((recovery.unknownStatusCount ?? 0) > 0) {
+				if (outcome.unknownPairs > 0)
 					logLatency({
 						type: "phase",
 						phase: "opaque_mutation_status_pair_unknown",
-						filePath: command.slice(0, 80),
+						filePath: opaqueLabel.slice(0, 80),
 						durationMs: Date.now() - started,
-						result: `kept:${recovery.unknownStatusCount}`,
+						result: `kept:${outcome.unknownPairs}`,
+						metadata: { root: outcome.root },
 					});
-				}
-			} else if (pending.stats) {
-				const outcome = await captureFileStats(scanRoot, {
-					withHashes: true,
-					...deps._opaqueCaptureOptions,
-				});
-				if (outcome.snapshot && !outcome.unknownReason) {
-					opaquePaths = diffFileContent(pending.stats, outcome.snapshot);
-					observedChangedKeys = new Set(opaquePaths);
-				} else {
-					unknownReason =
-						outcome.unknownReason ??
-						pending.statsUnknownReason ??
-						"walk-failed";
-				}
-			} else {
-				unknownReason = pending.statsUnknownReason ?? "walk-failed";
 			}
+			opaquePaths = recoveryScopes.roots.flatMap((root) => [
+				...(recoveredByRoot.get(root) ?? []),
+			]);
+			// A file the extractor already recognized must not be dispatched twice
+			// through the opaque half: recovery's `git status` names it too. The
+			// OBSERVATION keeps it (`recoveredByRoot`), because that is the evidence
+			// its authorship is judged on below.
 			if (opaquePaths.length > 0 && recognizedWritten.length > 0) {
+				// #4713 F3: the recovered keys are git's own identities, so the
+				// recognized side is compared by its real path too. A symlinked
+				// spelling of a worktree file is the same file, and subtracting it
+				// keeps one dispatch and one authorship rather than an authored
+				// write plus an opaque copy of its own bytes.
 				const survivingKeys = new Set(
-					recognizedWritten.map((p) => normalizeMapKey(path.resolve(p))),
+					recognizedWritten.map((p) => normalizeMapKey(realpathOrResolve(p))),
 				);
 				opaquePaths = opaquePaths.filter((p) => !survivingKeys.has(p));
 			}
-			hadOpaqueRecovery = opaquePaths.length > 0;
-			if (observedChangedKeys) {
-				recognizedAuthored = recognizedWritten.filter((file) =>
-					observedChangedKeys!.has(normalizeMapKey(path.resolve(file))),
+			// #4732: a path the #2430 net armed an observation of for this same
+			// call is the settle's to answer, with the tool's own attribution.
+			// #4737 r3: it still goes out in the awaited primary send below, so a
+			// sibling dispatched first never reads its old bytes (#4507).
+			if (opaquePaths.length > 0 && opaqueNonBash) {
+				const observed = new Set(
+					pendingObservationPaths(toolCallId, runtime.sessionGeneration).map(
+						(p) => normalizeMapKey(realpathOrResolve(p)),
+					),
 				);
-				if (recognizedAuthored.length === 0) recognizedWritten = [];
-			} else if (unknownReason) {
-				recognizedAuthored = [];
-				// The bounded opaque_mutation_coverage_unknown record below remains
-				// the production proof that authorship evidence was unavailable.
+				if (observed.size > 0) {
+					for (const p of opaquePaths)
+						if (observed.has(p)) observedOpaquePaths.push(p);
+					opaquePaths = opaquePaths.filter((p) => !observed.has(p));
+				}
+			}
+			hadOpaqueRecovery = opaquePaths.length > 0;
+			if (recoveredByRoot.size > 0 || unknownRoots.size > 0) {
+				// The scan speaks only for the checkout it ran in (#4504 r1, #2050):
+				// a recognized write is judged by ITS OWN root's verdict, so a clean
+				// `git status` in the session root can no longer clear a write in a
+				// linked worktree (shape 54: a scan may not drop the only fresh answer
+				// it cannot see) and a recovered path earns authorship only from the
+				// root that saw it (shape 65).
+				const scanned: string[] = [];
+				const unscanned: string[] = [];
+				for (const file of recognizedWritten) {
+					const owner = ownerRootOf(file);
+					const observed =
+						owner === undefined ? undefined : recoveredByRoot.get(owner);
+					if (owner === undefined || observed === undefined)
+						unscanned.push(file);
+					// #4713 F3: the observation is keyed by the identity git reported, so
+					// the LOOKUP takes the file's real path too. A symlinked spelling of a
+					// worktree path matched nothing, so a recognised write that WAS
+					// observed read as unscanned and lost its authorship.
+					else if (observed.has(normalizeMapKey(realpathOrResolve(file))))
+						scanned.push(file);
+				}
+				recognizedAuthored = scanned;
+				if (recognizedAuthored.length === 0 && unscanned.length === 0)
+					recognizedWritten = [];
 			}
 			if (unknownReason) {
 				logLatency({
 					type: "phase",
 					phase: "opaque_mutation_coverage_unknown",
-					filePath: command.slice(0, 80),
+					filePath: opaqueLabel.slice(0, 80),
 					durationMs: Date.now() - started,
 					result: unknownReason,
+					metadata: {
+						root: scanRoot,
+						unknownRoots: unknownRoots.size,
+					},
 				});
 			}
-			if (opaquePaths.length > 0) {
+			// One row per recovering root that found something (bounded by
+			// `OPAQUE_RECOVERY_ROOT_CAP`), each naming its own root: a reader must be
+			// able to tell WHICH checkout a population came from, and the roots of
+			// one call are not interchangeable (#2050).
+			for (const root of recoveryScopes.roots) {
+				const keys = recoveredByRoot.get(root);
+				if (keys === undefined || keys.size === 0) continue;
+				// The row's path field names at most five of them.
+				const listed = [...keys];
+				listed.length = Math.min(listed.length, 5);
 				logLatency({
 					type: "phase",
 					phase: "opaque_mutation_recovered",
-					filePath: opaquePaths.slice(0, 5).join(","),
+					filePath: listed.join(","),
 					durationMs: Date.now() - started,
-					result: `changed:${opaquePaths.length}`,
-				});
-				void resyncGitChangedFiles(opaquePaths).catch((err) => {
-					dbg(`git-change LSP resync failed: ${err}`);
+					result: `changed:${keys.size}`,
+					metadata: { root, roots: recoveryScopes.roots.length },
 				});
 			}
+		}
+		// #4493: a command that moved HEAD resyncs the held documents it
+		// rewrote before this result returns, ahead of the synthetic dispatches
+		// below, so their diagnostics read the new dependencies. It has the edit
+		// budget, as the bash-write primary phase does: a move is a write, and
+		// the 500 ms read-only bound cut a slow primary mid-send (#4528 r4).
+		// #4504 r1: the head-move record and take resolve their root through the
+		// same owner as the baseline slot, so a concurrent secondary (#473) joins
+		// the look its own `tool_call` recorded, not the live primary's.
+		// #4502: the same look carries a same-HEAD discard. The paths are read
+		// from this call's own baseline (dirty before) against the status now
+		// (clean after), which is the only evidence those commands leave, and
+		// they ride the one awaited look so the resync still lands before this
+		// result returns.
+		const headScanRoot = opaquePrescanRoot(deps.cwd, workspaceRoot);
+		if (headScanRoot) {
+			const headMoveSignal = deps.signal ?? undefined;
+			const discarded =
+				dirtyBefore === undefined
+					? undefined
+					: await readSameHeadDiscards(headScanRoot, dirtyBefore);
+			await bounded(
+				resyncHeadMove({
+					root: headScanRoot,
+					key: headRecordKey(
+						opaqueBaselineSlot(headScanRoot, runtime.sessionGeneration),
+						deps.sessionId,
+					),
+					trigger: "tool_result",
+					label: opaqueLabel,
+					...(discarded ? { discarded } : {}),
+					runtime,
+				}),
+				{
+					ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+					signal: headMoveSignal,
+					hook: "tool_result_edit",
+					label: "head-move-resync",
+				},
+			);
+		}
+		// #4532 gap 7: the install look also runs at the roots of the LIVE primary
+		// clients, not only at the session's cwd. A session whose cwd is a main
+		// checkout can drive a server rooted in a LINKED WORKTREE, and a
+		// `node_modules` symlinked into that worktree was invisible to a look that
+		// only ever read the session root's install stamp: tsserver republished the
+		// same seven `@types/node` gaps for 14 minutes after `tsc` was clean. Keyed
+		// on the live ROOTS, not on the files this command wrote (a `ln -s` writes
+		// no project file), and each root is looked at with its own client's spawn
+		// epoch, so a FIRST look at that root publishes an install the client never
+		// read instead of recording it as the baseline. It runs before the primary
+		// resync below, so a restart lands before the resend.
+		const clientRoots = liveClientRootsApartFrom(headScanRoot);
+		if (clientRoots.length > 0) {
+			const lookSignal = deps.signal ?? undefined;
+			await bounded(
+				Promise.all(
+					clientRoots.map((entry) =>
+						lookForOutOfBandChanges(
+							entry.root,
+							"tool_result",
+							// AGENTS.md "What it is" (analysis-root invariant): the look may run at
+							// an adopted root (its client must restart when its install
+							// appears), but an adopted root never receives session
+							// bookkeeping — no sequence, no receipt, no change-log entry
+							// (#4532 round 3, Greptile). The session root and its
+							// repository's linked worktrees are bookkeeping roots.
+							isSessionBookkeepingRoot(entry.root, headScanRoot)
+								? runtime
+								: undefined,
+							{
+								since: entry.spawnedAt,
+								walk: "interval",
+							},
+						).catch((cause: unknown) => {
+							// One bounded record per root: a look that threw tells nothing
+							// about the root's install, so it must not read as "no install".
+							recordDegradationOnce({
+								kind: "lsp-client-root-look-failed",
+								subject: normalizeMapKey(entry.root),
+								reason: `the install look at a live client root failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+							});
+						}),
+					),
+				),
+				{
+					ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+					signal: lookSignal,
+					hook: "tool_result_edit",
+					label: "client-root-install-look",
+				},
+			);
 		}
 		// wp iterates opaquePaths VERBATIM (already normalizeMapKey keys), so the
 		// set must hold those exact strings - no re-resolution.
 		const opaqueSet = new Set(opaquePaths);
 		const written = [...recognizedWritten, ...opaquePaths];
+		// #2050: one bounded record when a single command's written population
+		// spans more than one checkout. Without it the recovered/primary rows read
+		// like any other multi-file write and nothing says the session reached
+		// outside its own root.
+		const writtenRoots = new Set<string>();
+		for (const file of written) writtenRoots.add(ownerRootOf(file) ?? scanRoot);
+		if (writtenRoots.size > 1)
+			logLatency({
+				type: "phase",
+				phase: "opaque_mutation_multi_root",
+				filePath: [...writtenRoots].join(",").slice(0, 300),
+				durationMs: 0,
+				result: `roots:${writtenRoots.size}`,
+				metadata: { written: written.length },
+			});
+		// #4507: every file the command wrote reaches the primary servers that
+		// hold it before the synthetic dispatches below. They run one file at a
+		// time, so without this a dependent dispatched ahead of its dependency
+		// was checked against the dependency's old bytes (a phantom STOP). The
+		// full resync of the opaque paths (auxiliaries, held importers, drift
+		// records) follows the primary phase, detached.
+		//
+		// #4528 r1 F1: the dispatch loop waits for the phase itself, under the
+		// edit budget its dispatches already run under, not the 500 ms read-only
+		// bound: under load the phase outlasted 500 ms, the cut let a.ts be
+		// checked while z.ts was still unsent, and the phantom STOP came back.
+		// A live primary takes the capped sends far inside the budget; one that
+		// does not answers the dispatches after it no better (no verdict).
+		const sentPopulation = [...written, ...observedOpaquePaths];
+		if (workspaceRoot && sentPopulation.length > 0) {
+			const primaryStarted = Date.now();
+			// The servers must also have READ the sends before a dispatch reads a
+			// check (#4528 r1 F1): the held-primary pass's drain barrier.
+			//
+			// #4504 r1: a server answers for the checkout that roots it, so the
+			// phase runs one publish per root `written` spans. A concurrent
+			// secondary's recovered files belong to its own checkout; looking them
+			// up under the coordinator's root found no holder, so the awaited send
+			// skipped every document and a dispatch could read the stale bytes.
+			//
+			// #4535 slice 2: both phases are the publisher's LSP consumer. This
+			// detector names no service: `bash-write` is the population every
+			// written path feeds (the awaited primary phase), and `recovered-drift`
+			// is the recovered subset's detached follow-up.
+			ensureDiskChangeSubscribers();
+			const sendsByRoot = new Map<string, string[]>();
+			for (const file of sentPopulation) {
+				// #2050: the root that OWNS the file. A recovered path from a linked
+				// worktree belongs to that worktree's clients, not to the session
+				// root's (which hold no document for it); the fallback keeps the
+				// pre-existing answer for a path no recovery root covers.
+				const owner =
+					ownerRootOf(file) ??
+					(isUnderDir(path.resolve(file), scanRoot) ? scanRoot : workspaceRoot);
+				const bucket = sendsByRoot.get(owner);
+				if (bucket) bucket.push(file);
+				else sendsByRoot.set(owner, [file]);
+			}
+			const publishes = Promise.all(
+				[...sendsByRoot].map(async ([root, files]) => ({
+					root,
+					published: await publishDiskChangeChunked({
+						root,
+						origin: "bash-recovery",
+						sources: [BASH_WRITE_SOURCE],
+						// The population is what the command wrote; recovery only
+						// read stat evidence for its opaque half. Chunked: a code-mod
+						// that writes more than the publisher's cap otherwise degrades
+						// to `"unknown"`, and this branch's consumer then takes every
+						// held document for the awaited send (review round 3, HIGH:
+						// `changedSent 0/65`, probe F) with no drift pass to heal it.
+						kind: "inferred",
+						paths: files,
+					}),
+				})),
+			);
+			const primaryPhase = publishes.then((groups) => {
+				const answers = groups.flatMap(({ root, published }) =>
+					published.map(({ results, failedSubscribers }) =>
+						readHeldDocumentsAnswer(results, root, failedSubscribers),
+					),
+				);
+				return {
+					targets: answers.flatMap((answer) => answer.targets),
+					primary: answers.reduce((count, answer) => count + answer.primary, 0),
+					failed: answers.some((answer) => answer.failed),
+					drained: answers.every((answer) => answer.drained),
+				};
+			});
+			// The drift pass carries the OPAQUE half only. `recoveredByRoot` is the
+			// OBSERVATION (it also holds a recognized file, which the authorship
+			// judgement above reads), while `opaquePaths` is the population that
+			// still needs the follow-up: a recognized write already went to the
+			// primaries in the awaited phase and is dispatched on its own, so
+			// publishing it here ran a second LSP drift pass over the same bytes
+			// (#2050 r2, `disk-change-detectors-4535` "a parser-recognized write").
+			const driftByRoot = new Map<string, string[]>();
+			for (const file of opaquePaths) {
+				const root = ownerRootOf(file) ?? scanRoot;
+				const bucket = driftByRoot.get(root);
+				if (bucket) bucket.push(file);
+				else driftByRoot.set(root, [file]);
+			}
+			if (driftByRoot.size > 0)
+				void primaryPhase
+					.then(() =>
+						Promise.all(
+							[...driftByRoot].map(([root, paths]) =>
+								publishRecoveredDrift(root, paths),
+							),
+						),
+					)
+					.catch((err) => {
+						// The one handler the base branch had for this detached chain.
+						// The publisher never rejects (see `publishDiskChange`'s contract)
+						// and a drift rejection is recorded by `publishRecoveredDrift`
+						// chunk by chunk (review round 3, p3-3; #4612 r4 lets the chain
+						// go on), so only a programming error reaches here.
+						// none: the two failure paths this chain owns record themselves, so
+						// a record here would duplicate one and mislabel the other.
+						dbg(`git-change LSP resync failed: ${err}`);
+					});
+			// A name of its own: the HEAD look above bounds with the same signal.
+			const primarySignal = deps.signal ?? undefined;
+			const sent = await bounded(primaryPhase, {
+				ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+				signal: primarySignal,
+				hook: "tool_result_edit",
+				label: "bash-write-primary-resync",
+			});
+			// One row per bash result that had held documents to resend, or whose
+			// phase failed or was cut ("cut": the bound ended the wait, and its
+			// hook-await-exceeded row names it; "undrained": a server did not
+			// answer the drain barrier in time, so a check may predate the sends).
+			if (sent === undefined || sent.failed || sent.targets.length > 0)
+				logLatency({
+					type: "phase",
+					phase: "bash_write_primary_resync",
+					filePath: written.slice(0, 5).join(","),
+					durationMs: Date.now() - primaryStarted,
+					result:
+						sent === undefined
+							? "cut"
+							: sent.failed
+								? "failed"
+								: sent.drained
+									? "sent"
+									: "undrained",
+					metadata: {
+						written: written.length,
+						opaque: opaquePaths.length,
+						targets: sent?.targets.length ?? -1,
+						primary: sent?.primary ?? 0,
+					},
+				});
+		}
 		const recognizedAuthoredSet = new Set(recognizedAuthored);
 		bashAuthorshipConfirmed = recognizedAuthored.length > 0;
 		for (const wp of written) {
 			// #3525: a parser-recognized bash write is whole-file authorship only
 			// after the tool_call preflight proved no foreign writer intervened.
 			// Opaque recovery is observed bridge evidence, not bytes the parser
-			// accounted for, so it remains UNKNOWN for F-4210-2.
+			// accounted for, so it remains UNKNOWN for F-4210-2. No pre-write
+			// check covered those bytes, so it may only end an existing
+			// authorship, never advance it (#4387).
+			const opaqueEvidence = hadOpaqueRecovery || opaqueSet.has(wp);
 			if (!getFlag("no-read-guard") && recognizedAuthoredSet.has(wp))
 				deps.readGuard?.recordWritten(wp, {
-					authorship:
-						hadOpaqueRecovery || opaqueSet.has(wp) ? "unknown" : "whole-file",
+					authorship: opaqueEvidence ? "unknown" : "whole-file",
+					...(opaqueEvidence && { advanceAuthorship: false }),
 					stampFileTime: false,
 					...(toolCallId !== undefined && { toolCallId }),
 				});
@@ -1838,10 +2858,14 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				...deps,
 				event: syntheticEvent,
 				_bypassDebounce: true,
+				// #4713 F2: the checkout that owns this written path, so the ignore
+				// gate below asks the root that admitted the write.
+				_ownerRoot: ownerRootOf(wp),
 				_autofixMode: autofixMode,
 				_attachmentBudget: syntheticAttachmentBudget,
 				_mutationSourceOverride: isOpaque ? "opaque-script" : undefined,
 				_readGuardAuthorship: recognizedAuthoredSet.has(wp),
+				_pathAlreadyResolved: true,
 				_ownWriteStamp: {
 					stampFileTime: false,
 					...(toolCallId !== undefined && { toolCallId }),
@@ -1872,12 +2896,25 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					};
 				}
 			)?.truncation;
-			const parsedSpans = extractReadPathsFromCommand(command, workspaceRoot);
-			let spans = parsedSpans;
-			if (
+			const clippedLines =
 				truncation?.truncated === true &&
 				typeof truncation.outputLines === "number"
-			) {
+					? truncation.outputLines
+					: undefined;
+			const clipped = clippedLines !== undefined;
+			// #1649: an unclipped view drops vendor and ignored files before their
+			// lines are counted. A clipped one keeps every span: the multi-span
+			// check below must still see a file the loop then skips, or
+			// `cat a.ts vendor.js` would credit lines of a.ts pi never showed.
+			const parsedSpans = extractReadPathsFromCommand(
+				command,
+				workspaceRoot,
+				clipped
+					? undefined
+					: (candidate) => isRecordableProjectPath(candidate, workspaceRoot),
+			);
+			let spans = parsedSpans;
+			if (clipped) {
 				if (parsedSpans.length === 1) {
 					const span = parsedSpans[0];
 					if (span) {
@@ -1885,13 +2922,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						// convention, where a trailing newline contributes an empty final
 						// element. The host's output line count does not include that
 						// element, so remove it from the span basis before taking the tail.
-						const hasTrailingNewline = nodeFs
-							.readFileSync(span.filePath, "utf8")
-							.endsWith("\n");
+						const hasTrailingNewline = lastByteIsNewline(span.filePath);
 						const spanLineCount = hasTrailingNewline
 							? Math.max(1, span.limit - 1)
 							: span.limit;
-						const shown = Math.min(truncation.outputLines, spanLineCount);
+						const shown = Math.min(clippedLines, spanLineCount);
 						spans =
 							shown > 0
 								? [
@@ -1925,9 +2960,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				}
 			}
 			for (const span of spans) {
-				if (isExternalOrVendorFile(span.filePath, workspaceRoot)) continue;
-				if (isPathIgnoredByProject(span.filePath, workspaceRoot, false))
-					continue;
+				if (!isRecordableProjectPath(span.filePath, workspaceRoot)) continue;
 				deps.readGuard?.recordRead({
 					filePath: span.filePath,
 					requestedOffset: span.offset,
@@ -2047,10 +3080,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					  }
 					| undefined
 			)?.truncation;
-			const available = Math.max(
-				0,
-				countFileLines(deliveredFilePath) - requestedOffset + 1,
+			// #1649: one bounded pass gives the count and the delivered range's
+			// line hashes, read at the same moment the capture always was. The
+			// delivered limit waits on the count, so the range is open-ended: the
+			// scan keeps at most READ_HASH_MAX_LINES lines from the offset.
+			const deliveredScan = scanFileLines(
+				deliveredFilePath,
+				[{ offset: requestedOffset, limit: Number.POSITIVE_INFINITY }],
+				{ count: true },
 			);
+			// An unreadable file counts one line, as countFileLines always answered.
+			const totalLines = deliveredScan?.totalLines ?? 1;
+			const available = Math.max(0, totalLines - requestedOffset + 1);
 			const deliveredLimit = Math.min(
 				available,
 				truncation?.outputLines ?? requestedLimit ?? available,
@@ -2072,7 +3113,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					effectiveOffset: requestedOffset,
 					effectiveLimit: deliveredLimit,
 					metadata: {
-						totalLines: countFileLines(deliveredFilePath),
+						totalLines,
 						isPartial: deliveredLimit < available,
 						fileKind: detectFileKind(deliveredFilePath) ?? "unknown",
 						fractionRead:
@@ -2095,7 +3136,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// result supersedes, the newest one, since an id can be reused,
 				// its range clipped to the lines pi showed. Where the capture
 				// equals the text, the two are the same evidence; where a write
-				// landed before pi's read, the capture refuses lines the agent was
+				// landed before DM's read, the capture refuses lines the agent was
 				// shown until it re-reads. With no hashed capture there is no
 				// evidence, and nothing is recorded.
 				const raced = deps.readGuard.diskMovedSinceStamp(deliveredFilePath);
@@ -2155,10 +3196,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						kind: "native-read-raced-writer",
 						subject: deliveredFilePath,
 						reason: delivered
-							? "the file changed between pi's read and its tool_result; the read is recorded from the delivered text"
+							? "the file changed between DM's read and its tool_result; the read is recorded from the delivered text"
 							: captureEvidence
-								? "the file changed between pi's read and its tool_result; pi's line count does not vouch for the delivered text, so the tool_call's capture is the evidence"
-								: "the file changed between pi's read and its tool_result; pi's line count does not vouch for the delivered text and there is no hashed tool_call capture, so the read is not recorded",
+								? "the file changed between DM's read and its tool_result; pi's line count does not vouch for the delivered text, so the tool_call's capture is the evidence"
+								: "the file changed between DM's read and its tool_result; pi's line count does not vouch for the delivered text and there is no hashed tool_call capture, so the read is not recorded",
 					});
 				}
 				const evidence =
@@ -2167,7 +3208,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						: {
 								effectiveOffset: requestedOffset,
 								effectiveLimit: delivered?.lineCount ?? deliveredLimit,
-								lineHashes: delivered?.lineHashes,
+								// Unraced, the disk is what pi delivered: the scan above is
+								// the capture recordRead would otherwise take again.
+								lineHashes: raced
+									? delivered?.lineHashes
+									: deliveredScan?.hashes(requestedOffset, deliveredLimit),
 							};
 				if (evidence) {
 					const deliveredRecord = {
@@ -2240,8 +3285,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// bytes is read HERE, before the yield. Otherwise the racing call rewrites
 	// the file while this one is awaiting and this one registers under the
 	// OTHER call's state hash, collapsing two distinct pipelines into one.
+	// #4732: a write dm-lens replays from an opaque diff carries its call's id,
+	// and that call's observation is the call's own to settle, never a replay's.
 	const observationPending =
 		!getFlag("no-read-guard") &&
+		!isBashDerivedReplay(event) &&
 		hasPendingObservation(resolveToolCallCorrelationId(event));
 	// #2464 review round 2 (S2): NOT gated on `mutation !== undefined` any more.
 	// The observed path now dispatches on call ONE of an unknown tool too, and
@@ -2256,7 +3304,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		const observed = await settleObservedMutation({
 			toolCallId: resolveToolCallCorrelationId(event),
 			toolName: event.toolName,
-			sessionGeneration: runtime.sessionGeneration,
+			// #4737 r2: the session captured at entry. After the opaque recovery's
+			// await the live one can be a replacement that reused this call id.
+			sessionGeneration: writeSession.scopeId,
 			// #3613 F2: the budget of this session's own turn.
 			turnIndex: runtime.turnKey(deps.sessionId),
 			signal: getAmbientAbortSignal(),
@@ -2266,8 +3316,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			getStoredLineHashes: (candidate) =>
 				storedLineHashesFor(deps.readGuard, candidate),
 			isRecordable: (candidate) =>
-				!isExternalOrVendorFile(candidate, workspaceRoot) &&
-				!isPathIgnoredByProject(candidate, workspaceRoot, false),
+				isRecordableProjectPath(candidate, workspaceRoot),
 			dbg,
 		});
 		observedReplayed = observed.replayed;
@@ -2357,41 +3406,25 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// once the bridge has recorded the edit, re-running the classified chain
 		// double-records it regardless of how the tool classifies. They are
 		// consulted for what this block can still usefully DO.
-		if (filePath && !isExternalOrVendorFile(filePath, workspaceRoot)) {
+		// #4737 r3: an unset `filePath` (the result refused a relative path no
+		// attribution backs) still dispatches what the settle recorded; only the
+		// steps keyed on the tool's named path need it.
+		if (!filePath || !isExternalOrVendorFile(filePath, workspaceRoot)) {
 			// On call ONE the tool is not classified at all, so there is no
 			// `mutation.kind` to read. The observation itself is the authority and
 			// it only ever records "edit" (`settleObservedMutation` hard-codes
 			// `kind: "edit"`, and #2430 tier 4 only ever classifies a learned tool
 			// as "edit"), so the two agree wherever both exist.
 			const observedKind: MutationKind = mutation?.kind ?? "edit";
-			const observedStateHash =
-				preSettleStateHash ?? getFileStateHash(filePath);
-			const observedAppliedPairs = recordNativeAppliedPairs({
-				runtime,
-				input: event.input,
-				kind: observedKind,
-				filePath,
-				stateHash: observedStateHash,
-			});
-			// #3763: the settle awaited; a replaced session's receipt stays out
-			// of the live session's turn.
-			const receiptOutcome = writeSession.guardedWrite(filePath, () =>
-				(
-					runtime as Partial<RuntimeCoordinator>
-				).recordMutationToolReceipt?.call(runtime, filePath, observedKind),
-			);
-			refreshCachedExports(runtime, filePath);
-			// Same fallback formula the classified chain uses below, minus its
-			// `_bypassDebounce` branch (#2464 review round 2, S3): that branch was
-			// unreachable here. Both callers that set `_bypassDebounce` arrive with
-			// no pending baseline — `scheduleDebounced`'s re-entry because THIS
-			// call already consumed it at the settle above, and the bash-derived
-			// synthetic write because `runtime-tool-call.ts` excludes `bash` from
-			// arming outright (`toolName !== "bash"`). `observedKind` is always
-			// "edit", so the un-receipted default is "deferred" either way.
-			const observedAutofixMode: "immediate" | "deferred" =
-				receiptOutcome?.autofixMode ??
-				(observedKind === "edit" ? "deferred" : "immediate");
+			const observedAppliedPairs = filePath
+				? recordNativeAppliedPairs({
+						runtime,
+						input: event.input,
+						kind: observedKind,
+						filePath,
+						stateHash: preSettleStateHash ?? getFileStateHash(filePath),
+					})
+				: [];
 			// Analyse the files the observation actually RECORDED, not merely the
 			// path the tool named. A directory is never a pipeline target.
 			const observedDispatchPaths = observedChangedPaths
@@ -2412,6 +3445,29 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					reason: `observed mutation dispatch capped at ${OBSERVED_DISPATCH_MAX_PATHS}; ${observedDispatchDropped} path(s) not dispatched`,
 				});
 			}
+			// #4737 r3 F1, r4: each recorded file's own receipt and exports, before
+			// the client wait below can return. The receipt is the write->edit
+			// turn transition (it releases a file an earlier write's autofix
+			// marked fixed, so the deferred pass fixes these bytes too), and a
+			// removed export left cached blocks the next write of that name.
+			// #3763: the settle awaited; a replaced session's receipt stays out of
+			// the live session's turn. The fallback is the classified chain's,
+			// minus its `_bypassDebounce` branch (#2464 review round 2, S3), which
+			// no caller reaching this block sets.
+			const observedAutofixModes = new Map<string, "immediate" | "deferred">();
+			for (const observedPath of observedChangedPaths)
+				writeSession.guardedWrite(observedPath, () => {
+					refreshCachedExports(runtime, observedPath);
+					const receipt = (
+						runtime as Partial<RuntimeCoordinator>
+					).recordMutationToolReceipt?.call(
+						runtime,
+						observedPath,
+						observedKind,
+					);
+					if (receipt)
+						observedAutofixModes.set(observedPath, receipt.autofixMode);
+				});
 			if (observedDispatchPaths.length > 0) {
 				const observedClients = ensureToolResultClients(deps);
 				if (
@@ -2438,6 +3494,13 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					// one's writes would be dropped, so its run is wasted work.
 					if (writeSession.guardedWrite(observedPath, () => true) !== true)
 						continue;
+					// #4737 r4: the file's own class, never the named path's: a refused
+					// relative path leaves `filePath` unset, and a sibling is not the
+					// file the tool named.
+					const observedRootMode = classifyAnalysisRoot(
+						observedPath,
+						workspaceRoot,
+					).mode;
 					const observedDispatchSignal = deps.signal;
 					const observedJoinSignal = deps.signal;
 					const observedStateHashForPath = getFileStateHash(observedPath);
@@ -2461,6 +3524,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						}
 						continue;
 					}
+					// #4737 r2: one token and one root for the dispatch and the verdict
+					// it publishes.
+					const observedWriteIndex = runtime.nextWriteIndex();
+					const observedWriteOrderTurn = runtime.writeOrderTurn;
+					const observedTurnStateCwd = path.resolve(workspaceRoot);
 					const observedDispatchOutcome = await bounded(
 						dispatchPipelineAnalysis({
 							deps,
@@ -2470,12 +3538,14 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 								observedPath,
 								workspaceRoot,
 							),
-							turnStateCwd: path.resolve(workspaceRoot),
-							analysisRootMode,
-							autofixMode: observedAutofixMode,
+							turnStateCwd: observedTurnStateCwd,
+							analysisRootMode: observedRootMode,
+							autofixMode:
+								observedAutofixModes.get(observedPath) ??
+								(observedKind === "edit" ? "deferred" : "immediate"),
 							modifiedRanges: undefined,
-							writeIndex: runtime.nextWriteIndex(),
-							writeOrderTurn: runtime.writeOrderTurn,
+							writeIndex: observedWriteIndex,
+							writeOrderTurn: observedWriteOrderTurn,
 							initialStateHash: observedStateHashForPath,
 							readGuardCorrelationId: observedReadGuardCorrelationId,
 							requestedEditIndexes: getRequestedEditIndexes(
@@ -2521,6 +3591,24 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							`tool_result: pipeline analysis crashed for the observed mutation on ${observedPath}; the recorded edit stands, analysis did not run this turn`,
 						);
 						return observedDispatchOutcome.response;
+					}
+					// #4737 r2: the verdict gates the commit now, as the classified
+					// chain's does, not from turn_end. The observation is the
+					// authorship evidence (the claim above runs with `authored: true`).
+					if (observedDispatchOutcome) {
+						publishInlineVerdict({
+							runtime,
+							cacheManager,
+							filePath: observedPath,
+							result: observedDispatchOutcome.result,
+							writeSession,
+							writeIndex: observedWriteIndex,
+							writeOrderTurn: observedWriteOrderTurn,
+							authored: true,
+							getFlag,
+							turnStateCwd: observedTurnStateCwd,
+							analysisRootMode: observedRootMode,
+						});
 					}
 				}
 				dbg(
@@ -2569,7 +3657,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			});
 			if (firstOutsideRootEdit) {
 				queueAgentAdvisory(
-					`dm-lens skipped analysis for the edit at ${filePath} because it is outside the session root. Start pi in that directory or add it to the workspace to get analysis.`,
+					`dm-lens skipped analysis for the edit at ${filePath} because it is outside the session root. Start DM in that directory or add it to the workspace to get analysis.`,
 					writeSession,
 				);
 			}
@@ -2580,7 +3668,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		return;
 	}
 	if (analysisRootMode === "adopted") {
-		const adoptedRoot = resolveAnalysisRootPath(filePath, workspaceRoot);
+		const adoptedRoot = analysisRoot.root;
 		if (adoptedRoot) {
 			const firstAdoptedRoot = recordDegradationOnce({
 				kind: "tool-result-adopted-project",
@@ -2857,7 +3945,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// declaration right after the observational settle.
 	dbg(`tool_result: tracking turn state for ${event.toolName} on ${filePath}`);
 
-	if (isPathIgnoredByProject(filePath, workspaceRoot, false)) {
+	if (
+		isPathIgnoredByProject(filePath, deps._ownerRoot ?? workspaceRoot, false)
+	) {
 		dbg(`tool_result: skipping gitignored file ${filePath}`);
 		return;
 	}
@@ -3029,7 +4119,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			participantTotal,
 			toolResultStart,
 			nativeAppliedPairs,
-			preserveNativeAuthorship: nativeAuthoredRanges !== undefined,
+			preserveNativeAuthorship: mutation.kind !== "write",
 			allowAutonomousWriters: bashAuthorshipConfirmed,
 			// #3512: one capture for the whole dispatch, the same one the
 			// inline verdict below writes through.
@@ -3243,68 +4333,52 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		analysisRootMode,
 	});
 
-	// #3507: both verbs are ordered by this dispatch's token, so an older
-	// pipeline that settles after a newer one of the same file changes nothing.
-	let inlineVerdictApplied: boolean;
-	const { inlineBlockerSummary } = result;
-	if (inlineBlockerSummary) {
-		// #1561: stamp the verdict with THIS dispatch's write token — the same
-		// counter `lsp_diagnostics`' reconciliation seam draws from — so a later
-		// confirmed-clean result can be ordered against it instead of racing it.
-		inlineVerdictApplied =
-			writeSession.guardedWrite(filePath, () =>
-				runtime.recordInlineBlockers(
-					filePath,
-					inlineBlockerSummary,
-					// #3506: the token of the bytes the pipeline analysed.
-					result.writeIndex ?? writeIndex,
-					result.inlineBlockerSources,
-					result.inlineBlockerLines,
-					result.inlineBlockerFileContent,
-					// #3246: the structured blockers the summary was rendered from, so a
-					// later `lens_diagnostic_mark` can be applied to this record at turn
-					// end instead of replaying pre-mark text.
-					result.inlineBlockerDiagnostics,
-					// #3559: a re-token's own turn.
-					result.orderTurn ?? writeOrderTurn,
-					// #3503: the freshness baseline is the analysis read.
-					result.analysisReadAtMs,
-				),
-			) !== undefined;
-	} else {
-		inlineVerdictApplied =
-			writeSession.guardedWrite(filePath, () =>
-				runtime.clearInlineBlockers(
-					filePath,
-					result.writeIndex ?? writeIndex,
-					result.orderTurn ?? writeOrderTurn,
-					// #4137 round 3: a run without authorship does not retire a
-					// record about the very bytes it read. The already-analysed latch
-					// is a cost rule, not the record's guard.
-					{
-						authored: bashAuthorshipConfirmed,
-						sha256: result.inlineBlockerFileContent?.sha256,
-					},
-				),
-			) ?? false;
-	}
+	publishInlineVerdict({
+		runtime,
+		cacheManager,
+		filePath,
+		result,
+		writeSession,
+		writeIndex,
+		writeOrderTurn,
+		authored: bashAuthorshipConfirmed,
+		getFlag,
+		turnStateCwd,
+		analysisRootMode,
+	});
 
-	// A superseded verdict must not latch the commit gate either (#3507).
-	if (resultLive) {
-		runtime.updateGitGuardStatus(
-			inlineVerdictApplied && result.hasBlockers,
-			result.output,
-		);
-		if (getFlag("lens-guard")) {
-			syncGitGuardRecord(
-				runtime,
-				cacheManager,
-				turnStateCwd,
-				filePath,
-				analysisRootMode,
-			);
-			if (result.isError && !result.hasBlockers) {
-				runtime.markGitGuardCacheUnknown("pipeline_error");
+	// #2050 AC3 / #2657: `linked-worktree` is a WRITABLE class
+	// (`canWriteAnalysisRoot`), so the pipeline above ran the full set — format,
+	// autofix, LSP touch/sync and dispatch. That makes it the one class whose
+	// silence is ambiguous: the agent saw a real analysis and heard nothing,
+	// which it cannot tell apart from "analysis never ran". Record one bounded
+	// row per (mode, root) per session, and state it when the primary checked
+	// the file and found nothing. Any delivery is its own statement. The
+	// pipeline answers that (`checkedClean`, required); `output` cannot, because
+	// the all-clear line also ends a run with only warnings or one no language
+	// server answered, and an empty one is a format-only change (#4734 F1).
+	// #3596: after the pipeline await, so a replaced session's handler records
+	// nothing; its once-key would otherwise latch in the live session's ledger.
+	if (resultLive && analysisRootMode === "linked-worktree") {
+		const worktreeRoot = analysisRoot.root;
+		if (worktreeRoot) {
+			recordDegradationOnce({
+				kind: "tool-result-linked-worktree",
+				subject: worktreeRoot,
+				reason: `analysed a linked worktree of this repository: ${worktreeRoot}`,
+			});
+			if (result.checkedClean) {
+				const firstSilentRun = recordDegradationOnce({
+					kind: "tool-result-linked-worktree-clean",
+					subject: worktreeRoot,
+					reason: `a linked-worktree edit produced no finding: ${filePath}`,
+				});
+				if (firstSilentRun) {
+					queueAgentAdvisory(
+						`dm-lens analysed the edit at ${filePath} in the linked worktree ${worktreeRoot} (full LSP, formatting, autofix and dispatch) and found nothing to report.`,
+						writeSession,
+					);
+				}
 			}
 		}
 	}

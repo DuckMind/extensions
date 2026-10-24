@@ -1,73 +1,59 @@
 /**
- * Tier-aware cascade-lane wait policy (#458, re-scope №2).
+ * Tier-aware cascade-lane wait policy (#458, re-scope №2; #4485).
  *
- * The cascade/deferred lane (`computeCascadeForFile`'s neighbor-touch fan-out
- * in `clients/dispatch/integration.ts`) actively opens neighbor files against
- * their LSP client and waits up to a per-touch budget (~1000ms cold-snapshot /
- * 2000ms warm) for `textDocument/publishDiagnostics` before deciding the
- * neighbor is clean. For a Tier-3 server — one that is `push-only` AND known
- * to publish NOTHING on a clean→clean transition (see
- * docs/lsp-capability-matrix.md; today that's typescript-language-server, the
- * lone core-set instance) — that wait can never distinguish "clean" from
- * "still analyzing"; it always burns its full budget. Dogfooding measured
- * ~221 such `lsp_diagnostics_timeout` events/day.
+ * The cascade lane (`computeCascadeForFile`'s neighbor-touch fan-out in
+ * `clients/dispatch/integration.ts`) opens each neighbor against its LSP
+ * client and needs an answer for it: its errors, or a confirmed clean. How it
+ * gets one depends on the server's diagnostics model, read from the live
+ * capability snapshot (`workspaceDiagnosticsSupport.mode`, cached at
+ * `initialize`) and the `silentOnClean` marker on the server's
+ * `DiagnosticStrategy` (`wait-policy/strategies.ts`), never from a hardcoded
+ * server list. A server with no live snapshot yet, or whose mode is not
+ * `push-only`, or that is not marked `silentOnClean`, keeps the full in-lane
+ * wait. Fail-safe is always "wait like before".
  *
- * pi 0.80.6's `agent_settled` quiet window (#483, `clients/quiet-window.ts`)
- * gives the cascade lane a place to resolve that ambiguity OUT of the
- * per-touch budget: fire the touch (didOpen/didChange still happens, so the
- * server starts real work), record it as outstanding, and reconcile against
- * whatever landed in the client's diagnostics cache by the time the agent run
- * goes idle. A touch nothing arrived for by then is recorded `unresolved` —
- * never silently treated as `clean` (the #240 doctrine: a missing answer is
- * not an affirmative answer).
+ * - `command-pull` (#4485): a `silentOnClean` push-only server can still be
+ *   asked. Classic typescript-language-server advertises
+ *   `typescript.tsserverRequest`, and the in-lane touch's #707 sync confirm
+ *   (`clients/lsp/index.ts`) uses it to get tsserver's verdict in ~320 ms.
+ *   The cascade sends these neighbors down the normal waiting touch.
+ * - `tier3-silent` without the command (marksman, a classic TS build that
+ *   does not advertise it) and `collect-later` (native TS7 on a push-only
+ *   snapshot): the cascade touches without collecting and waits up to
+ *   `SILENT_PUSH_WAIT_MS` for a publish newer than the touch
+ *   (integration.ts). A publish answers the neighbor; silence leaves it
+ *   unconfirmed, which the run carries and turn_end names. Silence is never
+ *   read as clean (the #240 doctrine).
  *
- * This module is deliberately NOT hardcoded to server names for the "should
- * this file skip its in-lane wait" question: it reads the live capability
- * snapshot's `workspaceDiagnosticsSupport.mode` (from
- * `detectWorkspaceDiagnosticsSupport`, cached at `initialize`) and combines it
- * with the `silentOnClean` marker on that server's `DiagnosticStrategy`
- * (`wait-policy/strategies.ts`) — the same per-server behavioral-knowledge table
- * the rest of the LSP layer already uses. A server with no live snapshot yet,
- * or whose mode isn't `push-only`, or that isn't marked `silentOnClean`, is
- * NOT tier-3 — the caller keeps today's full in-lane wait. Fail-safe is
- * always "wait like before".
+ * Only that silent leftover is recorded here as outstanding. turn_end peeks
+ * the registry once after its settle (`peekOutstandingCascadeTouches`), the
+ * `agent_settled` quiet window reconciles what is left
+ * (`registerCascadeTierReconcileTask`), and an entry reaching the age bound
+ * is read once more before it goes, so what it held is delivered or logged
+ * instead of vanishing. Before #4485 every classic TS neighbor took this
+ * path, and most answers expired unread: 77% of real neighbor outcomes were
+ * deferred, and 58 runs whose every neighbor was deferred read
+ * `no_neighbors`.
  *
  * Native TS7 is the cascade-only exception. It is not silent on clean, but
- * its publication does not settle inside the cold-snapshot budget. Cascade
- * classifies it as `collect-later`, sends the same no-wait touch, and
- * reconciles its later per-file push or pull publication. The shared server
- * policy remains `waits`, so main-lane behavior does not change.
- *
- * #524/#529/#541/#558: a server id can now be backed by more than one actual
- * binary — "typescript" is classic typescript-language-server OR TS7's
- * native `tsc --lsp --stdio` (PR #526). PR #526 originally routed the
- * native-ts7 variant through the fail-safe "waits" path because
- * `silentOnClean` had only been measured against the classic server; #541
- * (2026-07-11) briefly lifted that exclusion after a clean-signal probe run
- * appeared to show native-ts7 silent too. A follow-up dual-environment
- * re-measurement (2026-07-12, nightly CI on Linux AND a live local run on
- * Windows dev, same `typescript@7.0.2` both times) found native-ts7 now
- * publishes 2 version-less diagnostic sets on the clean transition
- * (`cleanPubs=2(v:0)`) — it is NOT silent. Classic is unaffected and
- * confirmed still silent (`cleanPubs=0(v:0)`) in the same run. This is
- * therefore an EVIDENCE-BASED revert, not the original unverified caution:
- * native-ts7's clean-signal behavior IS known, and it is "publishes, not
- * silent". The shared classifier still routes a native-ts7 snapshot through
- * `waits`. The cascade-only wrapper routes it through `collect-later` because
- * the measured publication arrives after the in-lane budget. The shared
- * `silentOnClean` flag stays `true` for classic.
- * `scripts/probe-clean-signal.mjs`'s drift check no
- * longer compares native-ts7 rows against the shared marker (it now expects
- * `false` for them explicitly) — see that file's header for the regression
- * watch this sets up for a future TS7 build that becomes silent again.
+ * its publication does not settle inside the cold-snapshot budget, so the
+ * cascade classifies it as `collect-later`. The shared server policy remains
+ * `waits`, so main-lane behavior does not change. A 2026-07-12
+ * dual-environment re-measurement (`typescript@7.0.2`, Linux CI and Windows)
+ * found native-ts7 publishes 2 version-less diagnostic sets on the clean
+ * transition (`cleanPubs=2(v:0)`), so it is NOT silent; classic was confirmed
+ * still silent (`cleanPubs=0(v:0)`). `scripts/probe-clean-signal.mjs`
+ * watches for a TS7 build that becomes silent again.
  */
 
 import { logCascade } from "../cascade-logger.js";
+import { BoundedFifoMap } from "../bounded-cache.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
 import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { registerQuietWindowTask } from "../quiet-window.js";
-import type { LSPDiagnostic } from "./client.js";
+import type { GenerationHandle } from "../generation-guard.js";
+import type { LSPClientInfo, LSPDiagnostic } from "./client.js";
 import type { LSPService } from "./index.js";
 
 import {
@@ -89,24 +75,35 @@ export {
 } from "../dispatch/collect-later-tier.js";
 
 /** Cascade-only extension of the shared wait policy. Native TS7 keeps the
- * shared `waits` policy everywhere else, but cascade collects its late pull
- * result outside the bounded in-lane fan-out. */
-export type CascadeWaitTier = SharedCascadeWaitTier | "collect-later";
+ * shared `waits` policy everywhere else, but cascade waits for its publish
+ * on the silent-push path. `command-pull` is a `tier3-silent` server the
+ * cascade can still ask (#4485). */
+export type CascadeWaitTier =
+	| SharedCascadeWaitTier
+	| "collect-later"
+	| "command-pull";
+
+/**
+ * typescript-language-server's command channel to tsserver, which the #707
+ * sync confirm sends `projectInfo` and `geterr` through. Owned by
+ * `clients/lsp/tsserver-sync.ts`, which does not export it; spelled once
+ * more here so the cascade can tell a server it can ask from one it cannot.
+ */
+const TSSERVER_REQUEST_COMMAND = "typescript.tsserverRequest";
 
 /**
  * The cascade lane's wait tier for `filePath`. DELEGATES to the shared
- * `wait-policy/classification.ts` rule — this wrapper adds exactly one
- * cascade-only override on top of it (native TS7's push-only snapshot →
- * `collect-later`) and never re-implements the classification itself.
+ * `wait-policy/classification.ts` rule — this wrapper adds two cascade-only
+ * overrides on top of it (native TS7's push-only snapshot → `collect-later`;
+ * a `tier3-silent` classic tsserver that advertises the sync command →
+ * `command-pull`, #4485) and never re-implements the classification itself.
  *
- * #1444 coverage tradeoff: the no-wait touch this tier selects is
+ * #1444 coverage tradeoff: the silent-push touch these tiers select is
  * `clientScope: "primary"`, and the tier itself is decided from the PRIMARY
- * (non-auxiliary) server alone. That tradeoff already existed for
- * `tier3-silent`; the override enlarges the population it applies to — every
- * native-TS7 TypeScript neighbour now takes the no-wait path too, so an
- * auxiliary server configured for those files no longer gets touched in-lane
- * for them (its findings arrive via the next per-edit dispatch, as they
- * already did for classic tier-3 files).
+ * (non-auxiliary) server alone, so an auxiliary server configured for those
+ * files is not touched in-lane for them (its findings arrive via the next
+ * per-edit dispatch). `command-pull` takes the waiting touch, which is
+ * `clientScope: "primary"` as well (#1720).
  */
 export function classifyCascadeWaitTier(
 	lspService: Pick<LSPService, "getCapabilitySnapshots">,
@@ -121,7 +118,17 @@ export function classifyCascadeWaitTier(
 	) {
 		return "collect-later";
 	}
-	return classifySharedCascadeWaitTier(lspService, filePath, snapshots);
+	const shared = classifySharedCascadeWaitTier(lspService, filePath, snapshots);
+	// #4485: the #707 sync confirm needs the server id and the command, the
+	// same two facts its own eligibility gate checks (`clients/lsp/index.ts`).
+	if (
+		shared === "tier3-silent" &&
+		primary?.serverId === "typescript" &&
+		primary.snapshot?.advertisedCommands?.includes(TSSERVER_REQUEST_COMMAND)
+	) {
+		return "command-pull";
+	}
+	return shared;
 }
 
 // --- Kill switch (lazy, memoized — house style per clients/runtime-config.ts /
@@ -145,9 +152,22 @@ export function _resetTierAwareCascadeEnabledForTests(): void {
 
 // --- Outstanding-touch registry -------------------------------------------
 
+/** The touched client, as much of it as a registry read needs. */
+export type OutstandingTouchClient = Pick<
+	LSPClientInfo,
+	"serverId" | "getAllDiagnostics"
+> & { isAlive?: () => boolean };
+
 interface OutstandingTouch {
 	filePath: string;
 	serverId: string;
+	/**
+	 * #4485: the client the touch went to, for the synchronous reads (turn_end's
+	 * peek and the expiry read), which cannot await `getWarmClientForFile`.
+	 * Weak, so the registry never keeps an idle-reaped client alive; a
+	 * collected or dead client reads as no answer.
+	 */
+	client?: WeakRef<OutstandingTouchClient>;
 	/**
 	 * Sampled BEFORE the touch's didOpen/didChange notify is sent, so any
 	 * publish that lands after the notify — including one landing in the
@@ -186,23 +206,146 @@ interface OutstandingTouch {
 const MAX_OUTSTANDING_TOUCHES = 256;
 const OUTSTANDING_TOUCH_MAX_AGE_MS = 15 * 60_000;
 
-const _outstandingTouches = new Map<string, OutstandingTouch>();
+// Insertion order IS touch order, and the size cap lives in the map's own
+// `set` (#4570: was a hand-rolled `while (size > cap)` evict-oldest block).
+const _outstandingTouches = new BoundedFifoMap<string, OutstandingTouch>(
+	MAX_OUTSTANDING_TOUCHES,
+);
 
 /** Entries dropped by the age bound since the last sweep reported. */
 let _expiredSinceLastSweep = 0;
 /** Entries dropped by the size cap since the last sweep reported. */
 let _evictedSinceLastSweep = 0;
 
+/** The paths an expiry or peek row lists, at most. */
+const MAX_LOGGED_PATHS = 20;
+
+/** Where a delivery from a synchronous read runs: the session's write guard. */
+type DeliveryGuard = Pick<GenerationHandle, "guardedWrite">;
+
 /**
  * Drop every entry older than `OUTSTANDING_TOUCH_MAX_AGE_MS`. The map is held
  * in touch order, so the expired entries are a prefix and the walk stops at
  * the first live one.
+ *
+ * #4485: each expired entry is read once from its touched client before it
+ * goes. An answer is delivered like any other late answer; the sweep writes
+ * one `cascade_tier3_expired` row naming what expired and what it held.
  */
-function pruneExpiredOutstandingTouches(now: number): void {
+function pruneExpiredOutstandingTouches(
+	now: number,
+	guard?: DeliveryGuard,
+	reads: ClientReads = new Map(),
+): void {
+	const expired: OutstandingTouch[] = [];
 	for (const [key, touch] of _outstandingTouches) {
 		if (now - touch.touchedAt <= OUTSTANDING_TOUCH_MAX_AGE_MS) break;
 		_outstandingTouches.delete(key);
 		_expiredSinceLastSweep++;
+		expired.push(touch);
+	}
+	if (expired.length === 0) return;
+	let found = 0;
+	let clean = 0;
+	for (const touch of expired) {
+		const outcome = readTouchedClient(touch, now, reads);
+		if (!outcome) continue;
+		if (outcome.outcome === "resolved-found") found++;
+		else clean++;
+		deliverResolvedOutcome(outcome, guard);
+	}
+	logCascade({
+		phase: "cascade_tier3_expired",
+		filePath: "<cascade-registry>",
+		metadata: {
+			count: expired.length,
+			found,
+			clean,
+			unanswered: expired.length - found - clean,
+			maxAgeCapMs: OUTSTANDING_TOUCH_MAX_AGE_MS,
+			paths: expired.slice(0, MAX_LOGGED_PATHS).map((t) => t.filePath),
+			...(expired.length > MAX_LOGGED_PATHS && {
+				pathsTruncated: expired.length - MAX_LOGGED_PATHS,
+			}),
+		},
+	});
+}
+
+/**
+ * One sweep's reads of each touched client's per-file diagnostics.
+ * `getAllDiagnostics` rebuilds the map over every file the client tracks, so
+ * a sweep reads it once per client, not once per touch (#4495 review F3).
+ */
+type ClientReads = Map<
+	OutstandingTouchClient,
+	ReturnType<OutstandingTouchClient["getAllDiagnostics"]>
+>;
+
+/**
+ * #4485: a synchronous read of one touch against the client it went to. The
+ * same per-file rule as the async reconcile below (a publish for THAT file,
+ * stamped after the pre-notify `touchedAt`); anything less is no answer.
+ */
+function readTouchedClient(
+	touch: OutstandingTouch,
+	now: number,
+	reads: ClientReads,
+): ReconcileOutcome | undefined {
+	const client = touch.client?.deref();
+	if (!client || client.serverId !== touch.serverId) return undefined;
+	if (client.isAlive?.() === false) return undefined;
+	let all = reads.get(client);
+	if (all === undefined) {
+		all = client.getAllDiagnostics();
+		reads.set(client, all);
+	}
+	const entry = all.get(normalizeMapKey(touch.filePath));
+	if (!entry || entry.ts <= touch.touchedAt) return undefined;
+	const found = entry.diags.length > 0;
+	return {
+		filePath: touch.filePath,
+		serverId: touch.serverId,
+		outcome: found ? "resolved-found" : "resolved-clean",
+		ageMs: now - touch.touchedAt,
+		diagnosticCount: entry.diags.length,
+		publishedAt: entry.ts,
+		touchedAt: touch.touchedAt,
+		...(found && { diagnostics: entry.diags }),
+	};
+}
+
+/**
+ * The delivery every late answer takes, whichever read found it: a
+ * `resolved-found` re-injects through `onResolvedFound` (#1023) under the
+ * session's write guard (#3499), a `resolved-clean` clears the footer and the
+ * pending record through `onResolvedClean` (#1444). Best-effort: a throwing
+ * callback must not drop the caller's record or the sibling deliveries.
+ */
+function deliverResolvedOutcome(
+	o: ReconcileOutcome,
+	guard: DeliveryGuard | undefined,
+): void {
+	try {
+		if (o.outcome === "resolved-found" && o.diagnostics?.length) {
+			const neighbor: ResolvedFoundNeighbor = {
+				filePath: o.filePath,
+				serverId: o.serverId,
+				diagnostics: o.diagnostics,
+				...(o.publishedAt !== undefined ? { publishedAt: o.publishedAt } : {}),
+				...(o.touchedAt !== undefined ? { touchedAt: o.touchedAt } : {}),
+			};
+			const deliver = () => _reconcileOptions.onResolvedFound?.(neighbor);
+			if (guard) guard.guardedWrite(o.filePath, deliver);
+			else deliver();
+		} else if (o.outcome === "resolved-clean" && o.publishedAt != null) {
+			_reconcileOptions.onResolvedClean?.({
+				filePath: o.filePath,
+				serverId: o.serverId,
+				publishedAt: o.publishedAt,
+			});
+		}
+	} catch {
+		// best-effort surfacing; the caller's row is the durable record.
 	}
 }
 
@@ -226,11 +369,8 @@ export function recordOutstandingCascadeTouch(entry: OutstandingTouch): void {
 	// its notify, so it trails real time, and the age bound is a statement about
 	// the clock rather than about the newest touch's own stamp.
 	pruneExpiredOutstandingTouches(Date.now());
-	_outstandingTouches.set(key, entry);
-	while (_outstandingTouches.size > MAX_OUTSTANDING_TOUCHES) {
-		const oldest = _outstandingTouches.keys().next();
-		if (oldest.done) break;
-		_outstandingTouches.delete(oldest.value);
+	const evicted = _outstandingTouches.set(key, entry);
+	for (let i = 0; i < evicted.length; i++) {
 		_evictedSinceLastSweep++;
 		// Bounded by construction: one ledger tally per session, not per
 		// eviction event. The subject is the cap itself rather than the evicted
@@ -258,14 +398,62 @@ export function recordOutstandingCascadeTouch(entry: OutstandingTouch): void {
  * primary's outstanding touches.
  */
 export function resetCascadeTierSessionState(): void {
+	const dropped = _outstandingTouches.size;
+	_outstandingTouches.clear();
+	_expiredSinceLastSweep = 0;
+	_evictedSinceLastSweep = 0;
+	// #4485: one row per reset, only when something went unanswered.
+	if (dropped > 0) {
+		logCascade({
+			phase: "cascade_tier3_dropped",
+			filePath: "<session-reset>",
+			metadata: { count: dropped },
+		});
+	}
+}
+
+/** Test-only: clear the outstanding-touch registry between test cases,
+ * without the reset's dropped row. */
+export function _resetOutstandingCascadeTouchesForTests(): void {
 	_outstandingTouches.clear();
 	_expiredSinceLastSweep = 0;
 	_evictedSinceLastSweep = 0;
 }
 
-/** Test-only: clear the outstanding-touch registry between test cases. */
-export function _resetOutstandingCascadeTouchesForTests(): void {
-	resetCascadeTierSessionState();
+/**
+ * #4485: turn_end's one read of the registry, after its cascade settle and
+ * before it consumes the turn's runs. Each answered touch is removed and
+ * delivered (a found one appends its run in time for this turn_end); a
+ * silent one stays for the quiet window. Synchronous: it reads each touch's
+ * own client (`OutstandingTouch.client`) and never spawns or awaits one.
+ * One `cascade_tier3_peek` row when the registry held anything.
+ */
+export function peekOutstandingCascadeTouches(guard?: DeliveryGuard): void {
+	const now = Date.now();
+	const reads: ClientReads = new Map();
+	pruneExpiredOutstandingTouches(now, guard, reads);
+	const count = _outstandingTouches.size;
+	if (count === 0) return;
+	let found = 0;
+	let clean = 0;
+	for (const [key, touch] of _outstandingTouches) {
+		const outcome = readTouchedClient(touch, now, reads);
+		if (!outcome) continue;
+		_outstandingTouches.delete(key);
+		if (outcome.outcome === "resolved-found") found++;
+		else clean++;
+		deliverResolvedOutcome(outcome, guard);
+	}
+	logCascade({
+		phase: "cascade_tier3_peek",
+		filePath: "<turn_end>",
+		metadata: {
+			count,
+			found,
+			clean,
+			outstanding: _outstandingTouches.size,
+		},
+	});
 }
 
 /** Test-only: peek at the registry without mutating it. */
@@ -330,6 +518,11 @@ export interface ReconcileOutcome {
 	 * recorded as observed "now". Never set for `unresolved`.
 	 */
 	publishedAt?: number;
+	/**
+	 * #4495 round 3: the touch's pre-notify stamp, the earliest moment the
+	 * answered content could have been read. Set with `publishedAt`.
+	 */
+	touchedAt?: number;
 }
 
 /**
@@ -357,13 +550,16 @@ export interface ReconcileOutcome {
  */
 export async function reconcileOutstandingCascadeTouches(
 	lspService: Pick<LSPService, "getWarmClientForFile">,
+	/** Where an expiring entry's answer is delivered (the quiet-window task's
+	 * session guard). */
+	guard?: DeliveryGuard,
 ): Promise<ReconcileOutcome[]> {
 	const outcomes: ReconcileOutcome[] = [];
 	// #1899: the age bound applies at sweep time too, not only at record time —
 	// a registry that received no further touches would otherwise hand the sweep
 	// entries of unbounded age.
-	pruneExpiredOutstandingTouches(Date.now());
-	const entries = [..._outstandingTouches.entries()];
+	pruneExpiredOutstandingTouches(Date.now(), guard);
+	const entries = _outstandingTouches.entriesArray();
 	_outstandingTouches.clear();
 
 	for (const [key, touch] of entries) {
@@ -403,6 +599,7 @@ export async function reconcileOutstandingCascadeTouches(
 				ageMs,
 				diagnosticCount: entry.diags.length,
 				publishedAt: entry.ts,
+				touchedAt: touch.touchedAt,
 				// #1023: carry the diagnostics so the task can re-surface them.
 				...(found && { diagnostics: entry.diags }),
 			});
@@ -427,6 +624,9 @@ export async function reconcileOutstandingCascadeTouches(
 }
 
 let _reconcileTaskRegistered = false;
+/** #4485: the delivery callbacks, kept so every read (the quiet window,
+ * turn_end's peek, the expiry read) delivers through the same wiring. */
+let _reconcileOptions: CascadeTierReconcileOptions = {};
 
 /** #1023: a `resolved-found` neighbor error to re-inject into agent-facing output. */
 export interface ResolvedFoundNeighbor {
@@ -437,6 +637,8 @@ export interface ResolvedFoundNeighbor {
 	 * neighbor carries its own observation time — the carried-run age label
 	 * renders from it instead of claiming no stamp exists. */
 	publishedAt?: number;
+	/** #4495 round 3: the touch's pre-notify stamp, the run's read bound. */
+	touchedAt?: number;
 }
 
 export interface CascadeTierReconcileOptions {
@@ -475,49 +677,27 @@ export function registerCascadeTierReconcileTask(
 ): void {
 	if (_reconcileTaskRegistered) return;
 	_reconcileTaskRegistered = true;
+	_reconcileOptions = options;
 
 	registerQuietWindowTask("cascade_tier3_reconcile", async (context) => {
 		if (!isTierAwareCascadeEnabled()) return;
 		// #3499: `context.sessionGeneration` was captured when this task started,
 		// with no await before the synchronous drain below, so it is the
-		// generation of the touches drained.
-		const outcomes = await reconcileOutstandingCascadeTouches(getLspService());
+		// generation of the touches drained. The re-injection appends to the
+		// runtime shared with a same-cwd replacement; it is dropped if the
+		// task's session is gone.
+		const guard = context?.sessionGeneration;
+		const outcomes = await reconcileOutstandingCascadeTouches(
+			getLspService(),
+			guard,
+		);
 
 		// #1023: re-inject each resolved-found neighbor error so it reaches the
 		// agent (previously logs-only). #1444: hand each resolved-CLEAN outcome to
-		// the footer reconcile for the mirror-image case. Isolated per-outcome — a
-		// throwing callback must not drop the log line or the sibling deliveries.
-		for (const o of outcomes) {
-			try {
-				if (o.outcome === "resolved-found" && o.diagnostics?.length) {
-					const neighbor: ResolvedFoundNeighbor = {
-						filePath: o.filePath,
-						serverId: o.serverId,
-						diagnostics: o.diagnostics,
-						...(o.publishedAt !== undefined
-							? { publishedAt: o.publishedAt }
-							: {}),
-					};
-					const deliver = () => options.onResolvedFound?.(neighbor);
-					// #3499: the re-injection appends to the runtime shared with a
-					// same-cwd replacement; drop it if the task's session is gone.
-					if (context)
-						context.sessionGeneration.guardedWrite(o.filePath, deliver);
-					else deliver();
-				} else if (o.outcome === "resolved-clean" && o.publishedAt != null) {
-					// #1444: the stale-footer half of the same honesty problem — the
-					// neighbour proved clean, but only after the in-lane wait was
-					// skipped, so nothing has cleared its earlier error entries.
-					options.onResolvedClean?.({
-						filePath: o.filePath,
-						serverId: o.serverId,
-						publishedAt: o.publishedAt,
-					});
-				}
-			} catch {
-				// best-effort surfacing; the log below is the durable record.
-			}
-		}
+		// the footer reconcile for the mirror-image case: the neighbour proved
+		// clean only after the in-lane wait, so nothing has cleared its earlier
+		// error entries.
+		for (const o of outcomes) deliverResolvedOutcome(o, guard);
 
 		let resolvedFound = 0;
 		let resolvedClean = 0;
@@ -572,4 +752,5 @@ export function registerCascadeTierReconcileTask(
 /** Test-only: undo registerCascadeTierReconcileTask's idempotency guard. */
 export function _resetCascadeTierReconcileRegistrationForTests(): void {
 	_reconcileTaskRegistered = false;
+	_reconcileOptions = {};
 }

@@ -142,8 +142,12 @@ export class RuffClient {
 					"check",
 					"--output-format",
 					"json",
-					"--target-version",
-					"py310",
+					// No target-version override here (#4638): one made the pre-check
+					// parse at py310 while `check --fix` below (and the lint runner)
+					// read the project's own setting, so a 3.12-only line looked
+					// fixable to one pass and unparseable to the other. Ruff
+					// discovers the level from the project config itself; a value
+					// derived here would be a second owner of that decision.
 					...configArgs,
 					absolutePath,
 				],

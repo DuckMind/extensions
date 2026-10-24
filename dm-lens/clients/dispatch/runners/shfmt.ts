@@ -13,6 +13,7 @@ import {
 	createAvailabilityChecker,
 	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
+import { skipUnlessToolRan } from "./utils/tool-failure.js";
 
 const shfmt = createAvailabilityChecker("shfmt", ".exe");
 
@@ -56,6 +57,16 @@ const shfmtRunner: RunnerDefinition = {
 			timeout: 10000,
 			cwd,
 		});
+
+		// A shfmt that was killed or timed out never reported an exit status; the
+		// `?? 2` below would read that as a parse error in the script (#4522).
+		// Both streams are its output: the diff is on stdout, a parse error on
+		// stderr.
+		const didNotRun = skipUnlessToolRan("shfmt", {
+			result,
+			output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+		});
+		if (didNotRun) return didNotRun;
 
 		// exit 0 = already formatted, exit 1 = needs formatting, exit >1 = parse error
 		if (result.status === 0) {

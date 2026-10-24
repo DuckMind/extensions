@@ -861,14 +861,6 @@ export function listSafePipelineAutofixTools(): string[] {
 		.map(([id]) => id);
 }
 
-export function canToolAutoFix(toolId: string): boolean {
-	return getAutofixCapability(toolId)?.toolSupportsFix ?? false;
-}
-
-export function isSafePipelineAutofixTool(toolId: string): boolean {
-	return getAutofixCapability(toolId)?.safePipelineAutofix ?? false;
-}
-
 export function getToolCommandSpec(
 	toolId: string,
 ): ToolCommandSpec | undefined {

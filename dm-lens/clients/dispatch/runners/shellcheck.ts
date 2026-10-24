@@ -38,9 +38,17 @@ import {
 	lspPrimaryCoversFile,
 	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
-import { finishParsedRun } from "./utils/tool-failure.js";
+import type { ToolExitCodes } from "./utils/spawn-outcome.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 const shellcheck = createAvailabilityChecker("shellcheck", ".exe");
+
+// EXIT TABLE (ShellCheck v0.11.0 documents these codes, pinned at
+// https://github.com/koalaman/shellcheck/blob/b12c2a6a0834a5b8c12b1c0eb36704f698de5bac/shellcheck.1.md#return-values):
+// 0 = no issues, 1 = issues found, 2 = some files could not be processed,
+// 3 = invoked with bad syntax, 4 = invoked with bad options. Only 1 is a run
+// that carries findings; 2, 3 and 4 are rejected invocations, never a scan.
+const SHELLCHECK_EXIT_CODES: ToolExitCodes = { ran: [1] };
 
 /**
  * ShellCheck's supported linter dialects, pinned per defect shape 16 to
@@ -269,6 +277,9 @@ const shellcheckRunner: RunnerDefinition = {
 				// WHO claimed (#3968 F2): declared (the row's own covers, gated
 				// on the custom row's own command) or builtin-fact.
 				claimSource: cover.claimSource,
+				// #4484 round 8: the skip is a verdict only when that server's
+				// lane answers; the dispatcher voids it otherwise.
+				coveredBy: { runnerId: "lsp", serverId: cover.serverId },
 			};
 		}
 
@@ -338,15 +349,22 @@ const shellcheckRunner: RunnerDefinition = {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}
 
-		// Parse diagnostics
-		const raw = result.stdout + result.stderr;
-		const diagnostics = parseShellcheckOutput(raw, ctx.filePath, cwd);
+		// A shellcheck that was killed, timed out, or exited without a word did
+		// not analyse the file; `finishParsedRun` alone reads that as clean
+		// (#4522: the tool-state matrix's crashed and unanswered cells).
+		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+		const parsed = parseToolRun(
+			"shellcheck",
+			{ result, output: raw, exitCodes: SHELLCHECK_EXIT_CODES },
+			(output) => parseShellcheckOutput(output, ctx.filePath, cwd),
+		);
+		if (parsed.skipped) return parsed.skipped;
 
 		return finishParsedRun({
 			tool: "shellcheck",
 			ctx,
 			result,
-			diagnostics,
+			diagnostics: parsed.diagnostics,
 		});
 	},
 };

@@ -221,49 +221,20 @@ function isCallPassThrough(
 	return { pass: true, target: (expr.children ?? [])[0]?.text };
 }
 
+function isDecisionPoint(type: string, children: TsNode[]): boolean {
+	if (COMPLEXITY_TYPES.has(type)) return true;
+	return (
+		type === "binary_expression" &&
+		children.some((c: TsNode) => LOGICAL_OPERATORS.has(c?.type))
+	);
+}
+
 export function calcCyclomaticComplexity(body: TsNode): number {
 	let cc = 1;
 	walk(body, (node) => {
-		if (COMPLEXITY_TYPES.has(node.type)) {
-			cc++;
-		} else if (node.type === "binary_expression") {
-			if (
-				(node.children ?? []).some((c: TsNode) =>
-					LOGICAL_OPERATORS.has(c?.type),
-				)
-			) {
-				cc++;
-			}
-		}
+		if (isDecisionPoint(node.type, node.children ?? [])) cc++;
 	});
 	return cc;
-}
-
-function calcMaxNestingDepth(body: TsNode): number {
-	let maxDepth = 0;
-	const walkDepth = (node: TsNode, depth: number): void => {
-		if (depth > maxDepth) maxDepth = depth;
-		const next = NESTING_TYPES.has(node.type) ? depth + 1 : depth;
-		for (const child of node.children ?? []) {
-			if (child) walkDepth(child, next);
-		}
-	};
-	// Start at the body's children at depth 0 (the body block itself isn't counted).
-	for (const child of body.children ?? []) {
-		if (child) walkDepth(child, 0);
-	}
-	return maxDepth;
-}
-
-function collectOutgoingCalls(body: TsNode): string[] {
-	const calls = new Set<string>();
-	walk(body, (node) => {
-		if (node.type === "call_expression") {
-			const callee = (node.children ?? [])[0]?.text ?? "";
-			if (callee.length < 80) calls.add(callee);
-		}
-	});
-	return [...calls];
 }
 
 /**
@@ -274,30 +245,22 @@ function collectOutgoingCalls(body: TsNode): string[] {
  * text form as before); those richer shapes need real type inference to
  * resolve safely, which is out of scope for this bounded slice.
  */
-function collectMemberCallSites(body: TsNode): MemberCallSite[] {
-	const sites: MemberCallSite[] = [];
-	walk(body, (node) => {
-		if (node.type !== "call_expression") return;
-		const callee = (node.children ?? [])[0];
-		if (!callee || callee.type !== "member_expression") return;
-		const object = (callee.children ?? [])[0];
-		const property = (callee.children ?? []).find(
-			(c: TsNode) => c?.type === "property_identifier",
-		);
-		if (!object || object.type !== "identifier" || !property) return;
-		sites.push({ receiver: object.text, method: property.text });
-	});
-	return sites;
+function memberCallSite(callee: TsNode): MemberCallSite | undefined {
+	if (callee?.type !== "member_expression") return undefined;
+	const object = (callee.children ?? [])[0];
+	const property = (callee.children ?? []).find(
+		(c: TsNode) => c?.type === "property_identifier",
+	);
+	if (object?.type !== "identifier" || !property) return undefined;
+	return { receiver: object.text, method: property.text };
 }
 
 /**
  * Best-effort receiver -> class-name map for one function (refs #655 phase
  * 2). Two clear, common shapes only — see {@link FunctionSummary.receiverTypes}.
+ * This covers typed parameters; `summarizeBody` adds `new` assignments.
  */
-function collectReceiverTypes(
-	body: TsNode,
-	params: TsNode[],
-): Record<string, string> {
+function parameterReceiverTypes(params: TsNode[]): Record<string, string> {
 	const types: Record<string, string> = {};
 	for (const param of params) {
 		const id = firstNamedChild(param);
@@ -310,18 +273,93 @@ function collectReceiverTypes(
 			: undefined;
 		if (typeId) types[id.text] = typeId.text;
 	}
-	walk(body, (node) => {
-		if (node.type !== "variable_declarator") return;
-		const id = firstChildOfType(node, "identifier");
-		if (!id) return;
-		const value = (node.children ?? []).find(
-			(c: TsNode) => c?.type === "new_expression",
-		);
-		if (!value) return;
-		const ctor = firstNamedChild(value);
-		if (ctor?.type === "identifier") types[id.text] = ctor.text;
-	});
 	return types;
+}
+
+/** `return await call()`, the shape `hasReturnAwaitCall` reports. */
+function returnsAwaitedCall(stmt: TsNode): boolean {
+	const ret = firstNamedChild(stmt);
+	return (
+		ret?.type === "await_expression" &&
+		firstNamedChild(ret)?.type === "call_expression"
+	);
+}
+
+function addCallFacts(
+	callee: TsNode,
+	calls: Set<string>,
+	memberCallSites: MemberCallSite[],
+): void {
+	const calleeText = callee?.text ?? "";
+	if (calleeText.length < 80) calls.add(calleeText);
+	const site = memberCallSite(callee);
+	if (site) memberCallSites.push(site);
+}
+
+/** `x = new Ctor()` makes `Ctor` the receiver type of `x`. */
+function addNewReceiverType(
+	children: TsNode[],
+	receiverTypes: Record<string, string>,
+): void {
+	const id = children.find((c: TsNode) => c?.type === "identifier");
+	const value = children.find((c: TsNode) => c?.type === "new_expression");
+	const ctor = value ? firstNamedChild(value) : undefined;
+	if (id && ctor?.type === "identifier") receiverTypes[id.text] = ctor.text;
+}
+
+type BodySummary = Pick<
+	FunctionSummary,
+	| "hasAwait"
+	| "hasReturnAwaitCall"
+	| "cyclomaticComplexity"
+	| "maxNestingDepth"
+	| "outgoingCalls"
+	| "memberCallSites"
+	| "receiverTypes"
+>;
+
+/**
+ * Every body-derived summary field in one pre-order pass (#1740). Node `type`
+ * is an uncached wasm call, so separate walks per field paid it once per field.
+ */
+function summarizeBody(body: TsNode, params: TsNode[]): BodySummary {
+	let hasAwait = false;
+	let hasReturnAwaitCall = false;
+	let cyclomaticComplexity = 1;
+	let maxNestingDepth = 0;
+	const calls = new Set<string>();
+	const memberCallSites: MemberCallSite[] = [];
+	const receiverTypes = parameterReceiverTypes(params);
+	const visit = (node: TsNode, depth: number): void => {
+		const type: string = node.type;
+		const children: TsNode[] = node.children ?? [];
+		if (depth > maxNestingDepth) maxNestingDepth = depth;
+		if (isDecisionPoint(type, children)) cyclomaticComplexity++;
+		if (type === "await_expression") {
+			hasAwait = true;
+		} else if (type === "return_statement") {
+			if (returnsAwaitedCall(node)) hasReturnAwaitCall = true;
+		} else if (type === "call_expression") {
+			addCallFacts(children[0], calls, memberCallSites);
+		} else if (type === "variable_declarator") {
+			addNewReceiverType(children, receiverTypes);
+		}
+		// Depth counts nesting structures between the body and the node.
+		const next = NESTING_TYPES.has(type) ? depth + 1 : depth;
+		for (const child of children) {
+			if (child) visit(child, next);
+		}
+	};
+	visit(body, 0);
+	return {
+		hasAwait,
+		hasReturnAwaitCall,
+		cyclomaticComplexity,
+		maxNestingDepth,
+		outgoingCalls: [...calls],
+		memberCallSites,
+		receiverTypes,
+	};
 }
 
 /**
@@ -335,26 +373,6 @@ function hasExplicitPromiseReturnType(node: TsNode): boolean {
 	const returnType = firstChildOfType(node, "type_annotation");
 	if (!returnType) return false;
 	return /:\s*Promise\b/.test(returnType.text);
-}
-
-function hasAwaitInNode(node: TsNode): boolean {
-	let found = false;
-	walk(node, (n) => {
-		if (n.type === "await_expression") found = true;
-	});
-	return found;
-}
-
-function hasReturnAwaitCall(node: TsNode): boolean {
-	let found = false;
-	walk(node, (n) => {
-		if (n.type !== "return_statement") return;
-		const ret = firstNamedChild(n);
-		if (ret?.type !== "await_expression") return;
-		const awaited = firstNamedChild(ret);
-		if (awaited?.type === "call_expression") found = true;
-	});
-	return found;
 }
 
 export const functionFactProvider: FactProvider = {
@@ -403,33 +421,35 @@ export const functionFactProvider: FactProvider = {
 						lowerTarget.startsWith(prefix),
 					);
 
+					const bodySummary = summarizeBody(body, params);
 					summaries.push({
 						name: getFunctionName(node),
 						line: node.startPosition.row + 1,
 						column: node.startPosition.column + 1,
 						endLine: body.endPosition.row + 1,
 						isAsync: Boolean(firstChildOfType(node, "async")),
-						hasAwait: hasAwaitInNode(body),
-						hasReturnAwaitCall: hasReturnAwaitCall(body),
+						hasAwait: bodySummary.hasAwait,
+						hasReturnAwaitCall: bodySummary.hasReturnAwaitCall,
 						statementCount,
 						parameterCount: params.length,
 						isPassThroughWrapper: passThrough.pass,
 						passThroughTarget: passThrough.target,
 						isBoundaryWrapper,
 						hasExplicitPromiseReturnType: hasExplicitPromiseReturnType(node),
-						cyclomaticComplexity: calcCyclomaticComplexity(body),
-						maxNestingDepth: calcMaxNestingDepth(body),
-						outgoingCalls: collectOutgoingCalls(body),
-						memberCallSites: collectMemberCallSites(body),
-						receiverTypes: collectReceiverTypes(body, params),
+						cyclomaticComplexity: bodySummary.cyclomaticComplexity,
+						maxNestingDepth: bodySummary.maxNestingDepth,
+						outgoingCalls: bodySummary.outgoingCalls,
+						memberCallSites: bodySummary.memberCallSites,
+						receiverTypes: bodySummary.receiverTypes,
 					});
 				};
 
 				walk(root, (node) => {
-					if (FUNCTION_TYPES.has(node.type)) addSummary(node);
+					const type: string = node.type;
+					if (FUNCTION_TYPES.has(type)) addSummary(node);
 					if (
-						node.type === "class_declaration" ||
-						node.type === "interface_declaration"
+						type === "class_declaration" ||
+						type === "interface_declaration"
 					) {
 						const nameNode =
 							firstChildOfType(node, "type_identifier") ??

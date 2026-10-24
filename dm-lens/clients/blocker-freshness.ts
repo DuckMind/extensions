@@ -92,12 +92,23 @@
  * that, because it is what makes widening this sweep to security provenance
  * safe at all.
  *
- * Resolution boundary (#1631 review F8): `extractForwardImportPaths` parses static
- * import/require syntax via tree-sitter. It does not, and cannot, resolve a
- * dependency reached only through a dynamic `import()` or `require()` behind a
- * runtime condition — that edge is invisible to this gate, so a blocker whose only
- * stale dependency arrives that way survives a replay. This is an honest boundary,
- * not a silently-closed one.
+ * Resolution boundary (#1631 review F8, narrowed by #4438): `extractForwardImportPaths`
+ * parses import and export statements and, since #4438, `import("x")` and
+ * `require("x")` calls with a string argument. A computed specifier
+ * (`import(name)`, a template literal) is still invisible to this gate, so a
+ * blocker whose only stale dependency arrives that way survives a replay.
+ *
+ * Implicit scope (#4438). An LSP verdict also depends on files no import names:
+ * a Go file's package peers and, for a JS/TS file, every file that feeds the
+ * global scope (`clients/lsp/implicit-scope.ts`, the diagnostics cache's scope).
+ * A blocker is demoted when a mutation receipt after the verdict, under the
+ * sweep's root, names such a file: for a Go blocker a same-package, non-test
+ * peer in the host build (its own file is left to the content axis), for a
+ * JS/TS blocker a file whose role reads as feeding the global scope. Only
+ * positive evidence demotes (#4438 r2): a file whose role cannot be read is a
+ * cut counted in `truncatedImports`. The receipts are the writes dm-lens
+ * observed (every tool, bash included); a writer dm-lens never sees, and a
+ * deletion, leave the blocker as it is (#4476).
  *
  * Delivery cap (#1950). A demoted-but-confirmable entry (`alreadyStale` above)
  * is deliberately NOT retired after its past-EOF sibling's one-delivery rule
@@ -131,12 +142,24 @@
  * with this module is the one number both caps retire against,
  * `DEPENDENCY_DRIFT_MAX_DELIVERIES`, rather than inventing a second one.
  */
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as nodePath from "node:path";
+import { BoundedLruCache } from "./bounded-cache.js";
+import { hashContentBytes } from "./content-stamp.js";
 import { bounded } from "./deadline-utils.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
-import { normalizeEphemeralMapKey } from "./path-utils.js";
+import {
+	classifyJsTsGlobalScope,
+	globalScopeRoleByName,
+	globalScopeRoleByText,
+	goPackagePeersOf,
+	implicitScopeOf,
+	isGoSourceFile,
+	type GlobalScopeRole,
+} from "./lsp/implicit-scope.js";
+import { notePathAppeared } from "./path-birth.js";
+import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import { resolveImportToFiles } from "./review-graph/import-resolvers.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
@@ -189,6 +212,9 @@ export interface BlockerFreshnessCounts {
 	 * {@link MAX_DRIFT_CHECK_IMPORTS} and was truncated before the drift check —
 	 * a signal the sweep could have missed drift past the cap, surfaced rather
 	 * than folded silently into a clean-looking `kept`/`revalidated` count.
+	 * #4438: also entries whose implicit-scope check stopped short: the
+	 * per-sweep parse budget ({@link MAX_IMPLICIT_SCOPE_PARSES}) ran out, or
+	 * the receipt ring evicted receipts newer than the verdict.
 	 */
 	truncatedImports: number;
 	/**
@@ -266,6 +292,193 @@ export interface BlockerFreshnessOptions {
 	 * `undefined` for exactly that reason, and a wall-clock bound still applies.
 	 */
 	signal?: AbortSignal;
+}
+
+/**
+ * #4438: files one sweep may parse to classify their TS/JS global-scope role
+ * (`classifyJsTsGlobalScope` reads and parses a JS/TS file its name does not
+ * decide). The receipts after a long-lived verdict can name hundreds of
+ * files; past this budget a receipt is not classified, the entry stays as it
+ * is, and the cut is counted in `truncatedImports`. A role the name decides
+ * (a declaration file, a file that is not JS/TS) or the text decides (a
+ * module with no ambient declaration) spends nothing (#4438 r2).
+ */
+const MAX_IMPLICIT_SCOPE_PARSES = 32;
+
+/**
+ * #4438: global-scope roles kept across sweeps, keyed by the file's stat
+ * identity (mtime, ctime and size, as {@link forwardImportSources} keys its
+ * parses), so a file the receipts keep naming is parsed once per version,
+ * not once per turn.
+ */
+const GLOBAL_SCOPE_ROLE_MEMO_ENTRIES = 1024;
+interface GlobalScopeRoleEntry {
+	mtimeMs: number;
+	ctimeMs: number;
+	size: number;
+	role: GlobalScopeRole;
+}
+const globalScopeRoleMemo = new BoundedLruCache<string, GlobalScopeRoleEntry>(
+	GLOBAL_SCOPE_ROLE_MEMO_ENTRIES,
+);
+
+interface ImplicitScopeDrift {
+	/** Files in the entry's implicit scope that changed after the verdict. */
+	drifted: string[];
+	/** The check stopped short (an unknown role, the parse budget, or receipts evicted). */
+	truncated: boolean;
+}
+
+type ImplicitScopeCheck = (
+	filePath: string,
+	recordedAtMs: number,
+) => ImplicitScopeDrift;
+
+/**
+ * #4438 r2: a receipt file's role from its text alone
+ * (`globalScopeRoleByText`), or `undefined` when a parse must decide or the
+ * file does not read. Most JS/TS files open a line with `import` or
+ * `export`, so most receipts cost a read and no parse: 32 parses cost
+ * ~80 ms on dm-lens's own files.
+ */
+function roleByTextOf(filePath: string): GlobalScopeRole | undefined {
+	try {
+		return globalScopeRoleByText(fs.readFileSync(filePath, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * #4438: one sweep's implicit-scope check (see the module doc). The receipts
+ * are read once, at the first eligible entry; each file's role is read at
+ * most once per sweep.
+ *
+ * #4438 r2: only positive evidence demotes. A receipt counts when it names
+ * a file in the entry's scope: for a JS/TS entry a file under `cwd` whose
+ * role reads `"feeds"`, for a Go entry a peer `goPackagePeersOf` admits (a
+ * peer shares the blocker's directory). A file that no longer stats is no evidence and no cut (a deleted
+ * dependency is not drift, #1631); an `"unknown"` role or a spent budget is
+ * a cut.
+ */
+function createImplicitScopeCheck(
+	runtime: RuntimeCoordinator,
+	cwd: string,
+): ImplicitScopeCheck {
+	let receipts: Array<{ filePath: string; ts: number }> | undefined;
+	let receiptsDropped = false;
+	const roles = new Map<string, GlobalScopeRole>();
+	let parses = 0;
+	const roleOf = (other: string): GlobalScopeRole => {
+		const known = roles.get(other);
+		if (known !== undefined) return known;
+		let stat: fs.Stats;
+		try {
+			stat = fs.statSync(other);
+		} catch {
+			roles.set(other, "none");
+			return "none";
+		}
+		// A receipt path is a `normalizeMapKey` spelling already.
+		const memo = globalScopeRoleMemo.get(other);
+		let role: GlobalScopeRole;
+		if (
+			memo?.mtimeMs === stat.mtimeMs &&
+			memo.ctimeMs === stat.ctimeMs &&
+			memo.size === stat.size
+		) {
+			role = memo.role;
+		} else {
+			const byName = globalScopeRoleByName(other);
+			const byText = byName ? undefined : roleByTextOf(other);
+			if (byName ?? byText) {
+				role = (byName ?? byText)!;
+			} else if (parses >= MAX_IMPLICIT_SCOPE_PARSES) {
+				return "unknown";
+			} else {
+				parses += 1;
+				role = classifyJsTsGlobalScope(other);
+			}
+			globalScopeRoleMemo.set(other, {
+				mtimeMs: stat.mtimeMs,
+				ctimeMs: stat.ctimeMs,
+				size: stat.size,
+				role,
+			});
+		}
+		roles.set(other, role);
+		return role;
+	};
+	// Receipt paths are `normalizeMapKey` spellings already
+	// (`MutationReceipt.filePath`), so the root is spelled once and compared
+	// by prefix: `isUnderDir` normalizing both sides cost ~2.4 ms per 459
+	// receipts per sweep.
+	const rootKey = normalizeMapKey(nodePath.resolve(cwd));
+	const rootPrefix = rootKey.endsWith("/") ? rootKey : `${rootKey}/`;
+	const inRoot = (file: string): boolean =>
+		file === rootKey || file.startsWith(rootPrefix);
+	// JS/TS entries share one newest-first scan: a receipt's role does not
+	// depend on the entry, so each receipt is classified once per sweep, and
+	// the scan reaches back only as far as the oldest JS/TS verdict asked.
+	let scanned: number | undefined;
+	const feeding: Array<{ filePath: string; ts: number }> = [];
+	let newestUnknownTs = Number.NEGATIVE_INFINITY;
+	const scanBackTo = (
+		all: ReadonlyArray<{ filePath: string; ts: number }>,
+		recordedAtMs: number,
+	): void => {
+		scanned ??= all.length;
+		while (scanned > 0 && all[scanned - 1]!.ts > recordedAtMs) {
+			const receipt = all[--scanned]!;
+			if (!inRoot(receipt.filePath)) continue;
+			const role = roleOf(receipt.filePath);
+			if (role === "feeds") feeding.push(receipt);
+			else if (role === "unknown") {
+				newestUnknownTs = Math.max(newestUnknownTs, receipt.ts);
+			}
+		}
+	};
+	const feedsGlobalScope = (other: string): boolean =>
+		roles.get(other) === "feeds";
+	return (filePath, recordedAtMs) => {
+		const key = normalizeMapKey(filePath);
+		const goFile = isGoSourceFile(key);
+		const inScope = goFile
+			? goPackagePeersOf(key)
+			: implicitScopeOf(key, feedsGlobalScope);
+		if (!inScope) return { drifted: [], truncated: false };
+		if (receipts === undefined) {
+			const coordinator = runtime as Partial<RuntimeCoordinator>;
+			receipts = coordinator.getMutationsSince?.(0) ?? [];
+			receiptsDropped = (coordinator.droppedMutationReceiptCount ?? 0) > 0;
+		}
+		let drifted: string | undefined;
+		let unknownAfter = false;
+		if (goFile) {
+			// Newest first: the fix that landed last is the likeliest one.
+			for (let i = receipts.length - 1; i >= 0; i--) {
+				const receipt = receipts[i]!;
+				if (receipt.ts <= recordedAtMs) break;
+				// A peer shares the blocker's directory, so its root too.
+				if (inScope(receipt.filePath)) {
+					drifted = receipt.filePath;
+					break;
+				}
+			}
+		} else {
+			scanBackTo(receipts, recordedAtMs);
+			drifted = feeding.find(
+				(receipt) => receipt.ts > recordedAtMs && inScope(receipt.filePath),
+			)?.filePath;
+			unknownAfter = newestUnknownTs > recordedAtMs;
+		}
+		if (drifted) return { drifted: [drifted], truncated: false };
+		// The ring evicted receipts that may be newer than the verdict.
+		const evictedAfter =
+			receiptsDropped &&
+			(receipts.length === 0 || receipts[0]!.ts > recordedAtMs);
+		return { drifted: [], truncated: unknownAfter || evictedAfter };
+	};
 }
 
 /**
@@ -367,50 +580,188 @@ async function resolveForwardImportsMemoized(
 }
 
 /**
- * Production forward-import resolver. Parses `filePath` with its tree-sitter grammar
- * and resolves every extracted import source to in-project files. Degrades to an
- * empty list (never throws) when the grammar, client, or file is unavailable — the
- * sweep then falls back to checking only the blocker file's own drift.
+ * #4346: one file's parsed import sources, kept while its mtime, ctime and
+ * size are unchanged, so a caller that asks on every diagnostics call (the
+ * LSP created-module producer, `clients/lsp/created-import-targets.ts`)
+ * parses each file version once. #4368 r1: ctime is in the key because a
+ * rewrite that keeps the size and restores the mtime (`utimes`) is otherwise
+ * invisible; every write and every `utimes` moves ctime. Only the parse is kept: `extractForwardImportPaths`
+ * resolves the sources on every call, because a module created since can
+ * answer one without the importer changing. The stat is taken before the read,
+ * so a write racing the parse leaves a key that no longer matches the disk.
+ *
+ * #4368 r1 row 13: `unresolved` holds the sources that resolved to nothing at
+ * the last call, carried across the file's versions, so a later call that
+ * resolves one sees a path that appeared in between (`notePathAppeared`).
+ *
+ * #4346 r3: `uncaptured` is set when a JS/TS file's sources may not be all of
+ * its dependencies ({@link holdsUncapturedDependency}).
  */
-export async function extractForwardImportPaths(
-	cwd: string,
+const FORWARD_IMPORT_SOURCE_MEMO_ENTRIES = 1024;
+interface ForwardImportSourceEntry {
+	mtimeMs: number;
+	ctimeMs: number;
+	size: number;
+	sources: string[];
+	unresolved: ReadonlySet<string>;
+	uncaptured: boolean;
+}
+
+/** The JS/TS grammars, whose import query captures `import`/`export`
+ * statement sources and, since #4438, `import("x")` and `require("x")` with a
+ * string argument, never a computed one. Go captures every import spec, and
+ * `import (` is its grouped import. */
+const JS_TS_LANGUAGES = new Set(["typescript", "tsx", "javascript"]);
+/**
+ * A relative specifier string: quoted, starting `./` or `../`. A backtick
+ * specifier is valid only in an `import(` or `require(` call, which
+ * `DEPENDENCY_CALL` already counts.
+ */
+const RELATIVE_SPECIFIER = /(["'])(\.{1,2}\/(?:(?!\1)[^\n])*)\1/g;
+/**
+ * Dependency forms whose specifiers need not start with `./` or `../`.
+ * Even when captured, keep their scope conservative: an alias, package or
+ * triple-slash reference can name a newly created module (#4477).
+ */
+const DEPENDENCY_CALL =
+	/\bimport\s*\(|\brequire\s*\(|@import\b|\bdeclare\s+module\s*["']|\/\/\/\s*<reference\s+(?:path|types)/;
+
+/**
+ * #4346 r3: whether a JS/TS file's captured sources may miss a dependency.
+ * Uncaptured relative strings and non-relative dependency forms fail closed;
+ * a false positive costs a cache refusal and a re-touch, not stale findings.
+ */
+function holdsUncapturedDependency(
+	content: string,
+	sources: readonly string[],
+): boolean {
+	if (DEPENDENCY_CALL.test(content)) return true;
+	const captured = new Set(sources);
+	for (const match of content.matchAll(RELATIVE_SPECIFIER)) {
+		if (!captured.has(match[2]!)) return true;
+	}
+	return false;
+}
+const forwardImportSourceMemo = new BoundedLruCache<
+	string,
+	ForwardImportSourceEntry
+>(FORWARD_IMPORT_SOURCE_MEMO_ENTRIES);
+let forwardImportParses = 0;
+
+/** #4346: parses `forwardImportSources` has run (memo misses), for tests. */
+export function _getForwardImportParsesForTests(): number {
+	return forwardImportParses;
+}
+
+async function forwardImportSources(
 	filePath: string,
-): Promise<string[]> {
-	const languageId = resolveTreeSitterLanguage(filePath);
-	if (!languageId) return [];
+	languageId: string,
+): Promise<ForwardImportSourceEntry | undefined> {
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(filePath);
+	} catch {
+		return undefined;
+	}
+	const key = normalizeMapKey(filePath);
+	const memo = forwardImportSourceMemo.get(key);
+	if (
+		memo?.mtimeMs === stat.mtimeMs &&
+		memo.ctimeMs === stat.ctimeMs &&
+		memo.size === stat.size
+	) {
+		return memo;
+	}
 	const client = getSharedTreeSitterClient();
-	if (!client) return [];
+	if (!client) return undefined;
 	const extractor = await getExtractor(languageId);
-	if (!extractor) return [];
+	if (!extractor) return undefined;
 
 	let content: string;
 	try {
 		content = fs.readFileSync(filePath, "utf-8");
 	} catch {
-		return [];
+		return undefined;
 	}
 
 	const outcome = await client.withParsedTree(
 		filePath,
 		languageId,
 		content,
-		(tree) => extractor.extract(tree, filePath, content).imports,
+		// Imports only (#4368 r1 F2): the definitions pass of a full extract is
+		// what made a large file cost seconds.
+		(tree) => extractor.extractImports(tree),
 		"blocker-freshness",
 	);
-	if (!outcome.parsed) return [];
+	if (!outcome.parsed) return undefined;
+	forwardImportParses++;
+	const sources = [...new Set(outcome.value.map((ref) => ref.source))];
+	const entry: ForwardImportSourceEntry = {
+		mtimeMs: stat.mtimeMs,
+		ctimeMs: stat.ctimeMs,
+		size: stat.size,
+		sources,
+		unresolved: memo?.unresolved ?? new Set(),
+		uncaptured:
+			JS_TS_LANGUAGES.has(languageId) &&
+			holdsUncapturedDependency(content, sources),
+	};
+	forwardImportSourceMemo.set(key, entry);
+	return entry;
+}
 
+/** #4346: one file's imports now: the files they resolve to, and the sources
+ * that resolve to nothing. */
+export interface ForwardImports {
+	targets: string[];
+	unresolved: string[];
+	/**
+	 * #4346 r2 F1: whether the sources are all of the file's dependencies:
+	 * false when it could not be parsed (no grammar, client or read) or holds
+	 * a form the query does not capture.
+	 */
+	complete: boolean;
+}
+
+/**
+ * Production forward-import resolver. Parses `filePath` with its tree-sitter grammar
+ * and resolves every extracted import source to in-project files. Degrades to an
+ * empty answer (never throws) when the grammar, client, or file is unavailable —
+ * the sweep then falls back to checking only the blocker file's own drift.
+ */
+export async function extractForwardImports(
+	cwd: string,
+	filePath: string,
+): Promise<ForwardImports> {
+	const languageId = resolveTreeSitterLanguage(filePath);
+	if (!languageId) return { targets: [], unresolved: [], complete: false };
+	const entry = await forwardImportSources(filePath, languageId);
+	if (!entry) return { targets: [], unresolved: [], complete: false };
 	const resolved = new Set<string>();
-	for (const ref of outcome.value) {
-		for (const target of resolveImportToFiles(
-			cwd,
-			filePath,
-			languageId,
-			ref.source,
-		)) {
+	const unresolved = new Set<string>();
+	for (const source of entry.sources) {
+		const targets = resolveImportToFiles(cwd, filePath, languageId, source);
+		if (targets.length === 0) unresolved.add(source);
+		for (const target of targets) {
+			// #4368 r1 row 13: resolved to nothing last time, to `target` now.
+			if (entry.unresolved.has(source)) notePathAppeared(target);
 			resolved.add(target);
 		}
 	}
-	return [...resolved];
+	entry.unresolved = unresolved;
+	return {
+		targets: [...resolved],
+		unresolved: [...unresolved],
+		complete: !entry.uncaptured,
+	};
+}
+
+/** The files `filePath`'s imports resolve to now ({@link extractForwardImports}). */
+export function extractForwardImportPaths(
+	cwd: string,
+	filePath: string,
+): Promise<string[]> {
+	return extractForwardImports(cwd, filePath).then(({ targets }) => targets);
 }
 
 async function statSignature(
@@ -541,7 +892,7 @@ async function detectSelfDrift(args: {
 	if (content === undefined)
 		return { verdict: "unverifiable", unverifiableReason: "hash-unavailable" };
 	args.budget.bytesLeft -= content.byteLength;
-	const hash = createHash("sha256").update(content).digest("hex");
+	const hash = hashContentBytes(content);
 	return { verdict: hash === args.recordedHash ? "unchanged" : "drift" };
 }
 
@@ -626,6 +977,7 @@ async function detectDrift(
 	recordedAtMs: number,
 	resolveForwardImports: ForwardImportResolver,
 	turnIndex: number | undefined,
+	implicitScope: ImplicitScopeCheck,
 	/** Skip the own-file mtime tier after content confirms it is unchanged. */
 	skipOwnFile = false,
 ): Promise<DriftResult> {
@@ -650,7 +1002,9 @@ async function detectDrift(
 		});
 		if (verdict.verdict === "stale") drifted.push(depPath);
 	}
-	return { drifted, truncated };
+	const implicit = implicitScope(filePath, recordedAtMs);
+	drifted.push(...implicit.drifted);
+	return { drifted, truncated: truncated || implicit.truncated };
 }
 
 /**
@@ -800,6 +1154,7 @@ export async function sweepInlineBlockerFreshness(
 	};
 	const resolveForwardImports =
 		options?.resolveForwardImports ?? extractForwardImportPaths;
+	const implicitScope = createImplicitScopeCheck(runtime, cwd);
 	let turnIndex: number | undefined;
 	try {
 		turnIndex = runtime.turnIndex;
@@ -1080,6 +1435,7 @@ export async function sweepInlineBlockerFreshness(
 				entry.recordedAtMs,
 				resolveForwardImports,
 				turnIndex,
+				implicitScope,
 				skipOwnFile,
 			);
 			if (truncated) counts.truncatedImports += 1;

@@ -30,6 +30,7 @@ import { logLatency } from "./latency-logger.js";
 import { normalizeEphemeralMapKey } from "./path-utils.js";
 import { isSlowFs, SLOW_FS_REDUCED_MAX_FILES } from "./slow-fs.js";
 import {
+	type DirectoryListing,
 	shouldRecurseIntoDir,
 	walkTreeRecursiveSync,
 	walkTreeStackAsync,
@@ -79,12 +80,20 @@ export function createArtifactProbeCache(): ArtifactProbeCache {
 	return new Map();
 }
 
-function probeExists(filePath: string, cache?: ArtifactProbeCache): boolean {
-	if (!cache) return fs.existsSync(filePath);
+function probeExists(
+	filePath: string,
+	cache?: ArtifactProbeCache,
+	siblings?: DirectoryListing,
+): boolean {
+	// Only a miss in the walk's own listing short-circuits (#1979); a hit still
+	// asks the filesystem, which keeps its exact verdict.
+	const exists = (): boolean =>
+		(!siblings || siblings.mayContain(filePath)) && fs.existsSync(filePath);
+	if (!cache) return exists();
 	const key = normalizeEphemeralMapKey(filePath);
 	const cached = cache.get(key);
 	if (cached !== undefined) return cached;
-	const result = fs.existsSync(filePath);
+	const result = exists();
 	cache.set(key, result);
 	return result;
 }
@@ -359,6 +368,12 @@ export interface SourceCollectionResult {
 	generatedDirSkips?: number;
 	generatedNameOverrides?: number;
 	generatedNameOnlySkips?: number;
+	/**
+	 * Directory entries the walk touched (#1979), ignored and skipped ones
+	 * included: the unit the entry budget counts. With the walk's wall time it
+	 * separates a cold filesystem (many ms per entry) from a big tree.
+	 */
+	entriesVisited?: number;
 }
 
 /**
@@ -494,9 +509,10 @@ function getDir(filePath: string): string {
 export function findSourceSibling(
 	filePath: string,
 	probeCache?: ArtifactProbeCache,
+	siblings?: DirectoryListing,
 ): string | null {
 	for (const candidate of sourceTwinCandidates(filePath)) {
-		if (probeExists(candidate, probeCache)) return candidate;
+		if (probeExists(candidate, probeCache, siblings)) return candidate;
 	}
 
 	// Keep the legacy non-JS source policies (Vue/Svelte/CoffeeScript) on the
@@ -510,7 +526,7 @@ export function findSourceSibling(
 			shadowedExts.includes(ext)
 		) {
 			const siblingPath = path.join(dir, base + sourceExt);
-			if (probeExists(siblingPath, probeCache)) return siblingPath;
+			if (probeExists(siblingPath, probeCache, siblings)) return siblingPath;
 		}
 	}
 	return null;
@@ -521,6 +537,9 @@ export function findSourceSibling(
  *
  * @param probeCache - Optional per-walk memo (see {@link ArtifactProbeCache}).
  * Omit for the original, uncached behavior.
+ * @param siblings - Optional listing of `path.dirname(filePath)` the caller
+ * already read (the directory walk's own `readdir`, #1979). A twin absent from
+ * it is answered without a filesystem probe; omit to probe every candidate.
  */
 function sourceExtsForCompiledExt(sourceExt: string): string[] {
 	return sourceExt === ".ts" ||
@@ -534,8 +553,9 @@ function sourceExtsForCompiledExt(sourceExt: string): string[] {
 export function isBuildArtifact(
 	filePath: string,
 	probeCache?: ArtifactProbeCache,
+	siblings?: DirectoryListing,
 ): boolean {
-	return findSourceSibling(filePath, probeCache) !== null;
+	return findSourceSibling(filePath, probeCache, siblings) !== null;
 }
 
 /**
@@ -648,6 +668,7 @@ function classifyEntry(
 	cfg: ResolvedCollectionConfig,
 	probeCache?: ArtifactProbeCache,
 	skipCounters?: SourceWalkSkipCounters,
+	siblings?: DirectoryListing,
 ): { recurseInto?: string; keepFile?: string } {
 	const { ignoreMatcher, extraExcludePatterns, extensions, options } = cfg;
 	if (entry.isDirectory()) {
@@ -684,7 +705,7 @@ function classifyEntry(
 		// changes what gets skipped) so an invisible coverage hole (a real
 		// `src/gen.ts` silently dropped by the name heuristic) is at least
 		// visible via `SourceCollectionResult` and the walk's rollup log line.
-		if (isBuildArtifact(fullPath, probeCache)) {
+		if (isBuildArtifact(fullPath, probeCache, siblings)) {
 			if (skipCounters) skipCounters.buildArtifactSkips += 1;
 			return {};
 		}
@@ -771,7 +792,7 @@ export function collectSourceFilesWithBudget(
 	// `maxFiles` results cap (#250) is checked BEFORE charging the entry budget
 	// (#760), and a file that reaches `maxFiles` is the last one kept — the cap
 	// then trips on the following entry, matching the pre-#761 loop exactly.
-	walkTreeRecursiveSync(rootDir, (entry, fullPath) => {
+	walkTreeRecursiveSync(rootDir, (entry, fullPath, siblings) => {
 		if (kept.isFull()) return "stop"; // hard cap (#250)
 		if (!chargeEntryBudget(budget)) return "stop"; // entry budget (#760)
 		const { recurseInto, keepFile } = classifyEntry(
@@ -780,6 +801,7 @@ export function collectSourceFilesWithBudget(
 			cfg,
 			probeCache,
 			skipCounters,
+			siblings,
 		);
 		if (recurseInto) return "recurse";
 		if (keepFile) kept.push(keepFile);
@@ -794,6 +816,7 @@ export function collectSourceFilesWithBudget(
 		generatedDirSkips: skipCounters.generatedDirSkips,
 		generatedNameOverrides: skipCounters.generatedNameOverrides,
 		generatedNameOnlySkips: skipCounters.generatedNameOnlySkips,
+		entriesVisited: budget.visited,
 	};
 }
 
@@ -854,7 +877,7 @@ export async function collectSourceFilesWithBudgetAsync(
 	// but preserved verbatim, so both stay byte-identical to their pre-#761 form.
 	await walkTreeStackAsync(
 		rootDir,
-		(entry, fullPath) => {
+		(entry, fullPath, siblings) => {
 			options?.onEntryVisited?.();
 			if (!chargeEntryBudget(budget)) return "stop"; // entry budget (#760)
 			const { recurseInto, keepFile } = classifyEntry(
@@ -863,6 +886,7 @@ export async function collectSourceFilesWithBudgetAsync(
 				cfg,
 				probeCache,
 				skipCounters,
+				siblings,
 			);
 			if (recurseInto) return "recurse";
 			if (keepFile) {
@@ -893,6 +917,7 @@ export async function collectSourceFilesWithBudgetAsync(
 		generatedDirSkips: skipCounters.generatedDirSkips,
 		generatedNameOverrides: skipCounters.generatedNameOverrides,
 		generatedNameOnlySkips: skipCounters.generatedNameOnlySkips,
+		entriesVisited: budget.visited,
 	};
 }
 

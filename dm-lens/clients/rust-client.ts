@@ -27,23 +27,8 @@ export interface RustDiagnostic {
 	file: string;
 }
 
-// --- Common install paths ---
-
-const CARGO_WINDOWS_PATHS = [
-	path.join(process.env.USERPROFILE || "", ".cargo", "bin", "cargo.exe"),
-	path.join(process.env.SYSTEMDRIVE || "C:", "\\cargo", "bin", "cargo.exe"),
-	"cargo.exe", // PATH
-];
-
 /** Budget for the PATH candidate's `cargo --version` probe, ms. */
 const PROBE_TIMEOUT_MS = 3_000;
-
-const CARGO_UNIX_PATHS = [
-	path.join(process.env.HOME || "", ".cargo", "bin", "cargo"),
-	"/usr/local/cargo/bin/cargo",
-	"/usr/bin/cargo",
-	"cargo", // PATH
-];
 
 // --- Client ---
 
@@ -62,8 +47,24 @@ export class RustClient {
 		this.availability = createToolchainAvailability({
 			tool: "cargo",
 			label: "Cargo",
-			windowsPaths: CARGO_WINDOWS_PATHS,
-			unixPaths: CARGO_UNIX_PATHS,
+			// Common install paths, read when the client is built rather than at
+			// import, so the home they name is the one the client runs under.
+			windowsPaths: [
+				path.join(process.env.USERPROFILE || "", ".cargo", "bin", "cargo.exe"),
+				path.join(
+					process.env.SYSTEMDRIVE || "C:",
+					"\\cargo",
+					"bin",
+					"cargo.exe",
+				),
+				"cargo.exe", // PATH
+			],
+			unixPaths: [
+				path.join(process.env.HOME || "", ".cargo", "bin", "cargo"),
+				"/usr/local/cargo/bin/cargo",
+				"/usr/bin/cargo",
+				"cargo", // PATH
+			],
 			probeArgs: ["--version"],
 			budgetMs: PROBE_TIMEOUT_MS,
 			log: (msg) => this.log(msg),

@@ -30,6 +30,18 @@ import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 const golangci = createAvailabilityChecker("golangci-lint", ".exe");
 
+/** Every `golangci-lint run` output format except json (2.14.0 `run --help`). */
+const OTHER_OUTPUT_FORMATS = [
+	"text",
+	"tab",
+	"html",
+	"checkstyle",
+	"code-climate",
+	"junit-xml",
+	"teamcity",
+	"sarif",
+];
+
 interface GolangciInlineReplacement {
 	StartCol?: number;
 	Length?: number;
@@ -106,7 +118,7 @@ function parseGolangciJson(
 			pathsEqual(path.resolve(cwd, issue.Pos.Filename), absFile),
 		).map((issue) => {
 			const severity = issue.Severity === "error" ? "error" : "warning";
-			// golangci-lint's --out-format=json emits a Replacement object per
+			// golangci-lint's JSON output emits a Replacement object per
 			// issue when `golangci-lint run --fix` would deterministically
 			// rewrite the code. Mirror the rust-clippy structured-output path
 			// (commit 221b34d): propagate the field to fixable / fixSuggestion
@@ -157,9 +169,22 @@ const golangciRunner: RunnerDefinition = {
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
 		// Run on the specific file. golangci-lint accepts file paths directly.
+		// v2 (the major the installer downloads) removed `--out-format`: it exits
+		// 3 "unknown flag" (#4455). JSON now comes from `--output.json.path`, and
+		// the run stats go to stdout after the document unless switched off,
+		// which leaves stdout unparseable as one JSON value. The project's own
+		// `output.formats` merge with the flags, so a config that prints any other
+		// format to stdout puts that text beside the JSON; every other format is
+		// pointed at nowhere (`--output.<format>.path=`), probed against 2.14.0.
 		const result = await safeSpawnAsync(
 			cmd,
-			["run", "--out-format=json", ctx.filePath],
+			[
+				"run",
+				"--output.json.path=stdout",
+				...OTHER_OUTPUT_FORMATS.map((format) => `--output.${format}.path=`),
+				"--show-stats=false",
+				ctx.filePath,
+			],
 			{ timeout: 60000, cwd },
 		);
 
@@ -180,7 +205,7 @@ const golangciRunner: RunnerDefinition = {
 			{
 				result,
 				output: raw,
-				// EXIT TABLE (golangci-lint 1.60 docs https://golangci-lint.run/docs/welcome/quick-start/): 0 clean; 1 findings; 2 error; 3 error; 4 error; 5 error; other nonzero rejected.
+				// EXIT TABLE (golangci-lint v2 docs https://golangci-lint.run/docs/welcome/quick-start/; 2.14.0 exits 1 on findings and 3 on an unknown flag): 0 clean; 1 findings; 2 error; 3 error; 4 error; 5 error; other nonzero rejected.
 				exitCodes: { ran: [1, 2, 3, 4, 5] },
 			},
 			(raw) => parseGolangciJson(raw, ctx.filePath, cwd),

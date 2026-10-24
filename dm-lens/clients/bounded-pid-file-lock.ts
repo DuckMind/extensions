@@ -197,6 +197,9 @@ async function tryAcquireQuarantineLock(
 			}
 			return () => releaseQuarantineLock(lockPath, owner.token);
 		} catch (error) {
+			// none: EEXIST means another holder won the `mkdir`; the stale-owner
+			// branch below decides whether this attempt reclaims the lock, and a
+			// non-EEXIST failure rethrows on the next line.
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
 		let stale: boolean;

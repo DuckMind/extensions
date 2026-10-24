@@ -81,8 +81,8 @@ export const TIER_CLASS: Readonly<Record<SourceTier, TierClass>> = {
 
 /**
  * The host's trust decision, reused verbatim from `project-trust.ts` rather
- * than re-spelled. dm-lens CONSUMES the host decision (AGENTS.md, "Project
- * trust is CONSUMED, never answered"); a second three-valued type here would be
+ * than re-spelled. dm-lens CONSUMES the host decision (AGENTS.md, "LSP, trust, and process execution";
+ * project trust is consumed, never answered); a second three-valued type here would be
  * a second place for the vocabulary to drift.
  */
 export type TrustDecision = ProjectTrustState;

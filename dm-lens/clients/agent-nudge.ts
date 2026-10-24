@@ -410,7 +410,7 @@ export interface WireAgentNudgeSubscriberArgs {
  * Subscribe to `dmlens:files:touched` on pi's shared event bus. Called once
  * at extension factory time from index.ts, mirroring `wireBusEmitter`'s
  * placement (clients/bus-publish.ts). No-ops silently when `pi.events` or
- * `.on` is unavailable (older pi host) — never throws.
+ * `.on` is unavailable (older DM host) — never throws.
  */
 export function wireAgentNudgeSubscriber(
 	args: WireAgentNudgeSubscriberArgs,
@@ -429,7 +429,7 @@ export function wireAgentNudgeSubscriber(
 			}
 		});
 	} catch (err) {
-		dbg?.(`agent-nudge: subscribe failed (older pi host?): ${err}`);
+		dbg?.(`agent-nudge: subscribe failed (older DM host?): ${err}`);
 	}
 }
 

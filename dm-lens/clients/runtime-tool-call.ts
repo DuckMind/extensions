@@ -2,6 +2,7 @@ import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { loadBootstrapClients, requestBootstrapClients } from "./bootstrap.js";
 import type { CacheManager } from "./cache-manager.js";
+import { resolveSessionConfigRoot } from "./analysis-root.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
@@ -9,14 +10,22 @@ import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
 import { dropHashlineAnchorMemo } from "./hashline-anchor.js";
 import { evaluateSharedCheckoutGuard } from "./shared-checkout-guard.js";
 import { logLatency } from "./latency-logger.js";
-import { toPosix } from "./path-utils.js";
 import {
 	captureFileStats,
+	captureGitDirtyPaths,
 	getOpaqueBaselineStore,
+	headRecordKey,
 	isGitWorktree,
 	opaqueBaselineSlot,
+	opaquePrescanRoot,
+	recordOpaqueCaptureRefused,
+	recordOpaqueRootRefusals,
+	resolveOpaqueRecoveryRoots,
+	shouldRunOpaqueRecovery,
 	type PendingOpaqueBaseline,
 } from "./opaque-mutation-scan.js";
+import { bounded } from "./deadline-utils.js";
+import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
 import {
@@ -47,16 +56,16 @@ import {
 } from "./oldtext-autopatch.js";
 import { applyPartiallyApplicableEdits } from "./partial-edit-apply.js";
 import {
-	type HostPathVariantResolution,
 	isExternalOrVendorFile,
-	resolveHostPathVariants,
-	resolveHostToolPath,
+	resolveToolCallFilePath,
+	toPosix,
 } from "./path-utils.js";
 import {
 	EXPANSION_BUDGET_MS,
 	EXPANSION_LIMIT_LINES,
 	tryExpandRead,
 } from "./read-expansion.js";
+import { scanFileLines } from "./read-guard.js";
 import {
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
@@ -64,7 +73,6 @@ import {
 	logReadGuardEvent,
 } from "./read-guard-logger.js";
 import {
-	countFileLines,
 	formatAlreadyAppliedNotes,
 	getTouchedLinesForGuard,
 	relocateEditRange,
@@ -72,12 +80,13 @@ import {
 	tryCorrectIndentationMismatchFromContent,
 } from "./read-guard-tool-lines.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import { handleToolResult } from "./runtime-tool-result.js";
+import { handleToolResult, resyncHeadMove } from "./runtime-tool-result.js";
 import {
 	resolveReadEvidenceCorrelationId,
 	resolveToolCallCorrelationId,
 } from "./tool-event.js";
 import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
+import { loadDispatchIntegration } from "./dispatch/lazy.js";
 
 const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
 	0,
@@ -201,48 +210,6 @@ function retireAstGrepApplyTargets(
 	);
 }
 
-/**
- * Resolve a tool_call's raw path to the file pi will actually touch.
- *
- * The `cwd` basis is the host `ctx.cwd`, which for the pinned host IS the same
- * value the tools were constructed with — `AgentSession` passes its one `_cwd`
- * to both `createAllToolDefinitions`
- * (`@duckmind/dm-coding-agent/dist/core/agent-session.js:2026`, source
- * `src/core/tools/index.ts:99-124`) and the `ExtensionRunner` behind `ctx.cwd`
- * (`dist/core/agent-session.js:2037`; `runner.js:154`, `:476-479`). Neither is
- * reassigned after construction, so there is no drift TODAY (#1655 item 4).
- * `tests/clients/pi-host-contract.test.ts` pins that, because the day a host
- * lets one move independently, every path here silently retargets.
- *
- * The path is produced the way pi produces it, in pi's two stages (#1655 item
- * 5, plus review F1):
- *
- *   1. `resolveHostToolPath` mirrors pi's BASE resolution, `resolveToCwd`
- *      (`dist/core/tools/path-utils.js:42-44`, source
- *      `src/core/tools/path-utils.ts:~44-46`) — unicode-space folding, `@`
- *      prefix stripping, `~` expansion, `file://` conversion, and Git-Bash
- *      drive paths, all BEFORE anything is probed.
- *   2. `resolveHostPathVariants` mirrors pi's fallback LADDER
- *      (`dist/core/tools/path-utils.js:45-70`, source
- *      `src/core/tools/path-utils.ts:52-83`).
- *
- * Stage 1 was missing in the first cut of this fix, and the ladder cannot
- * stand in for it: an `@`-prefixed path, a `file://` URL, or a non-breaking
- * space are all resolved by pi at stage 1 and are untouched by any of the four
- * stage-2 candidates. A plain `path.resolve` therefore produced a path pi
- * never opens, and the miss looked identical to "file genuinely absent".
- */
-function resolveToolCallFilePath(
-	rawFilePath: string | undefined,
-	cwd: string | undefined,
-	projectRoot: string,
-): HostPathVariantResolution | undefined {
-	if (!rawFilePath) return undefined;
-	return resolveHostPathVariants(
-		resolveHostToolPath(rawFilePath, cwd ?? projectRoot),
-	);
-}
-
 type ReadToolInput = {
 	path?: string;
 	filePath?: string;
@@ -256,19 +223,6 @@ function getReadToolInput(
 ): ReadToolInput | undefined {
 	if (toolName !== "read") return undefined;
 	return input as ReadToolInput;
-}
-
-function getEffectiveReadLimit(
-	filePath: string | undefined,
-	readInput: ReadToolInput | undefined,
-): number | undefined {
-	if (!filePath || !readInput) return undefined;
-	const requestedOffset = Math.max(1, readInput.offset ?? 1);
-	const requestedLimit = readInput.limit;
-	return (
-		requestedLimit ??
-		Math.max(1, countFileLines(filePath) - requestedOffset + 1)
-	);
 }
 
 function isLspCapableFile(filePath: string): boolean {
@@ -475,6 +429,58 @@ export type ToolCallResult = { block: true; reason?: string } | void;
  * recorded (a gitignored SKIP is not a block, so it is unaffected). This
  * cleanup runs INSIDE the try, so a throw out of it is absorbed too.
  */
+/**
+ * The pre-call baseline for ONE recovery root (#2050).
+ *
+ * The session root keeps the strategy it has always chosen: git when it is a
+ * worktree, the bounded stat snapshot otherwise. Every further root was
+ * admitted by {@link resolveOpaqueRecoveryRoots} because its checkout belongs
+ * to this repository, so it IS a worktree and its baseline is the timestamp.
+ *
+ * `startedAt` is passed in rather than taken here so every root of one call
+ * shares one window floor: a timestamp taken after the first root's baseline
+ * work would miss a write that landed in the meantime.
+ */
+async function captureOpaqueBaseline(
+	root: string,
+	sessionRoot: boolean,
+	startedAt: number,
+): Promise<{ state: PendingOpaqueBaseline; note: string }> {
+	if (!sessionRoot)
+		return { state: { startedAt, strategy: "git" }, note: "git" };
+	if (await isGitWorktree(root)) {
+		// Git-first: the timestamp IS the baseline; git answers what changed, at
+		// any repo size, with no file-universe cap.
+		//
+		// #4502: the dirty set is the second half. A same-HEAD discard
+		// (`git stash`, `git checkout .`, `git restore`) moves no HEAD and
+		// leaves the tree clean, so neither signal names the reverted files; the
+		// pre-command dirty set is the only evidence that they were ours to
+		// resync. `undefined` when git could not answer, which says "unknown",
+		// never "the tree was clean".
+		const dirtyPaths = await captureGitDirtyPaths(root);
+		return {
+			state: {
+				startedAt,
+				strategy: "git",
+				...(dirtyPaths === undefined ? {} : { dirtyPaths }),
+			},
+			note: "git",
+		};
+	}
+	const outcome = await captureFileStats(root, { withHashes: true });
+	return {
+		state: outcome.snapshot
+			? { startedAt, strategy: "stat-diff", stats: outcome.snapshot }
+			: {
+					startedAt,
+					strategy: "stat-diff",
+					statsUnknownReason: outcome.unknownReason ?? "walk-failed",
+				},
+		note: outcome.unknownReason ?? `scanned:${outcome.scannedCount}`,
+	};
+}
+
 export async function handleToolCall(
 	deps: ToolCallDeps,
 ): Promise<ToolCallResult> {
@@ -624,14 +630,45 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			},
 		});
 	if (!lensEnabled) return;
+	// #4493: before every tool, a HEAD move this session has not seen (made
+	// outside DM, or by a bash call still in its tool_result) resyncs the held
+	// documents it rewrote, and a look already running for this session is
+	// joined, so a parallel read or edit never runs against the stale primary
+	// (review r1 F1). A bash call's look also records the HEAD its command
+	// starts from, without which the first move of a session would read as a
+	// first sight at its tool_result. Reading HEAD is a file read; the bound
+	// ends the wait, and a cut look writes a `hook-await-exceeded` row.
+	// #4504 r1: the head-move record resolves its root through the same owner as
+	// the opaque baseline slot, so a concurrent secondary's (#473) `tool_result`
+	// take finds the look this hook recorded.
+	const headRoot = opaquePrescanRoot(ctx.cwd, runtime.projectRoot);
+	if (headRoot)
+		await bounded(
+			resyncHeadMove({
+				root: headRoot,
+				key: headRecordKey(
+					opaqueBaselineSlot(headRoot, runtime.sessionGeneration),
+					deps.sessionId,
+				),
+				trigger: "tool_call",
+				label: toolName,
+				runtime,
+			}),
+			{
+				ms: HOOK_WALL_BUDGET_MS.tool_result_read_only,
+				signal: ctx.signal,
+				hook: "tool_call",
+				label: "head-move-resync",
+			},
+		);
 	// #2000 phase 2: opaque-command pre-snapshot. A bash command whose writes
 	// the extractor will not recognize gets a bounded stat snapshot of the
 	// project source universe BEFORE it runs; the tool_result side diffs it.
 	// Fire-and-forget capture is WRONG here (the child may finish first), but
 	// the capture is stat-only and budgeted, so awaiting it is bounded work on
 	// an already-second-scale bash path.
+	const commandInput = (event as { input?: { command?: unknown } }).input;
 	if (toolName === "bash") {
-		const commandInput = (event as { input?: { command?: unknown } }).input;
 		// #4131: a recognized bash write credits authorship without the bytes
 		// it wrote, so it may only advance an authorship whose bytes still
 		// hold. One another writer broke ends here, before the command rewrites
@@ -642,62 +679,84 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				runtime.projectRoot || process.cwd(),
 			))
 				runtime.readGuard?.retireChangedAuthorship?.(target);
-		if (typeof commandInput?.command === "string" && commandInput.command) {
-			const scanRoot = ctx.cwd ?? runtime.projectRoot;
-			if (scanRoot) {
-				const started = Date.now();
-				const baselineSlot = opaqueBaselineSlot(
-					scanRoot,
-					runtime.sessionGeneration,
+	}
+	// #4504: the record and the take resolve their root through one owner, so a
+	// session whose cwd is not the coordinator's project root (a concurrent
+	// secondary, #473) cannot key the two lookups apart.
+	const scanRoot = opaquePrescanRoot(ctx.cwd, runtime.projectRoot);
+	const callId = resolveToolCallCorrelationId(event);
+	// #4732: the command text the prescan reads its roots from. bash: its
+	// non-empty command, as before. Any other tool the gate does not know to be
+	// read-only or structured, and whose event the structured classifier does
+	// not recognize either: no text, so its one root is the session's. Such a
+	// call needs its own id, because a host with none gives every call the one
+	// shared slot and a non-bash take there would consume a bash call's baseline.
+	const otherOpaqueTool =
+		toolName !== "bash" &&
+		mutation === undefined &&
+		shouldRunOpaqueRecovery(toolName, scanRoot);
+	if (otherOpaqueTool && callId === undefined)
+		recordOpaqueCaptureRefused("no-tool-call-id", toolName);
+	const opaqueCommand =
+		toolName === "bash"
+			? typeof commandInput?.command === "string" && commandInput.command
+				? commandInput.command
+				: undefined
+			: otherOpaqueTool && callId !== undefined
+				? ""
+				: undefined;
+	if (opaqueCommand !== undefined) {
+		if (scanRoot && shouldRunOpaqueRecovery(toolName, scanRoot)) {
+			const started = Date.now();
+			// #2050: the trees this command's writes must be recovered from. The
+			// session root is where the host ran it; any further root is a
+			// checkout the command itself named and that belongs to THIS
+			// repository (a linked worktree), so its baseline is taken here and
+			// its recovery happens there. Bounded by `OPAQUE_RECOVERY_ROOT_CAP`,
+			// and every refused or over-cap root leaves one record per session.
+			const scopes = resolveOpaqueRecoveryRoots(opaqueCommand, scanRoot);
+			recordOpaqueRootRefusals(scopes);
+			const turn = {
+				key: runtime.turnKey(deps.sessionId),
+				isLive: (key: number) => runtime.isLiveTurnKey(key),
+			};
+			let resultNote = "";
+			for (const [index, root] of scopes.roots.entries()) {
+				// The session root keeps the strategy it chose before: git when it
+				// is a worktree, the bounded stat snapshot otherwise. An admitted
+				// worktree IS a checkout by admission, so its baseline is the
+				// timestamp and its recovery is `git status` in that root.
+				const baseline = await captureOpaqueBaseline(
+					root,
+					index === 0,
+					started,
 				);
-				let baseline: PendingOpaqueBaseline;
-				let resultNote: string;
-				if (await isGitWorktree(scanRoot)) {
-					// Git-first: the timestamp IS the baseline; git answers what
-					// changed, at any repo size, with no file-universe cap.
-					baseline = { startedAt: started, strategy: "git" };
-					resultNote = "git";
-				} else {
-					const outcome = await captureFileStats(scanRoot, {
-						withHashes: true,
-					});
-					baseline = outcome.snapshot
-						? {
-								startedAt: started,
-								strategy: "stat-diff",
-								stats: outcome.snapshot,
-							}
-						: {
-								startedAt: started,
-								strategy: "stat-diff",
-								statsUnknownReason: outcome.unknownReason ?? "walk-failed",
-							};
-					resultNote =
-						outcome.unknownReason ?? `scanned:${outcome.scannedCount}`;
-				}
+				if (index === 0) resultNote = baseline.note;
 				// Session-stamped slot: a concurrent-secondary session (#473)
 				// replacing it must yield a no-pending-snapshot UNKNOWN for us -
 				// never a diff against another session's baseline. One entry per
-				// call (#4137): parallel bash calls all record before the first
+				// call (#4137): parallel calls all record before the first
 				// result. The turn lets the store retire the entry of a call that
 				// never gets a result (#3613 F2: this session's own turn).
 				getOpaqueBaselineStore().record(
-					baselineSlot,
-					resolveToolCallCorrelationId(event),
-					baseline,
-					{
-						key: runtime.turnKey(deps.sessionId),
-						isLive: (key) => runtime.isLiveTurnKey(key),
-					},
+					opaqueBaselineSlot(root, runtime.sessionGeneration),
+					callId,
+					baseline.state,
+					turn,
 				);
-				logLatency({
-					type: "phase",
-					phase: "opaque_mutation_prescan",
-					filePath: commandInput.command.slice(0, 80),
-					durationMs: Date.now() - started,
-					result: resultNote,
-				});
 			}
+			logLatency({
+				type: "phase",
+				phase: "opaque_mutation_prescan",
+				// A tool with no command text is named by the tool instead.
+				filePath: (opaqueCommand || toolName).slice(0, 80),
+				durationMs: Date.now() - started,
+				result: resultNote,
+				metadata: {
+					root: scanRoot,
+					roots: scopes.roots.join(",").slice(0, 300),
+				},
+			});
 		}
 	}
 	// #2430: the observational net. A call the seam could NOT classify, whose
@@ -816,10 +875,17 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 
 	if (!getFlag("no-lsp")) {
 		try {
-			const configCwd = filePath
-				? path.dirname(filePath)
-				: (ctx.cwd ?? runtime.projectRoot ?? process.cwd());
-			await ensureLSPConfigInitialized(configCwd);
+			// #2657: the session registers a WORKSPACE, and the owning class
+			// decides whether it registers at all. This seam answered with a raw
+			// `path.dirname(filePath)`, so every touched directory became a root
+			// (cycling the FIFO(128) registry out from under the operator's
+			// `lsp.disabledServers` denial) and an adopted project was laundered
+			// into a session root.
+			const sessionRoot = ctx.cwd ?? runtime.projectRoot ?? process.cwd();
+			const configRoot = filePath
+				? resolveSessionConfigRoot(filePath, sessionRoot).register
+				: sessionRoot;
+			if (configRoot) await ensureLSPConfigInitialized(configRoot);
 		} catch (cfgErr) {
 			dbg(`lsp config init failed during tool_call: ${cfgErr}`);
 		}
@@ -999,7 +1065,30 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	const requestedReadOffset = Math.max(1, readInput?.offset ?? 1);
 	const requestedReadLimit = readInput?.limit;
 	let effectiveReadOffset = requestedReadOffset;
-	let effectiveReadLimit = getEffectiveReadLimit(filePath, readInput);
+	// #1649: one bounded pass serves every read-accounting consumer below: the
+	// effective limit, the expansion's line count, the read_pattern total and
+	// the provisional record's line hashes. None of them runs for an external
+	// or vendor file, so it pays nothing.
+	let readScan =
+		readInput && filePath && !isExternalOrVendor
+			? scanFileLines(
+					filePath,
+					[
+						{
+							offset: requestedReadOffset,
+							limit: requestedReadLimit ?? Number.POSITIVE_INFINITY,
+						},
+					],
+					{ count: true },
+				)
+			: undefined;
+	// An unreadable file counts one line, as countFileLines always answered.
+	const readTotalLines = readScan?.totalLines ?? 1;
+	let effectiveReadLimit =
+		readInput && filePath
+			? (requestedReadLimit ??
+				Math.max(1, readTotalLines - requestedReadOffset + 1))
+			: undefined;
 
 	// --- Opportunistic read expansion via tree-sitter ---
 	// For partial reads (small limit, not from line 1), find the enclosing
@@ -1038,16 +1127,12 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		readInput &&
 		requestedReadLimit != null
 	) {
-		const totalLines =
-			effectiveReadLimit != null && requestedReadLimit == null
-				? effectiveReadLimit
-				: countFileLines(filePath);
 		try {
 			const expansion = await tryExpandRead(
 				filePath,
 				requestedReadOffset,
 				requestedReadLimit,
-				totalLines,
+				readTotalLines,
 				readExpansionClient,
 			);
 			if (expansion) {
@@ -1138,6 +1223,15 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		} catch {
 			// Best-effort only.
 		}
+		// The expansion awaited tree-sitter, so the record's evidence is read
+		// again now, over the range it settled on: the capture is taken after
+		// the await, next to the FileTime stamp, as it always was. Only the
+		// hashes are needed, so the pass stops after the range.
+		readScan = scanFileLines(
+			filePath,
+			[{ offset: effectiveReadOffset, limit: effectiveReadLimit ?? 1 }],
+			{ count: false },
+		);
 	}
 
 	// Register the host-resolved path at tool_call. This path is load-bearing for
@@ -1145,8 +1239,9 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// --no-read-guard. The paired tool_result adds the authoritative delivered
 	// range after the host applies EOF and output-cap clipping (#2802 probe 3).
 	if (toolName === "read" && filePath && !isExternalOrVendor) {
-		const totalLines = countFileLines(filePath);
+		const totalLines = readTotalLines;
 		const deliveredLimit = effectiveReadLimit ?? 1;
+		const lineHashes = readScan?.hashes(effectiveReadOffset, deliveredLimit);
 		logToolReadGuardEvent({
 			event: "read_pattern",
 			sessionId: runtime.telemetrySessionId,
@@ -1167,27 +1262,32 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				expandedByTs: enclosingSymbol !== undefined,
 			},
 		});
-		runtime.readGuard.recordRead({
-			filePath,
-			requestedOffset: requestedReadOffset,
-			requestedLimit: requestedReadLimit ?? deliveredLimit,
-			effectiveOffset: effectiveReadOffset,
-			effectiveLimit: deliveredLimit,
-			expandedByLsp: enclosingSymbol !== undefined,
-			...(enclosingSymbol !== undefined && { enclosingSymbol }),
-			turnIndex: runtime.turnIndex,
-			writeIndex: runtime.peekWriteIndex(),
-			timestamp: Date.now(),
-			provisional: true,
-			// The call identity keys this capture for the tool_result that
-			// supersedes it (unique per call, nested or not). No `toolCallId`: the
-			// record showed the agent nothing yet, so no branch move may keep it.
-			// A read that errors leaves only this record, and with an identity it
-			// licensed an edit after /clone (#4185 round 1, F1).
-			...(toolCallId !== undefined && {
-				source: `native-read:${toolCallId}:provisional`,
-			}),
-		});
+		runtime.readGuard.recordRead(
+			{
+				filePath,
+				requestedOffset: requestedReadOffset,
+				requestedLimit: requestedReadLimit ?? deliveredLimit,
+				effectiveOffset: effectiveReadOffset,
+				effectiveLimit: deliveredLimit,
+				expandedByLsp: enclosingSymbol !== undefined,
+				...(enclosingSymbol !== undefined && { enclosingSymbol }),
+				turnIndex: runtime.turnIndex,
+				writeIndex: runtime.peekWriteIndex(),
+				timestamp: Date.now(),
+				provisional: true,
+				...(lineHashes && { lineHashes }),
+				// The call identity keys this capture for the tool_result that
+				// supersedes it (unique per call, nested or not). No `toolCallId`: the
+				// record showed the agent nothing yet, so no branch move may keep it.
+				// A read that errors leaves only this record, and with an identity it
+				// licensed an edit after /clone (#4185 round 1, F1).
+				...(toolCallId !== undefined && {
+					source: `native-read:${toolCallId}:provisional`,
+				}),
+			},
+			// The scan above is the disk capture; recordRead takes none of its own.
+			{ captureLineHashes: false },
+		);
 	}
 
 	// Record complexity baseline for historical tracking (booboo/tdi).
@@ -1240,7 +1340,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		)?.complexityClient;
 		const baseline = await complexityClient?.analyzeFile(filePath);
 		if (baseline) {
-			runtime.complexityBaselines.set(filePath, baseline);
+			runtime.complexityBaselines.add(filePath);
 			const { captureSnapshot } = await import("./metrics-history.js");
 			captureSnapshot(filePath, {
 				maintainabilityIndex: baseline.maintainabilityIndex,
@@ -1827,4 +1927,111 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			}
 		}
 	}
+
+	// #4483: last, so only a call every dm-lens guard allowed pays for it.
+	if (isWriteOrEdit && !isExternalOrVendor) {
+		const started = Date.now();
+		const controller = new AbortController();
+		const signal = deps.ctx.signal
+			? AbortSignal.any([deps.ctx.signal, controller.signal])
+			: controller.signal;
+		const outcome = await bounded(capturePreEditSeed(filePath, deps, signal), {
+			ms: PRE_EDIT_CAPTURE_BUDGET_MS,
+			signal: deps.ctx.signal,
+			hook: "tool_call",
+			label: "pre-edit-linter-capture",
+		});
+		controller.abort();
+		if (!outcome || outcome.outcome === "failed")
+			recordDegradationOnce({
+				kind: "pre-edit-capture-incomplete",
+				subject: "pre-edit",
+				reason: outcome?.outcome ?? "abandoned",
+			});
+		recordPreEditCapture(filePath, outcome, Date.now() - started);
+	}
+}
+
+/**
+ * #4483: how long a `tool_call` waits for the pre-edit linter capture.
+ * `tool_call` has no wall budget of its own (clients/hook-budgets.ts); this
+ * is the per-await bound. Measured in PR #4483's body.
+ */
+export const PRE_EDIT_CAPTURE_BUDGET_MS = 500;
+
+type PreEditCaptureResult =
+	| Awaited<
+			ReturnType<
+				Awaited<
+					ReturnType<typeof loadDispatchIntegration>
+				>["capturePreEditLinterFindings"]
+			>
+	  >
+	| { outcome: "failed"; failure: string };
+
+/**
+ * #4483: before the host first replaces an existing file's bytes this
+ * session, run its linters over those bytes and seed the file's delta, so
+ * the write's dispatch reports their old errors as pre-existing instead of
+ * as blockers (`capturePreEditLinterFindings`). Never rejects.
+ */
+function capturePreEditSeed(
+	filePath: string,
+	deps: ToolCallDeps,
+	signal: AbortSignal,
+): Promise<PreEditCaptureResult> {
+	const session = deps.runtime.captureSessionGeneration();
+	const workspaceRoot = deps.runtime.projectRoot || process.cwd();
+	const pi = { getFlag: (flag: string) => deps.getFlag(flag) };
+	return loadDispatchIntegration()
+		.then(({ capturePreEditLinterFindings }) =>
+			capturePreEditLinterFindings(
+				filePath,
+				workspaceRoot,
+				pi,
+				session,
+				signal,
+			),
+		)
+		.catch((cause: unknown): PreEditCaptureResult => {
+			const failure = cause instanceof Error ? cause.message : String(cause);
+			return { outcome: "failed", failure: failure.slice(0, 200) };
+		});
+}
+
+/**
+ * #4483: one latency row per capture that ran (`undefined` = the bound gave
+ * up first, `abandoned`). A file already dispatched this session, a file
+ * whose abandoned capture is still running, or a session with `--no-delta`
+ * writes none, so a long session pays one row per file, not one per write.
+ */
+function recordPreEditCapture(
+	filePath: string,
+	outcome: PreEditCaptureResult | undefined,
+	durationMs: number,
+): void {
+	if (
+		outcome?.outcome === "skipped" &&
+		(outcome.reason === "already-dispatched" ||
+			outcome.reason === "no-delta" ||
+			outcome.reason === "in-flight")
+	)
+		return;
+	logLatency({
+		type: "phase",
+		phase: "pre_edit_capture",
+		filePath,
+		durationMs,
+		result: outcome?.outcome ?? "abandoned",
+		metadata: {
+			...(outcome?.outcome === "seeded" && {
+				seeded: outcome.seeded,
+				runners: outcome.runners.join(","),
+			}),
+			...((outcome?.outcome === "skipped" ||
+				outcome?.outcome === "discarded") && { reason: outcome.reason }),
+			...(outcome?.outcome === "failed" && { failure: outcome.failure }),
+			budgetMs: PRE_EDIT_CAPTURE_BUDGET_MS,
+		},
+	});
 }

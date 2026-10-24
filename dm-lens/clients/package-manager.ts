@@ -35,8 +35,23 @@ import {
 } from "./generation-guard.js";
 import { isAtOrAboveHomeDir, isUnderDir, walkUpDirs } from "./path-utils.js";
 import { getProjectTrustState } from "./project-trust.js";
+import {
+	NODE_MODULES_BIN_DIRS,
+	isUntrustedProjectPath,
+	projectLocalBinDirs,
+	recordProjectCommandRefusal,
+} from "./session-repository.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
+
+// The project-local bin layouts moved to `session-repository.ts` (#4530),
+// which the spawn seam can import; existing importers keep this seam.
+export {
+	NODE_MODULES_BIN_DIRS,
+	PROJECT_LOCAL_BIN_DIRS,
+	VENDOR_BIN_DIRS,
+	VENV_BIN_DIRS,
+} from "./session-repository.js";
 
 export type NodePackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -298,14 +313,6 @@ export function runScriptArgs(script: string): string[] {
 	return ["run", script];
 }
 
-/** Human-readable "run script" command for display (bare manager name). */
-export function formatRunScript(
-	pm: NodePackageManager,
-	script: string,
-): string {
-	return `${pm} run ${script}`;
-}
-
 export interface InstallOptions {
 	/** Skip lifecycle scripts (`--ignore-scripts`). */
 	ignoreScripts?: boolean;
@@ -351,53 +358,6 @@ export function updateArgs(
 	return args;
 }
 
-/**
- * Args to install a single package **globally** (`-g`). npm/pnpm/bun spell this
- * `install -g` / `add -g`; yarn uses `global add` (yarn classic — Berry removed
- * global installs, but dm-lens's manager resolution prefers npm/pnpm first, so
- * yarn is only chosen when it is the declared/only manager). The resulting
- * binary is found again by `allAvailableGlobalBinDirs`, which covers every
- * manager's global bin dir.
- */
-export function globalInstallArgs(
-	pm: NodePackageManager,
-	pkg: string,
-): string[] {
-	switch (pm) {
-		case "yarn":
-			return ["global", "add", pkg];
-		case "npm":
-			return ["install", "-g", pkg];
-		default: // pnpm, bun
-			return ["add", "-g", pkg];
-	}
-}
-
-/**
- * Command + args to run a package's binary without a global install — the
- * `npx --no <pkg>` equivalent for each manager (`bun x`, `pnpm dlx`, `yarn dlx`).
- */
-export function execArgs(
-	pm: NodePackageManager,
-	pkg: string,
-	args: string[] = [],
-): { command: string; args: string[] } {
-	switch (pm) {
-		case "bun":
-			return { command: pmBinary("bun"), args: ["x", pkg, ...args] };
-		case "pnpm":
-			return { command: pmBinary("pnpm"), args: ["dlx", pkg, ...args] };
-		case "yarn":
-			return { command: pmBinary("yarn"), args: ["dlx", pkg, ...args] };
-		default:
-			// --no prevents silently downloading an uncached package.
-			return {
-				command: onWindows() ? "npx.cmd" : "npx",
-				args: ["--no", pkg, ...args],
-			};
-	}
-}
-
 // ============================================================================
 // GLOBAL BIN DISCOVERY
 // ============================================================================
@@ -412,7 +372,7 @@ export function execArgs(
  * a session reset cannot repopulate the fresh memo. Reset clears the flight
  * map separately, so later callers cannot share the pre-reset probe.
  */
-const globalBinDirCache = new Map<NodePackageManager, string[]>();
+const globalBinDirCache = new Map<string, string[]>();
 const packageManagerCacheGeneration = createGenerationSource(
 	"package-manager-global-bin",
 );
@@ -420,28 +380,36 @@ const globalBinDirProbeFlights = createAvailabilityProbeFlight<string[]>();
 
 /** Directories where a given manager installs global binaries. */
 async function globalBinDirsFor(pm: NodePackageManager): Promise<string[]> {
-	const cached = globalBinDirCache.get(pm);
+	// #4530: keyed by trust scope too. A trusted query reads the project's own
+	// manager configuration and an untrusted one does not, so neither answer
+	// may serve the other after `turn_start` re-adopts a different trust. The
+	// scope is captured with the key, before the await (defect shape 58).
+	const scoped = getProjectTrustState() !== "trusted";
+	const key = `${scoped ? "scoped" : "trusted"}:${pm}`;
+	const cached = globalBinDirCache.get(key);
 	if (cached) return cached;
 	const generation = packageManagerCacheGeneration.capture();
 
 	// Concurrent callers (dispatch runs several tools per edit) must share ONE
 	// probe rather than each spawning their own `npm config get prefix` (#1602).
-	const shared = globalBinDirProbeFlights.run(pm, () =>
-		probeGlobalBinDirs(pm, generation),
+	const shared = globalBinDirProbeFlights.run(key, () =>
+		probeGlobalBinDirs(pm, key, scoped, generation),
 	);
 	return shared.promise;
 }
 
 async function probeGlobalBinDirs(
 	pm: NodePackageManager,
+	key: string,
+	scoped: boolean,
 	generation: GenerationHandle,
 ): Promise<string[]> {
 	if (pm === "bun") {
 		// bun has no per-call query cost — the global bin dir is deterministic.
 		const base = process.env.BUN_INSTALL || path.join(os.homedir(), ".bun");
 		const dirs = [path.join(base, "bin")];
-		generation.guardedWrite(pm, () => {
-			globalBinDirCache.set(pm, dirs);
+		generation.guardedWrite(key, () => {
+			globalBinDirCache.set(key, dirs);
 		});
 		return dirs;
 	}
@@ -452,7 +420,13 @@ async function probeGlobalBinDirs(
 			: pm === "pnpm"
 				? ["bin", "-g"]
 				: ["global", "bin"]; // yarn
-	const res = await safeSpawnAsync(pmBinary(pm), query, { timeout: 5000 });
+	// #4530: the managers read project configuration (`.npmrc`, `.yarnrc`)
+	// from their cwd, so under untrusted pi trust the query runs from HOME and
+	// a project cannot redirect where global binaries are looked up.
+	const res = await safeSpawnAsync(pmBinary(pm), query, {
+		timeout: 5000,
+		...(scoped && { cwd: os.homedir() }),
+	});
 	if (res.status !== 0 || res.error) return [];
 	const out = res.stdout.trim();
 	if (!out) return [];
@@ -461,8 +435,8 @@ async function probeGlobalBinDirs(
 	// on Windows. pnpm/yarn already print the bin dir directly.
 	const dirs =
 		pm === "npm" ? [onWindows() ? out : path.join(out, "bin")] : [out];
-	generation.guardedWrite(pm, () => {
-		globalBinDirCache.set(pm, dirs);
+	generation.guardedWrite(key, () => {
+		globalBinDirCache.set(key, dirs);
 	});
 	return dirs;
 }
@@ -517,7 +491,15 @@ export async function findGlobalBinary(
 		for (const binDir of await allAvailableGlobalBinDirs()) {
 			for (const name of candidates) {
 				const full = path.join(binDir, name);
-				if (fs.existsSync(full)) return full;
+				if (!fs.existsSync(full)) continue;
+				// #4530: a global bin dir can hold a link into the project (an
+				// `npm link`ed tool), and the spawn follows it. The target is
+				// what runs, so the target is what the trust judgment reads.
+				if (isUntrustedProjectPath(full)) {
+					recordProjectCommandRefusal(full);
+					continue;
+				}
+				return full;
 			}
 		}
 	} catch {
@@ -526,40 +508,6 @@ export async function findGlobalBinary(
 	}
 	return undefined;
 }
-
-/**
- * The three project-local bin-directory shapes in this repo, most-preferred
- * first. Exported so every caller passes the SAME constant instead of
- * re-listing the directory names next to its own copy of the walk — the venv
- * list alone had three independent spellings before #2544 review F1
- * (`formatters.ts`, `runner-helpers.ts`'s `createVenvFinder`,
- * `dead-code-client.ts`'s `venvCandidates`).
- *
- * `VENV_BIN_DIRS` lists BOTH the POSIX (`bin`) and Windows (`Scripts`) layouts
- * unconditionally rather than branching on `process.platform` at module load:
- * a module-load platform constant cannot be forced per test, so the other
- * branch is never exercised on the ubuntu lane (defect shape 30). The extra
- * two `existsSync` calls per directory are the price of a testable list, and
- * a `.venv/Scripts` on Linux (or `.venv/bin` under msys) resolves correctly
- * instead of being invisible.
- */
-export const NODE_MODULES_BIN_DIRS: readonly string[] = [
-	path.join("node_modules", ".bin"),
-];
-export const VENDOR_BIN_DIRS: readonly string[] = [path.join("vendor", "bin")];
-export const VENV_BIN_DIRS: readonly string[] = [
-	path.join(".venv", "bin"),
-	path.join("venv", "bin"),
-	path.join(".venv", "Scripts"),
-	path.join("venv", "Scripts"),
-];
-
-/** Every project-local bin layout supported by the canonical resolver above. */
-export const PROJECT_LOCAL_BIN_DIRS: readonly string[] = [
-	...NODE_MODULES_BIN_DIRS,
-	...VENDOR_BIN_DIRS,
-	...VENV_BIN_DIRS,
-];
 
 /** A local candidate was present, but pi's trust policy refused its use. */
 export interface LocalBinTrustRefusal {
@@ -614,16 +562,29 @@ export function isProjectLocalBinPath(
 	resolvedCommand: string,
 	cwd: string,
 ): boolean {
-	for (const ancestor of walkUpDirs(cwd)) {
-		if (isAtOrAboveHomeDir(ancestor, os.homedir())) break;
-		if (
-			PROJECT_LOCAL_BIN_DIRS.some((binDir) =>
-				isUnderDir(resolvedCommand, path.join(ancestor, binDir)),
-			)
-		)
-			return true;
+	for (const binDir of projectLocalBinDirs(cwd)) {
+		if (isUnderDir(resolvedCommand, binDir)) return true;
 	}
 	return false;
+}
+
+/**
+ * #4515: whether a bare command spawned with this process's PATH can resolve
+ * into the project at `cwd`. An entry counts when it is a project-local bin dir
+ * (the classifier above), lies at or under `cwd`, or is relative: a relative
+ * entry follows each spawn's cwd, and on POSIX an empty entry is the cwd.
+ */
+export function commandSearchReachesProject(cwd: string): boolean {
+	const posix = process.platform !== "win32";
+	return (process.env.PATH ?? "")
+		.split(path.delimiter)
+		.some((entry) =>
+			entry === ""
+				? posix
+				: !path.isAbsolute(entry) ||
+					isUnderDir(entry, cwd) ||
+					isProjectLocalBinPath(entry, cwd),
+		);
 }
 
 /** Tuning for {@link findLocalBinUpwards}. */

@@ -12,7 +12,7 @@ import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { stripAnsi } from "../../sanitize.js";
 import { skipUnlessToolRan } from "./utils/tool-failure.js";
-import { parseGoVetOutput } from "./utils/diagnostic-parsers.js";
+import { GO_VET_LINE, parseGoVetOutput } from "./utils/diagnostic-parsers.js";
 import type {
 	DispatchContext,
 	RunnerDefinition,
@@ -104,7 +104,7 @@ const goVetRunner: RunnerDefinition = {
 		const relevant = raw
 			.split("\n")
 			.filter((line) => {
-				const m = line.match(/^(.+?):(\d+):(\d+):\s*(.+)/);
+				const m = line.match(GO_VET_LINE);
 				return m != null && pathsEqual(resolve(cwd, m[1].trim()), absTarget);
 			})
 			.join("\n");

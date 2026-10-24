@@ -17,6 +17,7 @@
 import * as path from "node:path";
 import { minimatch } from "./deps/minimatch.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
+import { applyPushedFindingPolicyByFile } from "./dispatch/finding-policy.js";
 import {
 	type DispatchLatencyReport,
 	getLatencyReports,
@@ -56,6 +57,7 @@ export {
 	createWarmIpcRequestQueue,
 	ipcPathForCwd,
 	readTurnEndStatus,
+	unlinkStaleUnixSocket,
 	WARM_TURN_END_SCHEMA_VERSION,
 	type WarmAnalyzeRequest,
 	type WarmTurnEndRequest,
@@ -122,18 +124,29 @@ export function recentLatency(
  * artifact NAME-heuristic filter — the actionable opt-out
  * `generatedSkipNotice` below points a user at. Default `false` (existing
  * filtering behavior unchanged).
+ *
+ * #1634: the returned rows have passed the finding policy (stored
+ * dispositions, `.dm-lens.json` rule policy, inline `dm-lens-ignore`) every
+ * other agent-facing surface applies, and `dispositionSuppressed` counts what
+ * it dropped. The persisted snapshot stays raw: each reader filters it.
  */
-export function projectScan(
+export async function projectScan(
 	cwd: string,
 	maxFiles?: number,
 	includeGenerated?: boolean,
-): Promise<ProjectDiagnosticsSnapshot> {
-	return scanProjectDiagnostics({
+): Promise<ProjectDiagnosticsSnapshot & { dispositionSuppressed: number }> {
+	const scan = await scanProjectDiagnostics({
 		cwd,
 		tier: "cheap",
 		maxFiles,
 		includeGenerated,
 	});
+	const policy = applyPushedFindingPolicyByFile(scan.diagnostics, cwd);
+	return {
+		...scan,
+		diagnostics: policy.kept,
+		dispositionSuppressed: policy.suppressed,
+	};
 }
 
 /**

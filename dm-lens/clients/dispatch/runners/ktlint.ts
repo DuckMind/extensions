@@ -31,11 +31,16 @@ const ktlint = createAvailabilityChecker("ktlint", ".exe");
 // stays a rejected invocation.
 const KTLINT_EXIT_CODES = { ran: [1, 2, 3] } as const;
 
+// Field names are the JSON reporter's own, read from ktlint 1.8.0's real output
+// (tests/fixtures/runner-output/ktlint/real.captured.json): `column`, `message`
+// and `rule`. The names this runner read before (`col`, `detail`, `ruleId`) were
+// never in that output, so every finding parsed as `[undefined] undefined`
+// (#4522).
 interface KtlintError {
 	line: number;
-	col: number;
-	detail: string;
-	ruleId: string;
+	column: number;
+	message: string;
+	rule: string;
 }
 
 interface KtlintResult {
@@ -57,13 +62,42 @@ function normalizeKtlintResults(parsed: unknown): KtlintResult[] | null {
 	return null;
 }
 
+function parseResults(text: string): KtlintResult[] | null {
+	try {
+		return normalizeKtlintResults(JSON.parse(text));
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * ktlint 1.8.0 prints its own log lines (`HH:MM:SS.mmm [main] WARN ...`) on
+ * stdout, ahead of the reporter's JSON document
+ * (tests/fixtures/runner-output/ktlint/real.captured.json), so the whole stream
+ * is not JSON. The document starts at the first line that opens one (a log line
+ * never starts with `[` or `{`) and ends at the last line that closes one and
+ * still parses (#4522: the dirty cell of the tool-state matrix read the real
+ * bytes as a parse error).
+ */
+function parseReporterDocument(raw: string): KtlintResult[] | null {
+	const lines = raw.split(/\r?\n/);
+	const start = lines.findIndex((line) => /^\s*[[{]/.test(line));
+	if (start < 0) return parseResults(raw);
+	for (let end = lines.length - 1; end >= start; end--) {
+		if (!/[\]}]\s*$/.test(lines[end] ?? "")) continue;
+		const results = parseResults(lines.slice(start, end + 1).join("\n"));
+		if (results) return results;
+	}
+	return null;
+}
+
 function parseKtlintOutput(
 	raw: string,
 	filePath: string,
 	cwd: string,
 ): Diagnostic[] | null {
 	try {
-		const parsed = normalizeKtlintResults(JSON.parse(raw));
+		const parsed = parseReporterDocument(raw);
 		if (!parsed) return null;
 
 		const autofix = getAutofixCapability("ktlint");
@@ -76,15 +110,15 @@ function parseKtlintOutput(
 				continue;
 			for (const err of result.errors ?? []) {
 				diagnostics.push({
-					id: `ktlint-${err.ruleId}-${err.line}-${err.col}`,
-					message: `[${err.ruleId}] ${err.detail}`,
+					id: `ktlint-${err.rule}-${err.line}-${err.column}`,
+					message: `[${err.rule}] ${err.message}`,
 					filePath,
 					line: err.line,
-					column: err.col,
+					column: err.column,
 					severity: "warning",
 					semantic: "warning",
 					tool: "ktlint",
-					rule: err.ruleId,
+					rule: err.rule,
 					fixable: true,
 					autoFixAvailable: autofix?.safePipelineAutofix ?? false,
 					fixKind: autofix?.fixKind === "none" ? undefined : autofix?.fixKind,

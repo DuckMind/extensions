@@ -28,6 +28,12 @@ export interface CascadeLogEntry {
 		| "cascade_indeterminate" // #1023: impact could not be computed — honest advisory surfaced
 		| "cascade_tier3_skip" // #458: in-lane wait skipped for a tier-3 neighbor touch
 		| "cascade_tier3_reconcile" // #458: quiet-window reconcile of outstanding tier-3 touches
+		| "cascade_tier3_peek" // #4485: turn_end's one read of the unanswered touches after its settle
+		| "cascade_tier3_expired" // #4485: touches that reached the age bound, read once before they go
+		| "cascade_tier3_dropped" // #4485: unanswered touches a session reset discarded
+		| "cascade_unconfirmed_rendered" // #4485: the turn's pending line for unanswered neighbours rendered
+		| "cascade_pending_rendered" // #4487: the turn's line for pending neighbour errors no cascade re-checked
+		| "cascade_pending_gated" // #4495 round 3: pending entries whose file changed outside DM (named once) or was deleted (forgotten)
 		| "cascade_carry_over_drop" // #1443: late/carried run dropped — superseded by a later write, or the one-turn carry bound lapsed
 		| "cascade_carry_rendered" // #3168 F6: a carried run/coverage advisory actually rendered with its carry label this turn
 		| "cascade_injected" // #1446 item 1: what cascade text actually reached blockerParts this turn

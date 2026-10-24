@@ -162,6 +162,9 @@ const taploRunner: RunnerDefinition = {
 				// (defect shape 10). F2 adds the claim's provenance beside it.
 				skipReason: "covered-by-primary",
 				claimSource: cover.claimSource,
+				// #4484 round 8: the skip is a verdict only when that server's
+				// lane answers; the dispatcher voids it otherwise.
+				coveredBy: { runnerId: "lsp", serverId: cover.serverId },
 			};
 		}
 

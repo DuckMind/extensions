@@ -49,6 +49,8 @@ import {
 import { getDispatchCascadeCacheStats } from "./dispatch/integration.js";
 import { getLspDocumentTextRetentionSnapshot } from "./lsp/client.js";
 import type { PersistWorkerHeapStatistics } from "./persist-worker-stats.js";
+import { getLspIdleEvictMs } from "./lsp/client-registry.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
 
 /** Every N turns, emit one `memory_sample` latency.log line (#1123 item 2). */
 export const MEMORY_SAMPLE_TURN_INTERVAL = 10;
@@ -98,11 +100,61 @@ export const HEAP_GROWTH_TIGHTEN_RATIO = 1.2;
 
 let _lastSampledHeapUsedBytes = 0;
 let _tightenThroughTurn = 0;
+/**
+ * #1332 (#4761 review F1): the most recent cap on sessions holding a pending
+ * turn end, the same bound `cache-observability.ts` puts on its per-session
+ * maps. A process that cycles through subagents leaves one entry per session
+ * whose last turn ended; the oldest goes first.
+ */
+const MAX_PENDING_TURN_END_SESSIONS = 32;
+
+/**
+ * #1332: epoch ms of each session's turn end not yet matched by that session's
+ * turn start, keyed by the stable session id (`undefined` for a host without
+ * one). One process-global slot let a coexisting session consume another's
+ * marker (AGENTS.md shape 72), so each session owns its own entry.
+ */
+const _pendingTurnEnds = new BoundedFifoMap<string | undefined, number>(
+	MAX_PENDING_TURN_END_SESSIONS,
+);
 
 /** Clear the rising-edge cadence state. Called on primary session_start. */
 export function resetMemorySamplerCadence(): void {
 	_lastSampledHeapUsedBytes = 0;
 	_tightenThroughTurn = 0;
+	_pendingTurnEnds.clear();
+}
+
+/**
+ * #1332: record that `sessionId`'s turn ended at `now` (epoch ms). Called at
+ * turn_end. Re-inserting keeps the FIFO order by latest turn end.
+ */
+export function recordMemoryTurnEnd(
+	sessionId: string | undefined,
+	now: number,
+): void {
+	_pendingTurnEnds.delete(sessionId);
+	_pendingTurnEnds.set(sessionId, now);
+}
+
+/**
+ * #1332 (post-idle heap reading): called once per turn start. Returns the idle
+ * gap in ms when the turn start is `sessionId`'s first after its own turn end
+ * and that gap is strictly greater than `windowMs` (the TS idle-evict window),
+ * otherwise null. Consumes only that session's pending turn end, so at most one
+ * idle sample is taken per idle period, however many turns start after it, and
+ * another session's turn never reads it.
+ */
+export function takeMemoryIdleGapMs(
+	sessionId: string | undefined,
+	now: number,
+	windowMs: number = getLspIdleEvictMs(),
+): number | null {
+	const endedAt = _pendingTurnEnds.get(sessionId);
+	_pendingTurnEnds.delete(sessionId);
+	if (endedAt === undefined) return null;
+	const gap = now - endedAt;
+	return gap > windowMs ? gap : null;
 }
 
 /** PURE: >20% heap growth between two sampled readings warrants tightening. */
@@ -245,11 +297,13 @@ export interface MemorySampleSubsystems {
 		projectSnapshot: PersistWorkerHeapStatistics | null;
 	};
 	dispatchCaches: {
-		recentlyCleanNeighborCacheSize: number;
+		/** #4487: entries in the pending cascade neighbour-error record
+		 *  (clients/cascade-format.ts), capped at 256. */
+		pendingNeighborCount: number;
 		/** Dispatch `FactStore`'s `sessionFacts` entry count — fixed vocabulary
 		 *  plus the bounded per-file map (#2282). */
 		sessionFactEntries: number;
-		/** Measured retained size of one `{ turnSeq, checkedAt }` cache entry. */
+		/** Measured retained bytes of both, see `estimateDispatchCacheBytes`. */
 		estimatedBytes: number;
 	};
 }
@@ -288,18 +342,22 @@ export interface MemorySample {
  * process-global singletons) but every individual read is a `.size`/`.length`
  * access — see the module docstring's hard constraint.
  */
-/** Byte attribution for `dispatchCaches`, from measured per-entry costs: three
- *  isolated-store runs put a recently-clean neighbor entry at 320 bytes, and
- *  #2282 measured a 500-file batch's 1,000 session-fact entries at 439,560
- *  bytes (~440 each). O(1) — the cache key and Map bookkeeping are included. */
+/** Byte attribution for `dispatchCaches`, from measured per-entry costs: seven
+ *  isolated-store runs of 256 entries put a pending neighbour entry holding
+ *  two errors at 613-679 bytes (#4487, `PENDING_NEIGHBOR_BYTES`), and #2282
+ *  measured a 500-file batch's 1,000 session-fact entries at 439,560 bytes
+ *  (~440 each). O(1) — the key and Map bookkeeping are included. */
 export function estimateDispatchCacheBytes(stats: {
-	recentlyCleanNeighborCacheSize: number;
+	pendingNeighborCount: number;
 	sessionFactEntries: number;
 }): number {
 	return (
-		stats.recentlyCleanNeighborCacheSize * 320 + stats.sessionFactEntries * 440
+		stats.pendingNeighborCount * PENDING_NEIGHBOR_BYTES +
+		stats.sessionFactEntries * 440
 	);
 }
+
+const PENDING_NEIGHBOR_BYTES = 615;
 
 export function collectMemorySampleSubsystems(
 	wordIndex: WordIndex | null,

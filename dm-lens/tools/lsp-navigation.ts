@@ -15,25 +15,46 @@ import {
 	type LspMutationContext,
 } from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
-import { uriToPath } from "../clients/path-utils.js";
+import { resolveHostToolPath, uriToPath } from "../clients/path-utils.js";
 import { escapeRegExp } from "../clients/string-utils.js";
 import { isRecordableProjectPath } from "../clients/file-utils.js";
 import { compactRenderResult } from "./render-compact.js";
 import {
 	applyWorkspaceEdit,
-	refuseStaleWorkspaceEdit,
+	captureRenameExpectedContent,
 	summarizeWorkspaceEdit,
-	workspaceEditTextPaths,
 } from "../clients/lsp/edits.js";
-import { hashDiagnosticContent } from "../clients/lsp/diagnostic-binding.js";
+import { configDisabledAuxiliaryLspServerIds } from "../clients/dispatch/auxiliary-lsp.js";
+import { readFileContent } from "../clients/dispatch/runners/utils.js";
+import {
+	PRIMARY_UNAVAILABLE_CAUSE,
+	primaryUnavailableCause,
+} from "../clients/lsp/diagnostic-binding.js";
 import {
 	getLSPService,
 	type LSPWorkspaceScopeAttribution,
 } from "../clients/lsp/capabilities.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
 import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
+import {
+	applyProbeFindingPolicy,
+	describePrimaryUnavailable,
+	mergeWithheld,
+	withheldCompileNote,
+	type PythonCompileWithheld,
+} from "./lsp-diagnostics.js";
+import {
+	dispositionSuppressedLine,
+	formatCacheAgeLabel,
+} from "../clients/finding-delivery-gate.js";
+import { disabledPrimaries } from "../clients/lsp/session-roots.js";
 import { SYMBOL_KIND_NAMES } from "../clients/lsp-document-symbols.js";
-
+import {
+	detectPythonTargetVersion,
+	isJediCompileVerdict,
+	PYTHON_DECLARATION_CONCURRENCY,
+} from "../clients/python-environment.js";
+import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
 const VALID_OPERATIONS = [
 	"definition",
 	"typeDefinition",
@@ -78,6 +99,54 @@ function isValidOperation(value: string): value is LspNavigationOperation {
 	return (VALID_OPERATIONS as readonly string[]).includes(value);
 }
 
+/** Why `value` is not an LSP `Range`, as a field-path suffix, or undefined. */
+function rangeProblem(value: unknown): string | undefined {
+	if (!value || typeof value !== "object") return " must be a range object";
+	for (const end of ["start", "end"] as const) {
+		const position = (value as Record<string, unknown>)[end];
+		if (!position || typeof position !== "object")
+			return `.${end} must be a position object`;
+		for (const axis of ["line", "character"] as const) {
+			if (typeof (position as Record<string, unknown>)[axis] !== "number")
+				return `.${end}.${axis} must be a number`;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * #4687: the schema carries `callHierarchyItem` as an opaque object, so the
+ * shape the LSP `CallHierarchyItem` requires is checked here, before any server
+ * call, on pi and on MCP alike (MCP never validates a schema). Fails closed: a
+ * missing or malformed field is named; extra fields (`detail`, `tags`, `data`)
+ * pass through unchanged, since a server may need `data` back.
+ */
+function checkCallHierarchyItem(
+	value: unknown,
+): { item: LSPCallHierarchyItem } | { problem: string } {
+	if (value === undefined || value === null)
+		return { problem: "callHierarchyItem parameter required" };
+	if (typeof value !== "object" || Array.isArray(value))
+		return {
+			problem:
+				"callHierarchyItem must be the object prepareCallHierarchy returned",
+		};
+	const item = value as Record<string, unknown>;
+	for (const [field, type] of [
+		["name", "string"],
+		["kind", "number"],
+		["uri", "string"],
+	] as const) {
+		if (typeof item[field] !== type)
+			return { problem: `callHierarchyItem.${field} must be a ${type}` };
+	}
+	for (const field of ["range", "selectionRange"] as const) {
+		const problem = rangeProblem(item[field]);
+		if (problem) return { problem: `callHierarchyItem.${field}${problem}` };
+	}
+	return { item: value as LSPCallHierarchyItem };
+}
+
 function operationSupportStatus(
 	operation: LspNavigationOperation,
 	support: import("../clients/lsp/client.js").LSPOperationSupport | null,
@@ -102,6 +171,26 @@ function operationSupportStatus(
 	)
 		return support.callHierarchy;
 	return null;
+}
+
+/**
+ * #4403: why no language server answered a file operation on a file the
+ * service has no client for, from the operator's `lsp.disabledServers`. A
+ * primary turned off is not a missing install, and a disabled owner whose
+ * fallback did not answer is still the denial (round 4, N1).
+ */
+function noServerAnsweredText(filePath: string): string {
+	const { disabledServerIds, fallbackServerIds } = disabledPrimaries(filePath);
+	const cause = primaryUnavailableCause(
+		[...fallbackServerIds, ...disabledServerIds],
+		disabledServerIds,
+		fallbackServerIds,
+	);
+	const who =
+		disabledServerIds.length > 0
+			? `Primary LSP (${disabledServerIds.join(", ")}) did not answer`
+			: "no language server answered";
+	return `No LSP server available for ${path.basename(filePath)}: ${who} (${PRIMARY_UNAVAILABLE_CAUSE[cause]}).`;
 }
 
 function emptyReasonForOperation(operation: LspNavigationOperation): string {
@@ -697,6 +786,8 @@ async function openFileBestEffort(
 	lspService: ReturnType<typeof getLSPService>,
 	filePath: string,
 	waitForDiagnostics = false,
+	// #4323: auxiliaries the operator's configuration turns off; never acquired.
+	excludeServerIds?: ReadonlySet<string>,
 ): Promise<string | undefined> {
 	let fileContent: string | undefined;
 	try {
@@ -717,143 +808,12 @@ async function openFileBestEffort(
 			diagnostics: waitForDiagnostics ? "document" : "none",
 			source: "lsp_navigation",
 			clientScope: waitForDiagnostics ? "all" : "primary",
+			...(excludeServerIds !== undefined && { excludeServerIds }),
 		});
 	} catch {
 		/* LSP server may not be ready yet — proceed anyway */
 	}
 	return fileContent;
-}
-
-/**
- * #3601: how far before the rename request a file's mtime may sit and still
- * count as "written after the request". Filesystem timestamps are coarse: FAT
- * stores 2 s, HFS+ 1 s, ext4/APFS/NTFS well under 1 ms, and Linux stamps a
- * write with a tick-coarse clock that can trail `Date.now()` by several ms. A
- * write made just after the request can therefore carry an mtime a little
- * before it, so 2 s (the coarsest common granularity) is the margin. The cost
- * is a false refusal for an unopened file written within 2 s before the
- * request; the failure it prevents is an overwrite.
- */
-const RENAME_MTIME_MARGIN_MS = 2000;
-
-/**
- * #3601: the content every file this rename's edit writes text to must still
- * hold, keyed the way `applyWorkspaceEdit` keys expected content (the file's
- * realpath). The rename's own target uses the content the pre-rename
- * `openFileBestEffort` read and sent to the server. Any other file:
- * - a file the language client has open: the server computed from the last
- *   send made before the request (`requestedAtMs`, taken just before it, on the
- *   same connection). The disk must hash to the client's last send, and that
- *   send's bytes must not have changed at or after `requestedAtMs`: a
- *   hook-synced write after the request makes the disk equal the last send
- *   while the server answered from the one before it.
- * - a file it has not opened: best effort only. The file is refused when its
- *   mtime is at or after `requestedAtMs` minus the margin. This cannot prove
- *   the server read the current bytes: the server answers from a copy it read
- *   earlier, and dm-lens does not tell it about a write it did not make, so an
- *   external write older than the margin that the server's own file watching
- *   missed, or a write that keeps the old mtime, is applied at the server's
- *   offsets (#3747).
- * - a file the client first opened at or after `requestedAtMs` (#3827): the
- *   server answered from its own copy, and that first `didOpen` stamps the
- *   file as changed although no byte did. It takes the unopened rule only when
- *   its mtime is older than the client's start by the margin: then the server
- *   could only have read the bytes it holds now, and the first open adds none.
- *   Only that first send's stamp is skipped: the disk must still hash to the
- *   last send, and the record must still hold the first send's bytes, or the
- *   file is refused (a write that keeps the old mtime after the first open).
- *   A file written after the client started (a pi write whose sync lands as
- *   that first open, say) keeps the send check and its stamp, which refuses it:
- *   the server may hold the load-time copy, not these bytes. A client that
- *   reports no start makes no such claim.
- * The read that passed either check is the content the apply is then held to.
- * A file the edit creates, or one that cannot be read, is left out of the map,
- * matching every other `expectedContent` caller.
- */
-function captureRenameExpectedContent(
-	lspService: ReturnType<typeof getLSPService>,
-	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
-	cwd: string,
-	targetFilePath: string,
-	targetContent: string | undefined,
-	requestedAtMs: number,
-): Map<string, string> {
-	const expected = new Map<string, string>();
-	let targetRealPath: string | undefined;
-	if (targetContent !== undefined) {
-		try {
-			targetRealPath = nodeFs.realpathSync.native(targetFilePath);
-		} catch {
-			targetRealPath = undefined;
-		}
-	}
-	for (const diskPath of workspaceEditTextPaths(edit)) {
-		let realPath: string;
-		let content: string;
-		let mtimeMs: number;
-		try {
-			realPath = nodeFs.realpathSync.native(diskPath);
-			content = nodeFs.readFileSync(realPath, "utf-8");
-			// Stat AFTER the read: a write before the read is then visible in the
-			// mtime, and one after it is caught by the apply-time comparison.
-			mtimeMs = nodeFs.statSync(realPath).mtimeMs;
-		} catch {
-			continue;
-		}
-		if (targetContent !== undefined && realPath === targetRealPath) {
-			expected.set(realPath, targetContent);
-			continue;
-		}
-		const tracked = lspService.getTrackedContent(diskPath, cwd);
-		// #3827: a file this client first opened at or after the request, and
-		// that nobody wrote since the client started, was unopened when the
-		// server answered and held the bytes the disk holds: the first open adds
-		// none, so its stamp is skipped. The disk must still hold the first
-		// open's bytes, then the unopened rule below applies.
-		const firstOpenedAfterRequest =
-			tracked !== undefined && (tracked.openedAtMs ?? 0) >= requestedAtMs;
-		const quietSinceClientStart =
-			tracked?.clientStartedAtMs !== undefined &&
-			mtimeMs < tracked.clientStartedAtMs - RENAME_MTIME_MARGIN_MS;
-		const sent =
-			firstOpenedAfterRequest && quietSinceClientStart ? undefined : tracked;
-		if (sent !== undefined) {
-			if (
-				sent.hash !== hashDiagnosticContent(content) ||
-				(sent.changedAtMs ?? requestedAtMs) >= requestedAtMs
-			) {
-				refuseStaleWorkspaceEdit(
-					diskPath,
-					"it changed after the language server computed the rename from it",
-				);
-			}
-		} else if (
-			tracked !== undefined &&
-			(tracked.hash !== hashDiagnosticContent(content) ||
-				tracked.openedHash !== tracked.hash)
-		) {
-			// #3827 verify r2 F4: the exemption skips only the first open's own
-			// stamp. A disk that no longer holds the last send, or a record whose
-			// bytes changed after its first send, was written after that open
-			// although the mtime says otherwise (#3747's mtime-kept write).
-			refuseStaleWorkspaceEdit(
-				diskPath,
-				"it changed after the language client first opened it, after the rename was requested",
-			);
-		} else if (mtimeMs >= requestedAtMs) {
-			refuseStaleWorkspaceEdit(
-				diskPath,
-				"it was written after the rename was requested and the language server has no open copy, so it may not have read these bytes",
-			);
-		} else if (mtimeMs >= requestedAtMs - RENAME_MTIME_MARGIN_MS) {
-			refuseStaleWorkspaceEdit(
-				diskPath,
-				`it was modified within ${RENAME_MTIME_MARGIN_MS / 1000} s of the rename request; retry`,
-			);
-		}
-		expected.set(realPath, content);
-	}
-	return expected;
 }
 
 export function createLspNavigationTool(
@@ -897,8 +857,8 @@ export function createLspNavigationTool(
 		}),
 		parameters: Type.Object({
 			operation: Type.String({
-				description:
-					"LSP operation to perform. Valid values: definition, typeDefinition, declaration, references, hover, signatureHelp, documentSymbol, findSymbol, workspaceSymbol, codeAction, rename, rename_file, implementation, prepareCallHierarchy, incomingCalls, outgoingCalls, executeCommand, workspaceDiagnostics, capabilities.",
+				enum: [...VALID_OPERATIONS],
+				description: "LSP operation.",
 			}),
 			path: Type.Optional(
 				Type.String({
@@ -980,34 +940,15 @@ export function createLspNavigationTool(
 					description: "Maximum symbol matches.",
 				}),
 			),
+			// #4687: opaque on the wire (the nested schema was 817 bytes per
+			// request); `checkCallHierarchyItem` checks the shape at execute.
 			callHierarchyItem: Type.Optional(
 				Type.Object(
-					{
-						name: Type.String(),
-						kind: Type.Number(),
-						uri: Type.String(),
-						range: Type.Object({
-							start: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-							end: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-						}),
-						selectionRange: Type.Object({
-							start: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-							end: Type.Object({
-								line: Type.Number(),
-								character: Type.Number(),
-							}),
-						}),
-					},
 					{},
+					{
+						description:
+							"An item prepareCallHierarchy returned, passed back unchanged.",
+					},
 				),
 			),
 		}),
@@ -1026,6 +967,9 @@ export function createLspNavigationTool(
 			const session = mutationDeps?.runtime?.captureSessionGeneration?.();
 			const startedAt = Date.now();
 			let supported: boolean | null = null;
+			// #4403 round 5 (V5): `getOperationSupport` found no client for the
+			// file, after trying to start one.
+			let noFileClient = false;
 			let diagnosticsMode: "pull" | "push-only" | "unknown" = "unknown";
 			let columnResolution: SymbolColumnResolution | undefined;
 			// #3601: the content the rename's pre-flight `openFileBestEffort` read,
@@ -1277,10 +1221,13 @@ export function createLspNavigationTool(
 				);
 			}
 
+			// #4577 M2: `path` is a host-supplied tool path, so it resolves
+			// through the shared host resolver (`~`/`~/` expansion, `file://`,
+			// `@` prefix, unicode spaces). The bare join pinned `~/x` under the
+			// cwd — a path that cannot exist — and the LSP then answered for a
+			// document nothing had opened (#4576).
 			const filePath = rawPath
-				? path.isAbsolute(rawPath)
-					? rawPath
-					: path.resolve(ctx.cwd || ".", rawPath)
+				? resolveHostToolPath(rawPath, ctx.cwd || ".")
 				: "";
 
 			let filePathIsDirectory = false;
@@ -1323,6 +1270,7 @@ export function createLspNavigationTool(
 			}
 
 			if (operation === "workspaceDiagnostics") {
+				const policyCwd = ctx.cwd || process.cwd();
 				const wsDiagSupport = rawPath
 					? await lspService.getWorkspaceDiagnosticsSupport(filePath)
 					: await lspService.getWorkspaceDiagnosticsSupport(
@@ -1332,7 +1280,12 @@ export function createLspNavigationTool(
 				diagnosticsMode = wsDiagSupport?.mode ?? "unknown";
 
 				if (rawPath && !filePathIsDirectory) {
-					const hasLSP = lspService.supportsLSP(filePath);
+					// #4403: a file whose primary the operator disabled has a
+					// language server; it is turned off, which the read below
+					// reports as the cause instead of "not installed".
+					const hasLSP =
+						lspService.supportsLSP(filePath) ||
+						disabledPrimaries(filePath).disabledServerIds.length > 0;
 					if (!hasLSP) {
 						return finalize(
 							{
@@ -1353,8 +1306,50 @@ export function createLspNavigationTool(
 						);
 					}
 
-					await openFileBestEffort(lspService, filePath, true);
-					const diagnostics = await lspService.getDiagnostics(filePath);
+					// #4323: an explicit diagnostics read leaves an auxiliary the
+					// operator turned off unstarted, as `lsp_diagnostics` does.
+					const excludeServerIds = configDisabledAuxiliaryLspServerIds((name) =>
+						getFlag(name, ctx.cwd),
+					);
+					// #1634: the content the diagnostics below answer for is the
+					// content the policy's inline and strict-anchor checks read.
+					const openedContent = await openFileBestEffort(
+						lspService,
+						filePath,
+						true,
+						excludeServerIds,
+					);
+					// #1634: the same finding policy (stored dispositions, `.dm-lens.json`
+					// rule policy, inline `dm-lens-ignore`) the `lens_diagnostics
+					// source=lsp` probe applies to the same server answer.
+					// #4638: the project's declared Python syntax level, so jedi's own
+					// `compile` verdict cannot outrank it on this route either.
+					const pythonCompileTarget = await detectPythonTargetVersion(filePath);
+					const policy = applyProbeFindingPolicy(
+						filePath,
+						await lspService.getDiagnostics(
+							filePath,
+							undefined,
+							excludeServerIds,
+						),
+						policyCwd,
+						openedContent,
+						"all",
+						"lsp_navigation",
+						pythonCompileTarget,
+					);
+					const diagnostics = policy.kept;
+					const suppressedLine = dispositionSuppressedLine(policy.suppressed);
+					// #4638 r3 (N2): a row the declaration withheld is named on this route
+					// too, so an empty answer cannot read as "no findings published".
+					const withheldLine = withheldCompileNote(policy.withheld);
+					// #4403: #4322's rule on this route. When no language server
+					// answered, the read's health record names it, and an empty
+					// answer is not 0 diagnostics.
+					const primaryUnavailable = describePrimaryUnavailable(
+						undefined,
+						lspService.getDiagnosticsHealth(filePath),
+					)?.text;
 					const result = [
 						{
 							filePath,
@@ -1376,7 +1371,7 @@ export function createLspNavigationTool(
 							content: [
 								{
 									type: "text" as const,
-									text: `${note}\n${JSON.stringify(result)}`,
+									text: `${note}\n${JSON.stringify(result)}${primaryUnavailable ? `\nNote: ${primaryUnavailable}` : ""}${suppressedLine ? `\nNote: ${suppressedLine}` : ""}${withheldLine ? `\nNote: ${withheldLine}` : ""}`,
 								},
 							],
 							details: {
@@ -1384,6 +1379,16 @@ export function createLspNavigationTool(
 								resultCount,
 								diagnosticsMode,
 								coverage: "requested-file",
+								...(policy.suppressed > 0 && {
+									dispositionSuppressed: policy.suppressed,
+								}),
+								...(policy.withheld && {
+									withheldCompile: policy.withheld,
+								}),
+								...(primaryUnavailable !== undefined && {
+									unconfirmed: true,
+									primaryUnavailable,
+								}),
 							},
 						},
 						{
@@ -1395,14 +1400,72 @@ export function createLspNavigationTool(
 					);
 				}
 
-				const allDiagnostics = await lspService.getAllDiagnostics();
-				const result = Array.from(allDiagnostics.entries()).map(
-					([trackedFile, { diags }]) => ({
-						filePath: trackedFile,
-						diagnostics: diags,
-						count: diags.length,
+				// #4323: the snapshot starts no server, but an auxiliary the
+				// operator turned off may still be running; leave its rows out.
+				const allDiagnostics = await lspService.getAllDiagnostics(
+					configDisabledAuxiliaryLspServerIds((name) => getFlag(name, ctx.cwd)),
+				);
+				// #1634: a tracked snapshot replays what each client last published,
+				// so every row passes the same finding policy as the path read and
+				// carries its age: nothing here re-checks the file.
+				// #4638 review (F10): only a file carrying a python-jedi `compile` row
+				// can be outranked, so only those pay for the declaration walk, and the
+				// reads go through the shared bounded pool instead of one unbounded
+				// Promise.all over the whole snapshot.
+				const compileVerdictFiles: string[] = [];
+				for (const [trackedFile, entry] of allDiagnostics) {
+					if (entry.diags.some(isJediCompileVerdict)) {
+						compileVerdictFiles.push(trackedFile);
+					}
+				}
+				const compileVerdictTargets = await mapWithConcurrency(
+					compileVerdictFiles,
+					PYTHON_DECLARATION_CONCURRENCY,
+					async (trackedFile) => ({
+						trackedFile,
+						target: await detectPythonTargetVersion(trackedFile),
 					}),
 				);
+				const pythonCompileTargets = new Map(
+					compileVerdictTargets.map(
+						(entry) => [entry.trackedFile, entry.target] as const,
+					),
+				);
+				let snapshotSuppressed = 0;
+				const snapshotWithheldEntries: Array<
+					PythonCompileWithheld | undefined
+				> = [];
+				const result = Array.from(allDiagnostics.entries()).map(
+					([trackedFile, { diags, ts }]) => {
+						let kept = diags;
+						if (diags.length > 0) {
+							const policy = applyProbeFindingPolicy(
+								trackedFile,
+								diags,
+								policyCwd,
+								readFileContent(trackedFile),
+								"all",
+								"lsp_navigation",
+								pythonCompileTargets.get(trackedFile),
+							);
+							snapshotSuppressed += policy.suppressed;
+							// #4638 review (F10): the snapshot is model-facing too, so a
+							// withheld row is named on its text rather than left to the ledger.
+							snapshotWithheldEntries.push(policy.withheld);
+							kept = policy.kept;
+						}
+						return {
+							filePath: trackedFile,
+							diagnostics: kept,
+							count: kept.length,
+							lag: formatCacheAgeLabel(ts),
+						};
+					},
+				);
+				const snapshotSuppressedLine =
+					dispositionSuppressedLine(snapshotSuppressed);
+				const snapshotWithheld = mergeWithheld(snapshotWithheldEntries);
+				const snapshotWithheldLine = withheldCompileNote(snapshotWithheld);
 				const noteMap2: Record<string, string> = {
 					"push-only":
 						"Note: push-only tracked diagnostics snapshot (not full workspace pull diagnostics).",
@@ -1416,7 +1479,7 @@ export function createLspNavigationTool(
 						content: [
 							{
 								type: "text" as const,
-								text: `${note}\n${JSON.stringify(result)}`,
+								text: `${note}\n${JSON.stringify(result)}${snapshotSuppressedLine ? `\nNote: ${snapshotSuppressedLine}` : ""}${snapshotWithheldLine ? `\nNote: ${snapshotWithheldLine}` : ""}`,
 							},
 						],
 						details: {
@@ -1424,6 +1487,12 @@ export function createLspNavigationTool(
 							resultCount: result.length,
 							diagnosticsMode,
 							coverage: "tracked-open-files",
+							...(snapshotSuppressed > 0 && {
+								dispositionSuppressed: snapshotSuppressed,
+							}),
+							...(snapshotWithheld && {
+								withheldCompile: snapshotWithheld,
+							}),
 						},
 					},
 					{
@@ -1458,12 +1527,18 @@ export function createLspNavigationTool(
 
 			const hasLSP = filePath ? lspService.supportsLSP(filePath) : false;
 			if (needsFilePath && !hasLSP) {
+				// #4403 round 4 (N4): the same check as the workspaceDiagnostics
+				// gate above. A primary the operator turned off is not a missing
+				// install, so the advice would send the reader the wrong way.
 				return finalize(
 					{
 						content: [
 							{
 								type: "text" as const,
-								text: `No LSP server available for ${path.basename(filePath)}. Check that the language server is installed.`,
+								text:
+									disabledPrimaries(filePath).disabledServerIds.length > 0
+										? noServerAnsweredText(filePath)
+										: `No LSP server available for ${path.basename(filePath)}. Check that the language server is installed.`,
 							},
 						],
 						isError: true,
@@ -1479,6 +1554,7 @@ export function createLspNavigationTool(
 
 			if (needsFilePath) {
 				const support = await lspService.getOperationSupport(filePath);
+				noFileClient = support === null;
 				supported = operationSupportStatus(operation, support);
 				if (supported === false) {
 					return finalize(
@@ -1666,12 +1742,14 @@ export function createLspNavigationTool(
 							// refused inside pi's queue, before any write, so the edit never
 							// lands on text it was not computed for.
 							expectedContent: captureRenameExpectedContent(
-								lspService,
 								edit,
 								ctx.cwd || ".",
-								filePath,
-								openedFileContent,
 								renameRequestedAtMs,
+								(filePath: string, atCwd: string) =>
+									lspService.getTrackedContent(filePath, atCwd),
+								openedFileContent === undefined
+									? undefined
+									: { filePath, content: openedFileContent },
 							),
 						});
 						for (const touchedFile of applied.files) {
@@ -1689,9 +1767,15 @@ export function createLspNavigationTool(
 								"__BADINPUT__ newFilePath parameter required for rename_file",
 							);
 						}
-						const resolvedNewFilePath = path.isAbsolute(newFilePath)
-							? newFilePath
-							: path.resolve(ctx.cwd || ".", newFilePath);
+						// #4578: the destination is a WRITE target, so it resolves through
+						// the same host-path seam pi's own write tool uses — `~` expands to
+						// `$HOME`, a leading `@` mention prefix drops, and pi's unicode
+						// space class folds (defect shape 74: a bare `path.resolve(cwd,
+						// `~/x`)` names `<cwd>/~/x`, a path that cannot exist).
+						const resolvedNewFilePath = resolveHostToolPath(
+							newFilePath,
+							ctx.cwd || ".",
+						);
 						const result = await lspService.renameFile(
 							filePath,
 							resolvedNewFilePath,
@@ -1765,9 +1849,10 @@ export function createLspNavigationTool(
 								);
 					}
 					case "incomingCalls": {
-						if (!callHierarchyItem) {
+						const checked = checkCallHierarchyItem(callHierarchyItem);
+						if ("problem" in checked) {
 							throw new Error(
-								"__BADINPUT__ callHierarchyItem parameter required for incomingCalls",
+								`__BADINPUT__ ${checked.problem} for incomingCalls`,
 							);
 						}
 						// #1803 fix-round F1: needsFilePath is false for call-hierarchy
@@ -1784,36 +1869,33 @@ export function createLspNavigationTool(
 						// every other capability-gated operation already reports.
 						supported = operationSupportStatus(
 							operation,
-							await lspService.getOperationSupport(
-								uriToPath(callHierarchyItem.uri),
-							),
+							await lspService.getOperationSupport(uriToPath(checked.item.uri)),
 						);
 						if (supported === false) {
 							throw new Error(
 								"__UNSUPPORTED__ Active LSP server does not advertise support for incomingCalls",
 							);
 						}
-						return lspService.incomingCalls(callHierarchyItem);
+						return lspService.incomingCalls(checked.item);
 					}
 					case "outgoingCalls": {
-						if (!callHierarchyItem) {
+						const checked = checkCallHierarchyItem(callHierarchyItem);
+						if ("problem" in checked) {
 							throw new Error(
-								"__BADINPUT__ callHierarchyItem parameter required for outgoingCalls",
+								`__BADINPUT__ ${checked.problem} for outgoingCalls`,
 							);
 						}
 						// #1803 fix-round F1: same pre-check as incomingCalls above.
 						supported = operationSupportStatus(
 							operation,
-							await lspService.getOperationSupport(
-								uriToPath(callHierarchyItem.uri),
-							),
+							await lspService.getOperationSupport(uriToPath(checked.item.uri)),
 						);
 						if (supported === false) {
 							throw new Error(
 								"__UNSUPPORTED__ Active LSP server does not advertise support for outgoingCalls",
 							);
 						}
-						return lspService.outgoingCalls(callHierarchyItem);
+						return lspService.outgoingCalls(checked.item);
 					}
 					default:
 						return [];
@@ -1945,6 +2027,22 @@ export function createLspNavigationTool(
 			}
 
 			const isEmpty = !result || (Array.isArray(result) && result.length === 0);
+			// #4403 round 5 (V5): with no client for the file (a missing binary,
+			// a disabled primary while an auxiliary serves the file, a disabled
+			// owner whose fallback is missing), an empty answer came from no
+			// language server. `hover` returns null for both cases, so the
+			// empty answer here is no_server, not "No results".
+			if (isEmpty && noFileClient) {
+				return finalize(
+					{
+						content: [
+							{ type: "text" as const, text: noServerAnsweredText(filePath) },
+						],
+						isError: true,
+					},
+					{ operation, filePath, failureKind: "no_server", resultCount: 0 },
+				);
+			}
 			const fileCtx = filePath ? " at " + path.basename(filePath) : "";
 			const lineCtx = line ? ":" + line + ":" + character : "";
 			let output = isEmpty

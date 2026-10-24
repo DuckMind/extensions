@@ -4,7 +4,11 @@ import {
 	SPECIAL_FILENAMES,
 } from "../file-kinds.js";
 import { getLspCapableKinds } from "../language-policy.js";
-import { EXTENSION_TO_LSP_ID } from "../language-registry.js";
+import {
+	EXTENSION_TO_LSP_ID,
+	lspLanguageId,
+	resolveFilenameLanguage,
+} from "../language-registry.js";
 
 /**
  * Language ID Mappings for LSP
@@ -64,8 +68,28 @@ function getBasenameLanguageId(base: string): string | undefined {
 
 /**
  * Get language ID for a file path
+ *
+ * Filename-tier first (#4636). The registry declares some files by BASENAME —
+ * exact names and closed `<stem>*<tail>` patterns — because their format is a
+ * convention rather than a suffix, and `EXTENSION_TO_LSP_ID` cannot answer for
+ * them: it is a projection of `extensions` only, so `tsconfig.json` fell
+ * through to `.json` and was announced `json`. The JSON language server reads
+ * `languageId === 'jsonc'` as "comments are allowed"
+ * (vscode-langservers-extracted 4.10.0, lib/json-language-server/jsonServer.js:521),
+ * so every upstream comment in that file came back blocking.
+ *
+ * The filename tier is consulted only for entries that DECLARE a name, so its
+ * blast radius is the declared vocabulary itself. Two declared answers move
+ * besides the #4636 additions, both toward the registry's own `lspId`: a
+ * `Makefile` now takes the `shell` entry's `shellscript` (the protocol spelling
+ * every `.sh` file already used) instead of file-kinds.ts's per-kind `shell`,
+ * and `terragrunt.hcl`/`root.hcl` answer `terragrunt` instead of `undefined`
+ * (no server covers that kind, so no wire carries either).
  */
 export function getLanguageId(filePath: string): string | undefined {
+	const declared = resolveFilenameLanguage(filePath);
+	if (declared) return lspLanguageId(declared);
+
 	const ext = path.extname(filePath).toLowerCase();
 	if (ext && LANGUAGE_EXTENSIONS[ext]) {
 		return LANGUAGE_EXTENSIONS[ext];

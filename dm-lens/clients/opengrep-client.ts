@@ -28,7 +28,8 @@
  * Enablement mirrors the LSP server (`opengrepInitialization` in server.ts):
  * opengrep is structurally always-on — `resolveOpengrepConfig` only chooses
  * WHICH rules run (a local `.opengrep.yml`/`.semgrep.yml` rule file if
- * present, else the `auto` registry ruleset), not whether it runs at all.
+ * present, else the registry pack dm-lens refreshed into its cache, else the `auto`
+ * registry ruleset, #4765), not whether it runs at all.
  *
  * `// nosemgrep` / `# nosemgrep` suppression: unlike opengrep's LSP mode
  * (which does NOT honor it natively — that gap is exactly why
@@ -57,6 +58,7 @@ import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { resolveOpengrepConfig } from "./opengrep-config.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import { stripPackRuleIdPrefix } from "./opengrep-rule-pack.js";
 import { getScratchTreeDirNames } from "./scratch-tree-policy.js";
 import { realpathOrResolve } from "./path-utils.js";
 import { scannerReportParentDir } from "./scanner-temp-root.js";
@@ -140,7 +142,7 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 	}
 
 	/**
-	 * Scan a directory tree with opengrep's rule set (local config or `auto`).
+	 * Scan a directory tree with opengrep's rule set (local config, else the refreshed pack, else `auto`).
 	 * Re-entrancy safe: concurrent calls against the same root share a single
 	 * opengrep process (mirrors `GitleaksClient`/`JscpdClient`).
 	 */
@@ -164,6 +166,8 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 		const scannedAt = new Date().toISOString();
 		const bin = this.binaryPath ?? "opengrep";
 		const resolved = OpengrepClient.resolveConfig(cwd);
+		const packPath =
+			resolved.source === "pack" ? resolved.configArg : undefined;
 		const outDir = mkdtempSync(
 			path.join(scannerReportParentDir(), "dm-lens-opengrep-"),
 		);
@@ -273,7 +277,14 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 				...(report.partial && report.scanned.length === 0
 					? { reason: "partial-no-paths" as const }
 					: {}),
-				findings: report.findings,
+				// The cached pack is loaded from a path, so Opengrep prefixes its rule
+				// ids with it; report the registry-form id instead.
+				findings: packPath
+					? report.findings.map((finding) => ({
+							...finding,
+							checkId: stripPackRuleIdPrefix(finding.checkId, packPath),
+						}))
+					: report.findings,
 				scannedAt,
 			};
 		} catch (err) {

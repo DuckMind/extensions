@@ -101,6 +101,20 @@ export interface DiagnosticStrategy {
 	 *  `Notification_handler.on_notification`: `DidSaveTextDocument` ->
 	 *  `Scan_helpers.scan_file`). The client expects that publication. */
 	rescansOnSave?: boolean;
+	/** #4763: until this server sends `semgrep/rulesRefreshed`, an EMPTY publish
+	 *  is not an answer. Opengrep with `--config auto` loads its rules after
+	 *  `didOpen`; a scan before that logs "Rules not loaded yet, not scanning
+	 *  anything" and publishes `[]` (opengrep@60ed3b3 `Scan_helpers.run_semgrep`
+	 *  `when not session.cached_session.initialized`), then
+	 *  `Scan_helpers.refresh_rules` sends `semgrep/rulesRefreshed` and
+	 *  republishes every open document. Measured 3/3 on 1.30.0 and 2/2 on 1.32.0
+	 *  (docs/lsp-capability-matrix.md, opengrep): `[]` at +10..20 ms, the
+	 *  notification at +0.7..1.0 s, the findings 0.25..0.5 s later. The client
+	 *  holds that `[]` (not cached, no stamp, no emit), so it can neither end the
+	 *  wait nor read as "answered". With a local rule file the notification
+	 *  arrives before the first publish and nothing is held. A non-empty publish
+	 *  is a scan result and is never held. */
+	emptyUntilRulesRefreshed?: boolean;
 	/** #3548: `textDocument/didClose` makes this server publish once more, an
 	 *  empty, version-less set that answers no send (tekumara/typos-lsp
 	 *  `crates/typos-lsp/src/lsp.rs` `did_close`:
@@ -260,10 +274,20 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			debounceMs: 50,
 			aggregateWaitMs: 1000,
 			expectSemanticSecondPush: false,
-			// #3310 / nightly run 37930006227: the clean TypeScript fixture
-			// published an empty pre-index result before its settled result.
-			// Hold that first publish so it cannot resolve a push wait as clean.
-			emptyFirstPublish: "indexing",
+			// #4615: NO `emptyFirstPublish` marker. Measured 2026-10-20 over a raw
+			// JSON-RPC wire against typescript-language-server@5.3.0 with
+			// typescript@5.9.3: the DIRTY fixture's first publish already carries
+			// the finding (code 2322) — `direct`, so holding it can only delay the
+			// answer — and a CLEAN file's only publish is an EMPTY settled answer
+			// (one publish, nothing after it, nothing on the edit). The hold
+			// swallows that answer, so a first clean touch stays unconfirmed and
+			// spends the full `aggregateWaitMs` budget for a verdict the server had
+			// already sent. The `empty-first` this row used to carry was measured on
+			// the `typescript-clean` fixture, whose publish trace was scoped by
+			// server id alone while five live fixtures share "typescript": a foreign
+			// client's late publish decided the class (#4615). The axis is defined on
+			// a DIRTY file and docs/lsp-capability-matrix.md now records this row's
+			// measured `direct`; a `clean: true` fixture can never be its source.
 			// Tier 3 (#458): typescript-language-server publishes nothing on a
 			// clean→clean edit (docs/lsp-capability-matrix.md, re-confirmed
 			// 2026-07-12). It's the lone core-set tier-3 server, which is exactly
@@ -315,7 +339,10 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 		},
 		// Opengrep security scanner (cross-language LSP). It pushes an EMPTY result
 		// during the one-time rule-load window at startup, then the real scan after
-		// `semgrep/rulesRefreshed` — so never seed the first push. Push-only (no pull
+		// `semgrep/rulesRefreshed` — so never seed the first push, and hold that
+		// empty publish (`emptyUntilRulesRefreshed`, #4763): without the hold it
+		// ended the touch as "answered" and the findings arrived after the wait.
+		// Push-only (no pull
 		// diagnostics). Warm per-file scan ~1.3s; the first touch in a session may
 		// also pay rule-load (~3.5s cold). aggregateWaitMs is 3500: it's this
 		// server's OWN deadline, bounded by the per-edit caller cap as a ceiling
@@ -333,6 +360,7 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			// Opengrep re-scans only on a fresh didOpen — didChange is a no-op for it.
 			reopenOnResync: true,
 			rescansOnSave: true,
+			emptyUntilRulesRefreshed: true,
 		},
 		// ast-grep structural linter (sgconfig-gated auxiliary LSP). Push-only,
 		// compiles the project rules on the first scan of a session, and — like
@@ -500,25 +528,24 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			// #3484: the fence reply (+2..4 ms) precedes the publish (~+1 s).
 			diagnosticsFence: "reply-first",
 		},
-		// terraform-ls (#3310). The nightly tool-smoke measurement was identical
-		// on 2026-09-27, 2026-09-28, and 2026-09-29:
-		//
-		//   [terraform] clean-behavior=publishes-unversioned (tier 2*)
-		//   dirtyPubs=2(v:0) cleanPubs=2(v:0) first-publish=empty-first
-		//   provisional pre-index publish
-		//
-		// The first empty, unversioned publish is the cold-index artifact, so hold
-		// it once and let terraform-ls's next publish resolve the wait. A held
-		// clean-only trace therefore reaches the caller as unanswered/indeterminate
-		// at the wait ceiling rather than a false clean, by design (#3310). The
-		// marker is measured policy, not a blanket rule for Tier 2* push servers.
+		// terraform-ls: NO `emptyFirstPublish` marker (#4615). The earlier
+		// `empty-first` reading (2026-09-27..29, and the nightlies 2026-10-17..20)
+		// came from a probe that counted terraform-ls's EMPTY set for the
+		// WORKSPACE DIRECTORY URI. terraform-ls publishes that set in the same
+		// ~1 ms burst as the file's own finding, and the probe's drainer kept rows
+		// by server id only, so the directory row was read as the file's first
+		// publish. Scoped to the fixture's own document, the first publish carries
+		// the finding: `direct` (terraform-ls 0.39.0, 16/16 cold runs). The hold
+		// was also a no-op for a dirty file: the one-shot hold is spent on the
+		// directory row or an unrelated `.tf` file, never on the finding. On a
+		// clean `.tf` file it could swallow the file's own `[]`, which costs a
+		// wait to the ceiling (inferred from code, not probed).
 		terraform: {
 			seedFirstPush: false,
 			pullRetryBudgetMs: 0,
 			debounceMs: 150,
 			aggregateWaitMs: 1500,
 			expectSemanticSecondPush: false,
-			emptyFirstPublish: "indexing",
 		},
 		// yaml-language-server (#3484): the default strategy plus the measured
 		// fence order — reply +3..6 ms, publish +207..242 ms after didChange.

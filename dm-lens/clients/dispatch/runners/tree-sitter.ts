@@ -42,7 +42,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult } from "../types.js";
+import { findingsResult, spanOverlapsModifiedRanges } from "../types.js";
 
 const blastCooldownByFile = new Map<string, number>();
 const BLAST_COOLDOWN_MS = 5_000;
@@ -339,14 +339,6 @@ function defaultFixSuggestion(defectClass: string, ruleId: string): string {
 	return "Refactor this pattern to a safer, explicit form matching project conventions.";
 }
 
-function isLineInModifiedRanges(
-	line: number,
-	ranges: ReadonlyArray<{ start: number; end: number }> | undefined,
-): boolean {
-	if (!ranges || ranges.length === 0) return true;
-	return ranges.some((r) => line >= r.start && line <= r.end);
-}
-
 /**
  * Calculate total lines changed in modified ranges.
  * Used to skip expensive entity extraction for trivial changes.
@@ -556,6 +548,8 @@ const treeSitterRunner: RunnerDefinition = {
 		// results stay grouped in rule order. The post-match gating below (modified
 		// ranges, severity mapping) is unchanged.
 		const diagnostics: Diagnostic[] = [];
+		const withheld: Diagnostic[] = [];
+		let queryRunFailed = false;
 		try {
 			const found = await client.runQueriesOnFile(
 				effectiveQueries,
@@ -576,13 +570,17 @@ const treeSitterRunner: RunnerDefinition = {
 					query.severity === "error" ||
 					query.inline_tier === "blocking" ||
 					SILENT_ERROR_QUERY_IDS.has(query.id);
-				if (
+				// #4481 r2: gate on the match's span, not its start line. The
+				// first capture's text is the node's exact source, so its line
+				// breaks give the end line.
+				const endLine = line + (match.matchedText.match(/\n/g)?.length ?? 0);
+				// #4484 r2: the gate decides delivery only. A withheld match is
+				// still an observation, so it rides out as `outOfEditScope` for
+				// the recorded-blocker carry instead of being dropped.
+				const outOfScope =
 					ctx.blockingOnly &&
 					isSeverityBlocking &&
-					!isLineInModifiedRanges(line, ctx.modifiedRanges)
-				) {
-					continue;
-				}
+					!spanOverlapsModifiedRanges(line, endLine, ctx.modifiedRanges);
 
 				// Map severity to semantic
 				const semantic =
@@ -602,7 +600,7 @@ const treeSitterRunner: RunnerDefinition = {
 							: undefined;
 
 				const hasSuggestedFix = !!query.has_fix;
-				diagnostics.push({
+				(outOfScope ? withheld : diagnostics).push({
 					id: `tree-sitter:${query.id}:${line}`,
 					message: query.message.replace(
 						/\{\{(\w+)\}\}/g,
@@ -628,6 +626,7 @@ const treeSitterRunner: RunnerDefinition = {
 			}
 		} catch (err) {
 			// dm-lens-ignore: missing-error-propagation — per-dispatch resilience, intentional
+			queryRunFailed = true;
 			const msg = err instanceof Error ? err.message : String(err);
 			// Emscripten abort() corrupts the entire module-level wasm heap.
 			// Poison the singleton so no further queries attempt to use the dead runtime.
@@ -661,7 +660,7 @@ const treeSitterRunner: RunnerDefinition = {
 		// ~500-800ms snapshot cost on every dispatch. One guarded block now
 		// serves both paths.
 		// Absent/empty modifiedRanges means "whole file" (full-file dispatches,
-		// fresh writes — see isLineInModifiedRanges above), never "trivial edit":
+		// fresh writes — see spanOverlapsModifiedRanges in ../types.ts), never "trivial edit":
 		// entity extraction must run in that case.
 		const totalLinesChanged = getTotalLinesChanged(ctx.modifiedRanges);
 		const skipEntityExtraction =
@@ -720,6 +719,13 @@ const treeSitterRunner: RunnerDefinition = {
 			}
 		}
 
+		// #4484 r2: what the edit-range gate withheld, and whether the query run
+		// broke part way, travel with the verdict for the recorded-blocker carry.
+		const observationExtras = {
+			...(withheld.length > 0 && { outOfEditScope: withheld }),
+			...(queryRunFailed && { inconclusive: true }),
+		};
+
 		if (diagnostics.length === 0) {
 			// #3409: zero diagnostics because the language's GRAMMAR never loaded is
 			// not a clean file, and `runQueriesOnFile` returns [] for both. The
@@ -742,7 +748,11 @@ const treeSitterRunner: RunnerDefinition = {
 					reason: "grammar_unavailable",
 					status: "skipped",
 				});
-				return { status: "skipped", diagnostics: [], semantic: "none" };
+				return {
+					status: "skipped",
+					diagnostics: [],
+					semantic: "none",
+				};
 			}
 			logTreeSitter({
 				phase: "runner_complete",
@@ -754,7 +764,12 @@ const treeSitterRunner: RunnerDefinition = {
 				queryCount: languageQueries.length,
 				effectiveQueryCount: effectiveQueries.length,
 			});
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
+			return {
+				status: "succeeded",
+				diagnostics: [],
+				semantic: "none",
+				...observationExtras,
+			};
 		}
 
 		// Check if any blocking issues
@@ -774,10 +789,13 @@ const treeSitterRunner: RunnerDefinition = {
 			effectiveQueryCount: effectiveQueries.length,
 		});
 
-		return findingsResult(diagnostics, {
-			status: hasBlocking ? "failed" : "succeeded",
-			semantic: hasBlocking ? "blocking" : "warning",
-		});
+		return {
+			...findingsResult(diagnostics, {
+				status: hasBlocking ? "failed" : "succeeded",
+				semantic: hasBlocking ? "blocking" : "warning",
+			}),
+			...observationExtras,
+		};
 	},
 };
 

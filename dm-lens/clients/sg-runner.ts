@@ -7,7 +7,6 @@
 
 import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getSgCommand,
@@ -16,6 +15,7 @@ import {
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { getProjectTrustState } from "./project-trust.js";
+import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
 import { getIsolatedNpxSpawnOptions, probeToolAsync } from "./tool-probe.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
@@ -718,6 +718,7 @@ export class SgRunner {
 			case "cwd-unresolvable":
 			case "permission-denied":
 			case "spawn-failed":
+			case "trust-refused":
 			case undefined:
 				return result.error ? "cli-failure" : undefined;
 		}
@@ -882,7 +883,7 @@ export class SgRunner {
 		configFile: string;
 	} {
 		const sessionDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), `dm-lens-temp-${ruleId}-`),
+			path.join(scannerReportParentDir(), `dm-lens-temp-${ruleId}-`),
 		);
 		try {
 			const rulesSubdir = path.join(sessionDir, "rules");

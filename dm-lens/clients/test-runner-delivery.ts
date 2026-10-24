@@ -9,6 +9,7 @@
  */
 
 import type { CacheManager } from "./cache-manager.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import {
 	boundDeferredTargets,
@@ -39,7 +40,11 @@ interface PendingDelivery {
 	owner?: TestRunnerDeliveryOwner;
 }
 
-const pending = new Map<string, PendingDelivery>();
+// Insertion-ordered, bounded by `set` itself (#4570: was a hand-rolled
+// `while (pending.size > MAX) { pending.delete(pending.keys().next().value) }`).
+const pending = new BoundedFifoMap<string, PendingDelivery>(
+	MAX_PENDING_DELIVERIES,
+);
 
 interface StaleVerdict {
 	file: string;
@@ -220,14 +225,6 @@ function record(
 	);
 }
 
-function prunePending(): void {
-	while (pending.size > MAX_PENDING_DELIVERIES) {
-		const oldest = pending.keys().next();
-		if (oldest.done) return;
-		pending.delete(oldest.value);
-	}
-}
-
 /** Stage the newest result for this session. Clean results supersede failures. */
 export function stageTestRunnerDelivery(args: {
 	cwd: string;
@@ -277,7 +274,6 @@ export function stageTestRunnerDelivery(args: {
 		owner: args.owner,
 	};
 	pending.set(deliveryKey, delivery);
-	prunePending();
 	record(deliveryKey, "staged", delivery);
 }
 

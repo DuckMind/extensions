@@ -28,8 +28,10 @@
  *  - `normalizeEphemeralMapKey` (path-utils.ts) — cheap slash-fold +
  *    win32-lowercase, NO filesystem I/O — for hot, single-process, in-memory
  *    indexes whose keys this process produced itself (e.g. the word index).
- *  - `normalizeMapKey` — realpath-canonicalizing — for long-lived state shared
- *    across call sites where symlink/real-casing resolution matters.
+ *  - `normalizeMapKey` — the path identity of an absolute path (the
+ *    kernel-real path: links resolved, on-disk casing, on every platform since
+ *    #4689) — for long-lived state shared across call sites, where two
+ *    spellings of one file must be one entry.
  */
 import { BoundedFifoMap } from "./bounded-cache.js";
 

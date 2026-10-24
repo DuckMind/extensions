@@ -1,5 +1,6 @@
 import { logLatency } from "./latency-logger.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import type { LazyToolsSetting } from "./lens-flag-registry.js";
 import {
 	defineSessionStore,
 	type SessionScope,
@@ -9,6 +10,7 @@ import {
 type ToolSetMutationReason =
 	| "fresh_session_lazy_deactivation"
 	| "session_rebuild_restore"
+	| "model_switch"
 	| "lazy_activation";
 
 export interface ToolSetMutation {
@@ -84,8 +86,57 @@ export function getRememberedLazyTools(
 type DeferredToolModel = {
 	compat?: {
 		supportsToolReferences?: boolean;
+		supportsMidConvoSystemMessages?: boolean;
 	};
 };
+
+/**
+ * The lazy-tools posture the configuration asks for (#4687 item 7):
+ * `tools.lazy` = `true` (`on`, the default: lazy on every model), `"auto"`
+ * (decide per model), or `false` (`off`, also `--no-lazy-tools`). The CLI flag
+ * wins, as for every registry flag.
+ *
+ * The default stays `true` (maintainer decision, 2026-10-21): over the live
+ * window measured on #4687, one activation per 3,329 requests sits under the
+ * ~1-per-1,000 break-even at which a folding model's prefix rewrite costs more
+ * than carrying the situational schemas on every request.
+ */
+export type LazyToolsMode = "auto" | "on" | "off";
+
+export function resolveLazyToolsMode(
+	noLazyToolsFlag: boolean,
+	setting: LazyToolsSetting | undefined,
+): LazyToolsMode {
+	if (noLazyToolsFlag) return "off";
+	return setting === "auto" ? "auto" : "on";
+}
+
+/**
+ * Whether the situational tools start inactive for `model` (#4687 item 7).
+ *
+ * `auto` reads pi-ai's own per-model fact. A model WITHOUT mid-conversation
+ * system messages has pi-ai fold every system message into one head
+ * (`collapseSystemMessages`), so each tool-set change rewrites the whole cached
+ * prefix; such a model gets every tool from the start instead. A model that
+ * does not state the fact is `false`: it pays the schema bytes, never the
+ * rewrite. A session with NO resolved model is not a model without the fact:
+ * nothing is known yet, so it keeps the configured default posture (lazy), and
+ * the `model_select` that resolves one re-decides.
+ */
+export function lazyToolsApply(
+	mode: LazyToolsMode,
+	model: DeferredToolModel | undefined,
+): boolean {
+	if (mode !== "auto") return mode === "on";
+	if (!model) return true;
+	return supportsMidConvoSystemMessages(model);
+}
+
+export function supportsMidConvoSystemMessages(
+	model: DeferredToolModel | undefined,
+): boolean {
+	return model?.compat?.supportsMidConvoSystemMessages === true;
+}
 
 /**
  * Whether the host will send this model deferred (searchable) tool
@@ -170,6 +221,26 @@ export function planToolSet(
 		removedCount,
 		changed: addedCount > 0 || removedCount > 0,
 	};
+}
+
+/**
+ * One row per lazy-tools decision (#4687 item 7): every `session_start` and
+ * every model switch, so a session whose plan changed nothing still says which
+ * posture it chose and from what.
+ */
+export function recordToolSetDecision(decision: {
+	trigger: "session_start" | "model_select";
+	mode: LazyToolsMode;
+	lazy: boolean;
+	supportsMidConvoSystemMessages: boolean;
+}): void {
+	logLatency({
+		type: "phase",
+		filePath: "<dm-lens>",
+		phase: "tool_set_decision",
+		durationMs: 0,
+		metadata: { ...decision },
+	});
 }
 
 export function recordToolSetMutation(mutation: ToolSetMutation): void {

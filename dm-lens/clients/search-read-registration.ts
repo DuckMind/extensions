@@ -12,7 +12,12 @@ import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import { isExternalOrVendorFile } from "./path-utils.js";
-import type { ReadRecord, SearchCreditReason } from "./read-guard.js";
+import {
+	type FileLineScan,
+	type ReadRecord,
+	type SearchCreditReason,
+	scanFileLines,
+} from "./read-guard.js";
 
 /** Clamp a delivered-context count to a usable non-negative integer. */
 function normalizeMargin(value: number | undefined): number | undefined {
@@ -65,15 +70,24 @@ const DEFAULT_CONTEXT_MARGIN = 0;
  * Record each shown location as a read (± context margin). Resolves project-
  * relative paths, skips external/vendor/ignored/non-existent files, and dedupes
  * identical spans. Returns how many reads were recorded.
+ *
+ * #1649: each file's hits are hashed from one bounded pass over it
+ * ({@link scanFileLines}), however many hits it has, where `recordRead` used to
+ * read and split the whole file once per hit.
  */
 export function registerSearchReads(
-	readGuard: { recordRead: (record: ReadRecord) => void },
+	readGuard: {
+		recordRead: (
+			record: ReadRecord,
+			opts?: { captureLineHashes?: boolean },
+		) => void;
+	},
 	locations: SearchReadLocation[],
 	opts: RegisterOpts,
 ): number {
 	const margin = opts.contextMargin ?? DEFAULT_CONTEXT_MARGIN;
 	const seen = new Set<string>();
-	let recorded = 0;
+	const pending: ReadRecord[] = [];
 
 	for (const loc of locations) {
 		if (!loc?.file || !Number.isFinite(loc.startLine)) continue;
@@ -108,7 +122,7 @@ export function registerSearchReads(
 		if (seen.has(key)) continue;
 		seen.add(key);
 
-		readGuard.recordRead({
+		pending.push({
 			filePath: abs,
 			requestedOffset: start,
 			requestedLimit: limit,
@@ -125,8 +139,32 @@ export function registerSearchReads(
 			timestamp: Date.now(),
 			...(opts.toolCallId !== undefined && { toolCallId: opts.toolCallId }),
 		});
-		recorded++;
 	}
 
-	return recorded;
+	const rangesByFile = new Map<string, { offset: number; limit: number }[]>();
+	for (const r of pending) {
+		const ranges = rangesByFile.get(r.filePath) ?? [];
+		ranges.push({ offset: r.effectiveOffset, limit: r.effectiveLimit });
+		rangesByFile.set(r.filePath, ranges);
+	}
+	const scans = new Map<string, FileLineScan | undefined>();
+	for (const hit of pending) {
+		if (!scans.has(hit.filePath)) {
+			scans.set(
+				hit.filePath,
+				scanFileLines(hit.filePath, rangesByFile.get(hit.filePath) ?? [], {
+					count: false,
+				}),
+			);
+		}
+		const lineHashes = scans
+			.get(hit.filePath)
+			?.hashes(hit.effectiveOffset, hit.effectiveLimit);
+		readGuard.recordRead(
+			{ ...hit, ...(lineHashes && { lineHashes }) },
+			{ captureLineHashes: false },
+		);
+	}
+
+	return pending.length;
 }

@@ -182,8 +182,9 @@ export async function notifyExternalFileChange(
 
 export async function resyncGitChangedFiles(
 	changedPaths: readonly string[],
+	options?: { maxPasses?: number },
 ): Promise<ReadonlyMap<string, DriftDisposition>> {
-	return getLSPService().resyncGitChangedFiles(changedPaths);
+	return getLSPService().resyncGitChangedFiles(changedPaths, options);
 }
 
 export async function hasAuxiliaryLspPublishedForRoot(

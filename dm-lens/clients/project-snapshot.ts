@@ -7,6 +7,10 @@ import { writeFileAtomic } from "./atomic-write.js";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
+import {
+	readGzipStageWorkerResult,
+	reapStageFile,
+} from "./gzip-stage-write.js";
 import { withGenerationLockSync } from "./generation-lock.js";
 import { isStaleStageFile } from "./instance-reaper.js";
 import { readJsonCache } from "./json-cache-read.js";
@@ -26,6 +30,7 @@ import type { RuleScanResult } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { StartupScanContext } from "./startup-scan.js";
 import {
+	notePersistWorkerMessageFault,
 	readWorkerHeapStatistics,
 	type PersistWorkerHeapStatistics,
 } from "./persist-worker-stats.js";
@@ -1770,15 +1775,37 @@ function dispatchMainThreadWriteThroughSeam(
 	writeSnapshotBodyOnMainThread(pending, reason);
 }
 
+/**
+ * Remove a stage file from inside the worker `message` listener without ever
+ * throwing out of it (#4400): the caller's next step (the main-thread fallback,
+ * or completing the key) must still run. A failure is one ledger count per
+ * subject, not one record per message.
+ */
+function reapSnapshotStage(stagePath: string, subject: string): void {
+	const failure = reapStageFile(stagePath);
+	if (failure === undefined) return;
+	incrementDegradationCount({
+		kind: "project-snapshot-stage-reap-failed",
+		subject,
+		reason: `snapshot stage reap failed: ${failure.message}`,
+	});
+}
+
 function handleSnapshotWorkerResult(
 	result: ProjectSnapshotPersistWorkerResult,
 ): void {
 	const pending = _snapshotWorkerRequests.get(result.id);
 	if (!pending) {
-		fs.rmSync(result.stagePath, { force: true });
+		// Late result for a request the host no longer tracks: the echoed path is
+		// the only name left, and it is wire data (#4400).
+		if (typeof result.stagePath === "string") {
+			reapSnapshotStage(result.stagePath, result.stagePath);
+		}
 		return;
 	}
 	_snapshotWorkerRequests.delete(result.id);
+	// #4400: the host sent `pending.stagePath`, so every cleanup and promotion
+	// below uses its own record, never the worker's echo of it.
 	if (
 		result.error ||
 		result.rawBytes === undefined ||
@@ -1787,7 +1814,7 @@ function handleSnapshotWorkerResult(
 		result.writeMs === undefined ||
 		result.semanticFingerprint === undefined
 	) {
-		fs.rmSync(result.stagePath, { force: true });
+		reapSnapshotStage(pending.stagePath, pending.gzPath);
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			result.error ?? "invalid worker result",
@@ -1803,7 +1830,7 @@ function handleSnapshotWorkerResult(
 	) {
 		// The stale stage is part of the promotion transaction: remove it before
 		// returning so a superseded save cannot leave an orphan behind.
-		fs.rmSync(result.stagePath, { force: true });
+		reapSnapshotStage(pending.stagePath, pending.gzPath);
 		completeSnapshotPersist(pending);
 		return;
 	}
@@ -1853,7 +1880,7 @@ function handleSnapshotWorkerResult(
 	try {
 		const promoted = promoteSnapshotBody(
 			pending,
-			{ stagePath: result.stagePath },
+			{ stagePath: pending.stagePath },
 			{
 				fingerprint: result.semanticFingerprint,
 				generatedAt: pending.snapshot.generatedAt,
@@ -1878,7 +1905,7 @@ function handleSnapshotWorkerResult(
 		});
 		completeSnapshotPersist(pending);
 	} catch (err) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rm(pending.stagePath, { force: true }, () => {});
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			err instanceof Error ? err.message : String(err),
@@ -2000,14 +2027,28 @@ function getSnapshotPersistWorker(): Worker | undefined {
 		// binds the sync handler directly, so scheduling is byte-identical when
 		// no test seam is installed (the async-handler variant of this shifted
 		// promotion timing under full-suite load and flaked the round-trip test).
-		worker.on("message", (result: ProjectSnapshotPersistWorkerResult) => {
-			if (_snapshotPromotionSeamForTests) {
-				void _snapshotPromotionSeamForTests().then(() =>
-					handleSnapshotWorkerResult(result),
-				);
-				return;
+		// #4402: the message is wire data (#4400). It passes the shape check or is
+		// dropped and counted, and a throw below is counted here instead of
+		// leaving the listener, which would end the host.
+		worker.on("message", (message: unknown) => {
+			try {
+				const result = readGzipStageWorkerResult(message);
+				if (typeof result === "string") {
+					notePersistWorkerMessageFault("project-snapshot", "rejected", result);
+					return;
+				}
+				if (_snapshotPromotionSeamForTests) {
+					void _snapshotPromotionSeamForTests()
+						.then(() => handleSnapshotWorkerResult(result))
+						.catch((err: unknown) =>
+							notePersistWorkerMessageFault("project-snapshot", "threw", err),
+						);
+					return;
+				}
+				handleSnapshotWorkerResult(result);
+			} catch (err) {
+				notePersistWorkerMessageFault("project-snapshot", "threw", err);
 			}
-			handleSnapshotWorkerResult(result);
 		});
 		worker.on("error", (err: Error) => handleSnapshotWorkerDeath(err.message));
 		worker.on("exit", (code) => {

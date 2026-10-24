@@ -21,7 +21,7 @@ not query a third-party product registry.
 
 ## Test-runner delivery
 
-Lens 4.3 stages test-runner findings at the idle boundary and consumes them
+Lens stages test-runner findings at the idle boundary and consumes them
 at the next turn's event handler. This no longer needs the legacy non-context
 entry renderer or the old empty-message compatibility fallback.
 

@@ -91,7 +91,7 @@ test("PDF answer mode supplies extracted Markdown, saves the file, and retains o
 
 	const stored = getResult(result.details.responseId);
 	assert.equal(stored.urls[0].content, markdown);
-	const pdfDir = join(root, "pi-web-pdf");
+	const pdfDir = join(root, "dm-web-pdf");
 	const files = await readdir(pdfDir);
 	assert.equal(files.length, 1);
 	assert.equal(await readFile(join(pdfDir, files[0]), "utf8"), markdown);

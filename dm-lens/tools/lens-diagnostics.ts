@@ -29,14 +29,27 @@ import {
 	applyFindingPolicy,
 	loadProjectRulePolicyMap,
 } from "../clients/dispatch/finding-policy.js";
+import { readFileContent } from "../clients/dispatch/runners/utils.js";
 import {
 	gateFindingsByPathFreshness,
 	parseScannedAtMs,
 } from "../clients/advisory-provenance.js";
 import {
+	dispositionSuppressedLine,
 	formatCacheAgeLabel,
 	markUnreconciledFindings,
 } from "../clients/finding-delivery-gate.js";
+import {
+	detectPythonTargetVersion,
+	isJediCompileVerdict,
+	partitionOutrankedPythonCompileVerdicts,
+	PYTHON_DECLARATION_CONCURRENCY,
+	type PythonCompileVerdictPartition,
+	type PythonTargetVersion,
+	type PythonVerdictRow,
+	recordPythonCompileVerdictDrop,
+} from "../clients/python-environment.js";
+import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
 import { normalizeRuleId } from "../clients/dispatch/rule-id-normalize.js";
 import {
 	applyRulePolicy,
@@ -51,6 +64,8 @@ import {
 	normalizeFilePath,
 	normalizeMapKey,
 	realpathOrResolve,
+	resolveHostToolPath,
+	toProjectRelativePath,
 } from "../clients/path-utils.js";
 import { getLSPService } from "../clients/lsp/capabilities.js";
 import { retireInlineBlockerAndResyncGuard } from "../clients/git-guard.js";
@@ -64,6 +79,7 @@ import { getFullScanWallClockMs } from "../clients/lsp/workspace-sweep-hold.js";
 import { demoteInferredProjectSweepResults } from "../clients/lsp/inferred-project.js";
 import {
 	hashDiagnosticContent,
+	PRIMARY_UNAVAILABLE_CAUSE,
 	type BoundToCurrentDisk,
 } from "../clients/lsp/diagnostic-binding.js";
 import type { CacheManager } from "../clients/cache-manager.js";
@@ -105,6 +121,7 @@ import type { CodeQualityWarningsReport } from "../clients/code-quality-warnings
 import {
 	classifyDiagnosticTier,
 	getFileDiagnosticSummaries,
+	getSuppressedDiagnostics,
 	type FileDiagnosticSummary,
 	reconcileCorrelatedScanDiagnostics,
 	reconcileScanDiagnostics,
@@ -132,7 +149,10 @@ import {
 	LSP_SEVERITY_FILTERS,
 	MAX_BATCH_FILES,
 	renderBatchOutcomeLines,
+	mergeWithheld,
+	withheldCompileNote,
 	type BatchOutcomeDetail,
+	type LspDiagnosticsFlagReader,
 } from "./lsp-diagnostics.js";
 import {
 	demotePastEofDiagnostics,
@@ -260,6 +280,32 @@ async function findFullScanBindingMismatches(
 	return mismatched;
 }
 
+/**
+ * #4638 review (F1/F10): resolve a file's declared level only when the file
+ * carries one of jedi's `compile` rows, then apply the owner rule. The guard is
+ * the rule's own pre-filter, so a file with no such row costs no I/O and no
+ * await — the same check the full-sweep site makes before its walk.
+ */
+async function applyDeclarationRule<T extends PythonVerdictRow>(
+	filePath: string,
+	diagnostics: readonly T[],
+): Promise<
+	PythonCompileVerdictPartition<T> & { declared?: PythonTargetVersion }
+> {
+	if (!diagnostics.some(isJediCompileVerdict)) {
+		return { kept: [...diagnostics], dropped: 0 };
+	}
+	const declared = await detectPythonTargetVersion(filePath);
+	const partition = partitionOutrankedPythonCompileVerdicts(
+		diagnostics,
+		declared,
+	);
+	if (partition.dropped > 0 && declared) {
+		recordPythonCompileVerdictDrop(filePath, declared, partition.dropped);
+	}
+	return declared ? { ...partition, declared } : partition;
+}
+
 export function createLensDiagnosticsTool(
 	cacheManager: CacheManager,
 	getCwd: () => string,
@@ -290,6 +336,10 @@ export function createLensDiagnosticsTool(
 		| import("../clients/runtime-coordinator.js").RuntimeCoordinator
 		| undefined,
 	isLensGuardEnabled: () => boolean = () => true,
+	// #4323: the host's flag resolver, so the `source=lsp` probe leaves the
+	// auxiliaries the operator turned off unstarted (see
+	// `createLspDiagnosticsTool`'s `getFlag`). index.ts and mcp/server.ts inject it.
+	getFlag?: LspDiagnosticsFlagReader,
 ) {
 	const lspProbe = createLspDiagnosticsTool(
 		nextWriteIndex,
@@ -316,6 +366,7 @@ export function createLensDiagnosticsTool(
 			}
 		},
 		getLspService,
+		getFlag,
 	);
 	return {
 		name: "lens_diagnostics" as const,
@@ -353,7 +404,13 @@ export function createLensDiagnosticsTool(
 			incompleteFiles?: number;
 			unconfirmed?: boolean;
 			timedOut?: boolean;
+			primaryUnavailable?: string;
 			filePath?: string;
+			validationStatus?:
+				| "inconclusive"
+				| "unverified"
+				| "findings"
+				| "no-matching-findings";
 		}>(({ details, args, isError, text }) => {
 			if (details?.source === "lsp") {
 				const count = details.totalDiagnostics ?? 0;
@@ -397,7 +454,10 @@ export function createLensDiagnosticsTool(
 				if (count === 0 && details.unconfirmed)
 					return details.timedOut
 						? `lens_diagnostics${scope} — timed out (result may be incomplete)`
-						: `lens_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
+						: // #4322: no language server answered; it is not a silent server.
+							details.primaryUnavailable !== undefined
+							? `lens_diagnostics${scope} — unconfirmed (no language server answered)`
+							: `lens_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
 				return `lens_diagnostics${scope} — ${count} ${noun}`;
 			}
 			// Streaming progress partials render the live bar (see scanningSummaryLine)
@@ -449,15 +509,23 @@ export function createLensDiagnosticsTool(
 			// indistinguishable from a session with zero findings at all.
 			const adv = details?.totalAdvisories ?? 0;
 			const files = details?.filesWithIssues ?? details?.filesChecked ?? 0;
+			// A final hint-only snapshot is `findings` but keeps #2414's "clean, N
+			// hints" line: the cache verdict only replaces "clean" when it is not one.
+			const cacheVerdict =
+				details?.validationStatus === "no-matching-findings"
+					? "no matching cached findings"
+					: details?.validationStatus === "findings"
+						? undefined
+						: details?.validationStatus;
 			if (b + e + w === 0) {
 				const advisorySuffix =
 					adv > 0 ? `, ${adv} hint${adv === 1 ? "" : "s"}` : "";
-				return `lens_diagnostics ${mode} — clean${advisorySuffix} (${files} files)${coldSuffix}${failedSuffix}`;
+				return `lens_diagnostics ${mode} — ${cacheVerdict ?? "clean"}${advisorySuffix} (${files} files)${coldSuffix}${failedSuffix}`;
 			}
 			const parts = [`${b} blocking`];
 			if (b === 0 && e > 0) parts.push(`${e} errors`);
 			parts.push(`${w} warnings`);
-			return `lens_diagnostics ${mode} — ${parts.join(" · ")} (${files} files)${coldSuffix}${failedSuffix}`;
+			return `lens_diagnostics ${mode} — ${parts.join(" · ")}${cacheVerdict === "inconclusive" || cacheVerdict === "unverified" ? ` · ${cacheVerdict}` : ""} (${files} files)${coldSuffix}${failedSuffix}`;
 		}),
 		parameters: Type.Object({
 			source: Type.Optional(
@@ -590,6 +658,15 @@ export function createLensDiagnosticsTool(
 					Array.isArray(lspParams.paths) && lspParams.paths.length > 0;
 				if (scope === "workspace" && !hasExplicitPath && !hasExplicitPaths) {
 					lspParams.path = cwd;
+					// #4577 R2-2: this path is dm-lens's own, not the model's. It comes
+					// from `ctx.cwd` already absolute, so the probe must NOT put it
+					// through the host-argument stages again: a cwd holding a
+					// host-unicode space (a no-break space in a directory name) was
+					// folded to its U+0020 sibling, and the whole workspace scan then
+					// failed with `Path not found`. The flag states the provenance at
+					// the injection point, exactly as `_pathAlreadyResolved` does for
+					// a recovered write on the `tool_result` seam.
+					lspParams.pathAlreadyResolved = true;
 				}
 				const lspStart = Date.now();
 				const result = (await lspProbe.execute(
@@ -675,7 +752,8 @@ export function createLensDiagnosticsTool(
 			// file changed on disk afterwards / was deleted (stale, e.g. external
 			// edits). Together these stop fixed-this-session findings from lingering.
 			await flushPending();
-			const staleDropped = await reconcileStaleWidgetFiles();
+			const stalePaths: string[] = [];
+			await reconcileStaleWidgetFiles((file) => stalePaths.push(file));
 
 			if (mode === "all") {
 				// #1631 dependency-axis gate for the mode=all store. `reconcileStaleWidgetFiles`
@@ -700,14 +778,18 @@ export function createLensDiagnosticsTool(
 						surface: "mode=all",
 					},
 				});
+				const scopedStalePaths = stalePaths.filter(
+					createScopedFileFilter(cwd, pathsScope),
+				);
 				return formatAllMode(
 					cwd,
 					severity,
 					undefined,
 					undefined,
-					staleDropped,
+					scopedStalePaths.length,
 					pathsScope,
-					dependencyDemoted,
+					undefined,
+					{ stalePaths: scopedStalePaths, host: ctx.host ?? "pi" },
 				);
 			}
 			if (mode === "full") {
@@ -1123,17 +1205,20 @@ function getDeltaFileGroup(
 	cwd: string,
 	filePath: string,
 ): DeltaFileGroup {
-	const rel = path.relative(cwd, filePath);
-	let group = groups.get(rel);
+	// Producers arrive on either path axis (#4689 review r2 B): actionable
+	// rows carry the dispatch identity, quality rows the session spelling.
+	// Key by identity so one file is one group, and render on one axis.
+	const key = normalizeMapKey(filePath);
+	let group = groups.get(key);
 	if (!group) {
 		group = {
-			rel,
+			rel: toProjectRelativePath(filePath, cwd),
 			actionableLines: [],
 			qualityLines: [],
 			projectLines: [],
 			incomplete: false,
 		};
-		groups.set(rel, group);
+		groups.set(key, group);
 	}
 	return group;
 }
@@ -1430,9 +1515,11 @@ function resolvePathsScope(
 			(entry): entry is string =>
 				typeof entry === "string" && entry.trim().length > 0,
 		)
-		.map((entry) =>
-			path.resolve(path.isAbsolute(entry) ? entry : path.resolve(cwd, entry)),
-		);
+		// #4576: `paths` is a host-supplied tool input like any other, so it
+		// goes through the same resolver (`~`, `file://`, `@` prefix, unicode
+		// spaces) instead of a bare `path.resolve` that pinned a literal `~`
+		// under the session cwd.
+		.map((entry) => resolveHostToolPath(entry, cwd));
 
 	const missing: string[] = [];
 	const fileEntries: string[] = [];
@@ -1802,6 +1889,10 @@ const UNCONFIRMED_REASON_SENTENCE: Record<
 	// path, so the reader does not read an empty result as "clean" or retry it.
 	outside_project_root:
 		"the file is outside every initialized session project root, so no language server was asked",
+	// #4403: the per-file note's wording, one sentence per cause.
+	primary_unavailable: `no primary language server answered (${PRIMARY_UNAVAILABLE_CAUSE.unstarted})`,
+	primary_disabled: `no primary language server answered (${PRIMARY_UNAVAILABLE_CAUSE.disabled})`,
+	primary_disabled_fallback: `no primary language server answered (${PRIMARY_UNAVAILABLE_CAUSE.disabledFallback})`,
 };
 
 // Short per-reason label used only when MORE than one reason is present, so
@@ -1818,6 +1909,9 @@ const UNCONFIRMED_REASON_COUNT_LABEL: Record<
 	error: "errored",
 	binding_mismatch: "stale binding",
 	outside_project_root: "outside project root",
+	primary_unavailable: "no primary started",
+	primary_disabled: "primary disabled in config",
+	primary_disabled_fallback: "primary disabled, fallback did not answer",
 };
 
 /**
@@ -2113,6 +2207,12 @@ async function applyInlineSuppressionsToSummaries(
 	summaries: FileDiagnosticSummary[],
 	cwd: string,
 	policyMap: ReturnType<typeof rulePolicyMapFromConfig>,
+	/**
+	 * #1634: receives the rows a disposition mark hid, so the caller can state
+	 * the count scoped to its severity. Inline `dm-lens-ignore` and rule-policy
+	 * drops are not marks and are not added.
+	 */
+	dispositionDropped: WidgetDiagnostic[],
 ): Promise<FileDiagnosticSummary[]> {
 	return Promise.all(
 		summaries.map(async (summary) => {
@@ -2144,17 +2244,33 @@ async function applyInlineSuppressionsToSummaries(
 			// reappears here. #3088 folded the three calls onto the shared
 			// `applyFindingPolicy` seam, which the `source=lsp` probe lane now calls
 			// too — one stack, one order, for every model-facing surface.
-			const { kept: policyKept } = applyFindingPolicy(summary.diagnostics, {
+			const {
+				kept: policyKept,
+				inlineKept,
+				disposed,
+			} = applyFindingPolicy(summary.diagnostics, {
 				cwd,
 				filePath: summary.filePath,
 				content,
 				policyMap,
 			});
+			// #4638 review (F1/F10): the owner rule the post-write runner and the
+			// probe already apply, asked only when the file carries jedi's row.
+			const pythonKept = await applyDeclarationRule(
+				summary.filePath,
+				policyKept,
+			);
+			if (disposed.length < inlineKept.length) {
+				const survivors = new Set(disposed);
+				for (const d of inlineKept) {
+					if (!survivors.has(d)) dispositionDropped.push(d);
+				}
+			}
 			// Tag `flagged` diagnostics for the render loop (formatAllMode). Content
 			// is already in hand here (unlike mode=all/delta's cache-only path), so
 			// this is the one place the tag can be computed without adding I/O to
 			// the "instant" modes.
-			for (const d of policyKept) {
+			for (const d of pythonKept.kept) {
 				// flagged is weak-anchored (module doc, diagnostic-dispositions.ts) so
 				// the tag survives incidental edits to the flagged line itself.
 				const { weak } = anchorsForDiagnostic(
@@ -2167,10 +2283,12 @@ async function applyInlineSuppressionsToSummaries(
 					(d as { flagged?: boolean }).flagged = true;
 				}
 			}
-			if (policyKept.length === summary.diagnostics.length) return summary;
+			if (pythonKept.kept.length === summary.diagnostics.length) {
+				return summary;
+			}
 			return summarizeDiagnostics(
 				summary.filePath,
-				policyKept,
+				pythonKept.kept,
 				summary.hasFinalSnapshot,
 			);
 		}),
@@ -2416,13 +2534,52 @@ async function formatFullMode(
 	// merge, the rendered counts — demote TypeScript errors on files tsserver
 	// checked in its INFERRED project. Applied once, here, so a single seam
 	// governs the whole sweep instead of each renderer learning the rule.
-	const lspResults = await demoteInferredProjectSweepResults(
+	//
+	// #4532 (AGENTS.md defect shape 71): the sweep runs the environment-gap rule
+	// too, inside `demoteInferredProjectSweepResults`, the sweep form of the one
+	// pipeline the per-edit runner and `lsp_diagnostics` call (round 5, review
+	// F3), so one file reads the same in all three.
+	let lspResults = await demoteInferredProjectSweepResults(
 		rawLspResults.filter((result) => includeFile(result.filePath)),
 		cwd,
 		lspService,
 		// #1645 review F1: the sweep that produced these results is signal-bounded,
 		// so the probe loop that post-processes them must be too.
 		signal,
+	);
+	// #4638 review (F1): the sweep's answers still carry the server id here, so
+	// the declaration's owner rule runs before the widget/store conversion that
+	// drops it. `mode=full` and the `source=session` store it writes then see the
+	// same filtered set the probe and post-write lanes already deliver.
+	// The same pass counts what it withheld (#4638 r3 N2): the filtered report
+	// names the rows instead of reading as "No issues" with only the ledger to
+	// say otherwise. Collected per file in sweep order, so the aggregate's named
+	// declaration does not depend on which walk finished first.
+	const pythonSweep = await mapWithConcurrency(
+		lspResults,
+		PYTHON_DECLARATION_CONCURRENCY,
+		async (result) => {
+			const pythonKept = await applyDeclarationRule(
+				result.filePath,
+				result.diagnostics,
+			);
+			if (pythonKept.dropped === 0) return { result };
+			return {
+				result: { ...result, diagnostics: pythonKept.kept },
+				withheld: pythonKept.declared && {
+					count: pythonKept.dropped,
+					declared: pythonKept.declared,
+				},
+			};
+		},
+	);
+	lspResults = pythonSweep.map((entry) => entry.result);
+	// Each project's rows are cited under that project's own declaration
+	// (#4638 r4 F3).
+	const withheldCompile = mergeWithheld(
+		pythonSweep.map((entry) =>
+			"withheld" in entry ? entry.withheld : undefined,
+		),
 	);
 	// A result bound to a different document must not replace the current
 	// widget state, even when it contains real diagnostics. Pull results may carry
@@ -2457,6 +2614,18 @@ async function formatFullMode(
 	);
 	const authoritativeLspFiles = new Set<string>();
 	const unreconciledFiles = new Set<string>();
+	// Project rule policy (`.dm-lens.json` `rules.<id>.disable`/`select`) —
+	// loaded once per mode=full call, BEFORE the footer write below and before
+	// `projectSnapshot`/`projectDelta` are built, so `.diagnostics.length` on
+	// both (which feeds `details.projectDiagnostics`/
+	// `details.projectDiagnosticsDelta` as well as the merge into `summaries`)
+	// is the POST-policy count. Threaded into
+	// `applyInlineSuppressionsToSummaries` too (idempotent re-apply there) so
+	// the merged summaries honor the same policy the per-edit dispatch path
+	// applies. A project config read failure is treated as "no policy"
+	// (defensive, matches the `applyInlineSuppressionsToSummaries` read-error
+	// discipline).
+	const policyMap = loadProjectRulePolicyMap(cwd);
 	// #571: reconcile this scan's fresh, CONFIRMED per-file results into the
 	// footer cache. A footer write is never allowed to fail the tool call, so
 	// any unexpected throw is swallowed.
@@ -2472,8 +2641,8 @@ async function formatFullMode(
 			// #692: re-tag aux-sourced findings (ast-grep, opengrep, zizmor, typos)
 			// with their real tool id + semantic policy — the same treatment the
 			// per-edit dispatch runner gives them — so a scan-reconciled entry no
-			// longer keeps tool "lsp". No file content is read here (this loop
-			// only has `result.diagnostics`/`result.filePath` from the sweep, not
+			// longer keeps tool "lsp". The retag is given no file content (it
+			// runs on `result.diagnostics`/`result.filePath` from the sweep, not
 			// the file body) — `detectFileRole` still classifies test files
 			// correctly from the path alone (its content-based checks only refine
 			// generated/stub detection), and native inline-suppression comments
@@ -2486,9 +2655,29 @@ async function formatFullMode(
 				"",
 				{ cwd, fileRole: detectFileRole(result.filePath) },
 			);
+			// #4459 review F2: the store is handed the POST-policy set, as every
+			// other scan writer hands it (the per-edit dispatch, the correlated
+			// write below). Handing it the raw sweep made a re-reported marked
+			// finding read as "the mark no longer applies" (#3158 retention rule
+			// 2): it replaced the disposition-tagged row, the correlated write then
+			// dropped it, and the footer chip and mode=all lost the mark.
+			const content = readFileContent(result.filePath);
+			const { kept: policyKept } = applyFindingPolicy(retagged, {
+				cwd,
+				filePath: result.filePath,
+				content: content ?? "",
+				policyMap,
+			});
+			// #4638 review (F1/F10): the store is what `source=session` later serves,
+			// so the owner rule runs before this write — and only for a file that
+			// carries jedi's row.
+			const pythonKept = await applyDeclarationRule(
+				result.filePath,
+				policyKept,
+			);
 			const retired = reconcileScanDiagnostics(
 				result.filePath,
-				retagged,
+				pythonKept.kept,
 				true,
 				// The service reserves this token when the file enters the scan. The
 				// fallback preserves compatibility with older test doubles/services.
@@ -2527,17 +2716,6 @@ async function formatFullMode(
 			});
 		}
 	}
-	// Project rule policy (`.dm-lens.json` `rules.<id>.disable`/`select`) —
-	// loaded once per mode=full call, BEFORE `projectSnapshot`/`projectDelta`
-	// are built below, so `.diagnostics.length` on both (which feeds
-	// `details.projectDiagnostics`/`details.projectDiagnosticsDelta` as well
-	// as the merge into `summaries`) is the POST-policy count. Threaded into
-	// `applyInlineSuppressionsToSummaries` too (idempotent re-apply there) so
-	// the merged summaries honor the same policy the per-edit dispatch path
-	// applies. A project config read failure is treated as "no policy"
-	// (defensive, matches the `applyInlineSuppressionsToSummaries` read-error
-	// discipline).
-	const policyMap = loadProjectRulePolicyMap(cwd);
 	const scannedSnapshot = filterProjectDiagnosticsSnapshot(
 		rawProjectSnapshot,
 		includeFile,
@@ -2675,6 +2853,7 @@ async function formatFullMode(
 			},
 		});
 	}
+	const dispositionDropped: WidgetDiagnostic[] = [];
 	let summaries = await applyInlineSuppressionsToSummaries(
 		mergeDiagnosticsWithWidgetSummaries(
 			getFileDiagnosticSummaries().filter((summary) =>
@@ -2689,6 +2868,7 @@ async function formatFullMode(
 		),
 		cwd,
 		policyMap,
+		dispositionDropped,
 	);
 	if (unreconciledFiles.size > 0) {
 		summaries = summaries.map((summary) =>
@@ -2723,7 +2903,7 @@ async function formatFullMode(
 			projectScanObservedAt,
 		);
 	}
-	const result = await formatAllMode(
+	const formatted = await formatAllMode(
 		cwd,
 		severity,
 		summaries,
@@ -2751,7 +2931,34 @@ async function formatFullMode(
 		},
 		0,
 		pathsScope,
+		{
+			dropped: dispositionDropped,
+			// #1617: the #1616 suppressed-bucket rule applied to the analyzers —
+			// a finding marked false-positive/won't-fix drops out of
+			// `diagnostics` (fresh-fetch.ts's `record()`), and the drop stays
+			// visible as a count. Review-round F4 (#1625): per-lane attribution
+			// ("gitleaks 2, knip 1") says WHICH analyzer's marks are doing the
+			// suppressing. A lane that's 100% suppressed still won't appear in
+			// `runners`/`cold` as distinct from "ran clean" — #1623's territory.
+			analyzers: extracted.dispositionSuppressed ?? 0,
+			analyzersByLane: extracted.dispositionSuppressedByLane ?? {},
+		},
 	);
+	// #4638 r3 (N2): every return below builds on `result`, so the disclosure of
+	// rows the declaration withheld is added once, here, to text and details.
+	const withheldText = withheldCompileNote(withheldCompile);
+	const result = withheldText
+		? {
+				...formatted,
+				content: [
+					{
+						type: "text" as const,
+						text: `${formatted.content[0].text}\n\n${withheldText}`,
+					},
+				] as [{ type: "text"; text: string }],
+				details: { ...formatted.details, withheldCompile },
+			}
+		: formatted;
 	const missingNote = pathsScopeMissingNote(pathsScope);
 	// #630: mirrors `tools/lsp-diagnostics.ts`'s `unconfirmedReasonClause`/
 	// `tallyConfirmation` semantic guarantee (never silently render
@@ -2782,6 +2989,13 @@ async function formatFullMode(
 		lspServerBreakdown.size > 1
 			? ` — by server: ${formatLspServerBreakdown(lspServerBreakdown)}.`
 			: "";
+	// #4403 round 4 (N3): a retry cannot change a denial, so a sweep whose
+	// every unconfirmed file is a disabled primary does not suggest one.
+	const retryClause = [...unconfirmedByReason.keys()].every(
+		(reason) => reason === "primary_disabled",
+	)
+		? ""
+		: "; re-run mode=full to retry them";
 	const unconfirmedLspNote =
 		unconfirmedLspResults.length > 0
 			? `\n\n⚠ LSP sweep: ${confirmedLspResults.length} file(s) confirmed via LSP, ` +
@@ -2792,7 +3006,7 @@ async function formatFullMode(
 					.map((result) => result.filePath)
 					.join(
 						", ",
-					)}${unconfirmedLspResults.length > 20 ? ", …" : ""}. These files' LSP contribution is excluded from this result; re-run mode=full to retry them (they may still show findings above from cached/project-runner state).`
+					)}${unconfirmedLspResults.length > 20 ? ", …" : ""}. These files' LSP contribution is excluded from this result${retryClause} (they may still show findings above from cached/project-runner state).`
 			: "";
 	// Code-unit comparator (#1883): this list ships as the
 	// `unconfirmedLspServerIds` structured field and as the lane names in the
@@ -2934,24 +3148,6 @@ async function formatFullMode(
 						", ",
 					)}. These analyzers were not cached and will be retried; absence of their findings is NOT a clean verdict.`
 			: "";
-	// #1617: the #1616 suppressed-bucket rule applied to mode=full — a finding
-	// an agent/user marked false-positive/won't-fix now drops out of
-	// `diagnostics` (fresh-fetch.ts's `record()`), but that drop must stay
-	// visible as a count rather than reading as "nothing was wrong here".
-	// Review-round F4 (#1625): per-lane attribution — "gitleaks 2, knip 1" says
-	// WHICH analyzer's marks are doing the suppressing, not just a bare total.
-	// A lane that's 100% suppressed still won't appear in `runners`/`cold` as
-	// distinct from "ran clean" — that gap is #1623's lane-status territory,
-	// not fixed here.
-	const dispositionSuppressedByLaneText = Object.entries(
-		extracted.dispositionSuppressedByLane ?? {},
-	)
-		.map(([id, count]) => `${id} ${count}`)
-		.join(", ");
-	const dispositionSuppressedNote =
-		(extracted.dispositionSuppressed ?? 0) > 0
-			? `\n\nsuppressed by disposition: ${extracted.dispositionSuppressed} finding(s) dropped from this result because they're marked false-positive or won't-fix (${dispositionSuppressedByLaneText}). Not a clean verdict for those locations — they were found, then intentionally hidden.`
-			: "";
 	// #747/#250: the cheap project-diagnostics scan (scanProjectDiagnostics) and
 	// the LSP workspace sweep (collectWorkspaceDiagnosticFiles) both refuse to
 	// WALK from a cwd at/above $HOME — from there, walking would enumerate every
@@ -3059,7 +3255,11 @@ async function formatFullMode(
 			coldReasons: extracted.coldReasons ?? {},
 			failedAnalyzers,
 			analyzerTimingsMs: extracted.timings,
-			dispositionSuppressed: extracted.dispositionSuppressed ?? 0,
+			// #1634: every lane the call filtered — the sweep's and the
+			// analyzers' — in one count, the one the text states.
+			dispositionSuppressed:
+				(result.details as { dispositionSuppressed?: number })
+					.dispositionSuppressed ?? 0,
 			dispositionSuppressedByLane: extracted.dispositionSuppressedByLane ?? {},
 			// #1623: ms-old each cache-read-by-design lane's data was (today, only
 			// test-runner) — lets a caller distinguish "just ran" from "served
@@ -3144,7 +3344,6 @@ async function formatFullMode(
 						coldNote +
 						testRunnerEditScopedNote +
 						failedNote +
-						dispositionSuppressedNote +
 						walkUnsafeRootNote +
 						scanTruncatedNote +
 						generatedSkipNote +
@@ -3164,7 +3363,6 @@ async function formatFullMode(
 		partialNote ||
 		testRunnerEditScopedNote ||
 		failedNote ||
-		dispositionSuppressedNote ||
 		walkUnsafeRootNote ||
 		scanTruncatedNote ||
 		generatedSkipNote ||
@@ -3189,7 +3387,6 @@ async function formatFullMode(
 						coldNote +
 						testRunnerEditScopedNote +
 						failedNote +
-						dispositionSuppressedNote +
 						walkUnsafeRootNote +
 						scanTruncatedNote +
 						generatedSkipNote +
@@ -3230,33 +3427,17 @@ async function formatAllMode(
 	detailOverrides: Record<string, unknown> = { mode: "all" },
 	staleDropped = 0,
 	pathsScope?: PathsScope,
-	dependencyDemoted = 0,
+	/**
+	 * mode=full only: the rows its policy pass dropped for a mark, and what the
+	 * fresh analyzers dropped for one, per lane.
+	 */
+	fullModeDisposition: {
+		dropped: readonly WidgetDiagnostic[];
+		analyzers: number;
+		analyzersByLane: Record<string, number>;
+	} = { dropped: [], analyzers: 0, analyzersByLane: {} },
+	sessionEvidence?: { stalePaths: readonly string[]; host: LensToolHost },
 ): Promise<{ content: [{ type: "text"; text: string }]; details: object }> {
-	// #2275 review F2: the widget footer stops DRAWING a dependency-drift
-	// demotion once it hits `DEPENDENCY_DRIFT_MAX_DELIVERIES` unconfirmed
-	// deliveries, but the record stays here (dropping it would make an
-	// unconfirmed LSP error read as clean). Say so, through the same note
-	// channel as the demotion itself, so the agent knows why the footer went
-	// quiet and that a re-run can still confirm the finding.
-	const footerCapped = summaries.reduce(
-		(n, s) =>
-			n + (s.diagnostics ?? []).filter((d) => d.footerRetired === true).length,
-		0,
-	);
-	// Files changed/deleted since their diagnostics were recorded have already
-	// been dropped by reconcileStaleWidgetFiles; note them so the agent knows
-	// those aren't "clean", just un-rescanned (use mode=full to refresh).
-	const staleNote =
-		(staleDropped > 0
-			? ` (${staleDropped} changed file${staleDropped === 1 ? "" : "s"} omitted as stale — use mode=full to rescan)`
-			: "") +
-		(dependencyDemoted > 0
-			? ` (${dependencyDemoted} blocking finding${dependencyDemoted === 1 ? "" : "s"} demoted to [stale] — an imported file changed since; re-run to confirm)`
-			: "") +
-		(footerCapped > 0
-			? ` (${footerCapped} demoted finding${footerCapped === 1 ? "" : "s"} capped after ${DEPENDENCY_DRIFT_MAX_DELIVERIES} unconfirmed deliveries — no longer shown in the dm-lens footer, still listed here; re-run to confirm)`
-			: "");
-
 	// mode=full already actively scanned exactly the requested paths, so a zero
 	// result there IS a legitimate clean read — the cache-only note only applies
 	// to delta/all, which is why this is gated on detailOverrides.mode !== "full".
@@ -3268,6 +3449,26 @@ async function formatAllMode(
 	// false-positive anchors against current content when the file is
 	// unchanged since observation, weak-only fallback otherwise.
 	const policyMap = loadProjectRulePolicyMap(cwd);
+	// #1634 criterion 4: what marks hide is counted and said, scoped to the
+	// requested paths and severity like the rows themselves. Without it a file
+	// whose findings the agent marked after a mode=full read "No issues ✓" a
+	// minute after that sweep listed them. mode=full counts its own policy
+	// pass's drops (its summaries arrive filtered to the requested paths) plus
+	// the fresh analyzers'; mode=all counts the rows a mark tagged in the store
+	// (the footer's `suppressed: N`) plus what its cache-only disposition pass
+	// drops now.
+	const inScope = (rows: readonly WidgetDiagnostic[]) =>
+		rows.reduce((n, d) => n + (matchesSeverity(d, severity) ? 1 : 0), 0);
+	const sweepSuppressed = isFullMode ? inScope(fullModeDisposition.dropped) : 0;
+	const lanes: string[] = [];
+	for (const [id, count] of Object.entries(
+		fullModeDisposition.analyzersByLane,
+	)) {
+		if (count > 0) lanes.push(`${id} ${count}`);
+	}
+	const suppressedBreakdown =
+		lanes.length > 0 ? `analyzer lanes: ${lanes.join(", ")}` : undefined;
+	let dispositionSuppressed = sweepSuppressed + fullModeDisposition.analyzers;
 	const dispositioned = isFullMode
 		? summaries
 		: summaries.map((s) => {
@@ -3277,6 +3478,12 @@ async function formatAllMode(
 					root: cwd,
 					filePath: s.filePath,
 				});
+				if (includeFile(s.filePath)) {
+					dispositionSuppressed +=
+						inScope(getSuppressedDiagnostics(s.filePath)) +
+						inScope(diagnostics) -
+						inScope(kept);
+				}
 				if (
 					policyKept.length === kept.length &&
 					kept.length === diagnostics.length
@@ -3304,6 +3511,27 @@ async function formatAllMode(
 		return summarizeDiagnostics(s.filePath, diagnostics, s.hasFinalSnapshot);
 	});
 	const visibleSummaries = eofGated.filter((s) => includeFile(s.filePath));
+	// Scope and policy govern evidence notes too: a suppressed or unrelated
+	// demotion must not contaminate a requested-path result.
+	const visibleDiagnostics = visibleSummaries.flatMap(
+		(s) => s.diagnostics ?? [],
+	);
+	const dependencyDemoted = visibleDiagnostics.filter(
+		(d) => d.stale && d.staleReason === "dependency-drift",
+	).length;
+	// #2275: footer-capped rows remain evidence here, after policy and scope.
+	const footerCapped = visibleDiagnostics.filter(
+		(d) => d.footerRetired === true,
+	).length;
+	// The omitted-as-stale count is part of the session verdict line below, which
+	// states the reasons once; `mode=full` passes no stale count.
+	const staleNote =
+		(dependencyDemoted > 0
+			? ` (${dependencyDemoted} blocking finding${dependencyDemoted === 1 ? "" : "s"} demoted to [stale] — an imported file changed since; re-run to confirm)`
+			: "") +
+		(footerCapped > 0
+			? ` (${footerCapped} demoted finding${footerCapped === 1 ? "" : "s"} capped after ${DEPENDENCY_DRIFT_MAX_DELIVERIES} unconfirmed deliveries — no longer shown in the dm-lens footer, still listed here; re-run to confirm)`
+			: "");
 
 	// Filter to files with actual issues. A file whose only findings were
 	// demoted by the #1641 past-EOF gate has blocking/errors/warnings at 0 —
@@ -3331,21 +3559,148 @@ async function formatAllMode(
 		);
 	});
 
-	const pathsNote = isFullMode ? "" : pathsScopeCacheOnlyNote(pathsScope);
+	let validationStatus: string | undefined;
+	let validationNote = "";
+	let evidenceDetails: Record<string, unknown> = {};
+	if (!isFullMode) {
+		// Evidence is scoped and post-policy, but intentionally PRE-severity:
+		// filtering out a past-EOF error cannot make an incomplete cache clean.
+		const pending = visibleSummaries.filter((s) => !s.hasFinalSnapshot);
+		const stale = visibleSummaries.filter((s) =>
+			(s.diagnostics ?? []).some((d) => d.stale),
+		);
+		const staleDiagnosticCount = visibleDiagnostics.filter(
+			(d) => d.stale,
+		).length;
+		const requestedFiles = [
+			...(pathsScope?.existingEntries ?? []),
+			...(pathsScope?.missing ?? []),
+		];
+		// Canonicalization stats disk; only explicit file requests need this
+		// membership check, not an unscoped session replay or directory scope.
+		const observed =
+			requestedFiles.length > 0
+				? new Set(
+						[
+							...visibleSummaries.map((s) => s.filePath),
+							...(sessionEvidence?.stalePaths ?? []),
+						].map(normalizeFilePath),
+					)
+				: new Set<string>();
+		const unverified = requestedFiles.filter(
+			(file) => !observed.has(normalizeFilePath(file)),
+		);
+		const rescanPaths = [
+			...new Set([
+				...(sessionEvidence?.stalePaths ?? []),
+				...pending.map((s) => s.filePath),
+				...stale.map((s) => s.filePath),
+				...unverified,
+			]),
+		];
+		// #4522's rule at the session layer: only a clean read reads clean. A final
+		// snapshot with nothing matching is the one `no-matching-findings` (the ✓).
+		// No final snapshot yet, or evidence that changed since it was read, is
+		// `inconclusive` (#4522's `unanswered`); a requested file with nothing cached
+		// is `unverified` (its `unchecked`); matching findings are `findings` (its
+		// `dirty`).
+		validationStatus =
+			staleDropped > 0 || staleDiagnosticCount > 0 || pending.length > 0
+				? "inconclusive"
+				: visibleSummaries.length === 0 || unverified.length > 0
+					? "unverified"
+					: withIssues.length > 0
+						? "findings"
+						: "no-matching-findings";
+		const nextTool = resolveLensToolName(
+			"lens_diagnostics",
+			sessionEvidence?.host ?? "pi",
+		);
+		const nextPaths = rescanPaths.slice(0, MAX_PATHS_ENTRIES);
+		const remainingRescanPathCount = rescanPaths.length - nextPaths.length;
+		evidenceDetails = {
+			validationStatus,
+			pendingFileCount: pending.length,
+			staleDiagnosticCount,
+			unverifiedFileCount: unverified.length,
+			remainingRescanPathCount,
+			...(nextPaths.length > 0
+				? {
+						nextCheck: {
+							tool: nextTool,
+							source: "lsp",
+							scope: "paths",
+							paths: nextPaths,
+						},
+					}
+				: {}),
+		};
+		// Name the files this call's sweep changed. A deleted one leaves no record to
+		// count in another reason; a kept one also reads pending, here and later.
+		const omittedClause =
+			staleDropped > 0
+				? `, ${staleDropped} changed file${staleDropped === 1 ? "" : "s"} omitted as stale`
+				: "";
+		validationNote =
+			validationStatus === "inconclusive" || validationStatus === "unverified"
+				? `Session cache ${validationStatus} — not a clean verdict: ${pending.length} pending file(s), ${staleDiagnosticCount} stale finding(s), ${unverified.length} requested file(s) without cached evidence${omittedClause}. Not active validation.\n` +
+					`Next check: ${nextTool ?? "diagnostics"} source=lsp scope=paths${nextPaths.length > 0 ? ` paths=${JSON.stringify(nextPaths)}` : " with the changed paths"}.` +
+					(remainingRescanPathCount > 0
+						? ` ${remainingRescanPathCount} more path(s) need a check; narrow or batch the remaining paths.`
+						: "") +
+					" LSP may not cover these files; use a file-appropriate validator for unsupported or missing files.\n"
+				: "Session cache only; not active validation.\n";
+		// One bounded decision row per call; no diagnostic content or path list.
+		logLatency({
+			type: "phase",
+			phase: "lens_diagnostics_session_evidence",
+			toolName: "lens_diagnostics",
+			filePath: cwd,
+			durationMs: 0,
+			metadata: {
+				validationStatus,
+				pendingFileCount: pending.length,
+				staleDiagnosticCount,
+				staleDropped,
+				unverifiedFileCount: unverified.length,
+				remainingRescanPathCount,
+			},
+		});
+	}
+	// The verdict's next check already names the one targeted step; the older
+	// `mode=full` advice beside it would be a second, different instruction.
+	const pathsNote =
+		isFullMode || evidenceDetails.nextCheck !== undefined
+			? ""
+			: pathsScopeCacheOnlyNote(pathsScope);
+	const suppressedLine = dispositionSuppressedLine(
+		dispositionSuppressed,
+		suppressedBreakdown,
+	);
+	const suppressedNote = suppressedLine ? `\n${suppressedLine}` : "";
+	const suppressedDetails =
+		dispositionSuppressed > 0 ? { dispositionSuppressed } : {};
 
 	if (withIssues.length === 0) {
 		const text =
 			(visibleSummaries.length === 0
-				? "No files diagnosed yet this session."
-				: `No ${severity === "all" ? "" : severity + " "}issues across ${visibleSummaries.length} file${visibleSummaries.length === 1 ? "" : "s"} diagnosed this session. ✓`) +
+				? "No files diagnosed yet this session.\n"
+				: validationStatus === "inconclusive" ||
+					  validationStatus === "unverified"
+					? ""
+					: `No ${severity === "all" ? "" : severity + " "}issues across ${visibleSummaries.length} file${visibleSummaries.length === 1 ? "" : "s"} diagnosed this session. ✓\n`) +
+			validationNote +
 			staleNote +
+			suppressedNote +
 			pathsNote;
 		return {
 			content: [{ type: "text" as const, text }],
 			details: {
 				...detailOverrides,
+				...evidenceDetails,
 				filesChecked: visibleSummaries.length,
 				staleDropped,
+				...suppressedDetails,
 			},
 		};
 	}
@@ -3370,7 +3725,10 @@ async function formatAllMode(
 	let totalAdvisories = 0;
 
 	for (const s of rendered) {
-		const rel = path.relative(cwd, s.filePath);
+		// Widget rows are keyed by path identity, the root is the session's
+		// spelling: the owner renders `src/x.ts` under a root reached through a
+		// link, where a lexical relative path read `../repo/src/x.ts` (#4689 r2).
+		const rel = toProjectRelativePath(s.filePath, cwd);
 		const parts: string[] = [];
 		if (s.blocking > 0) parts.push(`🔴 ${s.blocking} blocking`);
 		if (s.errors > 0 && s.blocking === 0) parts.push(`${s.errors}E`);
@@ -3464,16 +3822,26 @@ async function formatAllMode(
 
 	return {
 		content: [
-			{ type: "text" as const, text: lines.join("\n") + summary + staleNote },
+			{
+				type: "text" as const,
+				text:
+					validationNote +
+					lines.join("\n") +
+					summary +
+					staleNote +
+					suppressedNote,
+			},
 		],
 		details: {
 			...detailOverrides,
+			...evidenceDetails,
 			filesWithIssues: withIssues.length,
 			totalBlocking,
 			totalErrors,
 			totalWarnings,
 			totalAdvisories,
 			staleDropped,
+			...suppressedDetails,
 		},
 	};
 }

@@ -54,6 +54,26 @@
  * and an older fingerprint, so the document stays eligible instead of going
  * invisible.
  *
+ * ## The cap never evicts a document a server still holds (#4503)
+ *
+ * The record set is capped so a workspace sweep — one touch per project file,
+ * which leaves every one of those documents open — cannot grow it without
+ * bound. Evicting by insertion order alone broke the very case the backstop
+ * exists for: the 513th file's stamp unbound the 1st, the server kept its
+ * pre-edit view, and no record was left to compare disk against, so an
+ * untracked edit to that document could never heal for the life of the
+ * server.
+ *
+ * Eviction therefore walks insertion order and skips every record whose
+ * document a live server still holds ({@link
+ * DocumentDriftTrackerOptions.holdsDocument}); it drops the oldest one nobody
+ * holds. When every tracked document is held, nothing is evicted and the set
+ * stands above the cap, bounded by the held-document count instead of by a
+ * constant. One bounded record per session names the first time that happens
+ * ({@link DocumentDriftTrackerOptions.onCapOverflow}), so growth past the cap
+ * stays visible. A record the sweep already proved unheld is evicted by the
+ * next insert.
+ *
  * ## Cost and pacing
  *
  * One `stat` per tracked document per pass, at most {@link DRIFT_CHECK_BATCH}
@@ -162,7 +182,12 @@ const SKIPPED: DriftSweepResult = {
 const DRIFT_CHECK_BATCH = 64;
 /** Resyncs issued per pass. Paces the heal so a bulk edit cannot burst. */
 export const DRIFT_RESYNC_BATCH = 4;
-/** Tracked-document ceiling. A workspace sweep can open far more than this. */
+/**
+ * Tracked-document ceiling for documents NO live server holds. A workspace
+ * sweep can open far more than this, and those documents stay open, so the
+ * tracked set is bounded by the max of this number and the held-document
+ * count — never by this number alone (#4503).
+ */
 export const DRIFT_TRACK_CAP = 512;
 
 const DEFAULT_DRIFT_CHECK_INTERVAL_MS = 10_000;
@@ -175,6 +200,29 @@ export function driftCheckIntervalMs(): number {
 	const raw = Number(process.env.DM_LENS_LSP_DRIFT_CHECK_MS);
 	if (!Number.isFinite(raw) || raw < 0) return DEFAULT_DRIFT_CHECK_INTERVAL_MS;
 	return Math.floor(raw);
+}
+
+export interface DocumentDriftTrackerOptions {
+	/**
+	 * Does a live language server still hold this document open?
+	 *
+	 * The cap below is enforced against this answer, so a record a held
+	 * document depends on is never the one evicted (#4503). A pass may answer
+	 * for itself through {@link DriftSweepDeps.holdsDocument}; this is the
+	 * tracker's standing answer when a pass supplies none.
+	 *
+	 * Omitting it means "nothing is held", which is the pre-#4503 FIFO cap: a
+	 * caller that can answer must, or a held document loses its record at the
+	 * cap and its stale view is never compared against disk again.
+	 */
+	holdsDocument?(filePath: string): boolean;
+	/**
+	 * Called at most once per session, when the tracked set first stands above
+	 * {@link DRIFT_TRACK_CAP} because every record belongs to a held document.
+	 * The population is bounded by the held-document count from there, so this
+	 * is the seam that keeps that growth visible (#4503).
+	 */
+	onCapOverflow?(state: { tracked: number; cap: number }): void;
 }
 
 export interface DriftSweepDeps {
@@ -221,6 +269,28 @@ export interface DriftSweepDeps {
 export class DocumentDriftTracker {
 	/** Insertion-ordered; the sweep cursor walks it round-robin. */
 	private readonly synced = new Map<string, SyncedDocumentRecord>();
+	/** Whether this tracker may drop a record while its document is still held. */
+	private readonly holds: ((filePath: string) => boolean) | undefined;
+	private readonly onCapOverflow:
+		| ((state: { tracked: number; cap: number }) => void)
+		| undefined;
+	/**
+	 * Set by the first cap crossing of the session, so the overflow record is
+	 * emitted at most once per session. {@link clear} re-arms it at the session
+	 * boundary: a later crossing is the same session's answer, and a per-crossing
+	 * row would grow with every sweep rather than with the session.
+	 */
+	private capOverflowRecorded = false;
+	/**
+	 * The last walk found no record it may evict, so the next insert into an
+	 * over-cap set has nothing new to learn. Cleared by {@link clear}, by a pass
+	 * that dropped an unheld record (see {@link evictPastCap}), and once
+	 * {@link DRIFT_TRACK_CAP} inserts have gone by without a walk, so a
+	 * population that grew while nobody looked is re-examined.
+	 */
+	private noEvictableRecord = false;
+	/** Inserts that skipped the walk since the last one. */
+	private skipsSinceWalk = 0;
 	/**
 	 * Git/external recovery targets waiting for the same paced resync budget,
 	 * each with whether its push is a save (#3828 r3). The save lives and dies
@@ -239,6 +309,11 @@ export class DocumentDriftTracker {
 	 */
 	private readonly flight: SingleFlight<DriftSweepResult> =
 		createSingleFlight<DriftSweepResult>();
+
+	constructor(options: DocumentDriftTrackerOptions = {}) {
+		this.holds = options.holdsDocument;
+		this.onCapOverflow = options.onCapOverflow;
+	}
 
 	get size(): number {
 		return this.synced.size;
@@ -294,11 +369,67 @@ export class DocumentDriftTracker {
 			fingerprint,
 			syncedAt: now,
 		});
-		while (this.synced.size > DRIFT_TRACK_CAP) {
-			const oldest = this.synced.keys().next();
-			if (oldest.done) break;
-			this.synced.delete(oldest.value);
+		this.evictPastCap();
+	}
+
+	/**
+	 * Drop the oldest record that no live server holds, and never one it does.
+	 *
+	 * #4503: the cap used to evict by insertion order alone. A workspace sweep
+	 * stamps one record per project file in a single burst and leaves every one
+	 * of those documents open, so the 513th file's stamp silently unbound the
+	 * 1st: the server still held it, but no record was left to compare disk
+	 * against, and an untracked edit to it could never heal.
+	 *
+	 * So the walk skips every record whose document is held and evicts the first
+	 * one that is not. When every record is held, nothing is evicted: the set
+	 * stands above the cap, bounded by the held-document count rather than by an
+	 * arbitrary number. Nothing is stranded by that: a record the sweep proves
+	 * unheld is dropped by the pass itself, and the next insert after a release
+	 * can evict instead of skip.
+	 *
+	 * The walk costs one predicate call per tracked record — the predicate is a
+	 * live-client map lookup — so it runs only when it can pay off:
+	 * {@link noEvictableRecord} remembers a walk that found nobody to evict, and
+	 * the inserts that follow skip it. That memo is sound because every record
+	 * arrives for a document that just landed on a live server
+	 * ({@link recordSynced} is only called under full coverage), and the one
+	 * thing that makes a tracked record evictable again is a server closing the
+	 * document, which the pass below discovers and drops. A document may close
+	 * and go unnoticed between passes, so the memo re-arms after
+	 * {@link DRIFT_TRACK_CAP} skipped inserts: the set then stands at most one
+	 * cap above the held-document count the last walk saw (not the current
+	 * one, which may since have dropped) instead of following churn upward.
+	 */
+	private evictPastCap(): void {
+		if (this.synced.size <= DRIFT_TRACK_CAP) return;
+		if (this.noEvictableRecord) {
+			this.skipsSinceWalk += 1;
+			if (this.skipsSinceWalk < DRIFT_TRACK_CAP) return;
 		}
+		this.skipsSinceWalk = 0;
+		this.noEvictableRecord = false;
+		let victim: string | undefined;
+		for (const key of this.synced.keys()) {
+			if (this.isHeld(key)) continue;
+			victim = key;
+			break;
+		}
+		if (victim !== undefined) {
+			this.synced.delete(victim);
+			return;
+		}
+		this.noEvictableRecord = true;
+		if (this.capOverflowRecorded) return;
+		this.capOverflowRecorded = true;
+		this.onCapOverflow?.({
+			tracked: this.synced.size,
+			cap: DRIFT_TRACK_CAP,
+		});
+	}
+
+	private isHeld(key: string): boolean {
+		return this.holds?.(key) === true;
 	}
 
 	forget(filePath: string): void {
@@ -311,6 +442,9 @@ export class DocumentDriftTracker {
 		this.pendingResync.clear();
 		this.cursor = 0;
 		this.lastSweepAt = 0;
+		this.capOverflowRecorded = false;
+		this.noEvictableRecord = false;
+		this.skipsSinceWalk = 0;
 		this.flight.clear();
 	}
 
@@ -336,7 +470,10 @@ export class DocumentDriftTracker {
 				if (intervalMs === 0) return SKIPPED;
 				if (now() - this.lastSweepAt < intervalMs) return SKIPPED;
 			}
-			if (this.synced.size === 0) {
+			// #4493: queued targets need no record (a held document whose record
+			// was evicted or never stamped), so only an empty queue AND no record
+			// leave nothing to do.
+			if (this.synced.size === 0 && this.pendingResync.size === 0) {
 				this.lastSweepAt = now();
 				return SKIPPED;
 			}
@@ -351,6 +488,11 @@ export class DocumentDriftTracker {
 		this.lastSweepAt = now();
 		const stat = deps.stat ?? defaultStat;
 		const read = deps.read ?? defaultRead;
+		// #4503: the pass may answer the holding question itself (the tests drive
+		// one answer per pass); otherwise the tracker's standing answer is the one
+		// the cap was already enforced against, so a pass and the eviction below
+		// can never disagree about whether a record is still load-bearing.
+		const holds = deps.holdsDocument ?? this.holds;
 		const keys = [...this.synced.keys()];
 		const tracked = keys.length;
 		if (this.cursor >= tracked) this.cursor = 0;
@@ -358,7 +500,7 @@ export class DocumentDriftTracker {
 		for (let i = 0; i < Math.min(DRIFT_CHECK_BATCH, tracked); i++) {
 			window.push(keys[(this.cursor + i) % tracked] as string);
 		}
-		this.cursor = (this.cursor + window.length) % tracked;
+		this.cursor = tracked === 0 ? 0 : (this.cursor + window.length) % tracked;
 
 		// Drop records nobody holds BEFORE spending a stat on them.
 		let unheld = 0;
@@ -366,9 +508,14 @@ export class DocumentDriftTracker {
 		for (const key of window) {
 			const record = this.synced.get(key);
 			if (!record) continue;
-			if (deps.holdsDocument && !deps.holdsDocument(key)) {
+			if (holds && !holds(key)) {
 				this.synced.delete(key);
 				unheld += 1;
+				// A dropped record is proof that the population holds something
+				// evictable again, so the next over-cap insert walks instead of
+				// trusting {@link noEvictableRecord}.
+				this.noEvictableRecord = false;
+				this.skipsSinceWalk = 0;
 				deps.onDrift?.({
 					filePath: key,
 					driftAgeMs: Math.max(0, now() - record.syncedAt),
@@ -438,7 +585,7 @@ export class DocumentDriftTracker {
 		const queued = [...this.pendingResync.keys()];
 		const queuedDispositions = new Map<string, DriftDisposition>();
 		for (const key of queued) {
-			if (deps.holdsDocument && !deps.holdsDocument(key)) {
+			if (holds && !holds(key)) {
 				this.pendingResync.delete(key);
 				unheld += 1;
 				queuedDispositions.set(key, "unheld");

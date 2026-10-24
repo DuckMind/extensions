@@ -515,6 +515,25 @@ function resolveJava(cwd: string, filePath: string, source: string): string[] {
 }
 
 /**
+ * #4346: the names an import source spells, the parts a created file can
+ * answer by name. `"./gen/swept_gen"` gives `gen` and `swept_gen`.
+ */
+export function importSourceNameParts(source: string): string[] {
+	return source.match(/[\w$-]+/g) ?? [];
+}
+
+/**
+ * #4346: the names `file` answers when an unresolved import spells them: its
+ * stem and its directory's name (`src/b.ts` answers `b` and `src`).
+ */
+export function fileAnswerNames(file: string): string[] {
+	return [
+		path.basename(file).split(".")[0] ?? "",
+		path.basename(path.dirname(file)),
+	].flatMap((name) => (name.length > 0 ? [name] : []));
+}
+
+/**
  * Resolve a single tree-sitter import source to in-project file(s). Returns
  * normalized paths (possibly several — a Go/Java package is a directory) or `[]`
  * when the source isn't a resolvable in-project file (keep it as external).

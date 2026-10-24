@@ -15,6 +15,7 @@ import {
 	workspaceEditDiskPaths,
 } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/capabilities.js";
+import { configDisabledAuxiliaryLspServerIds } from "./dispatch/auxiliary-lsp.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
 import {
 	bounded,
@@ -674,6 +675,14 @@ export interface BuildActionableWarningsArgs {
 	 * `actionable-warnings` cache the in-band report goes to.
 	 */
 	onDeferredReport?: (report: ActionableWarningsReport) => void;
+	/**
+	 * #4323: the host's flag resolver (the one the explicit diagnostics routes
+	 * use), so the cold LSP read leaves the auxiliaries the operator turned off
+	 * (`--no-opengrep`, `opengrep.enabled=false`) unstarted. Omitted by callers
+	 * that run no cold read (persistent re-verify passes the touch's own
+	 * diagnostics) and in tests, where no flag is set.
+	 */
+	getFlag?: (name: string) => boolean | string | undefined;
 }
 
 /** One file's LSP enrichment plan, resolved before any fresh pull happens. */
@@ -706,6 +715,12 @@ interface LspEnrichmentDeps {
 	 * session boundary had deliberately retired the one it started with.
 	 */
 	lspService: ReturnType<typeof getLSPService>;
+	/**
+	 * #4323: auxiliaries the operator's configuration turns off, resolved once
+	 * per build from `BuildActionableWarningsArgs.getFlag`; the cold read never
+	 * acquires them.
+	 */
+	excludeServerIds?: ReadonlySet<string> | undefined;
 	/** Per-round-trip timeout; the bound a between-files deadline cannot give. */
 	pullTimeoutMs: number;
 	/**
@@ -853,6 +868,9 @@ export async function buildActionableWarningsReport(
 	const cwd = path.resolve(args.cwd);
 	const records: ActionableWarningRecord[] = [...args.dispatchWarnings];
 	const lspService = getLSPService();
+	const excludeServerIds = args.getFlag
+		? configDisabledAuxiliaryLspServerIds(args.getFlag)
+		: undefined;
 	// #2504 review round 5 (F2): when each file's LSP observation FINISHED,
 	// keyed by normalized path. assembleReport used to stamp every entry with
 	// one `new Date()` taken at ASSEMBLY -- which for the deferred loop is the
@@ -987,6 +1005,7 @@ export async function buildActionableWarningsReport(
 		// deferral must not be the only path that is bounded.
 		const inBandDeps: LspEnrichmentDeps = {
 			lspService,
+			excludeServerIds,
 			pullTimeoutMs,
 			// #2504 review round 4 (F2). This is the AWAITED hook: the batch
 			// budget has to bound what happens INSIDE a file, not only how many
@@ -1068,6 +1087,7 @@ export async function buildActionableWarningsReport(
 					combineAbortSignals(args.signal, deferredSignal) ?? deferredSignal;
 				const deferredDeps: LspEnrichmentDeps = {
 					lspService,
+					excludeServerIds,
 					pullTimeoutMs,
 					signal: loopSignal,
 					// OFF the hook by construction: this loop is the answer to
@@ -1241,7 +1261,8 @@ export async function enrichFileFromLsp(
 				}
 			}
 			const pulled = await boundedLspCall(
-				() => lspService.getDiagnostics(filePath),
+				() =>
+					lspService.getDiagnostics(filePath, "full", deps.excludeServerIds),
 				deps,
 			);
 			if (pulled === undefined) {

@@ -41,8 +41,47 @@ registerWorkspaceTopologyReset(() => {
 	referencesCache.clear();
 });
 
-/** Strip JSONC comments and trailing commas without touching string contents. */
-function parseJsonc(content: string): TsconfigJson {
+/**
+ * Strip the trailing commas JSONC allows (`[1, 2,]`), outside string literals so
+ * a value like `"a, }"` survives. Input is already comment-free.
+ */
+function stripTrailingCommas(content: string): string {
+	let output = "";
+	let inString = false;
+	for (let i = 0; i < content.length; i++) {
+		const char = content[i];
+		if (inString) {
+			output += char;
+			if (char === "\\") {
+				output += content[i + 1] ?? "";
+				i++;
+			} else if (char === '"') {
+				inString = false;
+			}
+			continue;
+		}
+		if (char === '"') {
+			inString = true;
+			output += char;
+			continue;
+		}
+		if (char === ",") {
+			let lookahead = i + 1;
+			while (
+				lookahead < content.length &&
+				/\s/.test(content[lookahead] ?? "")
+			) {
+				lookahead++;
+			}
+			const next = content[lookahead];
+			if (next === "}" || next === "]") continue;
+		}
+		output += char;
+	}
+	return output;
+}
+
+export function parseJsonc<T = TsconfigJson>(content: string): T {
 	let output = "";
 	let inString = false;
 	let escaped = false;
@@ -74,7 +113,7 @@ function parseJsonc(content: string): TsconfigJson {
 			output += char;
 		}
 	}
-	return JSON.parse(output.replace(/,\s*([}\]])/g, "$1")) as TsconfigJson;
+	return JSON.parse(stripTrailingCommas(output)) as T;
 }
 
 function configSignature(configPath: string): string {

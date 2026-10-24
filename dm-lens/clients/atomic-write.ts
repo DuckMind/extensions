@@ -180,8 +180,12 @@ export function writeFileAtomic(
 		try {
 			fs.rmSync(tmpPath, { force: true });
 		} catch {
-			// ignore — best-effort cleanup of our own tmp file
+			// none: best-effort cleanup of our own tmp file, whose name is derived
+			// from this call's target; a failure here removes nothing (force: true)
 		}
+		// none: `bestEffort` defaults to true by design — the caller chose a
+		// write whose loss it can tolerate (a cache or snapshot). A caller that
+		// cannot tolerate it passes `bestEffort: false` and gets the rethrow.
 		if (!bestEffort) throw err;
 	}
 }
@@ -209,8 +213,12 @@ export async function writeFileAtomicAsync(
 		try {
 			await fs.promises.rm(tmpPath, { force: true });
 		} catch {
-			// ignore — best-effort cleanup of our own tmp file
+			// none: best-effort cleanup of our own tmp file, whose name is derived
+			// from this call's target; a failure here removes nothing (force: true)
 		}
+		// none: `bestEffort` defaults to true by design — the caller chose a
+		// write whose loss it can tolerate (a cache or snapshot). A caller that
+		// cannot tolerate it passes `bestEffort: false` and gets the rethrow.
 		if (!bestEffort) throw err;
 	}
 }

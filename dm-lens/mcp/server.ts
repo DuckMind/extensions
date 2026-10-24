@@ -77,6 +77,7 @@ import {
 	summarizeScan,
 	symbolSearch,
 	treeSitterRuntimeStatus,
+	unlinkStaleUnixSocket,
 	WARM_TURN_END_SCHEMA_VERSION,
 	type WarmAnalyzeRequest,
 	type WarmTurnEndRequest,
@@ -102,6 +103,7 @@ import {
 } from "../clients/situational-tool-telemetry.js";
 import { logExtension, flushExtensionLog } from "../clients/extension-log.js";
 import { createLspNavigationTool } from "../tools/lsp-navigation.js";
+import { dispositionSuppressedLine } from "../clients/finding-delivery-gate.js";
 import { shouldInitializeSessionRoot } from "../clients/lsp/session-roots.js";
 import {
 	findIgnoredArguments,
@@ -344,14 +346,9 @@ function isWithinServerWorkspace(cwd: string): boolean {
 
 function startIpcServer(): void {
 	// POSIX: a stale socket file blocks listen; remove it first. (Named pipes on
-	// Windows don't need this.)
-	if (process.platform !== "win32") {
-		try {
-			fs.unlinkSync(IPC_PATH);
-		} catch {
-			// no stale socket — fine
-		}
-	}
+	// Windows don't need this; the helper is a no-op there.) It names the bound
+	// file and removes only a socket, never an unrelated file the cut lands on.
+	unlinkStaleUnixSocket(IPC_PATH);
 
 	const requestQueue = createWarmIpcRequestQueue();
 	const ipc = net.createServer((socket) => {
@@ -493,13 +490,9 @@ function startIpcServer(): void {
 		} catch {
 			// ignore
 		}
-		if (process.platform !== "win32") {
-			try {
-				fs.unlinkSync(IPC_PATH);
-			} catch {
-				// ignore
-			}
-		}
+		// No unlink here: `ipc.close()` removes the file it bound. An explicit
+		// unlink of the shared name would also delete a LIVE sibling's socket when
+		// this server never bound (its `listen` failed EADDRINUSE).
 	};
 	process.on("exit", cleanup);
 }
@@ -568,7 +561,7 @@ function graphStalenessNote(
 
 // --- Tools -------------------------------------------------------------------
 
-// #4300: this process runs outside pi; its caller owns workspace trust.
+// #4300: this process runs outside DM; its caller owns workspace trust.
 setProjectTrustState("trusted");
 logExtension({
 	subsystem: "project-trust",
@@ -611,6 +604,10 @@ const lensDiagnosticsTool = createLensDiagnosticsTool(
 	// Matches index.ts:1656 and the two sibling readers
 	// (clients/runtime-tool-call.ts, clients/runtime-tool-result.ts).
 	() => isLensGuardEnabled(),
+	// #4323: `opengrep.enabled=false` keeps the explicit `source=lsp` probe from
+	// starting Opengrep, as it does for `dmlens_analyze`. Resolved per call
+	// against the call's own project, like `lspNavigationTool` below (#792).
+	(name, cwd) => createMcpHost(undefined, cwd).getFlag(name),
 );
 const astGrepClient = new AstGrepClient();
 const astGrepSearchTool = createAstGrepSearchTool(astGrepClient);
@@ -1250,8 +1247,14 @@ async function callTool(
 		// #2535: render the MCP-callable tool names on this route.
 		const skipNotice = generatedSkipNotice(snapshot, "mcp");
 		if (skipNotice) summaryLines.push(skipNotice);
+		// #1634: the count `projectScan`'s finding policy dropped, worded as the
+		// diagnostics probes word it.
+		const { dispositionSuppressed } = snapshot;
+		const suppressedLine = dispositionSuppressedLine(dispositionSuppressed);
+		if (suppressedLine) summaryLines.push(suppressedLine);
 		return toolText(summaryLines.join("\n"), {
 			filesScanned: snapshot.filesScanned,
+			...(dispositionSuppressed > 0 ? { dispositionSuppressed } : {}),
 			runners: snapshot.runners,
 			uniqueDiagnostics: deduped.length,
 			rawDiagnostics: snapshot.diagnostics.length,

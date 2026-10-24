@@ -51,6 +51,8 @@ type WordIndexLogPhase =
 	| "cold_build_failed"
 	/** A warm MCP index was normally released by idle/LRU lifecycle policy. */
 	| "warm_cache_evicted"
+	/** An empty warm MCP entry adopted the index a later build published (#4583). */
+	| "warm_cache_adopted"
 	/** A debounced snapshot persist landed — confirms the index is kept fresh
 	 *  across edits (the durable record the MCP host's no-op `dbg` couldn't give). */
 	| "persist_succeeded"
@@ -134,4 +136,8 @@ export function logWordIndex(entry: WordIndexLogEntry): void {
 		...entry,
 		cwd: normalizeFilePath(entry.cwd),
 	});
+}
+
+export function getWordIndexLogPath(): string {
+	return WORD_INDEX_LOG_FILE;
 }

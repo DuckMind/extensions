@@ -8,21 +8,27 @@ import type { CascadeRun } from "./cascade-types.js";
 import { logCascade } from "./cascade-logger.js";
 import {
 	appendProjectChangeAllocated,
+	appendProjectChangesAllocated,
 	type ProjectChangeRange,
 	type ProjectChangeSource,
 } from "./project-changes.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { Diagnostic } from "./dispatch/types.js";
+import {
+	ANY_POSITION,
+	foldedFindingIdentity,
+	retainRecordedFindings,
+} from "./finding-identity.js";
 import { formatDiagnostics } from "./dispatch/utils/format-utils.js";
 import {
 	inlineBlockerLines,
 	inlineBlockerSources,
 } from "./inline-blocker-fields.js";
-import type { FileComplexity } from "./complexity-client.js";
 import type { MutationKind } from "./mutating-tool.js";
 import { normalizeMapKey, pathsEqual } from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";
+import { type AnalysisAnchor, owedByContentOnly } from "./line-alignment.js";
 import { PartialApplyRecordStore } from "./partial-edit-apply.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
@@ -66,6 +72,27 @@ function nextTelemetrySessionId(): string {
  * oldest is evicted past it, and the eviction is counted by the caller.
  */
 export const MAX_CUT_ADVISORY_LANES = 16;
+
+/**
+ * Every background startup scan name. `session_start` starts scans under these
+ * names, the defer table in `runtime-session.ts` is keyed by them, and the
+ * in-flight ledger below is read by name in `runtime-turn.ts`. One type makes a
+ * misspelled or orphan name fail the build (#4352).
+ */
+export type StartupTaskName =
+	| "todo"
+	| "dead-code"
+	| "knip"
+	| "jscpd"
+	| "govulncheck"
+	| "gitleaks"
+	| "opengrep"
+	| "madge"
+	| "trivy"
+	| "call-graph"
+	| "codebase-model"
+	| "ast-grep-exports"
+	| "word-index";
 
 export interface ErrorDebtBaseline {
 	testsPassed: boolean;
@@ -344,6 +371,15 @@ export interface InlineBlockerRecord {
 	 * of the session.
 	 */
 	staleDeliveryCount?: number;
+	/**
+	 * #4484 round 4: what the verdict behind this record analysed (line
+	 * hashes, owed lines), set by `setAnalysisAnchor` right after the record
+	 * verb. It lives exactly as long as the record. At most 4 bytes per line
+	 * up to `MAX_ALIGNMENT_LINES` (400 KB), plus `MAX_OWED_RANGES` ranges per
+	 * owing runner. Absent on a record a collect-later settle started: the
+	 * next write then has no alignment and matches on identity alone.
+	 */
+	analysisAnchor?: AnalysisAnchor;
 }
 
 /**
@@ -352,6 +388,13 @@ export interface InlineBlockerRecord {
  * retires more than this in one turn says "… and N more".
  */
 const MAX_RESOLVED_BLOCKER_FILES = 10;
+
+/**
+ * #4484 round 5: files with no blocker record whose whole analysis anchor is
+ * kept (`_owedAnchors`), at most 400 KB each. Past it the oldest file's owed
+ * lines are matched by content, a superset that fails closed.
+ */
+export const MAX_OWED_ANCHORS = 16;
 
 /**
  * #3218 criterion 2: one file whose inline blocker a fresh clean verdict
@@ -507,7 +550,7 @@ export class RuntimeCoordinator {
 	private _errorDebtBaseline: ErrorDebtBaseline | null = null;
 	private _pipelineCrashCounts = new Map<string, number>();
 	private _cachedExports = new Map<string, string>();
-	private _startupScansInFlight = new Map<string, number>();
+	private _startupScansInFlight = new Map<StartupTaskName, number>();
 	private _cascadeRuns: CascadeRun[] = [];
 	// #3813/#3901: items an item-bearing turn-end advisory showed and the cap
 	// cut (knip, dead-code, call-graph impact), keyed by lane. Parked once,
@@ -526,7 +569,7 @@ export class RuntimeCoordinator {
 		diagnosticsSurfaced: 0,
 		coldSnapshotTouches: 0,
 	};
-	private _complexityBaselines = new Map<string, FileComplexity>();
+	private _complexityBaselines = new Set<string>();
 	private readonly _fixedThisTurn = new PathKeyedMap<true>(normalizeMapKey);
 	private readonly _writtenThisTurn = new PathKeyedMap<true>(normalizeMapKey);
 	private readonly _autofixDemotedThisTurn = new PathKeyedMap<true>(
@@ -602,6 +645,16 @@ export class RuntimeCoordinator {
 	private _gitGuardHasBlockers = false;
 	private _gitGuardSummary = "";
 	private _gitGuardCacheUnknownReason: string | undefined;
+	/**
+	 * #4733 r2 F12: per file, a dispatch that never answered
+	 * (`pipeline_crash`, `pipeline_error`). It is about that file, not the
+	 * persisted record, so it lives apart from the record's latch above: only
+	 * that file's own dispatch returning removes it, and no record write or
+	 * delete does. Cleared per session.
+	 */
+	private readonly _gitGuardUnansweredDispatches = new PathKeyedMap<string>(
+		normalizeMapKey,
+	);
 	callGraph: FunctionCallGraph | null = null;
 	wordIndex: WordIndex | null = null;
 	private _readGuard: ReadGuard | null = null;
@@ -627,6 +680,31 @@ export class RuntimeCoordinator {
 	>();
 	private readonly _pendingInlineBlockers =
 		new PathKeyedMap<InlineBlockerRecord>(normalizeMapKey);
+	/**
+	 * #4484 round 4: per file, what its last applied inline verdict left owed
+	 * (`setAnalysisAnchor`), for a file whose record is gone or has no anchor.
+	 * The positions live on the blocker record
+	 * (`InlineBlockerRecord.analysisAnchor`). Round 5: this keeps each owing
+	 * runner's owed line texts (`owedByContentOnly`, at most
+	 * `MAX_OWED_LINE_TEXTS` hashes per runner, 16 KB), not only its id, so
+	 * the next write owes it only the lines with those texts, never the whole
+	 * file for a skip. Replaced by every applied verdict of the file and
+	 * cleared per session.
+	 */
+	private readonly _owedRunners = new PathKeyedMap<AnalysisAnchor>(
+		normalizeMapKey,
+	);
+	/**
+	 * #4484 round 5: for a file with no blocker record, its last verdict's
+	 * whole anchor (line hashes too), so the next write still remaps owed
+	 * positions exactly (verify probe P23). At most `MAX_OWED_ANCHORS` files,
+	 * 400 KB each; an evicted file falls back to `_owedRunners`' owed line
+	 * texts, a superset. Cleared per session.
+	 */
+	private readonly _owedAnchors = new PathKeyedMap<AnalysisAnchor>(
+		normalizeMapKey,
+		MAX_OWED_ANCHORS,
+	);
 	/**
 	 * #3507: one per-path order for BOTH verbs on `_pendingInlineBlockers`,
 	 * the widget store's guard shape (`widget-state.ts` diagnosticsWriteGuard).
@@ -718,6 +796,7 @@ export class RuntimeCoordinator {
 		this._gitGuardHasBlockers = false;
 		this._gitGuardSummary = "";
 		this._gitGuardCacheUnknownReason = undefined;
+		this._gitGuardUnansweredDispatches.clear();
 		this._readGuard = null;
 		this._pendingDeferredMutations.clear();
 		// #1642 F5: every sibling correlation/state map is cleared here. A
@@ -727,6 +806,8 @@ export class RuntimeCoordinator {
 		this._readWidenings.clear();
 		this._lspReadWarmState.clear();
 		this._pendingInlineBlockers.clear();
+		this._owedRunners.clear();
+		this._owedAnchors.clear();
 		this._inlineBlockerWriteOrder.clear();
 		this._resolvedBlockerFilesThisTurn.clear();
 		this._resolvedBlockerFilesDropped = 0;
@@ -834,6 +915,30 @@ export class RuntimeCoordinator {
 
 	get gitGuardCacheUnknownReason(): string | undefined {
 		return this._gitGuardCacheUnknownReason;
+	}
+
+	markGitGuardDispatchUnanswered(filePath: string, reason: string): void {
+		this._gitGuardUnansweredDispatches.set(filePath, reason);
+	}
+
+	/** The file's dispatch returned: it answers its own latch, and only that. */
+	answerGitGuardDispatch(filePath: string): void {
+		this._gitGuardUnansweredDispatches.delete(filePath);
+	}
+
+	/** Every file whose dispatch has not answered, with its reason, in order. */
+	get gitGuardUnansweredDispatches(): ReadonlyArray<{
+		readonly filePath: string;
+		readonly reason: string;
+	}> {
+		return [...this._gitGuardUnansweredDispatches].map(
+			([filePath, reason]) => ({ filePath, reason }),
+		);
+	}
+
+	/** Whether this session holds an inline-blocker entry for the file. */
+	hasInlineBlocker(filePath: string): boolean {
+		return this._pendingInlineBlockers.has(filePath);
 	}
 
 	/**
@@ -960,20 +1065,97 @@ export class RuntimeCoordinator {
 		}
 		const { projectSeq, fileSeq, key } =
 			logged ?? this.bumpFileSeq(args.filePath);
+		this.recordMutationReceipt({ projectSeq, fileSeq, key }, args.source);
+		return { projectSeq, fileSeq };
+	}
+
+	/**
+	 * #4535: the bulk form of {@link recordProjectMutation}, for a disk change
+	 * dm-lens did not author that spans many paths (a publisher's recorded
+	 * population). It allocates from the SAME sequence, in ONE locked append:
+	 * `appendProjectChangesAllocated` takes the change-log lock once and writes
+	 * every line under it, so a 400-path HEAD move costs one lock round-trip
+	 * inside a hook budget instead of 400. The lock-failure semantics are the
+	 * single writer's: when the lock is unavailable every appended line is
+	 * tagged `unlocked` and one `change-log-lock-unavailable` degradation is
+	 * recorded for the batch. Receipts are appended per path with the same ring
+	 * cap and drop counter as a single mutation.
+	 *
+	 * Returns the batch's last allocated `projectSeq` (the record's seq after
+	 * the batch) and each path's `fileSeq` keyed by the bump's normalized key.
+	 * Duplicate paths are the caller's to collapse: each entry bumps.
+	 */
+	recordProjectMutations(args: {
+		paths: readonly string[];
+		source: ProjectChangeSource;
+		cwd?: string;
+		onAppendError?: (err: unknown) => void;
+	}): { projectSeq: number; fileSeqs: ReadonlyMap<string, number> } {
+		let logged:
+			| Array<ReturnType<RuntimeCoordinator["bumpFileSeq"]>>
+			| undefined;
+		if (args.cwd !== undefined && args.paths.length > 0) {
+			try {
+				const cwd = args.cwd;
+				const paths = args.paths;
+				appendProjectChangesAllocated(cwd, (logMaxSeq) => {
+					const ownSeq = this._projectSeq;
+					const bumps = paths.map((filePath) =>
+						this.bumpFileSeq(filePath, logMaxSeq),
+					);
+					logged = bumps;
+					if (this._viewMissingThrough > 0) {
+						recordViewIncomplete(cwd, { ownSeq, logMaxSeq });
+					}
+					return bumps.map((bump, index) => ({
+						seq: bump.projectSeq,
+						timestamp: new Date().toISOString(),
+						sessionId: this.telemetrySessionId,
+						turnIndex: this.turnIndex,
+						source: args.source,
+						filePath: path.resolve(paths[index] as string),
+						fileSeq: bump.fileSeq,
+					}));
+				});
+			} catch (err) {
+				args.onAppendError?.(err);
+			}
+		}
+		const bumps =
+			logged ?? args.paths.map((filePath) => this.bumpFileSeq(filePath));
+		const fileSeqs = new Map<string, number>();
+		for (const bump of bumps) {
+			this.recordMutationReceipt(
+				{ projectSeq: bump.projectSeq, fileSeq: bump.fileSeq, key: bump.key },
+				args.source,
+			);
+			fileSeqs.set(bump.key, bump.fileSeq);
+		}
+		return { projectSeq: this._projectSeq, fileSeqs };
+	}
+
+	/**
+	 * The receipt ring (§ {@link MutationReceipt}): one entry per bump, oldest
+	 * evicted at the cap and counted, never silently incomplete. One writer, so
+	 * the single and bulk mutation paths cannot drift apart on attribution.
+	 */
+	private recordMutationReceipt(
+		bump: { projectSeq: number; fileSeq: number; key: string },
+		source: ProjectChangeSource,
+	): void {
 		if (this._mutationReceipts.length >= MAX_MUTATION_RECEIPTS) {
 			this._mutationReceipts.shift();
 			this._droppedMutationReceipts += 1;
 		}
 		this._mutationReceipts.push({
-			seq: projectSeq,
+			seq: bump.projectSeq,
 			// Reuse the bump's normalized key (a realpath syscall: ~200us on
 			// Windows, ~1.8us on POSIX since #3098) — never re-derive it here.
-			filePath: key,
-			source: args.source,
+			filePath: bump.key,
+			source,
 			turnIndex: this._turnIndex,
 			ts: Date.now(),
 		});
-		return { projectSeq, fileSeq };
 	}
 
 	/**
@@ -1283,18 +1465,18 @@ export class RuntimeCoordinator {
 		return this._scope.scopeId === generation && this._scope.isLive();
 	}
 
-	markStartupScanInFlight(name: string, generation: number): void {
+	markStartupScanInFlight(name: StartupTaskName, generation: number): void {
 		this._startupScansInFlight.set(name, generation);
 	}
 
-	clearStartupScanInFlight(name: string, generation: number): void {
+	clearStartupScanInFlight(name: StartupTaskName, generation: number): void {
 		const owner = this._startupScansInFlight.get(name);
 		if (owner === generation) {
 			this._startupScansInFlight.delete(name);
 		}
 	}
 
-	isStartupScanInFlight(name: string): boolean {
+	isStartupScanInFlight(name: StartupTaskName): boolean {
 		return this._startupScansInFlight.has(name);
 	}
 
@@ -1625,8 +1807,11 @@ export class RuntimeCoordinator {
 		const key = path.resolve(filePath);
 		const existing = this._pendingInlineBlockers.get(key);
 		if (existing && !existing.diagnostics) return 0;
+		// #4484 round 5 (K3): not the id. A carry that moves a blocker's line
+		// keeps its line-bound id (`lsp:<code>:<line>`), so the settled copy at
+		// the same line has another one.
 		const identity = (d: Diagnostic) =>
-			JSON.stringify([d.tool, d.id, d.line, d.message]);
+			JSON.stringify([foldedFindingIdentity(d), d.line, d.column]);
 		const known = new Set((existing?.diagnostics ?? []).map(identity));
 		const added = blocking.flatMap((d) => (known.has(identity(d)) ? [] : [d]));
 		if (added.length === 0) return 0;
@@ -1662,6 +1847,128 @@ export class RuntimeCoordinator {
 			policySuppressed: false,
 		});
 		return added.length;
+	}
+
+	/**
+	 * #4484 round 2: the file's recorded blocking diagnostics, which the next
+	 * write's pipeline carries forward unless a conclusive observation from
+	 * their own source shows them gone. Undefined when nothing is recorded or
+	 * the record holds text only.
+	 */
+	getInlineBlockerDiagnostics(
+		filePath: string,
+	): readonly Diagnostic[] | undefined {
+		return this._pendingInlineBlockers.get(path.resolve(filePath))?.diagnostics;
+	}
+
+	/**
+	 * #4484 round 3: the anchor the next write's pipeline aligns to: the line
+	 * hashes of the bytes the file's blocker record is about, and the lines
+	 * still owed. Round 4: it is the record's own anchor. A file without one
+	 * (no record, or a record a collect-later settle started) gets no hashes,
+	 * so the pipeline cannot align. Round 5: it gets the owed line texts.
+	 */
+	getAnalysisAnchor(filePath: string): AnalysisAnchor | undefined {
+		return (
+			this._pendingInlineBlockers.get(filePath)?.analysisAnchor ??
+			this._owedAnchors.get(filePath) ??
+			this._owedRunners.get(filePath)
+		);
+	}
+
+	/**
+	 * #4484 round 3: store the anchor of an inline verdict that just applied
+	 * (`recordInlineBlockers` or `clearInlineBlockers` returned applied), so it
+	 * always describes the bytes the record is about. Round 4: it goes on the
+	 * record, and lives as long as the record; what is owed goes apart
+	 * (`_owedRunners`, by content since round 5), so it outlives a record that
+	 * a later retire drops. Round 5: a file with no record keeps its whole
+	 * anchor too (`_owedAnchors`, bounded).
+	 */
+	setAnalysisAnchor(
+		filePath: string,
+		anchor: AnalysisAnchor | undefined,
+	): void {
+		const existing = this._pendingInlineBlockers.get(filePath);
+		if (existing) {
+			// The display key every record writer uses.
+			const key = path.resolve(filePath);
+			const { analysisAnchor: _dropped, ...rest } = existing;
+			this._pendingInlineBlockers.set(
+				key,
+				anchor ? { ...rest, analysisAnchor: anchor } : rest,
+			);
+		}
+		const owed = owedByContentOnly(anchor);
+		if (owed) this._owedRunners.set(filePath, owed);
+		else this._owedRunners.delete(filePath);
+		if (owed && anchor?.lineHashes && !existing)
+			this._owedAnchors.set(filePath, anchor);
+		else this._owedAnchors.delete(filePath);
+	}
+
+	/**
+	 * #4484 round 2: a settled collect-later run is the observation that can
+	 * retire the blockers its runner left pending while it was in flight. Its
+	 * runner's recorded blockers that the run no longer observes leave the
+	 * record; blockers from other runners, and from a server the run left
+	 * unconfirmed, stay. A blocker is still observed only at its own line, in
+	 * range or withheld by the run's edit-range gate (#4484 round 3). The run
+	 * must be about the recorded bytes: marked after
+	 * they were read (`recordedAtMs`), with the file still holding them
+	 * (`recordedHash`). An emptied record is deleted and its file is noted
+	 * Resolved for turn end, as a clean write's clear does.
+	 *
+	 * @returns how many recorded blockers the run retired.
+	 */
+	retireUnobservedRunnerBlockers(
+		filePath: string,
+		run: {
+			runnerId: string;
+			observed: readonly Diagnostic[];
+			markedAtMs: number;
+			sha256: string | undefined;
+			unconfirmedServerIds?: readonly string[];
+		},
+	): number {
+		const key = path.resolve(filePath);
+		const existing = this._pendingInlineBlockers.get(key);
+		if (
+			!existing?.diagnostics ||
+			run.sha256 === undefined ||
+			existing.recordedHash !== run.sha256 ||
+			existing.recordedAtMs === undefined ||
+			run.markedAtMs < existing.recordedAtMs
+		)
+			return 0;
+		const unconfirmed = new Set(run.unconfirmedServerIds);
+		// #4484 round 3: the run is about the recorded bytes, so a recorded
+		// blocker's position is its own line. #4509 (N3): except a stale one,
+		// whose line is from older bytes; it matches its identity anywhere.
+		const { kept, retired } = retainRecordedFindings(
+			existing.diagnostics,
+			run.observed,
+			{
+				positionOf: (d) => (d.positionStale ? ANY_POSITION : d.line),
+				keepUnobserved: (d) =>
+					d.runnerId !== run.runnerId ||
+					(d.serverId !== undefined && unconfirmed.has(d.serverId)),
+			},
+		);
+		if (retired.length === 0) return 0;
+		if (kept.length === 0) {
+			this.noteResolvedBlockerFile(existing, undefined, false);
+			this._pendingInlineBlockers.delete(key);
+			return retired.length;
+		}
+		this._pendingInlineBlockers.set(key, {
+			...existing,
+			summary: formatDiagnostics(kept, "blocking").trim(),
+			diagnostics: kept,
+			sources: inlineBlockerSources(kept),
+			lines: inlineBlockerLines(kept, existing.filePath),
+		});
+		return retired.length;
 	}
 
 	/**
@@ -1712,14 +2019,32 @@ export class RuntimeCoordinator {
 	 * counted as `blocker-clear-refused` per file key. A record with no
 	 * `recordedHash` (#2982: the file was unreadable or over the baseline cap at
 	 * record time) cannot be matched and is cleared as before.
+	 *
+	 * #4484: a blocker is pending until a fresh observation no longer holds it,
+	 * so a run whose own observation still holds `analysis.blocking` blockers
+	 * never clears the record, whatever its authorship or its delta said; it
+	 * is refused and counted the same way.
 	 */
 	clearInlineBlockers(
 		filePath: string,
 		writeIndex?: number,
 		orderTurn = this._writeOrderTurn,
-		analysis?: { authored: boolean; sha256: string | undefined },
+		analysis?: {
+			authored: boolean;
+			sha256: string | undefined;
+			blocking?: number;
+		},
 	): boolean {
 		const existing = this._pendingInlineBlockers.get(path.resolve(filePath));
+		if (existing && (analysis?.blocking ?? 0) > 0) {
+			incrementDegradationCount({
+				kind: "blocker-clear-refused",
+				subject: normalizeMapKey(filePath),
+				reason:
+					"the clearing run still observed a blocker on the file; the record stays until an observation holds none (#4484)",
+			});
+			return false;
+		}
 		if (
 			existing &&
 			analysis &&
@@ -2227,7 +2552,7 @@ export class RuntimeCoordinator {
 		return this._turnSummary;
 	}
 
-	get complexityBaselines(): Map<string, FileComplexity> {
+	get complexityBaselines(): Set<string> {
 		return this._complexityBaselines;
 	}
 

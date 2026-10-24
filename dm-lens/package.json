@@ -1,6 +1,6 @@
 {
   "name": "dm-lens",
-  "version": "4.4.3",
+  "version": "4.4.4",
   "description": "Real-time code feedback for DM \u2014 LSP, linters, formatters, type-checking, and structural analysis.",
   "type": "module",
   "main": "./index.ts",
@@ -58,8 +58,8 @@
   },
   "homepage": "https://github.com/DuckMind/extensions/tree/main/dm-lens#readme",
   "dependencies": {
-    "@ast-grep/cli": "0.45.3",
-    "@ast-grep/napi": "^0.45.0",
+    "@ast-grep/cli": "0.51.0",
+    "@ast-grep/napi": "^0.51.0",
     "js-yaml": "^5.2.2",
     "minimatch": "^10.2.6",
     "pidusage": "^4.0.1",

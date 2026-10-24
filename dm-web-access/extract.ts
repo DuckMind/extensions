@@ -1,5 +1,8 @@
+import { Readability } from "@mozilla/readability";
+import { parseHTML } from "linkedom";
+import { Defuddle } from "defuddle/node";
 import { existsSync, readFileSync } from "node:fs";
-import type TurndownService from "turndown";
+import TurndownService from "turndown";
 import pLimit from "p-limit";
 import { activityMonitor } from "./activity.ts";
 import { extractRSCContent } from "./rsc-extract.ts";
@@ -80,8 +83,8 @@ function isDefuddleConsoleError(args: Parameters<typeof console.error>): boolean
 }
 
 async function extractWithDefuddle(text: string, url: string): Promise<{ title: string; content: string } | null> {
-	const { Defuddle } = await import("defuddle/node");
-	const { parseHTML } = await import("linkedom");
+
+
 	const { document } = parseHTML(text);
 	Object.defineProperty(document, "location", {
 		value: new URL(url),
@@ -318,7 +321,7 @@ function abortedResult(url: string): ExtractedContent {
 // Share first-use initialization without loading Turndown at extension startup.
 let turndownInstance: Promise<TurndownService> | undefined;
 async function loadTurndown(): Promise<TurndownService> {
-	const { default: TurndownService } = await import("turndown");
+
 	return new TurndownService({
 		headingStyle: "atx",
 		codeBlockStyle: "fenced",
@@ -1395,7 +1398,7 @@ async function extractViaHttp(
 			};
 		}
 
-		const { parseHTML } = await import("linkedom");
+
 		const { document } = parseHTML(text);
 		const documentTitle = document.title?.trim() ?? "";
 		const declaredLinks = discoverDeclaredWebLinks(
@@ -1403,7 +1406,7 @@ async function extractViaHttp(
 			response.headers.get("link"),
 			response.url || url,
 		);
-		const { Readability } = await import("@mozilla/readability");
+
 		const reader = new Readability(document as unknown as Document);
 		const article = reader.parse();
 

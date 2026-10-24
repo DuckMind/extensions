@@ -102,6 +102,29 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	/** #2052: a file's nearest LSP root is outside the session ceiling. */
 	"lsp_capability_skip",
 	/**
+	 * #4764: one server `window/showMessage` text, recorded once per distinct
+	 * message per session (rising edge per identity). The ledger counts every
+	 * repeat under `lsp-server-message`, or under `lsp-server-config-load-failed`
+	 * when an error-level message reports that the server's own config/rules
+	 * failed to load.
+	 */
+	"lsp_server_message",
+	/**
+	 * #4764: an empty publication refused as clean-scan evidence because the
+	 * auxiliary server reported its config failed to load — dropped at receipt or
+	 * debounce store time, or retracted from the stored cache. Rising edge per
+	 * (server, file); the ledger counts every occurrence under
+	 * `lsp-server-config-load-failed`, so a dropped file is never silent.
+	 */
+	"lsp_publish_dropped_server_config_failed",
+	/**
+	 * #4786: an unversioned empty publication from an auxiliary refused because
+	 * it landed in the same phase (rules generation, send) as the path's stored
+	 * or pending finding. Rising edge per (server, file, phase); the ledger counts
+	 * every occurrence under `lsp-auxiliary-empty-after-finding`.
+	 */
+	"lsp_publish_dropped_empty_after_finding",
+	/**
 	 * #2044: failed-first test state was retired after a confirmed missing path,
 	 * retained because the filesystem verdict was indeterminate, or evicted at
 	 * the state cap. Foreign-checkout failures, including aliases, are rejected

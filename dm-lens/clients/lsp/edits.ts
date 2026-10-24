@@ -1,5 +1,11 @@
 import fs from "node:fs/promises";
-import type { BigIntStats, Stats } from "node:fs";
+import {
+	type BigIntStats,
+	type Stats,
+	readFileSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
 import path from "node:path";
 import { URL } from "node:url";
 import {
@@ -12,12 +18,15 @@ import {
 } from "./path-utils.js";
 import {
 	convertCharacterOffset,
-	lineTextAt,
 	type PositionEncoding,
 } from "./position-encoding.js";
+import { lineTextAt } from "./content-scan.js";
 import { recordLspMutation, type LspMutationContext } from "../lsp-mutation.js";
 import { withHostFileMutationQueues } from "../file-mutation-queue.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
+import { hashDiagnosticContent } from "./diagnostic-binding.js";
+import { peekOwnedLspService } from "./service-singleton.js";
+import { FILE_CREATED, FILE_DELETED } from "./watch-queue.js";
 import { logLatency } from "../latency-logger.js";
 import {
 	detectLineEnding,
@@ -114,6 +123,17 @@ export interface ApplyWorkspaceEditOptions {
 	 * mismatch refuses the whole edit with {@link StaleWorkspaceEditContentError}.
 	 */
 	expectedContent?: ReadonlyMap<string, string>;
+	/**
+	 * #4346: where the watched-files events of applied resource operations go.
+	 * A service applying its own edit passes itself; otherwise the process's
+	 * LSP service, when one exists (none is ever created for this).
+	 */
+	watchedFileSink?: WatchedFileSink;
+}
+
+/** The one service method a resource operation's watched-files event needs. */
+export interface WatchedFileSink {
+	notifyExternalFileChange(filePath: string, type: number): Promise<void>;
 }
 
 /**
@@ -608,18 +628,24 @@ export interface MergeWorkspaceEditsResult {
 	droppedConflicts: number;
 	inputEditCount: number;
 	serverIds: string[];
+	/** The provenance side channel, keyed by the same normalized path as `edit`. */
+	sourceClientKeys: ReadonlyMap<string, readonly string[]>;
 }
 
 export function mergeWorkspaceTextEditsByPriority(
 	entries: Array<{
 		serverId: string;
+		clientKey?: string;
 		edit:
 			| { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }
 			| null
 			| undefined;
 	}>,
 ): MergeWorkspaceEditsResult {
-	const merged = new Map<string, { uri: string; edits: LSPTextEdit[] }>();
+	const merged = new Map<
+		string,
+		{ uri: string; edits: LSPTextEdit[]; sourceClientKeys: Set<string> }
+	>();
 	// Exact-duplicate dedup is a CROSS-SERVER concern only: two servers proposing
 	// the identical non-empty replace should collapse to one. Zero-width inserts
 	// are never deduplicated here — same as `validateTextEdits` on the normal
@@ -638,7 +664,11 @@ export function mergeWorkspaceTextEditsByPriority(
 		if (!entry.edit) continue;
 		for (const [uri, edits] of flattenWorkspaceTextEdits(entry.edit)) {
 			const key = pathIndexKey(uri);
-			const bucket = merged.get(key) ?? { uri, edits: [] };
+			const bucket = merged.get(key) ?? {
+				uri,
+				edits: [],
+				sourceClientKeys: new Set<string>(),
+			};
 			const kept = bucket.edits;
 			for (const edit of edits) {
 				inputEditCount += 1;
@@ -654,13 +684,24 @@ export function mergeWorkspaceTextEditsByPriority(
 				}
 				if (exactKey !== undefined) seenExact.add(exactKey);
 				kept.push(edit);
+				bucket.sourceClientKeys.add(entry.clientKey ?? entry.serverId);
 			}
 			if (kept.length > 0) merged.set(key, bucket);
 		}
 	}
 	const changes: Record<string, LSPTextEdit[]> = {};
-	for (const { uri, edits } of merged.values()) changes[uri] = edits;
-	return { edit: { changes }, droppedConflicts, inputEditCount, serverIds };
+	const sourceClientKeys = new Map<string, readonly string[]>();
+	for (const [key, { uri, edits, sourceClientKeys: sources }] of merged) {
+		changes[uri] = edits;
+		sourceClientKeys.set(key, [...sources]);
+	}
+	return {
+		edit: { changes },
+		droppedConflicts,
+		inputEditCount,
+		serverIds,
+		sourceClientKeys,
+	};
 }
 
 type TextEditOrigin =
@@ -746,6 +787,202 @@ export function workspaceEditTextPaths(edit: {
 	return planWorkspaceEdit(edit).flatMap((op) =>
 		op.kind === "text" ? [uriToDiskPath(op.uri)] : [],
 	);
+}
+
+/**
+ * #3601: how far before the rename request a file's mtime may sit and still
+ * count as "written after the request". Filesystem timestamps are coarse: FAT
+ * stores 2 s, HFS+ 1 s, ext4/APFS/NTFS well under 1 ms, and Linux stamps a
+ * write with a tick-coarse clock that can trail `Date.now()` by several ms. A
+ * write made just after the request can therefore carry an mtime a little
+ * before it, so 2 s (the coarsest common granularity) is the margin. The cost
+ * is a false refusal for an unopened file written within 2 s before the
+ * request; the failure it prevents is an overwrite.
+ */
+const RENAME_MTIME_MARGIN_MS = 2000;
+
+/**
+ * #3601: what a language client last sent for a document, as the rename guard
+ * reads it. `LSPService.getTrackedContent` answers it; a client that holds no
+ * record answers nothing.
+ */
+export interface RenameTrackedSend {
+	hash: string;
+	changedAtMs?: number | undefined;
+	openedAtMs?: number | undefined;
+	openedHash?: string | undefined;
+	clientStartedAtMs?: number | undefined;
+	/** The registry key of the client holding the record; set by the lookup
+	 *  that is given the edit's contributing client keys. */
+	clientKey?: string | undefined;
+}
+
+/**
+ * #3601: the content every file a rename's edit writes text to must still hold,
+ * keyed the way `applyWorkspaceEdit` keys expected content (the file's
+ * realpath). Both rename flows use this one capture: `lsp_navigation`'s
+ * `rename` (its target is the read `openFileBestEffort` sent) and
+ * `LSPService.renameFile` (no target, since nothing read the old path).
+ *
+ * The rename's own target, when given, uses the content the pre-rename
+ * `openFileBestEffort` read and sent to the server. Any other file:
+ * - a file the language client has open: the server computed from the last
+ *   send made before the request (`requestedAtMs`, taken just before it, on the
+ *   same connection). The disk must hash to the client's last send, and that
+ *   send's bytes must not have changed at or after `requestedAtMs`: a
+ *   hook-synced write after the request makes the disk equal the last send
+ *   while the server answered from the one before it.
+ * - a file it has not opened: best effort only. The file is refused when its
+ *   mtime is at or after `requestedAtMs` minus the margin. This cannot prove
+ *   the server read the current bytes: the server answers from a copy it read
+ *   earlier, and dm-lens does not tell it about a write it did not make, so an
+ *   external write older than the margin that the server's own file watching
+ *   missed, or a write that keeps the old mtime, is applied at the server's
+ *   offsets (#3747).
+ * - a file the client first opened at or after `requestedAtMs` (#3827): the
+ *   server answered from its own copy, and that first `didOpen` stamps the
+ *   file as changed although no byte did. It takes the unopened rule only when
+ *   its mtime is older than the client's start by the margin: then the server
+ *   could only have read the bytes it holds now, and the first open adds none.
+ *   Only that first send's stamp is skipped: the disk must still hash to the
+ *   last send, and the record must still hold the first send's bytes, or the
+ *   file is refused (a write that keeps the old mtime after the first open).
+ *   A file written after the client started (a pi write whose sync lands as
+ *   that first open, say) keeps the send check and its stamp, which refuses it:
+ *   the server may hold the load-time copy, not these bytes. A client that
+ *   reports no start makes no such claim.
+ * With `sourceClientKeysByPath` (the merged edit's contributors, #3734), every
+ * contributing client's record is checked, and the records bind the file only
+ * when every contributor holds a comparable one; otherwise the file also takes
+ * the unopened rule, and its refusal names the contributors that hold none.
+ * The read that passed either check is the content the apply is then held to.
+ * A file the edit creates, or one that cannot be read, is left out of the map,
+ * matching every other `expectedContent` caller.
+ */
+export function captureRenameExpectedContent(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	cwd: string,
+	requestedAtMs: number,
+	readTrackedSend: (
+		filePath: string,
+		cwd: string,
+		sourceClientKeys?: readonly string[],
+	) => RenameTrackedSend | readonly RenameTrackedSend[] | undefined,
+	target?: { filePath: string; content: string },
+	sourceClientKeysByPath?: ReadonlyMap<string, readonly string[]>,
+): Map<string, string> {
+	const expected = new Map<string, string>();
+	let targetRealPath: string | undefined;
+	if (target !== undefined) {
+		try {
+			targetRealPath = realpathSync.native(target.filePath);
+		} catch {
+			// none: an unresolvable target path matches no file, so it binds
+			// nothing and every file takes the rules below.
+			targetRealPath = undefined;
+		}
+	}
+	for (const diskPath of workspaceEditTextPaths(edit)) {
+		let realPath: string;
+		let content: string;
+		let mtimeMs: number;
+		try {
+			realPath = realpathSync.native(diskPath);
+			content = readFileSync(realPath, "utf-8");
+			// Stat AFTER the read: a write before the read is then visible in the
+			// mtime, and one after it is caught by the apply-time comparison.
+			mtimeMs = statSync(realPath).mtimeMs;
+		} catch {
+			// none: a file that cannot be read is not bound here, matching every
+			// other expectedContent caller; the apply reports its own failure.
+			continue;
+		}
+		if (target !== undefined && realPath === targetRealPath) {
+			expected.set(realPath, target.content);
+			continue;
+		}
+		const contributorKeys = sourceClientKeysByPath?.get(
+			normalizeEphemeralMapKey(realPath),
+		);
+		const trackedResult = readTrackedSend(diskPath, cwd, contributorKeys);
+		const tracked =
+			trackedResult === undefined
+				? []
+				: Array.isArray(trackedResult)
+					? trackedResult
+					: [trackedResult];
+		// #3827: a file this client first opened at or after the request, and
+		// that nobody wrote since the client started, was unopened when the
+		// server answered and held the bytes the disk holds: the first open adds
+		// none, so its stamp is skipped. The disk must still hold the first
+		// open's bytes, then the unopened rule below applies.
+		const contentHash = hashDiagnosticContent(content);
+		let hasComparableSend = false;
+		const comparableKeys = new Set<string | undefined>();
+		for (const trackedSend of tracked) {
+			const firstOpenedAfterRequest =
+				(trackedSend.openedAtMs ?? 0) >= requestedAtMs;
+			const quietSinceClientStart =
+				trackedSend.clientStartedAtMs !== undefined &&
+				mtimeMs < trackedSend.clientStartedAtMs - RENAME_MTIME_MARGIN_MS;
+			const sent =
+				firstOpenedAfterRequest && quietSinceClientStart
+					? undefined
+					: trackedSend;
+			if (sent !== undefined) {
+				hasComparableSend = true;
+				comparableKeys.add(trackedSend.clientKey);
+				if (
+					sent.hash !== contentHash ||
+					(sent.changedAtMs ?? requestedAtMs) >= requestedAtMs
+				) {
+					refuseStaleWorkspaceEdit(
+						diskPath,
+						"it changed after the language server computed the rename from it",
+					);
+				}
+			} else if (
+				trackedSend.hash !== contentHash ||
+				trackedSend.openedHash !== trackedSend.hash
+			) {
+				// #3827 verify r2 F4: the exemption skips only the first open's own
+				// stamp. A disk that no longer holds the last send, or a record whose
+				// bytes changed after its first send, was written after that open
+				// although the mtime says otherwise (#3747's mtime-kept write).
+				refuseStaleWorkspaceEdit(
+					diskPath,
+					"it changed after the language client first opened it, after the rename was requested",
+				);
+			}
+		}
+		// #3734 r3: a record binds the file only when EVERY contributing client
+		// holds a comparable one. A contributor with none (never opened, or first
+		// opened after the request) answered from bytes nothing here can see, so
+		// the file takes the mtime rule and the refusal names that client.
+		const unboundKeys =
+			contributorKeys?.filter((key) => !comparableKeys.has(key)) ?? [];
+		const boundByRecord = hasComparableSend && unboundKeys.length === 0;
+		const noOpenCopy =
+			unboundKeys.length === 0
+				? "the language server has no open copy"
+				: `the language client ${unboundKeys.join(", ")} that edits it had no open copy`;
+		if (!boundByRecord && mtimeMs >= requestedAtMs) {
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				`it was written after the rename was requested and ${noOpenCopy}, so it may not have read these bytes`,
+			);
+		} else if (
+			!boundByRecord &&
+			mtimeMs >= requestedAtMs - RENAME_MTIME_MARGIN_MS
+		) {
+			refuseStaleWorkspaceEdit(
+				diskPath,
+				`it was modified within ${RENAME_MTIME_MARGIN_MS / 1000} s of the rename request${unboundKeys.length === 0 ? "" : ` and ${noOpenCopy}`}; retry`,
+			);
+		}
+		expected.set(realPath, content);
+	}
+	return expected;
 }
 
 function planWorkspaceEdit(
@@ -1424,6 +1661,24 @@ async function preflightWorkspaceEdit(
 }
 
 /**
+ * #4346: a resource operation changes which paths exist, and a server that
+ * caches a failed lookup (Pyrefly, pyright) only drops it on a watched-files
+ * Created or Deleted. A file watcher would report these; dm-lens is that
+ * watcher for its own writes. With no sink and no service, nothing is sent and
+ * no service is created.
+ */
+async function announceResourceOperations(
+	changes: ReadonlyArray<{ filePath: string; type: number }>,
+	sink: WatchedFileSink | undefined,
+): Promise<void> {
+	const target = sink ?? peekOwnedLspService<WatchedFileSink>();
+	if (!target) return;
+	for (const change of changes) {
+		await target.notifyExternalFileChange(change.filePath, change.type);
+	}
+}
+
+/**
  * Applies a workspace edit. All URI, shape, version, resource-precondition and
  * text-bound checks happen in preflight before the first write. Once preflight
  * succeeds, an unexpected filesystem failure may still leave earlier mutations
@@ -1441,6 +1696,7 @@ export async function applyWorkspaceEdit(
 	let appliedOperationTotal = 0;
 	let operationIndex = 0;
 	const operationCounts = { textEdits: 0, create: 0, rename: 0, delete: 0 };
+	const resourceChanges: Array<{ filePath: string; type: number }> = [];
 	const planned = planWorkspaceEdit(edit);
 	let operationTotal = 0;
 	let prepared: Awaited<ReturnType<typeof preflightWorkspaceEdit>>;
@@ -1556,6 +1812,7 @@ export async function applyWorkspaceEdit(
 					await fs.mkdir(path.dirname(diskPath), { recursive: true });
 					if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
 					else await fs.writeFile(diskPath, "", { flag: "wx" });
+					resourceChanges.push({ filePath: diskPath, type: FILE_CREATED });
 					touchedFiles.add(filePath);
 					fileDetails.push({
 						filePath,
@@ -1576,6 +1833,10 @@ export async function applyWorkspaceEdit(
 					if (op.options?.overwrite)
 						await fs.rm(newDisk, { recursive: true, force: true });
 					await fs.rename(oldDisk, newDisk);
+					resourceChanges.push(
+						{ filePath: oldDisk, type: FILE_DELETED },
+						{ filePath: newDisk, type: FILE_CREATED },
+					);
 					touchedFiles.add(oldPath);
 					touchedFiles.add(newPath);
 					fileDetails.push(
@@ -1603,6 +1864,7 @@ export async function applyWorkspaceEdit(
 						recursive: op.options?.recursive === true,
 						force: false,
 					});
+					resourceChanges.push({ filePath: diskPath, type: FILE_DELETED });
 					touchedFiles.add(filePath);
 					fileDetails.push({
 						filePath,
@@ -1616,6 +1878,7 @@ export async function applyWorkspaceEdit(
 			}
 		});
 	} catch (err) {
+		await announceResourceOperations(resourceChanges, options.watchedFileSink);
 		const partial = makeResult();
 		if (options.mutationContext && options.observe !== false) {
 			recordLspMutation(options.mutationContext, {
@@ -1636,6 +1899,7 @@ export async function applyWorkspaceEdit(
 		}
 		throw err;
 	}
+	await announceResourceOperations(resourceChanges, options.watchedFileSink);
 	const applied = makeResult();
 	if (options.mutationContext && options.observe !== false) {
 		recordLspMutation(options.mutationContext, {

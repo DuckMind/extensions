@@ -1,11 +1,16 @@
 import * as path from "node:path";
+import { resolveOpengrepRulePack } from "./opengrep-rule-pack.js";
 import { findLocalToolConfig } from "./path-utils.js";
 
 export interface ResolvedOpengrepConfig {
 	enabled: boolean;
 	/** Value to pass after --config. */
 	configArg?: string;
-	source: "local" | "flag" | "disabled";
+	/**
+	 * `pack` is the registry pack dm-lens refreshed into its own cache (#4765):
+	 * a local file, never a download at spawn.
+	 */
+	source: "local" | "flag" | "pack" | "disabled";
 	reason?: string;
 }
 
@@ -56,7 +61,9 @@ export function normalizeOpengrepConfigArg(
  *   - the repo carries a rule file (`.opengrep.yml`/`.semgrep.yml`, …) — the
  *     rule file IS the opt-in signal; or
  *   - `--lens-opengrep` is set — self-sufficient: with no local/explicit config
- *     it defaults to `--config auto` (Opengrep's login-free Community ruleset).
+ *     it uses the registry pack dm-lens refreshed into its cache when one
+ *     exists (a local file, no download at spawn, #4765), else `--config auto`
+ *     (Opengrep's login-free Community ruleset; dm-lens ships no rules).
  *
  * `--lens-opengrep-config <auto|p/pack|path>` overrides the chosen config.
  */
@@ -75,11 +82,17 @@ export function resolveOpengrepConfig(
 	if (flags?.enabled || flagConfig) {
 		// Self-sufficient flag: explicit config → local rule file → `auto`.
 		const explicit = normalizeOpengrepConfigArg(flagConfig ?? localConfig, cwd);
-		return {
-			enabled: true,
-			configArg: explicit ?? "auto",
-			source: explicit && localConfig && !flagConfig ? "local" : "flag",
-		};
+		if (explicit) {
+			return {
+				enabled: true,
+				configArg: explicit,
+				source: localConfig && !flagConfig ? "local" : "flag",
+			};
+		}
+		const pack = resolveOpengrepRulePack();
+		return pack
+			? { enabled: true, configArg: pack, source: "pack" }
+			: { enabled: true, configArg: "auto", source: "flag" };
 	}
 
 	if (localConfig) {

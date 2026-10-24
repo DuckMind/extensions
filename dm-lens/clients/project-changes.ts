@@ -374,6 +374,22 @@ export function appendProjectChangeAllocated(
 	cwd: string,
 	build: (logMaxSeq: number) => ProjectChangeEntry,
 ): void {
+	appendProjectChangesAllocated(cwd, (logMaxSeq) => [build(logMaxSeq)]);
+}
+
+/**
+ * #4535: the bulk form. One lock acquisition and one file append for every
+ * entry `buildAll` returns, so a publisher recording N paths (a HEAD move's
+ * 400-file delta, a settled sweep's population) pays one lock round-trip and
+ * one write instead of N. The single-entry writer above delegates here, so the
+ * lock-failure semantics are the same code: when the lock is unavailable every
+ * line is appended `unlocked` and ONE degradation is recorded for the append,
+ * not one per line.
+ */
+export function appendProjectChangesAllocated(
+	cwd: string,
+	buildAll: (logMaxSeq: number) => ProjectChangeEntry[],
+): void {
 	const logPath = getProjectChangeLogPath(cwd);
 	fs.mkdirSync(path.dirname(logPath), { recursive: true });
 	// #3577: fold the log up to its current size before taking the lock, so the
@@ -382,9 +398,16 @@ export function appendProjectChangeAllocated(
 	// log while holding the lock (0.9 s at 150 MB).
 	readChangeLogMaxSeq(logPath);
 	const append = (locked: boolean) => {
-		const entry = build(readChangeLogMaxSeq(logPath));
-		const line = locked ? entry : { ...entry, unlocked: true as const };
-		fs.appendFileSync(logPath, `${JSON.stringify(line)}\n`, "utf-8");
+		const entries = buildAll(readChangeLogMaxSeq(logPath));
+		if (entries.length === 0) return;
+		// One write for the batch: the lines are the same bytes N single
+		// appends would produce, and a reader never observes a half-batch.
+		const payload = entries
+			.map((entry) =>
+				JSON.stringify(locked ? entry : { ...entry, unlocked: true as const }),
+			)
+			.join("\n");
+		fs.appendFileSync(logPath, `${payload}\n`, "utf-8");
 	};
 	const result = withGenerationLockSync(
 		`${logPath}.locks`,

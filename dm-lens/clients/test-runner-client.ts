@@ -822,7 +822,7 @@ function parsePytestSummary(output: string): PytestSummary {
 	// Rounded, like `jsonRunDurationMs` and PHPUnit's legacy path:
 	// `in 2.01s` is 2009.9999999999998 in binary floating point.
 	const duration = durationMatch
-		? Math.round(Number.parseFloat(durationMatch[1]) * 1000)
+		? toMeasuredDurationMs(Number.parseFloat(durationMatch[1]) * 1000)
 		: undefined;
 	return { passed, failed, skipped, duration };
 }
@@ -2309,14 +2309,14 @@ export class TestRunnerClient {
 			}
 		}
 		const span = maxEnd - minStart;
-		if (Number.isFinite(span) && span > 0) return Math.round(span);
-		if (assertionTotal > 0) return Math.round(assertionTotal);
+		if (Number.isFinite(span) && span > 0) return toMeasuredDurationMs(span);
+		if (assertionTotal > 0) return toMeasuredDurationMs(assertionTotal);
 		// Ordering above is unchanged from #1452 on purpose: a positive span
 		// still beats the assertion sum, and the sum still beats a suite pair
 		// that read as zero. Only the terminal case moved. A pair we could
 		// read whose span is 0 is a run that took under a millisecond — report
 		// it. Everything else was never measured.
-		if (Number.isFinite(span) && span === 0) return 0;
+		if (Number.isFinite(span) && span === 0) return toMeasuredDurationMs(span);
 		return undefined;
 	}
 
@@ -2523,7 +2523,9 @@ export class TestRunnerClient {
 			const millis = clockMatch[4]
 				? Number.parseInt(clockMatch[4].padEnd(3, "0"), 10)
 				: 0;
-			duration = ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis;
+			duration = toMeasuredDurationMs(
+				((hours * 60 + minutes) * 60 + seconds) * 1000 + millis,
+			);
 		} else {
 			const legacyMatch = output.match(
 				/^Time:\s*([\d.]+)\s*(seconds?|s|ms|milliseconds?|minutes?)\b/im,
@@ -2538,7 +2540,7 @@ export class TestRunnerClient {
 							? 60_000
 							: 1000;
 				if (Number.isFinite(value) && value > 0) {
-					duration = Math.round(value * scale);
+					duration = toMeasuredDurationMs(value * scale);
 				}
 			}
 		}
@@ -2597,10 +2599,9 @@ export class TestRunnerClient {
 
 		const durationMatch = output.match(/Finished in\s+([\d.]+)\s+seconds?/i);
 		if (durationMatch) {
-			// Rounded for the same reason pytest's is: `2.01` seconds is
-			// 2009.9999999999998 ms unrounded, and that reaches the log.
-			// (Routing this through `toMeasuredDurationMs` is #1484.)
-			duration = Math.round(Number.parseFloat(durationMatch[1]) * 1000);
+			duration = toMeasuredDurationMs(
+				Number.parseFloat(durationMatch[1]) * 1000,
+			);
 		}
 
 		// Individual failures: "  1) test some behavior (MyModuleTest)"
@@ -2815,7 +2816,7 @@ export class TestRunnerClient {
 		// reach the same 0 by finding no tokens, but only by accident, and the
 		// accident is indistinguishable from an unparseable tail — so the case
 		// is spelled out.
-		if (/^\s*</.test(dotnetTime[1])) return 0;
+		if (/^\s*</.test(dotnetTime[1])) return toMeasuredDurationMs(0);
 		let total = 0;
 		let tokens = 0;
 		// "ms" before "m", or "250 ms" scores as 250 minutes.

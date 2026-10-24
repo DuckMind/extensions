@@ -1,4 +1,3 @@
-import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { BoundedFifoMap } from "./bounded-cache.js";
@@ -6,6 +5,7 @@ import {
 	isRealGitMarker,
 	isUnderDir,
 	normalizeEphemeralMapKey,
+	realpathOrResolve,
 } from "./path-utils.js";
 
 /**
@@ -29,25 +29,6 @@ const NOT_EPHEMERAL: TmpDirClass = { checkout: false };
 const classified = new BoundedFifoMap<string, TmpDirClass>(1024);
 
 /**
- * `realpathSync.native` of `target`, or of its nearest existing ancestor with
- * the missing tail re-appended (#1129 F11: a directory not created yet,
- * spelled through a symlinked tmpdir). The resolved spelling when nothing on
- * the way up resolves.
- */
-function realPathOfNearestExisting(target: string): string {
-	const resolved = path.resolve(target);
-	const tail: string[] = [];
-	for (let current = resolved; ; current = path.dirname(current)) {
-		try {
-			return path.join(fs.realpathSync.native(current), ...tail.reverse());
-		} catch {
-			if (path.dirname(current) === current) return resolved;
-			tail.push(path.basename(current));
-		}
-	}
-}
-
-/**
  * One upward walk from `realpath(dir)` to just below `realpath(os.tmpdir())`,
  * both sides canonical through `realpathSync.native` (#1129 F4: macOS `/var`
  * links to `/private/var`, and Windows can report an 8.3 short tmpdir name).
@@ -63,8 +44,8 @@ function classifyTmpDir(dir: string): TmpDirClass {
 	const key = `${normalizeEphemeralMapKey(tmpSpelling)}\0${normalizeEphemeralMapKey(path.resolve(dir))}`;
 	const memo = classified.get(key);
 	if (memo) return memo;
-	const tmpRoot = realPathOfNearestExisting(tmpSpelling);
-	const real = realPathOfNearestExisting(dir);
+	const tmpRoot = realpathOrResolve(tmpSpelling);
+	const real = realpathOrResolve(dir);
 	let result = NOT_EPHEMERAL;
 	if (isUnderDir(real, tmpRoot)) {
 		for (
@@ -110,8 +91,8 @@ export function ephemeralStagingRoot(filePath: string): string | undefined {
  * nearest existing ancestor so output files need not exist yet.
  */
 export function isPiOwnedTempPath(filePath: string): boolean {
-	const tmpRoot = realPathOfNearestExisting(os.tmpdir());
-	const real = realPathOfNearestExisting(filePath);
+	const tmpRoot = realpathOrResolve(os.tmpdir());
+	const real = realpathOrResolve(filePath);
 	if (!isUnderDir(real, tmpRoot)) return false;
 	const relative = path.relative(tmpRoot, real);
 	if (relative.length === 0 || path.isAbsolute(relative)) return false;

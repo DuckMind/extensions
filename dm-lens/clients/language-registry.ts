@@ -93,6 +93,7 @@ export type LanguageId =
 	| "swift"
 	| "systemverilog"
 	| "terraform"
+	| "terraform-vars"
 	| "terragrunt"
 	| "toml"
 	| "typescript"
@@ -180,6 +181,7 @@ export const PINNED_LANGUAGE_IDS = [
 	"swift",
 	"systemverilog",
 	"terraform",
+	"terraform-vars",
 	"terragrunt",
 	"toml",
 	"typescript",
@@ -220,6 +222,16 @@ export interface LanguageEntry {
 	readonly extensions: readonly string[];
 	/** Exact basenames (case-insensitive) this language owns. */
 	readonly filenames?: readonly string[];
+	/**
+	 * Basename PATTERNS (case-insensitive) this language owns ahead of the
+	 * extension lookup, for files that are a format by CONVENTION rather than
+	 * by extension (#4636). A pattern is `<stem>*<tail>` with exactly one `*`,
+	 * and that `*` matches one or more characters of the basename:
+	 * `tsconfig.*.json` admits `tsconfig.app.json`, never `tsconfig..json`.
+	 * Keep a list here closed — a broader wildcard claims files the extension's
+	 * owner answers correctly.
+	 */
+	readonly filenamePatterns?: readonly string[];
 	/**
 	 * LSP `languageId` when the protocol spells it differently from {@link id}
 	 * (`shellscript`), or when the language has no LSP spelling at all (then
@@ -382,7 +394,44 @@ export const LANGUAGES: readonly LanguageEntry[] = [
 		grammar: "json",
 		grammarExtensions: [],
 	},
-	{ id: "jsonc", kind: "json", extensions: [".jsonc"] },
+	// JSONC by convention, not by extension (#4636). `.json` belongs to the
+	// `json` entry, so an extension-only lookup announced these files as `json`
+	// and the JSON language server applied its comments-not-allowed mode to
+	// them: `languageId === 'jsonc'` is the only spelling that selects
+	// `comments: 'ignore'` (vscode-langservers-extracted 4.10.0,
+	// lib/json-language-server/jsonServer.js:521), so every comment the file's
+	// own format allows arrived as a blocking finding. The catalog is CLOSED and
+	// copied from the two places that decide the association for editors,
+	// microsoft/vscode 1.105.0:
+	//   - extensions/typescript-basics/package.json:44-56 — the tsconfig and
+	//     jsconfig families, exact names plus the `.*.json` and `-*.json`
+	//     patterns;
+	//   - extensions/json/package.json:50-72 — the `jsonc` basenames and the
+	//     one `jsonc` extension that ends in `.json` (`babel.config.json`,
+	//     `.babelrc.json`, `.eslintrc.json`, `typedoc.json`).
+	// A jsonc name whose own extension is not `.json` (`.babelrc`, `.jshintrc`,
+	// `bun.lock`, `.ember-cli`) stays out: no extension lookup claims it, so it
+	// was never announced as `json` and this entry would have to own a format it
+	// does not parse.
+	{
+		id: "jsonc",
+		kind: "json",
+		extensions: [".jsonc"],
+		filenames: [
+			".babelrc.json",
+			".eslintrc.json",
+			"babel.config.json",
+			"jsconfig.json",
+			"tsconfig.json",
+			"typedoc.json",
+		],
+		filenamePatterns: [
+			"jsconfig-*.json",
+			"jsconfig.*.json",
+			"tsconfig-*.json",
+			"tsconfig.*.json",
+		],
+	},
 	{ id: "julia", extensions: [".jl"] },
 	{
 		id: "kotlin",
@@ -452,7 +501,14 @@ export const LANGUAGES: readonly LanguageEntry[] = [
 	{ id: "svelte", kind: "jsts", extensions: [".svelte"] },
 	{ id: "swift", kind: "swift", extensions: [".swift"], grammar: "swift" },
 	{ id: "systemverilog", extensions: [".sv"] },
-	{ id: "terraform", kind: "terraform", extensions: [".tf", ".tfvars"] },
+	{ id: "terraform", kind: "terraform", extensions: [".tf"] },
+	// terraform-ls validates a variables file only when its `languageId` is
+	// `terraform-vars`; announced as `terraform` it decodes the file as module
+	// code and (with enhanced validation, its default since 0.32) reports every
+	// assignment as "Unexpected attribute" (hashicorp/vscode-terraform#1672).
+	// Same kind, so the same server, runners, and formatter policy; only the LSP
+	// `languageId` differs.
+	{ id: "terraform-vars", kind: "terraform", extensions: [".tfvars"] },
 	{
 		id: "terragrunt",
 		kind: "terragrunt",
@@ -529,6 +585,35 @@ for (const entry of LANGUAGES) {
 		BY_FILENAME.set(filename.toLowerCase(), entry);
 	}
 }
+
+/**
+ * A declared `<stem>*<tail>` basename pattern (#4636). Exactly one `*`, it
+ * stands for one or more characters, and it is matched against a basename — so
+ * a pattern cannot cross a directory and cannot match an empty segment, which
+ * is what keeps `tsconfig.*.json` from claiming `tsconfig..json`. Matched
+ * case-insensitively, the rule {@link BY_FILENAME} uses.
+ */
+function matchesFilenamePattern(pattern: string, basename: string): boolean {
+	const star = pattern.indexOf("*");
+	if (star === -1 || pattern.indexOf("*", star + 1) !== -1) return false;
+	const name = basename.toLowerCase();
+	const prefix = pattern.slice(0, star).toLowerCase();
+	const suffix = pattern.slice(star + 1).toLowerCase();
+	if (!prefix || !suffix) return false;
+	return (
+		name.length > prefix.length + suffix.length &&
+		name.startsWith(prefix) &&
+		name.endsWith(suffix)
+	);
+}
+
+/** Declaration order, so a collision is settled the way `LANGUAGES` is. */
+const FILENAME_PATTERNS: readonly {
+	pattern: string;
+	entry: LanguageEntry;
+}[] = LANGUAGES.flatMap((entry) =>
+	(entry.filenamePatterns ?? []).map((pattern) => ({ pattern, entry })),
+);
 
 const BY_ID = new Map<string, LanguageEntry>(
 	LANGUAGES.map((entry) => [entry.id, entry]),
@@ -627,20 +712,46 @@ const BY_KIND = new Map<FileKind, LanguageEntry>();
 }
 
 /**
- * Resolve a file to its language entry, with the SAME precedence
- * `detectFileKind` uses: exact filename first, then extension, then
- * file-kinds.ts's basename PATTERNS (`Dockerfile.<suffix>`) mapped through the
- * kind they classify into. Returns undefined for a coarse kind owned by
- * several languages with no fallback (a `jsts` basename pattern), because there
- * is no single right answer to give.
+ * The entry a path's BASENAME declares, ignoring its extension: an exact
+ * `filenames` match first, then a declared `filenamePatterns` match. This is
+ * the tier that answers for a format chosen by convention rather than by
+ * suffix (#4636), and it is the one `clients/lsp/language.ts` asks before its
+ * extension lookup — the registry owns the filename vocabulary, so a consumer
+ * that projects only `EXTENSION_TO_LSP_ID` misses every entry here.
+ *
+ * Only entries that DECLARE a name are reachable, so this is narrower than
+ * {@link resolveLanguage}'s third tier (file-kinds.ts's basename patterns,
+ * which resolve through a kind and can be several languages' answer).
  */
-export function resolveLanguage(filePath: string): LanguageEntry | undefined {
+export function resolveFilenameLanguage(
+	filePath: string,
+): LanguageEntry | undefined {
 	if (!filePath) return undefined;
 	const base = basenameOf(filePath);
 	const byName = BY_FILENAME.get(base.toLowerCase());
 	if (byName) return byName;
+	return FILENAME_PATTERNS.find(({ pattern }) =>
+		matchesFilenamePattern(pattern, base),
+	)?.entry;
+}
+
+/**
+ * Resolve a file to its language entry, with the SAME precedence
+ * `detectFileKind` uses: exact filename first, then extension, then
+ * file-kinds.ts's basename PATTERNS (`Dockerfile.<suffix>`) mapped through the
+ * kind they classify into. A declared `filenamePatterns` member is part of the
+ * filename tier ({@link resolveFilenameLanguage}), because a convention that
+ * names the whole file outranks its suffix. Returns undefined for a coarse
+ * kind owned by several languages with no fallback (a `jsts` basename
+ * pattern), because there is no single right answer to give.
+ */
+export function resolveLanguage(filePath: string): LanguageEntry | undefined {
+	if (!filePath) return undefined;
+	const byName = resolveFilenameLanguage(filePath);
+	if (byName) return byName;
 	const byExtension = BY_EXTENSION.get(extensionOf(filePath));
 	if (byExtension) return byExtension;
+	const base = basenameOf(filePath);
 	for (const { pattern, kind } of SPECIAL_FILENAMES) {
 		if (pattern.test(base)) return BY_KIND.get(kind);
 	}
@@ -744,7 +855,7 @@ export const SCAN_LANGUAGE_PRIORITY: readonly (readonly LanguageId[])[] = [
 	["haskell"],
 	["elixir"],
 	["gleam"],
-	["terraform"],
+	["terraform", "terraform-vars"],
 	["nix"],
 	["shell"],
 	["php"],

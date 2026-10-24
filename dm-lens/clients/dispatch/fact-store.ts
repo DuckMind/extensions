@@ -1,4 +1,4 @@
-import { BoundedLruCache } from "../bounded-cache.js";
+import { BoundedLruCache, BoundedSet } from "../bounded-cache.js";
 import { normalizeMapKey } from "../path-utils.js";
 
 // #2243 item 4 telemetry sink, INJECTED rather than imported. fact-store must
@@ -89,10 +89,12 @@ const MAX_FILE_FACT_CONTENT_BYTES = 64 * 1024 * 1024;
 // only, and carry the same cap, so the coldest of them fall off in turn and
 // that key reverts to first-dispatch semantics.
 //
-// Four per-file keys are minted per dispatched file today (diagnostic
-// baseline, cascade baseline, entity snapshot, changed symbols), so 4096
-// records covers roughly 1024 distinct files before the coldest file's
-// baseline starts degrading.
+// Up to five per-file keys are minted per dispatched file today (diagnostic
+// baseline, cascade baseline, the #4483 pre-edit linter seed of a file the
+// tool_call captured, entity snapshot, changed symbols), so 4096 records
+// covers roughly 820 distinct files before the coldest file's baseline starts
+// degrading. An evicted seed leaves the delta baseline alone in charge, which
+// already holds the file's old findings after its first dispatch.
 const MAX_SESSION_FACT_RECORDS = 4096;
 
 export interface ReadonlyFactStore {
@@ -114,8 +116,12 @@ export class FactStore implements ReadonlyFactStore {
 		MAX_SESSION_FACT_RECORDS,
 	);
 	// Keys evicted from `boundedSessionFacts` and not written since, so a reader
-	// can tell "evicted" from "never seen" (#2282). Same cap, same FIFO order.
-	private readonly evictedSessionFactKeys = new Set<string>();
+	// can tell "evicted" from "never seen" (#2282). Same cap, same FIFO order —
+	// the cap lives in `BoundedSet.add`'s own overflow rather than in a
+	// hand-rolled tombstone trim here (#4580 review F1).
+	private readonly evictedSessionFactKeys = new BoundedSet<string>(
+		MAX_SESSION_FACT_RECORDS,
+	);
 	// Pin refcount per file. A file is exempt from capacity eviction while its
 	// count is > 0. Refcounted, not a Set, so two overlapping dispatches of the
 	// same file both hold the pin until BOTH settle (#2243 item 2).
@@ -414,13 +420,6 @@ export class FactStore implements ReadonlyFactStore {
 		const evicted = this.boundedSessionFacts.set(factId, value);
 		for (const [oldestKey] of evicted) {
 			this.evictedSessionFactKeys.add(oldestKey);
-			while (this.evictedSessionFactKeys.size > MAX_SESSION_FACT_RECORDS) {
-				const oldestTombstone = this.evictedSessionFactKeys
-					.values()
-					.next().value;
-				if (oldestTombstone === undefined) break;
-				this.evictedSessionFactKeys.delete(oldestTombstone);
-			}
 			capacityEvictionReporter?.(
 				this.subject,
 				"session-count",

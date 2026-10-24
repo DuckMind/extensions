@@ -51,7 +51,13 @@
 import { BoundedFifoMap } from "../bounded-cache.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
 import type { RegisteredLSPConfig } from "./config.js";
-import { isSameOrWithin } from "./server.js";
+import {
+	fileMatchKeys,
+	fileMatchReason,
+	registeredServers,
+} from "./file-server-match.js";
+import { isSameOrWithin, LSP_SERVERS, type LSPServerInfo } from "./server.js";
+import { isAuxiliary } from "./server-traits.js";
 import path from "node:path";
 
 /**
@@ -63,7 +69,7 @@ import path from "node:path";
  *
  * The value is `undefined` between `registerSessionRoot` and the config write
  * that follows the loader's `await` — the same window in which, before #2518,
- * no payload existed for the root at all. {@link sessionRootConfigEntries}
+ * no payload existed for the root at all. {@link sessionRootConfigForFile}
  * skips those entries, so an in-flight root resolves exactly as it did before:
  * to a shorter ancestor root's config, or to none.
  */
@@ -142,15 +148,88 @@ export function setSessionRootConfig(
 	return noteEvictedRoots(sessionRoots.set(path.resolve(cwd), config));
 }
 
+function isSameOrChildPath(filePath: string, candidateRoot: string): boolean {
+	if (filePath === candidateRoot) return true;
+	return filePath.startsWith(`${candidateRoot}${path.sep}`);
+}
+
 /**
- * Every served root that has a loaded config, in registration order —
- * `getConfigForFile`'s (`config.ts`) longest-prefix walk. Entries still
- * awaiting their first load are skipped; see the store's doc comment.
+ * The loaded config of the deepest served root that holds `filePath`, or
+ * undefined when none does. Entries still awaiting their first load are
+ * skipped; see the store's doc comment.
+ *
+ * #4403: the walk lives here, beside the store it reads, so a reader of the
+ * operator's `lsp.disabledServers` denial ({@link disabledPrimaryServerIds})
+ * reaches it without importing `config.js`. `getConfigForFile` (`config.ts`)
+ * is this walk with its empty fallback.
  */
-export function sessionRootConfigEntries(): Iterable<
-	[string, RegisteredLSPConfig | undefined]
-> {
-	return sessionRoots;
+export function sessionRootConfigForFile(
+	filePath: string,
+): RegisteredLSPConfig | undefined {
+	const resolvedFilePath = path.resolve(filePath);
+	let bestMatch: { root: string; config: RegisteredLSPConfig } | undefined;
+	// #2518: the per-root configs ARE this registry's values, so this walk sees
+	// a config for exactly the roots the registry still serves.
+	for (const [root, config] of sessionRoots) {
+		if (config === undefined) continue;
+		if (!isSameOrChildPath(resolvedFilePath, root)) continue;
+		if (!bestMatch || root.length > bestMatch.root.length) {
+			bestMatch = { root, config };
+		}
+	}
+	return bestMatch?.config;
+}
+
+/**
+ * #4403: which primaries the operator's `lsp.disabledServers` keeps from
+ * answering for this file, read from the file's session-root config.
+ *
+ * - `disabledServerIds`: the primaries the file gates select that are off.
+ *   An alternate (`fallbackFor`) counts only when its owner is off too: with
+ *   the owner on, the alternate is never consulted, so turning it off
+ *   changes nothing for the file.
+ * - `fallbackServerIds`: the alternates standing in for a disabled owner.
+ *   They answer only because the owner is off, so when they cannot, the
+ *   denial is still the cause (round 4, N1). A disabled alternate is in both
+ *   lists; `primaryUnavailableCause` reads the disabled list first.
+ *
+ * Here, not in `config.ts`: the LSP service and the routes import it, and
+ * `config.js`'s import surface is mirrored by whole-module `vi.mock`
+ * factories (#2052; see `clients/lsp/file-server-match.ts`).
+ *
+ * No root gate, on purpose: the service's root rule (`resolveServerRoot` in
+ * clients/lsp/client-registry.ts) gives every built-in primary a root in any
+ * served project through the marker fallback (#3750), so an enabled one is
+ * tried wherever the file gates select it, and named when it does not answer.
+ * A disabled one is named in the same places.
+ */
+export function disabledPrimaries(filePath: string): {
+	disabledServerIds: string[];
+	fallbackServerIds: string[];
+} {
+	const config = sessionRootConfigForFile(filePath);
+	if (!config || config.disabledServerIds.size === 0)
+		return { disabledServerIds: [], fallbackServerIds: [] };
+	const { ext, base } = fileMatchKeys(filePath);
+	const off = config.disabledServerIds;
+	const primaries = registeredServers(config, LSP_SERVERS).filter(
+		(server) =>
+			!isAuxiliary(server) &&
+			fileMatchReason(server, filePath, ext, base) === "selected",
+	);
+	const ownerOff = (server: LSPServerInfo) =>
+		server.fallbackFor === undefined || off.has(server.fallbackFor);
+	return {
+		disabledServerIds: primaries
+			.filter((server) => off.has(server.id) && ownerOff(server))
+			.map((server) => server.id),
+		fallbackServerIds: primaries
+			.filter(
+				(server) =>
+					server.fallbackFor !== undefined && off.has(server.fallbackFor),
+			)
+			.map((server) => server.id),
+	};
 }
 
 /** Return whether this exact root is still served after cap eviction. */

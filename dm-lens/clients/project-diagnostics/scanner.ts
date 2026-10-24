@@ -433,6 +433,10 @@ async function scanFileMajorRules(
 				// scanned file would exempt it from the capacity cap (#2243).
 				facts.dropFileFacts(filePath);
 			}
+			// Ready parser/provider promises do not drain host callbacks. Yield
+			// only after this file's facts are released; the next iteration checks
+			// cancellation before consuming another file (#1740).
+			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 		if (wasmAborted) {
 			// Mirror the phase-major #891 contract: the ast-grep phase never ran

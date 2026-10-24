@@ -1,3 +1,4 @@
+import { parseHTML } from "linkedom";
 import { activityMonitor } from "./activity.ts";
 import { normalizeDomain } from "./domain-filter-normalization.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
@@ -69,7 +70,6 @@ export async function searchWithDuckDuckGo(query: string, options: SearchOptions
 			throw new Error(`DuckDuckGo search error ${response.status}: ${body.slice(0, 300)}`);
 		}
 
-		const { parseHTML } = await import("linkedom");
 		const { document } = parseHTML(await response.text());
 		// DuckDuckGo's bot check answers 202 with an anomaly/challenge page instead of results.
 		if (response.status === 202 || document.querySelector(".anomaly-modal__box, #challenge-form")) {

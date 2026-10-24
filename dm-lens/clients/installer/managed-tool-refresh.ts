@@ -44,21 +44,30 @@
  *   22-package burst on every session).
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { HOOK_WALL_BUDGET_MS } from "../hook-budgets.js";
+import { writeFileAtomicAsync } from "../atomic-write.js";
 import { bounded } from "../deadline-utils.js";
 import { recordDegradationOnce } from "../degradation-ledger.js";
 import { commitDurableStoreAsync } from "../durable-store.js";
+import { isTestMode } from "../env-utils.js";
 import {
 	pmBinary,
 	resolveNodePackageManager,
 	updateArgs,
 } from "../package-manager.js";
+import {
+	cachedOpengrepPackPath,
+	OPENGREP_REGISTRY_PACK_URL,
+} from "../opengrep-rule-pack.js";
+import { stripAnsi } from "../sanitize.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import {
 	acquireManagedInstallGate,
+	findManagedToolBinary,
 	getManagedToolsDir,
 	getRefreshableManagedTools,
 	invalidateManagedToolResolution,
@@ -245,14 +254,22 @@ export async function readManagedToolRefreshState(): Promise<ManagedToolRefreshS
  * later commit can replace it. The read path above still reports `unreadable`,
  * which is what suppresses the refresh; this side only has to make sure the
  * file becomes valid again instead of staying corrupt forever.
+ *
+ * `retainNewerSuccess` is for a FAILURE record (AGENTS.md shape 21): the merge
+ * runs under the store lock, i.e. against the bytes on disk now, so a success
+ * a sibling wrote while this attempt was in flight is newer work than this
+ * attempt's start. Keeping the winner's entry keeps its `version` and its
+ * weekly cadence; replacing it with `failed: true` would erase both and demote
+ * the tool to the one-day retry (#4780 review, #4786's sibling).
  */
 async function writeRefreshStamp(
 	toolId: string,
 	entry: ManagedToolRefreshEntry,
+	options: { retainNewerSuccess?: boolean } = {},
 ): Promise<void> {
 	try {
 		await fs.mkdir(getManagedToolsDir(), { recursive: true });
-		await commitDurableStoreAsync<ManagedToolRefreshState>({
+		const committed = await commitDurableStoreAsync<ManagedToolRefreshState>({
 			path: getManagedToolRefreshStatePath(),
 			deserialize: (contents) => {
 				if (contents === undefined) return emptyState();
@@ -263,6 +280,16 @@ async function writeRefreshStamp(
 				}
 			},
 			merge: (disk) => {
+				const current = disk.tools[toolId];
+				if (
+					options.retainNewerSuccess === true &&
+					entry.failed === true &&
+					current !== undefined &&
+					current.failed !== true &&
+					current.checkedAt >= entry.checkedAt
+				) {
+					return disk;
+				}
 				disk.tools[toolId] = entry;
 				return disk;
 			},
@@ -278,6 +305,13 @@ async function writeRefreshStamp(
 				);
 			},
 		});
+		if (committed !== undefined && committed.tools[toolId] !== entry) {
+			// The merge kept another writer's newer success: one bounded record, and
+			// the caller's failure record still stands (only the stamp is kept).
+			logSessionStart(
+				`managed-tool-refresh ${toolId}: kept a newer successful stamp (checkedAt ${committed.tools[toolId]?.checkedAt ?? "unknown"}) — this failure does not replace it`,
+			);
+		}
 	} catch (err) {
 		// A stamp that cannot be written means this tool is eligible again next
 		// session. That is noisier than intended but never wrong, so it degrades
@@ -569,17 +603,21 @@ async function refreshNonNpmOne(
 		logSessionStart(
 			`managed-tool-refresh ${candidate.toolId}: ${candidate.strategy} refresh failed after ${elapsedMs}ms — keeping ${previousVersion ?? "installed"} (${attempt.reason ?? "unknown"})`,
 		);
-		await writeRefreshStamp(candidate.toolId, {
-			checkedAt: now,
-			failed: true,
-			...(previousVersion !== undefined && { version: previousVersion }),
-			...(entry?.resolutionId !== undefined && {
-				resolutionId: entry.resolutionId,
-			}),
-			// Deliberately NOT carrying `entry.etag` forward: a stamp that replays
-			// the validator of a run whose download failed would get a 304 next
-			// time and skip the install that never happened.
-		});
+		await writeRefreshStamp(
+			candidate.toolId,
+			{
+				checkedAt: now,
+				failed: true,
+				...(previousVersion !== undefined && { version: previousVersion }),
+				...(entry?.resolutionId !== undefined && {
+					resolutionId: entry.resolutionId,
+				}),
+				// Deliberately NOT carrying `entry.etag` forward: a stamp that replays
+				// the validator of a run whose download failed would get a 304 next
+				// time and skip the install that never happened.
+			},
+			{ retainNewerSuccess: true },
+		);
 		return {
 			toolId: candidate.toolId,
 			strategy: candidate.strategy,
@@ -720,11 +758,15 @@ async function performNpmRefresh(
 		logSessionStart(
 			`managed-tool-refresh ${candidate.toolId}: ${pm} update failed after ${elapsedMs}ms — package ${packageName}, covered ids ${coveredIds}; on disk now ${onDisk ?? "unreadable"} (was ${previousVersion ?? "unknown"}); resolution cache cleared for re-probe (${reason || "non-zero exit"})`,
 		);
-		await writeRefreshStamp(candidate.toolId, {
-			checkedAt: now,
-			failed: true,
-			...(onDisk !== undefined && { version: onDisk }),
-		});
+		await writeRefreshStamp(
+			candidate.toolId,
+			{
+				checkedAt: now,
+				failed: true,
+				...(onDisk !== undefined && { version: onDisk }),
+			},
+			{ retainNewerSuccess: true },
+		);
 		return {
 			toolId: candidate.toolId,
 			strategy: "npm",
@@ -785,11 +827,15 @@ async function performNpmRefresh(
 		logSessionStart(
 			`managed-tool-refresh ${candidate.toolId}: ${pm} update ran but ${binPath} failed verification — package ${packageName}, covered ids ${coveredIds}; resolution cache cleared for re-probe (${elapsedMs}ms)`,
 		);
-		await writeRefreshStamp(candidate.toolId, {
-			checkedAt: now,
-			failed: true,
-			...(currentVersion !== undefined && { version: currentVersion }),
-		});
+		await writeRefreshStamp(
+			candidate.toolId,
+			{
+				checkedAt: now,
+				failed: true,
+				...(currentVersion !== undefined && { version: currentVersion }),
+			},
+			{ retainNewerSuccess: true },
+		);
 		return {
 			toolId: candidate.toolId,
 			strategy: "npm",
@@ -867,6 +913,12 @@ const noopTap: RefreshTap = () => {};
  */
 export function runManagedToolRefresh(
 	now: number = Date.now(),
+	/**
+	 * `rulePack: false` leaves the Opengrep rule pack alone: the session was
+	 * started with `--no-opengrep` / `opengrep.enabled=false`, and a disabled
+	 * scanner downloads nothing (#4780 review).
+	 */
+	options: { rulePack?: boolean } = {},
 ): Promise<ManagedToolRefreshOutcome> {
 	const joined = refreshInFlight;
 	if (joined) {
@@ -886,9 +938,17 @@ export function runManagedToolRefresh(
 	// this `finally` runs the slot still holds `run`. #1746 review round 2 proved
 	// that branch unreachable (mutating it to an unconditional clear failed no
 	// test), and a branch no input can take is not a guard.
-	const run = executeManagedToolRefresh(now, noopTap).finally(() => {
-		refreshInFlight = null;
-	});
+	// The Opengrep rule pack rides the same run (#4765): one entry point, one
+	// single-flight slot, one stamp file. It has its own cadence and no spawn
+	// budget (a GET and one validate, not a package manager), and never throws.
+	const run = executeManagedToolRefresh(now, noopTap)
+		.then(async (outcome) => {
+			if (options.rulePack !== false) await refreshOpengrepRulePack(now);
+			return outcome;
+		})
+		.finally(() => {
+			refreshInFlight = null;
+		});
 	refreshInFlight = run;
 	return run;
 }
@@ -1007,13 +1067,17 @@ async function executeManagedToolRefresh(
 					for (const toolId of candidate.coveredToolIds) {
 						if (toolId === candidate.toolId) continue;
 						await bounded(
-							writeRefreshStamp(toolId, {
-								checkedAt: now,
-								...(result.currentVersion !== undefined && {
-									version: result.currentVersion,
-								}),
-								...(result.ok ? {} : { failed: true }),
-							}),
+							writeRefreshStamp(
+								toolId,
+								{
+									checkedAt: now,
+									...(result.currentVersion !== undefined && {
+										version: result.currentVersion,
+									}),
+									...(result.ok ? {} : { failed: true }),
+								},
+								{ retainNewerSuccess: true },
+							),
 							{
 								ms: HOOK_WALL_BUDGET_MS.session_start,
 								// The unref'd timer runs after session_start returns, so no
@@ -1038,5 +1102,301 @@ async function executeManagedToolRefresh(
 	} finally {
 		// A throw before any spawn must not leak the reservation.
 		releaseReservation();
+	}
+}
+
+// --- Opengrep rule pack (#4765) ---
+
+/** The pack's key in the shared stamp file; no managed tool has this id. */
+const OPENGREP_PACK_STAMP_ID = "opengrep-rules";
+const PACK_FETCH_TIMEOUT_MS = 60_000;
+/** Measured 28 to 35 s for the 1074-rule registry pack on a loaded 32-core host. */
+const PACK_VALIDATE_TIMEOUT_MS = 180_000;
+/** The registry pack is about 2.5 MB; a body past this is not a rule pack. */
+const PACK_MAX_BYTES = 16 * 1024 * 1024;
+/** A validated pack with fewer rules than this is a stub, not the registry set. */
+const PACK_MIN_RULES = 100;
+
+export type OpengrepPackRefreshOutcome =
+	| "refreshed"
+	| "unchanged"
+	| "failed"
+	| "declined"
+	| "skipped";
+
+/** `DM_LENS_TEST_OPENGREP_PACK_URL` is honoured only in test mode. */
+function opengrepPackUrl(): string | undefined {
+	if (isTestMode()) {
+		// A unit test never reaches semgrep.dev: no override, no fetch.
+		return process.env.DM_LENS_TEST_OPENGREP_PACK_URL;
+	}
+	return OPENGREP_REGISTRY_PACK_URL;
+}
+
+async function downloadOpengrepPack(url: string): Promise<Buffer> {
+	const res = await fetch(url, {
+		signal: AbortSignal.timeout(PACK_FETCH_TIMEOUT_MS),
+		// `identity` is load-bearing: semgrep.dev/c/auto answers a client that
+		// accepts gzip (Node's fetch does by default) with the rule set as JSON,
+		// and one that does not with YAML (measured 2026-10-23). The CLI loads
+		// either from a `.yaml` file; the language server loads the JSON as zero
+		// rules and publishes empty diagnostics, which would turn a cached pack
+		// into a silent clean scan.
+		headers: { "User-Agent": "dm-lens/1.0", "Accept-Encoding": "identity" },
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	if (!res.body) throw new Error("empty response body");
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	const reader = res.body.getReader();
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > PACK_MAX_BYTES) {
+			await reader.cancel();
+			throw new Error(`body exceeds ${PACK_MAX_BYTES} bytes`);
+		}
+		chunks.push(value);
+	}
+	const bytes = Buffer.concat(chunks);
+	// Fail closed on the form the language server cannot load (see above).
+	if (bytes.toString("utf-8", 0, 64).trimStart().startsWith("{"))
+		throw new Error("registry answered JSON, not the YAML rule file");
+	return bytes;
+}
+
+/**
+ * Prove a downloaded pack loads in the installed Opengrep BEFORE it can replace
+ * the working one: a registry rule newer than the binary understands would
+ * otherwise fail the language server's init for good, and no findings is worse
+ * than the `auto` set it replaces. Fails closed: any exit but 0, or a rule count it cannot
+ * read or that is below the floor, rejects the pack.
+ */
+async function validateOpengrepPack(
+	binary: string,
+	candidate: string,
+): Promise<string | undefined> {
+	const spawned = await safeSpawnAsync(
+		binary,
+		["scan", "--validate", "--config", candidate, "--disable-version-check"],
+		{
+			cwd: path.dirname(candidate),
+			timeout: PACK_VALIDATE_TIMEOUT_MS,
+			ignoreAmbientSignal: true,
+			lifetimeCoupled: true,
+		},
+	);
+	if (spawned.status !== 0) {
+		const detail =
+			spawned.stderr.trim() || spawned.failure || `exit ${spawned.status}`;
+		return `opengrep --validate failed: ${detail}`.slice(0, 240);
+	}
+	// Colour codes can sit between the count and `rule(s)` (AGENTS.md shape 63).
+	const count = /(\d+) rule\(s\)/.exec(
+		stripAnsi(`${spawned.stdout}\n${spawned.stderr}`),
+	);
+	const rules = count ? Number(count[1]) : 0;
+	if (rules < PACK_MIN_RULES) {
+		return `opengrep --validate reported ${count ? rules : "no"} rules (floor ${PACK_MIN_RULES})`;
+	}
+	return undefined;
+}
+
+/** A candidate this old belongs to a refresh that died; nothing live is that slow. */
+const PACK_CANDIDATE_MAX_AGE_MS = 60 * 60 * 1000;
+
+/** Remove candidates a killed refresh left beside the cached pack. Never throws. */
+async function sweepStaleCandidates(finalPath: string): Promise<void> {
+	const dir = path.dirname(finalPath);
+	const prefix = `${path.basename(finalPath)}.candidate-`;
+	try {
+		for (const name of await fs.readdir(dir)) {
+			if (!name.startsWith(prefix)) continue;
+			const file = path.join(dir, name);
+			const { mtimeMs } = await fs.stat(file);
+			if (Date.now() - mtimeMs > PACK_CANDIDATE_MAX_AGE_MS)
+				await fs.rm(file, { force: true });
+		}
+	} catch (err) {
+		logSessionStart(
+			`managed-tool-refresh ${OPENGREP_PACK_STAMP_ID}: could not sweep stale candidates (${(err as Error).message})`,
+		);
+	}
+}
+
+/**
+ * Refresh the cached Opengrep registry pack when it is due: download, check,
+ * swap atomically, or change nothing.
+ *
+ * Cadence is the managed tools': weekly after a success, daily after a failure,
+ * persisted in the shared stamp file under `opengrep-rules`, so a restart loop
+ * cannot turn it into a per-launch download. The run is bounded by a 60 s
+ * fetch, a 16 MB body and a 180 s validate.
+ *
+ * The cached file is replaced only by `rename` of a candidate that parsed and
+ * passed `opengrep --validate` in the installed binary, so a reader (the next
+ * spawn) sees the whole old pack or the whole new one, and a failure at any
+ * step leaves the current pack serving. A failure records ONE degradation per
+ * session (`recordDegradationOnce`) and the retry cooldown applies. Never
+ * throws: the caller is a background timer.
+ */
+export async function refreshOpengrepRulePack(
+	now: number = Date.now(),
+): Promise<OpengrepPackRefreshOutcome> {
+	try {
+		if (process.env.DM_LENS_DISABLE_TOOL_REFRESH === "1") return "skipped";
+		const url = opengrepPackUrl();
+		if (!url) return "skipped";
+		const binary = await findManagedToolBinary("opengrep");
+		// Without the managed binary nothing can validate the pack, and a
+		// PATH-only Opengrep keeps `auto` rather than an unchecked pack.
+		if (!binary) return "skipped";
+
+		const read = await readManagedToolRefreshState();
+		if (read.status === "unreadable") {
+			recordDegradationOnce({
+				kind: "managed-tool-refresh",
+				subject: "refresh-state",
+				reason: `refresh state unreadable (${read.reason}); skipping refresh this session`,
+			});
+			return "skipped";
+		}
+		const entry = read.state.tools[OPENGREP_PACK_STAMP_ID];
+		if (
+			entry &&
+			now - entry.checkedAt <
+				(entry.failed ? retryIntervalMs() : refreshIntervalMs())
+		) {
+			return "skipped";
+		}
+
+		// The gate is the one place the kill switch, the project-trust boundary and
+		// the cross-process install lock are judged, so the pack asks it twice and
+		// holds it for neither slow phase: once to clear the preconditions
+		// (released at once), and once more to swap and stamp. The 60 s fetch and
+		// the 180 s validate touch only the pack's own files, and holding the
+		// shared install lock across them made an unrelated `ensureTool` wait out
+		// its 150 s bound (#4780 review).
+		const declined = async (
+			phase: string,
+		): Promise<OpengrepPackRefreshOutcome> => {
+			logSessionStart(
+				`managed-tool-refresh ${OPENGREP_PACK_STAMP_ID}: declined (${phase}) — no stamp written, retried next session`,
+			);
+			return "declined";
+		};
+		const pre = await acquireManagedInstallGate(
+			`managed tool refresh: ${OPENGREP_PACK_STAMP_ID}`,
+		);
+		if (!pre.ok) return declined(pre.reason ?? "unknown");
+		await pre.release?.();
+
+		const finalPath = cachedOpengrepPackPath();
+		// Its own name per refresh: a second process that starts while this one is
+		// still validating (after a suspended process lost its lock, or simply
+		// within the cadence window) never reads, replaces or deletes this file.
+		const candidate = `${finalPath}.candidate-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+		const startedAt = Date.now();
+		try {
+			await fs.mkdir(path.dirname(finalPath), { recursive: true });
+			await sweepStaleCandidates(finalPath);
+			const bytes = await downloadOpengrepPack(url);
+			const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+			let current: Buffer | undefined;
+			try {
+				current = await fs.readFile(finalPath);
+			} catch (err) {
+				// none: ENOENT is the first-run answer (no cached pack to compare with);
+				// any other read error is rethrown to the refresh's failure record.
+				if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			}
+			if (
+				current &&
+				crypto.createHash("sha256").update(current).digest("hex") === digest
+			) {
+				await writeRefreshStamp(OPENGREP_PACK_STAMP_ID, {
+					checkedAt: now,
+					version: digest.slice(0, 12),
+				});
+				logSessionStart(
+					`managed-tool-refresh ${OPENGREP_PACK_STAMP_ID}: unchanged at ${digest.slice(0, 12)} (${Date.now() - startedAt}ms)`,
+				);
+				return "unchanged";
+			}
+			await writeFileAtomicAsync(candidate, bytes, { bestEffort: false });
+			const rejected = await validateOpengrepPack(binary, candidate);
+			if (rejected) throw new Error(rejected);
+
+			const swap = await acquireManagedInstallGate(
+				`managed tool refresh: ${OPENGREP_PACK_STAMP_ID} (swap)`,
+			);
+			if (!swap.ok) return await declined(swap.reason ?? "unknown");
+			try {
+				// Another process may have refreshed while this one validated: its
+				// stamp moved after the one read above. Its pack is as good as this
+				// one, so keep it and drop this candidate (removed in `finally`).
+				const after = await readManagedToolRefreshState();
+				const latest =
+					after.status === "ok"
+						? after.state.tools[OPENGREP_PACK_STAMP_ID]
+						: undefined;
+				if (latest && !latest.failed && latest.checkedAt !== entry?.checkedAt) {
+					logSessionStart(
+						`managed-tool-refresh ${OPENGREP_PACK_STAMP_ID}: another process refreshed first — keeping its pack`,
+					);
+					return "skipped";
+				}
+				await fs.rename(candidate, finalPath);
+				await writeRefreshStamp(OPENGREP_PACK_STAMP_ID, {
+					checkedAt: now,
+					version: digest.slice(0, 12),
+				});
+			} finally {
+				await swap.release?.();
+			}
+			logSessionStart(
+				`managed-tool-refresh ${OPENGREP_PACK_STAMP_ID}: cached pack now ${digest.slice(0, 12)} (${bytes.byteLength} bytes, ${Date.now() - startedAt}ms)`,
+			);
+			return "refreshed";
+		} catch (err) {
+			const reason = (err as Error).message;
+			recordDegradationOnce({
+				kind: "managed-tool-refresh",
+				subject: OPENGREP_PACK_STAMP_ID,
+				reason: `rule pack refresh failed: ${reason}`,
+			});
+			logSessionStart(
+				`managed-tool-refresh ${OPENGREP_PACK_STAMP_ID}: refresh failed after ${Date.now() - startedAt}ms — keeping the current pack (${reason})`,
+			);
+			await writeRefreshStamp(
+				OPENGREP_PACK_STAMP_ID,
+				{
+					checkedAt: now,
+					failed: true,
+					...(entry?.version !== undefined && { version: entry.version }),
+				},
+				// A winner that stamped while this attempt was validating keeps its
+				// `{checkedAt, version}` and its weekly cadence (shape 21).
+				{ retainNewerSuccess: true },
+			);
+			return "failed";
+		} finally {
+			try {
+				await fs.rm(candidate, { force: true });
+			} catch (err) {
+				// A later refresh's sweep removes it once it is an hour old; say so.
+				logSessionStart(
+					`managed-tool-refresh ${OPENGREP_PACK_STAMP_ID}: could not remove ${candidate} (${(err as Error).message})`,
+				);
+			}
+		}
+	} catch (err) {
+		recordDegradationOnce({
+			kind: "managed-tool-refresh",
+			subject: OPENGREP_PACK_STAMP_ID,
+			reason: `rule pack refresh threw: ${(err as Error).message}`,
+		});
+		return "failed";
 	}
 }

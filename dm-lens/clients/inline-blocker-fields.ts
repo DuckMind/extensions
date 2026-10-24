@@ -53,7 +53,11 @@ export function inlineBlockerLines(
 ): number[] {
 	const own = normalizeEphemeralMapKey(filePath);
 	return blockers
-		.filter((d) => normalizeEphemeralMapKey(d.filePath) === own)
+		.filter(
+			// #4509 (N3): a stale entry's line is from older bytes, so it cites
+			// none: the past-EOF sweep would retire the whole record on it.
+			(d) => !d.positionStale && normalizeEphemeralMapKey(d.filePath) === own,
+		)
 		.map((d) => d.line)
 		.filter((line): line is number => typeof line === "number");
 }

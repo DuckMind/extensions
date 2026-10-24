@@ -18,9 +18,21 @@
  * `sendDidSave`'s is different (it drops the redundant `text` and still sends
  * the save, because the server already received these bytes in the didOpen or
  * didChange this save follows).
+ *
+ * #2066: the line count this predicate compares is
+ * `clients/lsp/content-scan.ts`'s count-only entry point, not a `split("\n")`
+ * of its own. The verdicts are unchanged, byte for byte — the split's length
+ * was the `\n` count + 1 — and the split's allocation (one substring per line,
+ * ~40 800 of them on a 1.95 MB document) is gone. The count needs no
+ * terminator knowledge, so it stays native on EVERY document: asking the full
+ * `scanDocumentContent` here instead paid that owner's per-character
+ * `lastLine` loop for a number this predicate never reads, which made any
+ * document holding a `\r` 4.6x to 5.5x slower to check than the split it
+ * replaced (review F1).
  */
 
 import { RUNTIME_CONFIG } from "../runtime-config.js";
+import { countLfNewlines } from "./content-scan.js";
 
 const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
@@ -40,7 +52,15 @@ export function exceedsLspSyncLimits(content: string): LspContentLimitVerdict {
 		};
 	}
 
-	const lineCount = content.split("\n").length;
+	// #2066: the count is the document's `\n` occurrences + 1 — exactly what
+	// `content.split("\n").length` returned, including every one of its
+	// conventions: `\n` is the only separator (a lone-CR document has no `\n`,
+	// so it is ONE line here, as it always was), a trailing `\n` adds one more,
+	// empty, line, and the comparison below stays a strict `>`. The split built
+	// one substring per line to count them (1.18 ms and a 40 814-element array on
+	// a 1.95 MB document, measured through this function); the native count
+	// allocates nothing and costs a CRLF document what it costs an LF one.
+	const lineCount = countLfNewlines(content) + 1;
 	if (lineCount > LSP_MAX_FILE_LINES) {
 		return {
 			tooLarge: true,

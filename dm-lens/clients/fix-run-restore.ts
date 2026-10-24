@@ -169,6 +169,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 
 import { writeFileAtomicAsync } from "./atomic-write.js";
+import { noteAtomicReplace } from "./path-birth.js";
 import {
 	incrementDegradationCount,
 	recordDegradationOnce,
@@ -200,7 +201,7 @@ export interface AgentWriteExpectation {
  *
  * - `verified`: they hold it.
  * - `overwritten`: they do not, and nothing the agent itself did explains it, so
- *   a writer outside pi's queue (the fixer) is the explanation.
+ *   a writer outside DM's queue (the fixer) is the explanation.
  * - `accounted`: they do not, and an own call still in flight states a write
  *   that covers the difference, so the agent itself replaced that region
  *   (#4205 round 4). It names nothing: the report is about the fixer's writes.
@@ -745,9 +746,24 @@ async function restoreFile(
 		skipped.push(file.filePath);
 		return;
 	}
+	let before: fs.Stats | undefined;
+	try {
+		before = fs.statSync(file.filePath);
+	} catch {
+		// Gone since the re-read: the write below recreates it, a new path.
+	}
 	await writeFileAtomicAsync(file.filePath, capture.bytes, {
 		bestEffort: false,
 	});
+	// #4320: the rewrite installs a new inode; the path is as old as it was,
+	// so its next first open must tell a language server Changed, not Created.
+	if (before) {
+		try {
+			noteAtomicReplace(before, fs.statSync(file.filePath));
+		} catch {
+			// Gone again: no path left to describe.
+		}
+	}
 	report.restored.push(file.filePath);
 }
 

@@ -130,10 +130,17 @@ interface DispositionStateFile {
 // relative path/tool/rule/message (e.g. "src/auth.ts" flagged by the same
 // eslint rule in project A and project B) collapse onto the IDENTICAL weak
 // anchor string. A defer in project A therefore silently suppressed the same
-// finding in project B for the rest of the process's life. Every read/write
-// below goes through `deferredKey`, which folds the resolved cwd into the Set
-// key, so the two projects can no longer collide.
-const deferredThisSession = new Set<string>();
+// finding in project B for the rest of the process's life. The map below is
+// keyed by the resolved cwd for exactly that reason.
+//
+// #4701 F1: the project is the KEY, not part of a composite string, because a
+// caller asks two different questions — "is THIS finding deferred"
+// (`isDeferredThisSession`) and "is THIS PROJECT marked at all"
+// (`hasAnyDispositionMarks`, the read-only turn's cost guard). The second read
+// the process-wide `size > 0`, so one `defer` in any project turned the policy
+// pass on in every other project. One container answers both, so no derived
+// index can disagree with the anchors it was derived from.
+const deferredByCwd = new Map<string, Set<string>>();
 let widgetDispositionReconciler:
 	| ((
 			cwd: string,
@@ -153,8 +160,28 @@ export function registerWidgetDispositionReconciler(
 	widgetDispositionReconciler = reconciler;
 }
 
-function deferredKey(cwd: string, anchor: string): string {
-	return `${normalizeMapKey(cwd)}::${anchor}`;
+/** The anchors deferred in THIS project, or undefined when it has none. */
+function deferredAnchorsFor(cwd: string): Set<string> | undefined {
+	return deferredByCwd.get(normalizeMapKey(cwd));
+}
+
+/** True when THIS project holds at least one session `defer` (#4701 F1). */
+function hasDeferredThisSession(cwd: string): boolean {
+	return deferredByCwd.has(normalizeMapKey(cwd));
+}
+
+/**
+ * The shared "nothing to apply here" hoist (#1625 F2, #4701 F1): no durable
+ * mark in THIS project and no session `defer` in it either. Both halves are
+ * project-scoped, so all three filter entry points answer for the same
+ * population — a defer recorded in another project is not a mark this one can
+ * apply, and the multi-file lane must not read a single file group for it.
+ */
+function nothingToApply(
+	dispositions: Record<string, DispositionEntry> | undefined,
+	cwd: string,
+): boolean {
+	return !dispositions && !hasDeferredThisSession(cwd);
 }
 
 /** Exported (#802) so lens-diagnostic-mark's cross-check against live widget
@@ -174,8 +201,8 @@ export const normalizeMessage = sharedNormalizeMessage;
 // case, symlink/realpath, or slash difference between the two forms silently
 // orphans the agent's own false-positive/flagged mark (a #533 dropped-signal).
 // Canonicalize BOTH inputs through `normalizeMapKey` (the SAME normalizer the
-// read side already relies on — realpathSync.native on Windows, and on POSIX
-// too since #3098) BEFORE computing
+// read side already relies on — the path identity, realpathSync.native on
+// every platform since #4689) BEFORE computing
 // the relative path, so write and read produce identical anchors regardless of
 // the form the caller held. `normalizeMapKey` is idempotent, so the already-
 // canonicalized read side is unaffected; the realpath I/O is acceptable here
@@ -344,14 +371,22 @@ export function _setDispositionStatForTests(
 
 /**
  * Zero-I/O guard for cache-only callers (lens_diagnostics delta/all): true
- * when ANY disposition mark or session defer exists, so a caller can skip its
- * whole strict/weak filter — including every file stat/read the strict branch
- * would need — in the overwhelmingly common no-marks case. Same hoist shape as
- * applyDispositionsMultiFile's #1625 F2 empty-store early return; `readState`
- * is mtime+size stat-cached, so repeated calls cost one stat.
+ * when ANY disposition mark or session defer exists IN THIS PROJECT, so a
+ * caller can skip its whole strict/weak filter — including every file stat/read
+ * the strict branch would need — in the overwhelmingly common no-marks case.
+ * Same hoist shape as applyDispositionsMultiFile's #1625 F2 empty-store early
+ * return; `readState` is mtime+size stat-cached, so repeated calls cost one
+ * stat.
+ *
+ * Project-scoped on BOTH halves (#4701 F1). The defer half used to be a
+ * process-wide container size, so one `defer` recorded in any project made
+ * every project look marked; the read-only turn's cost guard
+ * (`resyncCommitGateForReadOnlyTurn`, clients/runtime-turn.ts) is the first
+ * caller whose answer is load-bearing for a hot path, and it paid the whole
+ * policy pass in projects that hold no mark at all.
  */
 export function hasAnyDispositionMarks(cwd: string): boolean {
-	return Boolean(readState(cwd).dispositions) || deferredThisSession.size > 0;
+	return Boolean(readState(cwd).dispositions) || hasDeferredThisSession(cwd);
 }
 
 /**
@@ -593,7 +628,12 @@ export function markDisposition(
 	// mark) — the log should record what this mark shadowed either way.
 	const existing = readState(cwd).dispositions?.[anchor];
 	if (disposition === "defer") {
-		deferredThisSession.add(deferredKey(cwd, anchor));
+		// A defer never writes the store, so this map is its only record; the
+		// project entry is created with the first anchor and cleared whole.
+		const projectKey = normalizeMapKey(cwd);
+		const anchors = deferredByCwd.get(projectKey);
+		if (anchors) anchors.add(anchor);
+		else deferredByCwd.set(projectKey, new Set([anchor]));
 		widgetDispositionReconciler?.(cwd, target, disposition);
 		emitMarkTelemetry(
 			cwd,
@@ -652,13 +692,27 @@ export function getDisposition(
  * own identity, so `cwd` must be supplied to disambiguate which project's
  * defer is being checked. */
 export function isDeferredThisSession(cwd: string, anchor: string): boolean {
-	return deferredThisSession.has(deferredKey(cwd, anchor));
+	return deferredAnchorsFor(cwd)?.has(anchor) === true;
 }
 
-/** Test-only escape hatch — defer state is module-level (one process = one
- * session), so tests need to reset it between cases. */
+/**
+ * Session-boundary reset (#4701 F1, shapes 17 and 74): `defer` is
+ * session-ephemeral by design (#690), so a new session must see every deferred
+ * finding again. Until this existed the only reset was the test-only seam, so a
+ * `defer` stayed suppressed, and its project stayed "marked" for the read-only
+ * turn's cost guard, for the life of the PROCESS.
+ *
+ * Reached from `resetSessionScopedState`; the session-state conformance suite
+ * derives that reachability and proves the reset re-arms both halves.
+ */
+export function resetDeferredDispositions(): void {
+	deferredByCwd.clear();
+}
+
+/** Test-only alias of {@link resetDeferredDispositions} — defer state is
+ * module-level (one process = one session), so tests reset it between cases. */
 export function _resetDeferredForTests(): void {
-	deferredThisSession.clear();
+	resetDeferredDispositions();
 }
 
 /**
@@ -687,11 +741,12 @@ export function applyDispositions<T extends DispositionCandidate>(
 ): T[] {
 	if (!diagnostics.length) return diagnostics;
 	const dispositions = readState(cwd).dispositions;
-	if (!dispositions && deferredThisSession.size === 0) return diagnostics;
+	if (nothingToApply(dispositions, cwd)) return diagnostics;
+	const deferred = deferredAnchorsFor(cwd);
 	return diagnostics.filter((d) => {
 		const { strict, weak } = anchorsForDiagnostic(cwd, filePath, d, content);
 		const isBlocking = d.semantic === "blocking";
-		if (!isBlocking && deferredThisSession.has(deferredKey(cwd, weak))) {
+		if (!isBlocking && deferred?.has(weak)) {
 			return false;
 		}
 		if (dispositions?.[strict]?.disposition === "false-positive") return false;
@@ -739,7 +794,8 @@ export function applyWeakDispositions<T extends DispositionCandidate>(
 ): T[] {
 	if (!diagnostics.length) return diagnostics;
 	const dispositions = readState(cwd).dispositions;
-	if (!dispositions && deferredThisSession.size === 0) return diagnostics;
+	if (nothingToApply(dispositions, cwd)) return diagnostics;
+	const deferred = deferredAnchorsFor(cwd);
 	return diagnostics.filter((d) => {
 		if (d.semantic === "blocking") return true;
 		const weak = computeWeakAnchor({
@@ -750,7 +806,7 @@ export function applyWeakDispositions<T extends DispositionCandidate>(
 			message: d.message,
 			line: d.line,
 		});
-		if (deferredThisSession.has(deferredKey(cwd, weak))) return false;
+		if (deferred?.has(weak)) return false;
 		if (dispositions?.[weak]?.disposition === "suppress") return false;
 		return true;
 	});
@@ -795,7 +851,7 @@ export function applyDispositionsMultiFile<T extends DispositionCandidate>(
 ): T[] {
 	if (!diagnostics.length) return diagnostics;
 	const dispositions = readState(cwd).dispositions;
-	if (!dispositions && deferredThisSession.size === 0) return diagnostics;
+	if (nothingToApply(dispositions, cwd)) return diagnostics;
 	const groups = new Map<string, T[]>();
 	for (const d of diagnostics) {
 		const filePath = filePathOf(d);

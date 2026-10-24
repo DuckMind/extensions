@@ -188,8 +188,11 @@ const dartAnalyzeRunner: RunnerDefinition = {
 			{
 				result,
 				output: raw,
-				// EXIT TABLE (Dart 3.5 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
-				exitCodes: { ran: [1, 2] },
+				// EXIT TABLE (Dart 3.13 measured fixture, tests/fixtures/runner-output/
+				// dart-analyze): 0 clean; 1 infos; 2 warnings; 3 errors; other nonzero
+				// rejected. The 3.5 table stopped at 2, so a file with a compile error
+				// read as a rejected invocation and its findings were dropped.
+				exitCodes: { ran: [1, 2, 3] },
 			},
 			(out) => parseDartMachineOutput(out, ctx.filePath, cwd),
 		);

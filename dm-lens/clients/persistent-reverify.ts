@@ -40,6 +40,7 @@
  */
 
 import * as fs from "node:fs";
+import { freshnessFromMtime } from "./freshness.js";
 import type {
 	ActionableWarningsReport,
 	ActionableWarningsReportFile,
@@ -129,7 +130,10 @@ export function selectPersistentReverifyFiles(
 		} catch {
 			continue;
 		}
-		if (mtimeMs > stamp) {
+		if (
+			freshnessFromMtime({ mtimeMs, referenceMs: stamp, toleranceMs: 0 })
+				.verdict === "stale"
+		) {
 			skippedChanged += 1;
 			continue;
 		}

@@ -65,7 +65,15 @@ export const RECENT_PHASE_CAP = 5;
  * it, while staying O(1) per call and fixed-size in memory. Tracked before the
  * test-mode guard so it is deterministic and unit-testable.
  */
-let recentPhases: Array<{ phase: string; ts: string }> = [];
+let recentPhases: Array<{
+	phase: string;
+	ts: string;
+	// The tool that logged the phase, when it named one: a block breadcrumb
+	// says which tool's phase ran, and a test can see which tool a shared
+	// helper's record was stamped for (#4459 review F5).
+	toolName?: string;
+	metadata?: Record<string, unknown>;
+}> = [];
 
 /**
  * Phases excluded from `lastPhase` attribution alongside `loop_block`.
@@ -99,6 +107,8 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * #1453: `tool_set_mutation` records an active-tool-set rewrite (zero-duration
  * bookkeeping, and it fires during session_start where a real stall must stay
  * attributed to the work around it), so it is excluded for the same reason.
+ * #4687: `tool_set_decision`, its zero-duration sibling, records the lazy-tools
+ * choice at each session_start and model switch.
  * #1467: `availability_decision` records a tool-probe verdict. Its `durationMs`
  * is the child's own probe time (often zero for a fast path or a cached
  * decision) and the record is bookkeeping ABOUT a probe, not host work — a
@@ -151,8 +161,12 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * #3873: `session_handoff_slot`, `session_handoff_adopt`,
  * `session_store_action` and `session_end_fence_rollup` are zero-duration
  * decision and rollup rows written inside the session transition that owns any
- * real stall. `format_late_resync_chained` marks a formatter give-up and its
+ * real stall; #4751's `session_handoff_turn_state` is the same kind of row,
+ * written at turn_start. `format_late_resync_chained` marks a formatter give-up and its
  * `durationMs` is the formatter's age at the give-up, not work of its own.
+ *
+ * #4368 r1 F3: `lsp_created_import_scan_rollup` is a zero-duration session-end
+ * rollup of the created-module producer.
  */
 const LAST_PHASE_EXCLUDED = new Set([
 	"loop_block",
@@ -167,6 +181,7 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"turn_end_test_selection",
 	"lsp_aux_wait_outcome",
 	"tool_set_mutation",
+	"tool_set_decision",
 	"availability_decision",
 	"finding_dead_path_drop",
 	"finding_stale_line_demote",
@@ -188,7 +203,9 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"session_handoff_adopt",
 	"session_store_action",
 	"session_end_fence_rollup",
+	"session_handoff_turn_state",
 	"format_late_resync_chained",
+	"lsp_created_import_scan_rollup",
 ]);
 
 /**
@@ -210,9 +227,12 @@ export function getLastLoggedPhase():
  * request an unbounded ring. Same staleness caveat as `getLastLoggedPhase`:
  * these are breadcrumbs from whatever ran most recently, not proof of cause.
  */
-export function getRecentLoggedPhases(
-	limit = RECENT_PHASE_CAP,
-): Array<{ phase: string; ts: string; metadata?: Record<string, unknown> }> {
+export function getRecentLoggedPhases(limit = RECENT_PHASE_CAP): Array<{
+	phase: string;
+	ts: string;
+	toolName?: string;
+	metadata?: Record<string, unknown>;
+}> {
 	return recentPhases.slice(0, Math.min(limit, RECENT_PHASE_CAP));
 }
 
@@ -834,7 +854,12 @@ export function logLatency(entry: LatencyEntry): void {
 		!LAST_PHASE_EXCLUDED.has(entry.phase)
 	) {
 		recentPhases = [
-			{ phase: entry.phase, ts, metadata: entry.metadata },
+			{
+				phase: entry.phase,
+				ts,
+				...(entry.toolName !== undefined && { toolName: entry.toolName }),
+				...(entry.metadata !== undefined && { metadata: entry.metadata }),
+			},
 			...recentPhases,
 		].slice(0, RECENT_PHASE_CAP);
 	}

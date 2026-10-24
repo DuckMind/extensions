@@ -21,6 +21,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AstGrepClient } from "../ast-grep-client.js";
+import { BoundedFifoMap } from "../bounded-cache.js";
 import {
 	type BootstrapClients,
 	loadBootstrapClients,
@@ -294,7 +295,10 @@ class TurnEndQueue {
 }
 
 const turnEndQueue = new TurnEndQueue();
-const pendingTurnEndDeliveries = new Map<string, PendingTurnEndDelivery>();
+const pendingTurnEndDeliveries = new BoundedFifoMap<
+	string,
+	PendingTurnEndDelivery
+>(TURN_END_DELIVERY_MAX);
 /** In-flight Stop-hook passes, keyed by cwd — see `runTurnEndForIpc` (#1274). */
 const inFlightIpcTurnEnds = new Map<string, Promise<TurnEndDelivery>>();
 
@@ -416,18 +420,12 @@ function hasTurnEndFindings(outcome: TurnEndOutcome): boolean {
 	return Boolean(outcome.turnEnd || outcome.tests);
 }
 
-/** Drop expired deliveries, then the oldest ones over the cap. Never commits. */
+/** Drop expired deliveries. The count cap lives in the map's own `set` (#4570). */
 function prunePendingTurnEndDeliveries(now = Date.now()): void {
 	for (const [deliveryId, delivery] of pendingTurnEndDeliveries) {
 		if (now - delivery.createdAt >= TURN_END_DELIVERY_TTL_MS) {
 			pendingTurnEndDeliveries.delete(deliveryId);
 		}
-	}
-	// Map iteration is insertion-ordered, so the head is the oldest entry.
-	while (pendingTurnEndDeliveries.size > TURN_END_DELIVERY_MAX) {
-		const oldest = pendingTurnEndDeliveries.keys().next();
-		if (oldest.done) break;
-		pendingTurnEndDeliveries.delete(oldest.value);
 	}
 }
 

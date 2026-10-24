@@ -47,7 +47,6 @@
  * - GitHub releases (platform-specific binaries → ~/.dm-lens/bin/)
  */
 
-import { spawn } from "node:child_process";
 import {
 	existsSync,
 	readFileSync,
@@ -64,11 +63,20 @@ import path from "node:path";
 import { writeFileAtomicAsync } from "../atomic-write.js";
 import { BoundedLruCache } from "../bounded-cache.js";
 import { logExtension } from "../extension-log.js";
-import { isFullyQualified } from "../path-utils.js";
+import {
+	isFullyQualified,
+	isUnderDir,
+	realpathOrResolve,
+} from "../path-utils.js";
 import {
 	assertInstallAllowed,
+	getProjectTrustGeneration,
 	projectTrustDenialReason,
 } from "../project-trust.js";
+import {
+	isUntrustedProjectPath,
+	recordProjectCommandRefusal,
+} from "../session-repository.js";
 
 const _installerRequire = createRequire(import.meta.url);
 
@@ -102,19 +110,24 @@ import {
 } from "../package-manager.js";
 import {
 	resetSafeSpawnWindowsCommandCache,
+	type SpawnResult,
 	safeSpawnAsync,
 } from "../safe-spawn.js";
-import {
-	type BoundedOutputSink,
-	createBoundedOutputSink,
-	DEFAULT_MAX_OUTPUT_BYTES,
-} from "../spawn-output-cap.js";
 import { probeToolAsync } from "../tool-probe.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import { resolveGitHubToken } from "../zizmor-config.js";
 
 // Global installation directory for dm-lens tools
 const TOOLS_DIR = path.join(getGlobalDmLensDir(), "tools");
+
+/**
+ * #4530: bounds for the probes that moved onto the spawn seam. Both were raw
+ * `spawn` calls with no timeout: an interpreter whose `site` import stalls
+ * parked the installer's promise forever. 5 s matches the other interpreter
+ * probes; 120 s matches the install budget a cold, large archive needs.
+ */
+const USER_BASE_PROBE_TIMEOUT_MS = 5_000;
+const ARCHIVE_COMMAND_TIMEOUT_MS = 120_000;
 const INSTALL_LOCK_PATH = path.join(TOOLS_DIR, ".install.lock");
 const INSTALL_LOCK_GENERATIONS = `${INSTALL_LOCK_PATH}s`;
 const activeInstallLocks = new Set<InstallLockHold>();
@@ -345,7 +358,36 @@ async function acquireInstallLock(): Promise<{
 }
 
 // Directory for GitHub-downloaded binaries
-const GITHUB_BIN_DIR = path.join(getGlobalDmLensDir(), "bin");
+const GLOBAL_HOME_DIR = getGlobalDmLensDir();
+const GITHUB_BIN_DIR = path.join(GLOBAL_HOME_DIR, "bin");
+// Whether DM_LENS_HOME named the home GITHUB_BIN_DIR derives from. Read at the
+// same moment as the directory itself, so the answer cannot drift from it.
+const GITHUB_BIN_DIR_PINNED = Boolean(process.env.DM_LENS_HOME?.trim());
+
+/**
+ * Refuse a managed bin directory that leaves a PINNED home (#4789). A probe or
+ * test worker pins `DM_LENS_HOME`; a `bin` there that is a link to a directory
+ * outside it lets every write below land in the target, and the #4780 lane probe
+ * overwrote the maintainer's real `~/.dm-lens/bin/opengrep` that way (a symlinked
+ * FILE is replaced by the atomic writer's rename and never written through).
+ * Called after each `mkdir(GITHUB_BIN_DIR)`, so the link resolves. Throws, so
+ * each caller's existing install-failed catch reports it; the refusal is
+ * recorded once per tool. The default home is the user's own, so a link there
+ * (dotfiles) stays honored.
+ */
+function assertManagedBinDirInsidePinnedHome(toolId: string): void {
+	if (!GITHUB_BIN_DIR_PINNED) return;
+	const home = realpathOrResolve(GLOBAL_HOME_DIR);
+	const bin = realpathOrResolve(GITHUB_BIN_DIR);
+	if (isUnderDir(bin, home)) return;
+	const reason = `bin directory escapes the pinned DM_LENS_HOME: ${GITHUB_BIN_DIR} resolves to ${bin}, outside ${home}; refusing to write through the link`;
+	recordDegradationOnce({
+		kind: "managed-tool-install",
+		subject: `${toolId}:bin-dir-escape`,
+		reason,
+	});
+	throw new Error(reason);
+}
 
 // Debug flag - set via DM_LENS_DEBUG=1 or --debug
 const DEBUG =
@@ -853,7 +895,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "jscpd",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "jscpd@5.4.0", // v5.4.0 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
+		packageName: "jscpd@5.4.1", // v5.4.1 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
 		binaryName: "jscpd",
 	},
 	// Structural search and dead code detection
@@ -1011,8 +1053,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "helm",
 		name: "Helm",
 		checkCommand: "helm",
-		// intended: version --short — unverified against real binary (shape 16), do not wire until probed
-		checkArgs: ["--version"],
+		// Probed against helm 4.3.0: `--version` exits 1 ("unknown flag"), `version --short` exits 0.
+		checkArgs: ["version", "--short"],
 		installStrategy: "github",
 		binaryName: "helm",
 		github: {
@@ -1355,8 +1397,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "spotbugs",
 		name: "SpotBugs",
 		checkCommand: "spotbugs",
-		// intended: -version — unverified against real binary (shape 16), do not wire until probed
-		checkArgs: ["--version"],
+		// Probed against spotbugs 4.10.2 (JRE 21): `--version` exits 1 ("Unknown option"), `-version` prints 4.10.2.
+		checkArgs: ["-version"],
 		installStrategy: "archive",
 		binaryName: "spotbugs",
 		archive: {
@@ -1658,7 +1700,7 @@ export const TOOLS: ToolDefinition[] = [
 		id: "gitleaks",
 		name: "gitleaks",
 		checkCommand: "gitleaks",
-		// intended: version — unverified against real binary (shape 16), do not wire until probed
+		// Probed against gitleaks 8.30.1: `--version` exits 0.
 		checkArgs: ["--version"],
 		installStrategy: "github",
 		binaryName: "gitleaks",
@@ -1770,7 +1812,7 @@ export const TOOLS: ToolDefinition[] = [
 		id: "terraform-ls",
 		name: "terraform-ls",
 		checkCommand: "terraform-ls",
-		// intended: version — unverified against real binary (shape 16), do not wire until probed
+		// Probed against terraform-ls 0.39.0: `--version` exits 0.
 		checkArgs: ["--version"],
 		installStrategy: "github",
 		binaryName: "terraform-ls",
@@ -2547,13 +2589,25 @@ export async function isCommandAvailable(
 	for (const dir of dirs) {
 		if (!dir) continue;
 		for (const name of names) {
-			const candidate = path.join(dir, name);
+			// #4530: joined as text on POSIX, as the kernel joins it, so a
+			// `link/..` entry is read where the spawn would find it; Win32
+			// folds `..` lexically itself.
+			const candidate = isWindows
+				? path.join(dir, name)
+				: `${dir}${path.sep}${name}`;
 			try {
 				const stat = statSync(candidate);
 				// isFile() returns false for broken symlinks (target missing)
-				if (stat.isFile() && stat.size > 0) {
-					return true;
+				if (!stat.isFile() || stat.size === 0) continue;
+				// #4530: a candidate that is the session repository's bytes (a
+				// project PATH entry, a relative one, or a global link into the
+				// project) is no answer until pi trusts the project: the installer
+				// would otherwise report a project binary as an installed tool.
+				if (isUntrustedProjectPath(candidate)) {
+					recordProjectCommandRefusal(candidate);
+					continue;
 				}
+				return true;
 			} catch {
 				// ENOENT or permission denied — skip this candidate
 			}
@@ -2569,7 +2623,13 @@ export async function isCommandAvailable(
  * probe that is guaranteed to fail with a full spawn round-trip.
  */
 export async function isSpawnableCommand(command: string): Promise<boolean> {
-	if (/[\\/]/.test(command)) {
+	// The platform's separators (#4776): on POSIX a backslash is a name
+	// character, so such a name is a search-path lookup, not a file to stat.
+	const namesPath =
+		installerPlatform() === "win32"
+			? /[\\/]/.test(command)
+			: command.includes("/");
+	if (namesPath) {
 		try {
 			const stat = statSync(command);
 			return stat.isFile() && stat.size > 0;
@@ -2577,7 +2637,8 @@ export async function isSpawnableCommand(command: string): Promise<boolean> {
 			return false;
 		}
 	}
-	const memoKey = `${command}:${hashSync(process.env.PATH || "")}`;
+	// #4530: the walk's answer depends on project trust as well as PATH.
+	const memoKey = `${getProjectTrustGeneration()}:${command}:${hashSync(process.env.PATH || "")}`;
 	if (pathWalkMemo.has(memoKey)) return pathWalkMemo.get(memoKey) ?? false;
 	const isSpawnable = await isCommandAvailable(command);
 	pathWalkMemo.set(memoKey, isSpawnable);
@@ -3207,12 +3268,22 @@ export function wasLastResolveTransient(toolId: string): boolean {
 	return lastResolveTransient.get(toolId) ?? false;
 }
 
-export async function getToolPath(toolId: string): Promise<string | undefined> {
+export async function getToolPath(
+	toolId: string,
+	opts?: {
+		/** #4515: read only dm-lens's own store; spawn nothing found on PATH. */
+		storeOnly?: boolean;
+	},
+): Promise<string | undefined> {
 	let sawTransient = false;
 	const markTransient = (): void => {
 		sawTransient = true;
 	};
-	const result = await getToolPathResolved(toolId, markTransient);
+	const result = await getToolPathResolved(
+		toolId,
+		markTransient,
+		opts?.storeOnly === true,
+	);
 	lastResolveTransient.set(toolId, sawTransient);
 	return result;
 }
@@ -3220,6 +3291,7 @@ export async function getToolPath(toolId: string): Promise<string | undefined> {
 async function getToolPathResolved(
 	toolId: string,
 	onTransient: () => void,
+	storeOnly: boolean,
 ): Promise<string | undefined> {
 	const tool = TOOLS.find((t) => t.id === toolId);
 	if (!tool) return undefined;
@@ -3365,6 +3437,21 @@ async function getToolPathResolved(
 	) {
 		const githubPath = await findGitHubToolPath(tool.binaryName || tool.id);
 		if (githubPath) return githubPath;
+	}
+
+	// #4515: the store ends here, save dm-lens's own pip prefixes. Every other
+	// rung below spawns what a bare-name lookup resolves (`<cmd> --version`,
+	// `npm prefix -g`, `python -m site`).
+	if (storeOnly) {
+		return tool.installStrategy === "pip"
+			? findPipUserToolPath(
+					tool.binaryName || tool.id,
+					onTransient,
+					tool.checkArgs,
+					getToolVerificationTimeout(tool),
+					true,
+				)
+			: undefined;
 	}
 
 	// Check if global. `isCommandAvailable` is a PATH walk plus a stat — it
@@ -3563,6 +3650,12 @@ async function findNpmGlobalToolPath(
 		for (const candidate of candidates) {
 			try {
 				await fs.access(candidate);
+				// #4530 (#4776): a global bin dir can hold a link into the
+				// project, and the verification below starts the candidate.
+				if (isUntrustedProjectPath(candidate)) {
+					recordProjectCommandRefusal(candidate);
+					continue;
+				}
 				if (
 					await verifyToolBinary(
 						candidate,
@@ -3621,12 +3714,14 @@ async function findPipUserToolPath(
 	onTransient?: () => void,
 	verificationArgs: string[] = ["--version"],
 	verificationTimeoutMs = 10_000,
+	/** #4515: skip the Python user base, which takes a PATH-resolved spawn. */
+	piLensPrefixesOnly = false,
 ): Promise<string | undefined> {
 	const isWindows = installerPlatform() === "win32";
 	const userBaseCandidates = [
 		path.join(getGlobalDmLensDir(), "pip-tools"),
 		path.join(getGlobalDmLensDir(), "pip-user"),
-		...(await getPythonUserBaseCandidates()),
+		...(piLensPrefixesOnly ? [] : await getPythonUserBaseCandidates()),
 	];
 
 	for (const userBase of userBaseCandidates) {
@@ -3657,6 +3752,12 @@ async function findPipUserToolPath(
 			for (const candidate of candidates) {
 				try {
 					await fs.access(candidate);
+					// #4530 (#4776): the Python user base is an interpreter's
+					// answer, and its scripts dir can link into the project.
+					if (isUntrustedProjectPath(candidate)) {
+						recordProjectCommandRefusal(candidate);
+						continue;
+					}
 					if (
 						await verifyToolBinary(
 							candidate,
@@ -3679,41 +3780,39 @@ async function findPipUserToolPath(
 }
 
 /**
- * The verdict of one `<interpreter> -m site --user-base` probe (#3383).
+ * The verdict of one `<interpreter> -m site --user-base` probe (#3383): the
+ * trimmed path on a clean exit, else empty. A TRUNCATED probe resolves EMPTY
+ * rather than trimming a prefix, because the prefix of a path is a different
+ * path: `addBinToPath` would put a plausible-looking wrong directory on PATH.
+ * Empty is the value a missing interpreter resolves too, and every caller
+ * handles it. The spawn seam bounds the output and records the cap trip.
  *
- * Both probes accumulate through {@link createBoundedOutputSink} instead of
- * `stdout += data`: the concatenation ran inside a `data` handler, where V8's
- * `RangeError: Invalid string length` is an uncaught exception rather than this
- * promise's value, and nothing bounded an interpreter that decides to write
- * forever. A TRUNCATED probe resolves EMPTY rather than trimming a prefix,
- * because the prefix of a path is a different path: `addBinToPath` would put a
- * plausible-looking wrong directory on PATH. Empty is the value both probes
- * already resolve when an interpreter is missing, and every caller handles it.
- *
- * Exported for `tests/clients/off-seam-output-bounds.test.ts`: both `data`
- * handlers that feed it sit inside module-private probe loops that only a real
- * `python3` on PATH can drive, so this is the seam the bound is pinned at.
+ * Exported for `tests/clients/off-seam-output-bounds.test.ts`.
  */
 export function userBaseProbeResult(
-	command: string,
-	code: number | null,
-	stdout: BoundedOutputSink,
+	result: Pick<SpawnResult, "status" | "error" | "stdout" | "outputTruncated">,
 ): string {
-	if (stdout.truncated) {
-		recordDegradationOnce({
-			kind: "spawn-output-cap-truncated",
-			subject: `user-base-probe:${command}`,
-			reason: `\`${command} -m site --user-base\` reached the ${DEFAULT_MAX_OUTPUT_BYTES}-byte default cap after ${stdout.observedBytes} bytes; the probed user base is unusable`,
-			metadata: {
-				capBytes: DEFAULT_MAX_OUTPUT_BYTES,
-				capSource: "default",
-				observedBytes: stdout.observedBytes,
-				killed: false,
-			},
-		});
-		return "";
-	}
-	return code === 0 ? stdout.text.trim() : "";
+	if (result.outputTruncated || result.error || result.status !== 0) return "";
+	return result.stdout.trim();
+}
+
+/**
+ * Ask `command` where Python keeps user installs (#4530). It starts through the
+ * spawn seam, so a bare interpreter name is a lookup judged against project
+ * trust like every other; the raw `spawn` this replaces (with `shell: true` on
+ * Windows, which searches the cwd first) skipped that judgment and had no
+ * timeout. It runs from HOME: `-m` puts the cwd on `sys.path`, so a project's
+ * own `site.py` would answer from the session cwd.
+ */
+async function probeUserBase(command: string): Promise<string> {
+	return userBaseProbeResult(
+		await safeSpawnAsync(command, ["-m", "site", "--user-base"], {
+			timeout: USER_BASE_PROBE_TIMEOUT_MS,
+			cwd: os.homedir(),
+			ignoreAmbientSignal: true,
+			lifetimeCoupled: true,
+		}),
+	);
 }
 
 async function getPythonUserBaseCandidates(): Promise<string[]> {
@@ -3745,32 +3844,7 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
 				];
 
 	for (const probe of probes) {
-		const userBase = await new Promise<string>((resolve) => {
-			const isWin = process.platform === "win32";
-			// Bake args into command string when shell:true on Windows to avoid DEP0190.
-			const spawnCmd = isWin
-				? [probe.command, ...probe.args].join(" ")
-				: probe.command;
-			let proc: ReturnType<typeof spawn>;
-			try {
-				proc = spawn(spawnCmd, isWin ? [] : probe.args, {
-					stdio: ["ignore", "pipe", "pipe"],
-					shell: isWin,
-				});
-			} catch {
-				// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
-				// pidusage bug class, #533) — best-effort probe, resolve empty.
-				resolve("");
-				return;
-			}
-
-			const stdout = createBoundedOutputSink();
-			proc.stdout?.on("data", (data: Buffer | string) => stdout.append(data));
-			proc.on("exit", (code) =>
-				resolve(userBaseProbeResult(probe.command, code, stdout)),
-			);
-			proc.on("error", () => resolve(""));
-		});
+		const userBase = await probeUserBase(probe.command);
 		add(userBase);
 	}
 
@@ -3943,30 +4017,22 @@ async function httpsGet(
 }
 
 /**
- * Run a shell command and return true on exit code 0.
+ * Run an archive utility and return true on exit code 0. #4530: through the
+ * spawn seam, so the bare utility name is a lookup judged against project
+ * trust, and the run is bounded; the raw `spawn` this replaces had neither.
  */
-function runCommand(
+async function runCommand(
 	command: string,
 	args: string[],
 	cwd: string,
 ): Promise<boolean> {
-	return new Promise((resolve) => {
-		let proc: ReturnType<typeof spawn>;
-		try {
-			proc = spawn(command, args, {
-				cwd,
-				stdio: "ignore",
-				shell: process.platform === "win32",
-			});
-		} catch {
-			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
-			// bug class, #533) — resolve false rather than reject/crash.
-			resolve(false);
-			return;
-		}
-		proc.on("exit", (code) => resolve(code === 0));
-		proc.on("error", () => resolve(false));
+	const result = await safeSpawnAsync(command, args, {
+		cwd,
+		timeout: ARCHIVE_COMMAND_TIMEOUT_MS,
+		ignoreAmbientSignal: true,
+		lifetimeCoupled: true,
 	});
+	return !result.error && result.status === 0;
 }
 
 /**
@@ -4103,6 +4169,7 @@ async function installGitHubTool(
 	}
 
 	try {
+		assertManagedBinDirInsidePinnedHome(tool.id);
 		if (launcherRuntime) {
 			const assetPath = path.join(
 				GITHUB_BIN_DIR,
@@ -5111,6 +5178,7 @@ async function installMavenTool(
 
 	try {
 		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
+		assertManagedBinDirInsidePinnedHome(tool.id);
 		const jarPath = path.join(GITHUB_BIN_DIR, `${tool.id}.jar`);
 		await writeFileAtomicAsync(jarPath, jarBuffer, { bestEffort: false });
 
@@ -5247,6 +5315,8 @@ export async function swapExtractedDir(
 		await fs.rename(finalDir, backupDir);
 		hadPrevious = true;
 	} catch (err) {
+		// none: ENOENT means there was no previous install to move aside — the
+		// tree is absent, not a failure to read it; every other code rethrows.
 		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 	}
 	try {
@@ -5563,6 +5633,13 @@ async function installArchiveTool(
 			return undefined;
 		}
 
+		// The managed bin directory is created and checked BEFORE the swap
+		// (#4789): the guard throws for a pinned home whose `bin` links out, and a
+		// refusal after the swap would already have replaced the installed tree
+		// while the failure log says "keeping installed version". A throw from the
+		// shim write below still lands after the swap and reports the same words.
+		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
+		assertManagedBinDirInsidePinnedHome(tool.id);
 		await swapExtractedDir(tool.id, tmpExtractDir, extractDir);
 
 		// The launcher path inside `extractDir` — stable across every install and
@@ -5574,7 +5651,6 @@ async function installArchiveTool(
 		// Thin shim in the managed bin so discovery (findGitHubToolPath) resolves
 		// it like any other managed tool. `call`/`exec` preserves the real
 		// launcher's own %~dp0/$0 so it still finds its sibling lib/.
-		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
 		const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
 		const shimPath = path.join(GITHUB_BIN_DIR, launcherName);
 		if (isWindows) {
@@ -6192,24 +6268,7 @@ async function installPipTool(
 			const result = await run(candidate.command, args);
 			const error = (result.error?.message ?? result.stderr).trim();
 			if (result.status === 0) {
-				const base = await new Promise<string>((resolve) => {
-					let probe: ReturnType<typeof spawn>;
-					try {
-						probe = spawn(candidate.command, ["-m", "site", "--user-base"], {
-							stdio: ["ignore", "pipe", "pipe"],
-							shell: isWindows,
-						});
-					} catch {
-						resolve("");
-						return;
-					}
-					const stdout = createBoundedOutputSink();
-					probe.stdout?.on("data", (data) => stdout.append(data));
-					probe.on("exit", (code) =>
-						resolve(userBaseProbeResult(candidate.command, code, stdout)),
-					);
-					probe.on("error", () => resolve(""));
-				});
+				const base = await probeUserBase(candidate.command);
 				const binaryPath = base
 					? await addBinToPath(pipScriptsDir(base, installerPlatform()))
 					: undefined;

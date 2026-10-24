@@ -44,6 +44,7 @@ import {
 	isResolvedGlobalConfigPath,
 } from "./config-locations.js";
 import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
+import { MTIME_DRIFT_TOLERANCE_MS, freshnessFromMtime } from "./freshness.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	isAtOrAboveHomeDir,
@@ -291,6 +292,41 @@ function walkCacheKey(startDir: string, markerKey: string): string {
  * record and the shared freshness cadence.
  */
 export type DirMtimeRecord = { dir: string; mtimeMs: number };
+
+/**
+ * Whether a directory mtime recorded at `observedAtMs` can later prove "this
+ * directory did not change" (#4756). Equality of two mtimes proves it only when
+ * a change made after the record would have been stamped differently, and the
+ * file system stamps from a clock that advances in steps: 10-16 ms on Windows
+ * (`GetSystemTimeAsFileTime`, Microsoft Learn, "Acquiring high-resolution time
+ * stamps"). A directory last changed inside the tick before the walk takes its
+ * next change in the SAME tick, equal mtime and all.
+ *
+ * The rule is the one git uses for a "racily clean" index entry (an entry not
+ * older than the moment it was recorded is not trusted), with a different
+ * window: git compares whole-second stamps, this compares
+ * `MTIME_DRIFT_TOLERANCE_MS` (50 ms, the measured Windows mtime skew, #1710),
+ * read through the freshness kernel: an mtime later than `observedAtMs` minus
+ * the tolerance counts as modified after the reference. That also refuses an
+ * mtime AHEAD of the clock (skew), the fail-closed side. An absent directory
+ * (`-1`) and an unreadable one (`NaN`) are not racy: the first changes value
+ * when created, the second is never served.
+ *
+ * RESIDUAL: the window covers a tick of up to about 50 ms. A volume that stamps
+ * in whole seconds (FAT, HFS+, some network mounts) is NOT covered: a directory
+ * stamped 500 ms before the walk is not racy, a later change in the same second
+ * gets the same stamp, and the memo serves it until `FRESHNESS_CADENCE_MS`
+ * expires. The cadence is the only bound on that case.
+ */
+export function dirMtimeIsRacy(mtimeMs: number, observedAtMs: number): boolean {
+	return (
+		freshnessFromMtime({
+			mtimeMs,
+			referenceMs: observedAtMs - MTIME_DRIFT_TOLERANCE_MS,
+			toleranceMs: 0,
+		}).verdict === "stale"
+	);
+}
 
 export function dirMtimesStillFresh(
 	dirMtimes: readonly DirMtimeRecord[],

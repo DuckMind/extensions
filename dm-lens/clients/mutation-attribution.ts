@@ -45,7 +45,7 @@ import { recordDegradationOnce } from "./degradation-ledger.js";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
-import { DM_LENS_TOOL_NAMES } from "./tool-config.js";
+import { isDmLensToolName } from "./tool-config.js";
 
 /** Persisted-file schema version. A file of any other version is ignored. */
 const MUTATION_ATTRIBUTION_FILE_VERSION = 1;
@@ -134,14 +134,6 @@ interface AttributionState {
 }
 
 const ATTRIBUTION_FAMILY = "mutation-attribution";
-
-/**
- * dm-lens owns these tool names, so their mixed read/write operations must
- * never be promoted by the open-ended third-party learning mechanism (#4139).
- */
-function isDmLensToolName(toolName: string): boolean {
-	return DM_LENS_TOOL_NAMES.includes(toolName);
-}
 
 /**
  * Bumped to 2 (#2449 review round 5, F3): `session` changed shape from a

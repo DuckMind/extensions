@@ -4,31 +4,10 @@ import type { FunctionSummary } from "../facts/function-facts.js";
 import { isTestSuiteOrganizer } from "./framework-call-noise.js";
 
 // Defaults match the historical hardcoded values so behavior is unchanged for
-// projects without a config. Project-specific overrides are read from the
-// per-dispatch context; these mutable fallbacks exist for tests/legacy direct
-// rule evaluation only.
+// projects without a config. The complexity override is read from the
+// per-dispatch context.
 const DEFAULT_HIGH_COMPLEXITY_THRESHOLD = 15;
 const DEFAULT_HIGH_COMPLEXITY_DEPTH_THRESHOLD = 6;
-let ccThreshold = DEFAULT_HIGH_COMPLEXITY_THRESHOLD;
-let depthThreshold = DEFAULT_HIGH_COMPLEXITY_DEPTH_THRESHOLD;
-
-function isPositiveFiniteThreshold(value: number): boolean {
-	return Number.isFinite(value) && value > 0;
-}
-
-/** Override fallback thresholds for tests/legacy direct rule evaluation. */
-export function setHighComplexityThresholds(cc: number, depth: number): void {
-	// Non-positive thresholds make every function violate the rule; treat them as
-	// invalid config/test input rather than turning the rule into noise.
-	if (isPositiveFiniteThreshold(cc)) ccThreshold = cc;
-	if (isPositiveFiniteThreshold(depth)) depthThreshold = depth;
-}
-
-/** Test helper: restore compile-time defaults. */
-export function resetHighComplexityThresholds(): void {
-	ccThreshold = DEFAULT_HIGH_COMPLEXITY_THRESHOLD;
-	depthThreshold = DEFAULT_HIGH_COMPLEXITY_DEPTH_THRESHOLD;
-}
 
 export const highComplexityRule: FactRule = {
 	id: "high-complexity",
@@ -46,7 +25,8 @@ export const highComplexityRule: FactRule = {
 		const diagnostics: Diagnostic[] = [];
 		const configuredCcThreshold =
 			ctx.projectConfig?.rules["high-complexity"]?.threshold;
-		const activeCcThreshold = configuredCcThreshold ?? ccThreshold;
+		const activeCcThreshold =
+			configuredCcThreshold ?? DEFAULT_HIGH_COMPLEXITY_THRESHOLD;
 
 		for (const f of fns) {
 			// A describe()/it()/test() wrapper's own complexity/nesting-depth
@@ -60,7 +40,8 @@ export const highComplexityRule: FactRule = {
 			if (isTestSuiteOrganizer(f.outgoingCalls)) continue;
 
 			const ccBreached = f.cyclomaticComplexity >= activeCcThreshold;
-			const depthBreached = f.maxNestingDepth >= depthThreshold;
+			const depthBreached =
+				f.maxNestingDepth >= DEFAULT_HIGH_COMPLEXITY_DEPTH_THRESHOLD;
 			if (!ccBreached && !depthBreached) continue;
 
 			const parts: string[] = [];

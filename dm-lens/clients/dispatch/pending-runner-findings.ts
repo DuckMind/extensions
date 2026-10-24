@@ -246,3 +246,13 @@ export function resetPendingRunnerFindings(): void {
 export function pendingRunnerFindingsSize(): number {
 	return pending.length;
 }
+
+/**
+ * Test seam (#4484 review F5): resolves once every run in the store has
+ * settled. The store attached its own handler first, so each entry's
+ * `settled` view is current when this resolves; a test joins a collect-later
+ * run on its promise instead of polling.
+ */
+export async function settlePendingRunnerFindingsForTests(): Promise<void> {
+	await Promise.allSettled(pending.map((entry) => entry.promise));
+}

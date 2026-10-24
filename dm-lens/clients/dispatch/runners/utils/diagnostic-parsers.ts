@@ -134,11 +134,18 @@ export const parseRuffOutput = createLineParser({
 });
 
 /**
+ * One `go vet` finding line: `file:line:col: message`. A type error (the
+ * compiler stopped before any analyzer ran) arrives as
+ * `vet: file:line:col: message`; the prefix is not part of the path (#4451).
+ */
+export const GO_VET_LINE = /^(?:vet:\s+)?(.+?):(\d+):(\d+):\s*(.+)/;
+
+/**
  * Parse Go vet output: file:line:col: message
  */
 export const parseGoVetOutput = createLineParser({
 	tool: "go-vet",
-	regex: /^(.+?):(\d+):(\d+):\s*(.+)/,
+	regex: GO_VET_LINE,
 	extractMessage: (m) => m[4],
 	generateId: (m) => `go-vet-${m[2]}`,
 	defectClass: "correctness",

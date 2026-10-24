@@ -22,6 +22,7 @@ import {
 	type EditBatchRejection,
 	type ReadGuardEditBatchSummary,
 } from "./read-guard-logger.js";
+import { scanFileLines } from "./read-guard.js";
 
 export interface GuardLineResult {
 	touchedLines: [number, number] | undefined;
@@ -183,14 +184,13 @@ function formatSimilarLines(
 	return `\n\nDid you mean one of these current lines?\n${rows.join("\n")}`;
 }
 
+/**
+ * `split(/\r?\n/).length` of the file's text, 1 when it cannot be read.
+ * #1649: one bounded pass ({@link scanFileLines}) that counts newlines and
+ * keeps no line, never a whole-file string and its split.
+ */
 export function countFileLines(filePath: string): number {
-	try {
-		const content = nodeFs.readFileSync(filePath, "utf-8");
-		if (content.length === 0) return 1;
-		return content.split(/\r?\n/).length;
-	} catch {
-		return 1;
-	}
+	return scanFileLines(filePath, [], { count: true })?.totalLines ?? 1;
 }
 
 // Match the host edit tool's fuzzy-match space (NFKC + smart quotes/dashes/

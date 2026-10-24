@@ -8,22 +8,8 @@ import {
 
 // Default matches the historical hardcoded value so behavior is unchanged for
 // projects without a config. Project-specific overrides are read from the
-// per-dispatch context; this mutable fallback exists for tests/legacy direct
-// rule evaluation only.
+// per-dispatch context.
 const DEFAULT_HIGH_FAN_OUT_THRESHOLD = 20;
-let fanOutThreshold = DEFAULT_HIGH_FAN_OUT_THRESHOLD;
-
-/** Override fallback threshold for tests/legacy direct rule evaluation. */
-export function setHighFanOutThreshold(n: number): void {
-	// Non-positive thresholds make every function violate the rule; treat them as
-	// invalid config/test input rather than turning the rule into noise.
-	if (Number.isFinite(n) && n > 0) fanOutThreshold = n;
-}
-
-/** Test helper: restore compile-time default. */
-export function resetHighFanOutThreshold(): void {
-	fanOutThreshold = DEFAULT_HIGH_FAN_OUT_THRESHOLD;
-}
 
 export const highFanOutRule: FactRule = {
 	id: "high-fan-out",
@@ -41,7 +27,8 @@ export const highFanOutRule: FactRule = {
 		const diagnostics: Diagnostic[] = [];
 		const configuredFanOutThreshold =
 			ctx.projectConfig?.rules["high-fan-out"]?.threshold;
-		const activeFanOutThreshold = configuredFanOutThreshold ?? fanOutThreshold;
+		const activeFanOutThreshold =
+			configuredFanOutThreshold ?? DEFAULT_HIGH_FAN_OUT_THRESHOLD;
 
 		for (const f of fns) {
 			// A describe()/it()/test() wrapper's own call list aggregates every call

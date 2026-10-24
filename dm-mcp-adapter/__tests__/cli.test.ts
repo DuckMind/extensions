@@ -654,7 +654,7 @@ describe("cli doctor", () => {
     expect(unapproved.stdout).toContain("project: blocked — blocked: project server approval required");
 
     expect(existsSync(marker)).toBe(false);
-  }, 15_000);
+  });
 
   it("trusts a project without trust-requiring DM resources, as a DM session does", async () => {
     const projectServer = { command: process.execPath, args: [resolve("__tests__/fixtures/tools-only-server.mjs")] };

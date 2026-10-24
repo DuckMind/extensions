@@ -23,6 +23,7 @@ import { writeFileAtomic } from "../atomic-write.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
 import { DEFAULT_MAX_OUTPUT_BYTES } from "../spawn-output-cap.js";
 import type { LSPCodeAction, LSPDiagnostic } from "../lsp/client.js";
+import type { TsserverProjectIdentity } from "../lsp/tsserver-sync.js";
 import type { McpAnalyzeResult } from "./analyze.js";
 
 export const WARM_DIAGNOSTICS_SCHEMA_VERSION = 1;
@@ -118,7 +119,16 @@ function workspaceHash(
 }
 
 /** PID-scoped endpoint used by pi sessions. The legacy MCP analyze endpoint
- * remains workspace-scoped for compatibility with the PostToolUse hook. */
+ * remains workspace-scoped for compatibility with the PostToolUse hook.
+ *
+ * POSIX shape `dm-lens-mcp-<pid>-diagnostics-<hash>.sock`: the pid comes BEFORE
+ * the hash so it survives the `sun_path` cut (see {@link boundUnixSocketPath}),
+ * which removes the tail of a long path. With the pid last, a TMPDIR of 66
+ * bytes or more cut it out and every pi session in a workspace bound one name
+ * (#4376 review r1, F1). A pid is unique on a host, so the name stays unique
+ * while the pid is inside the bound name; the hash is the part that goes first.
+ * Consumers: the warm-attach server (`clients/warm-attach.ts`), both pid-scoped
+ * clients below, and the harness teardown; they all derive the name here. */
 export function diagnosticsIpcPathForCwd(
 	cwd: string,
 	pid: number,
@@ -126,7 +136,78 @@ export function diagnosticsIpcPathForCwd(
 ): string {
 	const base = ipcPathForCwd(cwd, platform);
 	if (platform === "win32") return `${base}-diagnostics-${pid}`;
-	return base.replace(/\.sock$/, `-diagnostics-${pid}.sock`);
+	const hash = workspaceHash(cwd, platform);
+	return path.join(
+		path.dirname(base),
+		`dm-lens-mcp-${pid}-diagnostics-${hash}.sock`,
+	);
+}
+
+/**
+ * The file name Node actually binds for a Unix socket path (#4353). A path past
+ * the `sun_path` size is cut to its first 108 bytes (104 on darwin) without an
+ * error, so under a long TMPDIR (a 79-character root already reaches it for
+ * the 33-character socket name) the bound file has lost its `.sock` tail.
+ * Every stale-socket `unlink` of an endpoint must name THIS path: unlinking the
+ * untruncated one misses the file, the next `listen` then fails `EADDRINUSE`,
+ * and the warm channel stays down until the file is removed by hand. Connects
+ * need no change, because `net.createConnection` truncates the same way.
+ * Windows pipes and paths that fit come back unchanged.
+ *
+ * Decision: unlink the bound name rather than move long paths to a short
+ * directory. A relocation would change where the server and the hook meet and
+ * who may create the entry; the unlink changes neither.
+ */
+export function boundUnixSocketPath(
+	endpoint: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const limit = platform === "darwin" ? 104 : platform === "win32" ? 0 : 108;
+	const bytes = Buffer.from(endpoint);
+	if (limit === 0 || bytes.length <= limit) return endpoint;
+	return bytes.subarray(0, limit).toString();
+}
+
+export type StaleSocketOutcome =
+	| "absent"
+	| "unlinked"
+	| "not-a-socket"
+	| "shared-name";
+
+/**
+ * The one stale-socket unlink for every endpoint a listener is about to bind
+ * (#4376 review r1, F1 and F2). It names the BOUND file, and it removes:
+ *
+ * - only a socket (`lstat`): the cut can land on an unrelated file such as
+ *   `$TMPDIR/dm-lens`, and unlinking that destroyed user data;
+ * - for a pid-scoped endpoint (`ownerPid`), only a name that still carries the
+ *   owner's pid. A truncated name without it is shared by every session, so a
+ *   socket there may belong to a LIVE session; clearing it would replace that
+ *   listener and orphan it. The listen then fails EADDRINUSE and the caller
+ *   falls back cold, as it did before the unlink named the bound file.
+ *
+ * Windows named pipes have no file to remove. A failed `lstat` or unlink is
+ * `absent`: the `listen` that follows reports any real conflict.
+ */
+export function unlinkStaleUnixSocket(
+	endpoint: string,
+	options: { ownerPid?: number; platform?: NodeJS.Platform } = {},
+): StaleSocketOutcome {
+	if ((options.platform ?? process.platform) === "win32") return "absent";
+	const bound = boundUnixSocketPath(endpoint, options.platform);
+	if (
+		options.ownerPid !== undefined &&
+		bound !== endpoint &&
+		!bound.includes(`${path.sep}dm-lens-mcp-${options.ownerPid}-`)
+	)
+		return "shared-name";
+	try {
+		if (!fs.lstatSync(bound).isSocket()) return "not-a-socket";
+		fs.unlinkSync(bound);
+		return "unlinked";
+	} catch {
+		return "absent";
+	}
 }
 
 export interface WarmDiagnosticsRequest {
@@ -173,6 +254,17 @@ export interface WarmDiagnosticsResponse {
 	 * diagnostics array.
 	 */
 	unconfirmedServerIds?: string[];
+	/**
+	 * #4645: the incumbent's own tsserver answer to "which project owns this
+	 * file", asked only when a row could be demoted by it. `diagnostics` stay the
+	 * server's raw rows: the reader runs the one demotion pipeline itself with
+	 * this answer standing in for the probe it cannot send without spawning, so
+	 * its rendered rows and the form its cache stores are a local read's. Absent
+	 * when nothing was asked, the probe did not answer, or the probe did not
+	 * settle before the reply's send reserve; an incumbent built before this
+	 * omits it, and an older reader ignores it and renders the raw rows.
+	 */
+	projectIdentity?: TsserverProjectIdentity;
 }
 
 export interface WarmCodeActionRange {

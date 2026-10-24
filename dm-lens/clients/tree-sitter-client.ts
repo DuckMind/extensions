@@ -27,12 +27,15 @@ import {
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
 import { BoundedFifoMap } from "./bounded-cache.js";
+import { withTimeout } from "./deadline-utils.js";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
 import { transientRetryDelayMs } from "./dispatch/runners/utils/availability-policy.js";
 import { getProjectIgnoreMatcher, isExcludedDirName } from "./file-utils.js";
 import {
 	downloadGrammarDetailed,
 	fileHasWasmMagic,
+	GRAMMAR_LOAD_TIMEOUT_MS,
+	GRAMMAR_STALL_MS,
 	grammarBlockReason,
 	grammarFileSha256,
 	isVendoredGrammar,
@@ -266,11 +269,28 @@ function createParserCounters(): TreeSitterParserCounters {
  * `tree-sitter.log` record and used to pick the remedy the user is given:
  * "nowhere to write" and "cannot write there" are neither download failures
  * nor package-manager build-script gaps, which is all the message used to name.
+ * `load-timed-out` (#4224) is the same idea one step later: the file was
+ * fetched and vouched for, and `Language.load` on it hung, which no download
+ * remedy fixes.
  */
 type GrammarFetchFailureCause =
 	| "write-dir-unresolvable"
 	| "write-dir-unwritable"
-	| "download-failed";
+	| "download-failed"
+	| "load-timed-out";
+
+/**
+ * `withTimeout` rejects with this EXACT message (`clients/deadline-utils.ts`)
+ * only when its own timer wins the race, so it is the one rejection that means
+ * the load was abandoned and may still settle. Mirrors `isPullTimeoutError`
+ * (#1713) and `isNavTimeoutError` (#1716) in `clients/lsp/client.ts`.
+ */
+function isGrammarLoadTimeout(err: unknown): boolean {
+	return (
+		err instanceof Error &&
+		err.message === `Timeout after ${GRAMMAR_LOAD_TIMEOUT_MS}ms`
+	);
+}
 
 /**
  * The errno that blocks writing into `dir`, or undefined when a write can be
@@ -486,6 +506,8 @@ export class TreeSitterClient {
 	 * (the `transientRetryDelayMs` shape from availability-policy.ts) instead
 	 * of latching for the process lifetime. */
 	private grammarRetryAtMs = new Map<string, number>();
+	/** Instance field so a test can shorten it without waiting out the real bound. */
+	private grammarStallMs = GRAMMAR_STALL_MS;
 	/**
 	 * Grammar path → the `size:mtimeMs` stamp at which its wasm preamble was
 	 * verified (#1548). A POSITIVE-only memo, so the steady-state resolve costs
@@ -1106,8 +1128,12 @@ export class TreeSitterClient {
 	 * `vendor/grammars` comes first because it is the ONLY source for a grammar
 	 * we build ourselves (`VENDORED_GRAMMARS`) — nothing downloads into the
 	 * later dirs for it, so a miss here is a miss everywhere.
+	 *
+	 * Public so the Vitest grammar prefetch (`tests/support/prewarm-grammars.ts`)
+	 * counts a grammar as present exactly where this resolver would find it
+	 * (#4342), instead of keeping its own copy of the list.
 	 */
-	private grammarSourceDirs(): string[] {
+	grammarSourceDirs(): string[] {
 		const dirs: string[] = [];
 		const push = (d: string | undefined): void => {
 			if (d && !dirs.includes(d)) dirs.push(d);
@@ -1536,6 +1562,7 @@ export class TreeSitterClient {
 		const { ok, retryable, reason } = await downloadGrammarDetailed(
 			dir,
 			grammarFile,
+			{ stallMs: this.grammarStallMs },
 		);
 		if (ok) {
 			if (!this.grammarsDir) this.grammarsDir = dir;
@@ -1618,11 +1645,14 @@ export class TreeSitterClient {
 				: cause === "write-dir-unwritable"
 					? `This is a filesystem-permission fault, not a download problem: make that directory writable ` +
 						`for the user dm-lens runs as, or reinstall dm-lens as that user.`
-					: retryable
-						? `if the problem persists, allow the package manager's build scripts ` +
-							`(pnpm approve-builds / bun trustedDependencies) or restore network access.`
-						: `Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
-							`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
+					: cause === "load-timed-out"
+						? `This is a local hang while loading the grammar, not a download problem: if it keeps ` +
+							`timing out, restart DM and attach the tree-sitter log to a bug report.`
+						: retryable
+							? `if the problem persists, allow the package manager's build scripts ` +
+								`(pnpm approve-builds / bun trustedDependencies) or restore network access.`
+							: `Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
+								`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
 		const unavailable =
 			`tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
 			`module reports and structural rules for this language will be degraded. ` +
@@ -1663,9 +1693,13 @@ export class TreeSitterClient {
 			// failures used to share one string, so the ledger could not tell an
 			// offline laptop from a captive portal serving HTML — the two need
 			// different user actions, and the ledger is what a bug report shows.
-			reason: retryable
-				? `runtime grammar download failed — retryable (${detail.trim()})`
-				: `runtime grammar download failed — durable (${detail.trim()})`,
+			// A hung load of a file already on disk is not a download failure (#4224).
+			reason:
+				cause === "load-timed-out"
+					? `grammar load timed out — retryable (${detail.trim()})`
+					: retryable
+						? `runtime grammar download failed — retryable (${detail.trim()})`
+						: `runtime grammar download failed — durable (${detail.trim()})`,
 		});
 
 		this.refreshGrammarSessionLatches();
@@ -1715,25 +1749,108 @@ export class TreeSitterClient {
 		grammarPath: string,
 		grammarFile: string,
 		err: unknown,
+		cause?: GrammarFetchFailureCause,
 	): void {
 		const stamp = grammarFileStamp(grammarPath);
 		this.verifiedGrammarPaths.delete(grammarPath);
 		if (stamp) this.decodeFailedGrammarPaths.set(grammarPath, stamp);
 		const message = err instanceof Error ? err.message : String(err);
+		// A load that hung on a file already on disk gives no sign of a truncated
+		// download (#4224). The recovery is the same, so only the diagnosis changes.
+		// This is why the timeout passes its own cause.
 		logTreeSitterDiagnostic({
 			subsystem: "tree-sitter-client",
 			level: "warn",
 			message:
-				`Language.load failed for ${grammarPath} even though the wasm preamble check ` +
-				`passed (${message}) — most likely a truncated download (#1564). Treating the ` +
-				`grammar as missing so the next demand re-fetches it.`,
+				cause === "load-timed-out"
+					? `Language.load did not settle for ${grammarPath} (${message}) — a hang in the ` +
+						`local load of a file that passed the wasm preamble check, with no sign of a ` +
+						`truncated download. Treating the grammar as missing so the next demand re-fetches it.`
+					: `Language.load failed for ${grammarPath} even though the wasm preamble check ` +
+						`passed (${message}) — most likely a truncated download (#1564). Treating the ` +
+						`grammar as missing so the next demand re-fetches it.`,
 			metadata: { grammarFile, path: grammarPath, outcome: "load-failed" },
 		});
 		this.recordGrammarFailure(
 			grammarFile,
 			`Language.load failed on a resolved grammar file (${message}).`,
 			/* retryable */ true,
+			cause,
 		);
+	}
+
+	/**
+	 * Watch a `Language.load` that the bound abandoned (#4224). web-tree-sitter
+	 * gives the load no abort, so it keeps running and settles later, and
+	 * `withDeadline` hands that late settle to a catch that records nothing.
+	 * Mirrors #1716's late-answer watch on a timed-out nav request.
+	 *
+	 * Every late failure is logged once to `tree-sitter.log`. Then:
+	 *
+	 * - An Emscripten abort kills the runtime whenever it lands, so it reaches
+	 *   the same latch an on-time abort does (AGENTS.md shape 60). A trap takes
+	 *   the other arm, as it does on time: charged to the grammar, not the budget.
+	 * - Any other failure says the load ended rather than hung. It leaves one
+	 *   bounded `grammar-blocked` record naming the grammar and the failure. The
+	 *   timeout already notified the user and climbed the cooldown ladder for
+	 *   this load, so neither happens again.
+	 * - A late success is dropped. The caller was answered null and the grammar
+	 *   sits on its cooldown, so keeping the language would make the answer depend
+	 *   on when the load happened to finish.
+	 *
+	 * One abandoned load has one watch, so a late settle is one record however
+	 * many callers joined the build that started it.
+	 *
+	 * No caller awaits the watch, so it ends in a logging catch: a handler that
+	 * throws (the host's `onWasmAbort` can) is written to `tree-sitter.log`
+	 * rather than escaping as an unhandled rejection.
+	 */
+	private observeAbandonedLoad(
+		loading: Promise<TreeSitterLanguage>,
+		grammarPath: string,
+		grammarFile: string,
+	): void {
+		loading
+			.then(
+				() => {
+					this.dbg(
+						`Abandoned Language.load for ${grammarFile} succeeded after the bound; ignored`,
+					);
+				},
+				(late: unknown) => {
+					const message = late instanceof Error ? late.message : String(late);
+					logTreeSitterDiagnostic({
+						subsystem: "tree-sitter-client",
+						level: "warn",
+						message:
+							`Language.load for ${grammarPath} settled after its ${GRAMMAR_LOAD_TIMEOUT_MS}ms ` +
+							`bound and failed (${message}).`,
+						metadata: { grammarFile, outcome: "late-load-failed" },
+					});
+					if (classifyTreeSitterWasmError(late) === "abort") {
+						this.reportWasmAbort(late);
+					} else {
+						incrementDegradationCount({
+							kind: "grammar-blocked",
+							subject: grammarFile,
+							reason: `Language.load failed after its ${GRAMMAR_LOAD_TIMEOUT_MS}ms bound (${message}).`,
+						});
+					}
+				},
+			)
+			// No caller awaits this chain, so a throw from either handler (the host's
+			// `onWasmAbort` is the live source) would be an unhandled rejection, which
+			// ends the process under Node's default. Log it with the grammar's name.
+			.catch((handlerErr: unknown) => {
+				const message =
+					handlerErr instanceof Error ? handlerErr.message : String(handlerErr);
+				logTreeSitterDiagnostic({
+					subsystem: "tree-sitter-client",
+					level: "warn",
+					message: `The late-settle handler for Language.load of ${grammarPath} threw (${message}).`,
+					metadata: { grammarFile, outcome: "late-load-handler-failed" },
+				});
+			});
 	}
 
 	/** Initialize tree-sitter WASM runtime */
@@ -1888,36 +2005,74 @@ export class TreeSitterClient {
 			return null;
 		}
 
+		// Kept outside the race so a timeout's catch still holds a handle on the
+		// load it abandoned (#4224).
+		let loading: Promise<TreeSitterLanguage> | undefined;
 		try {
 			if (!this.LanguageLoader?.load) {
 				this.dbg(`LanguageLoader.load not available`);
 				return null;
 			}
 			this.dbg(`Calling Language.load...`);
-			const language = await this.LanguageLoader.load(grammarPath);
+			// #4224: a load that never settles would hold every caller for this
+			// language, and the in-flight batch build later callers join. The
+			// timeout takes the failure path below, so the build settles, its record
+			// clears, and the grammar's cooldown keeps the next call from waiting
+			// out the bound again.
+			const started: Promise<TreeSitterLanguage> =
+				this.LanguageLoader.load(grammarPath);
+			loading = started;
+			const language = await withTimeout<TreeSitterLanguage>(
+				started,
+				GRAMMAR_LOAD_TIMEOUT_MS,
+			);
 			this.dbg(`Language loaded: ${language?.name || "unknown"}`);
 			if (language) {
 				this.languages.set(languageId, language);
 			}
 			return language;
 		} catch (err) {
-			// An uncatchable-shaped WASM abort poisons the whole process (#402) —
-			// `reportWasmAbort` already records + handles it. Everything else
-			// (#1564) is a DECODE failure on a file `resolveGrammarFile` just
-			// vouched for — e.g. "Code section extends past end of the module" on
-			// a truncated-but-magic-valid download. That is evidence the file
-			// itself is bad, not the runtime, so record it and stop vouching for
-			// this exact file so the next demand can re-fetch it. A trap here
-			// runs in the grammar's own module code, so it is charged to the
-			// file too, not to the trap budget: one bad grammar must not
-			// poison every language (#3605).
-			if (classifyTreeSitterWasmError(err) === "abort") {
-				this.reportWasmAbort(err);
-			} else {
-				this.recordGrammarLoadFailure(grammarPath, grammarFile, err);
-			}
+			this.recordLanguageLoadFailure(err, loading, grammarPath, grammarFile);
 			this.dbg(`Language load error: ${err}`);
 			return null;
+		}
+	}
+
+	/**
+	 * The one place a failed `Language.load` is recorded, so every path out of
+	 * `loadLanguage`'s catch publishes something.
+	 */
+	private recordLanguageLoadFailure(
+		err: unknown,
+		loading: Promise<TreeSitterLanguage> | undefined,
+		grammarPath: string,
+		grammarFile: string,
+	): void {
+		// When the bound won the race the load is still running and its own
+		// settle is yet to come. Watch it, or an abort that lands later is lost.
+		const abandoned = isGrammarLoadTimeout(err) ? loading : undefined;
+		if (abandoned) {
+			this.observeAbandonedLoad(abandoned, grammarPath, grammarFile);
+		}
+		// An uncatchable-shaped WASM abort poisons the whole process (#402) —
+		// `reportWasmAbort` already records + handles it. Everything else
+		// (#1564) is a DECODE failure on a file `resolveGrammarFile` just
+		// vouched for — e.g. "Code section extends past end of the module" on
+		// a truncated-but-magic-valid download. That is evidence the file
+		// itself is bad, not the runtime, so record it and stop vouching for
+		// this exact file so the next demand can re-fetch it. A trap here
+		// runs in the grammar's own module code, so it is charged to the
+		// file too, not to the trap budget: one bad grammar must not
+		// poison every language (#3605).
+		if (classifyTreeSitterWasmError(err) === "abort") {
+			this.reportWasmAbort(err);
+		} else {
+			this.recordGrammarLoadFailure(
+				grammarPath,
+				grammarFile,
+				err,
+				abandoned ? "load-timed-out" : undefined,
+			);
 		}
 	}
 

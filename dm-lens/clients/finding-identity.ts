@@ -43,6 +43,130 @@ export function normalizeMessage(message: string): string {
 	return message.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+/**
+ * A finding's line-agnostic identity: `[tool, rule, normalised message]`. The
+ * same finding keeps it when an edit above it moves its line, and two
+ * occurrences of one rule with one message share it, so callers that must
+ * tell occurrences apart count matches (see {@link retainRecordedFindings}).
+ * Shared by the widget's retention match (`widget-state.ts`) and the
+ * recorded-blocker carry (#4484 round 2).
+ */
+export function findingIdentity(d: {
+	tool?: string | undefined;
+	rule?: string | undefined;
+	message: string;
+}): string {
+	return JSON.stringify([
+		d.tool ?? "",
+		d.rule ?? "",
+		normalizeMessage(d.message),
+	]);
+}
+
+/**
+ * #4484 round 3: {@link findingIdentity} with digit runs folded, so a message
+ * that cites its own line (helm-lint's `deploy.yaml:4: …`) keeps it when the
+ * line moves. The recorded-blocker carry matches on it, and round 5's record
+ * merge dedupes on it.
+ */
+export function foldedFindingIdentity(d: {
+	tool?: string | undefined;
+	rule?: string | undefined;
+	message: string;
+}): string {
+	return findingIdentity({ ...d, message: d.message.replace(/\d+/g, "#") });
+}
+
+/**
+ * #4484 round 4: the position a carry reads when a recorded finding has no
+ * usable position (no alignment, or round 5's stale line). The finding then
+ * matches its identity anywhere `matchesAnywhere` allows.
+ */
+export const ANY_POSITION = "anywhere";
+
+/**
+ * #4484: which recorded findings a fresh observation leaves standing (R3 in
+ * PR #4491's round-3 table). A prior finding is matched by an observed finding
+ * of the same {@link findingIdentity} that sits at the prior finding's
+ * position (`positionOf`: its line, aligned to the observed bytes), and is
+ * replaced by that observed copy, one per prior entry. Identity alone is not
+ * enough: two occurrences of one rule share it, so an untouched occurrence
+ * elsewhere would stand in for a fixed one. Digit runs in the message are
+ * folded, so a message that cites its own line (helm-lint's
+ * `deploy.yaml:4: …`) still matches after the line moves. A prior finding
+ * with no position (its line was edited or deleted) is matched by nothing.
+ * Round 4: a prior finding at {@link ANY_POSITION} (no usable position) is
+ * matched by its identity at any line, after every positioned prior finding
+ * took its match; that fails closed. Round 5: only by an observed finding
+ * `matchesAnywhere` accepts (its line holds the prior finding's text), so a
+ * same-rule finding on another line's text never stands in. An unmatched prior entry
+ * survives only when `keepUnobserved` says its source gave no verdict;
+ * otherwise the observation retired it. Observed findings no prior entry
+ * matched are not returned: an observation keeps a recorded finding, it never
+ * records one by itself.
+ */
+export function retainRecordedFindings<
+	T extends {
+		tool?: string | undefined;
+		rule?: string | undefined;
+		message: string;
+		line?: number | undefined;
+	},
+>(
+	prior: readonly T[],
+	observed: readonly T[],
+	options: {
+		positionOf: (finding: T) => number | undefined | typeof ANY_POSITION;
+		keepUnobserved: (finding: T) => boolean;
+		matchesAnywhere?: (prior: T, observed: T) => boolean;
+	},
+): { kept: T[]; retired: T[] } {
+	const identity = foldedFindingIdentity;
+	const byPlace = new Map<string, T[]>();
+	const byIdentity = new Map<string, T[]>();
+	const file = (map: Map<string, T[]>, key: string, d: T) => {
+		const bucket = map.get(key);
+		if (bucket) bucket.push(d);
+		else map.set(key, [d]);
+	};
+	for (const d of observed) {
+		file(byIdentity, identity(d), d);
+		if (d.line !== undefined) file(byPlace, `${identity(d)}@${d.line}`, d);
+	}
+	const taken = new Set<T>();
+	const take = (
+		bucket: T[] | undefined,
+		accepts: (d: T) => boolean = () => true,
+	): T | undefined => {
+		const match = bucket?.find((d) => !taken.has(d) && accepts(d));
+		if (match !== undefined) taken.add(match);
+		return match;
+	};
+	const positions = prior.map((d) => options.positionOf(d));
+	const matches = prior.map((d, i) => {
+		const at = positions[i];
+		return typeof at === "number"
+			? take(byPlace.get(`${identity(d)}@${at}`))
+			: undefined;
+	});
+	prior.forEach((d, i) => {
+		if (positions[i] === ANY_POSITION)
+			matches[i] = take(
+				byIdentity.get(identity(d)),
+				(o) => options.matchesAnywhere?.(d, o) ?? true,
+			);
+	});
+	const kept: T[] = [];
+	const retired: T[] = [];
+	prior.forEach((d, i) => {
+		const match = matches[i];
+		if (match !== undefined) kept.push(match);
+		else if (options.keepUnobserved(d)) kept.push(d);
+		else retired.push(d);
+	});
+	return { kept, retired };
+}
+
 export function hashText(
 	value: string,
 	length: number = FINDING_ID_HASH_LENGTH,
@@ -51,10 +175,11 @@ export function hashText(
 }
 
 /**
- * Canonicalize BOTH `filePath` and `cwd` through `normalizeMapKey` (realpath
- * + case-fold on Windows) BEFORE computing the relative path, so two callers
- * holding different path FORMS of the same file (raw vs. already-normalized,
- * a Windows drive/segment case difference, a slash variant) converge on the
+ * Canonicalize BOTH `filePath` and `cwd` through `normalizeMapKey` (the path
+ * identity: realpath on every platform, #4689, plus the win32 case fold)
+ * BEFORE computing the relative path, so two callers holding different path
+ * FORMS of the same file (raw vs. already-normalized, a link spelling, a
+ * Windows drive/segment case difference, a slash variant) converge on the
  * identical relative-path component instead of silently diverging into two
  * different finding ids for the same file (the #533 orphaned-record class).
  * `normalizeMapKey` is idempotent, so an already-canonical caller pays no

@@ -60,6 +60,9 @@ export function convertLspDiagnostics(
 				fixKind: hasSuggestion ? "suggestion" : undefined,
 				fixSuggestion: options.fixSuggestionByIndex?.get(idx),
 				scanOrigin: options.scanOrigin,
+				// #4484 r2: the publishing server, so a run that leaves it
+				// unconfirmed keeps its recorded blockers. Never identity.
+				...(d.serverId !== undefined && { serverId: d.serverId }),
 			} satisfies Diagnostic;
 		});
 }

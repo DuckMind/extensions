@@ -538,7 +538,7 @@ All notable changes to this project will be documented in this file.
 - Resolve the OpenAI search model from DM’s model registry, with an `openaiSearchModel` override and preserved API-key fallback for partial registries. Thanks `@ahalekelly` for PR #182.
 - Surfaced RFC Link / HTML discovery relations (`service-desc`, `service-doc`, `service-meta`, `api-catalog`, `describedby`) from HTTP `Link` headers and matching `link`/`a[rel]` markup during `fetch_content` HTML extraction, including empty SPA shells, without broad `/docs` URL heuristics. Thanks `@XWIlluDelu` for PR #175.
 - Expand leading `~` and `$HOME`-style environment variables in `githubClone.clonePath` before cloning repositories. Thanks `@unship` for PR #184.
-- Write extracted PDF markdown to a temporary `pi-web-pdf` directory by default instead of `~/Downloads`, while preserving explicit output directories. Thanks `@ahalekelly` for PR #183.
+- Write extracted PDF markdown to a temporary `dm-web-pdf` directory by default instead of `~/Downloads`, while preserving explicit output directories. Thanks `@ahalekelly` for PR #183.
 
 ## [0.15.0] - 2026-07-28
 
@@ -903,7 +903,7 @@ All notable changes to this project will be documented in this file.
 ## [0.5.0] - 2026-02-01
 
 ### Added
-- GitHub repository clone extraction for `fetch_content` -- detects GitHub code URLs, clones repos to `/tmp/pi-github-repos/`, and returns actual file contents plus local path for further exploration with `read` and `bash`
+- GitHub repository clone extraction for `fetch_content` -- detects GitHub code URLs, clones repos to `/tmp/dm-github-repos/`, and returns actual file contents plus local path for further exploration with `read` and `bash`
 - Lightweight API fallback for oversized repos (>350MB) and commit SHA URLs via `gh api`
 - Clone cache with concurrent request deduplication (second request awaits first's clone)
 - `forceClone` parameter on `fetch_content` to override the size threshold

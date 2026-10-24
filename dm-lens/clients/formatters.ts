@@ -16,7 +16,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
-import { findNearestContaining, normalizeMapKey } from "./path-utils.js";
+import {
+	findNearestContaining,
+	normalizeMapKey,
+	realpathOrResolve,
+} from "./path-utils.js";
 import { resolveToolCwd } from "./tool-cwd.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
 import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
@@ -44,10 +48,14 @@ import {
 	VENV_BIN_DIRS,
 } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { admittedLookupAnswer } from "./session-repository.js";
 import { establishToolAgreement } from "./tool-agreement.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { probeToolAsync } from "./tool-probe.js";
-import { assertInstallAllowed } from "./project-trust.js";
+import {
+	assertInstallAllowed,
+	getProjectTrustGeneration,
+} from "./project-trust.js";
 import { tryLazyInstallForFormatter } from "./dispatch/runners/utils/lazy-installer.js";
 import { getToolPath } from "./installer/index.js";
 import { getIsolatedNpxSpawnOptions } from "./tool-probe.js";
@@ -519,9 +527,12 @@ async function which(command: string): Promise<string | null> {
 	const hostStallMs = stallSampler.stop();
 	const elapsedMs = Date.now() - startedAt;
 
+	// #4530: the answer is started later by its path, past the spawn seam's
+	// lookup judgment, so it is judged here: a global entry linking into the
+	// project is no answer until pi trusts the project.
 	const resolved =
 		!result.error && result.status === 0
-			? (result.stdout?.trim().split(/\r?\n/)[0] ?? null)
+			? admittedLookupAnswer(result.stdout ?? "")
 			: null;
 	if (resolved) {
 		entry.resolved = resolved;
@@ -893,35 +904,33 @@ async function indentationArgs(
 		});
 		return null;
 	}
+	// A tab file pins the style and nothing else (#4321): the formatter's own
+	// default (or the project's explicit config, handled above) owns the width.
+	const tab = indentation.style === "tab";
 	if (tool === "shfmt")
-		return indentation.style === "tab"
-			? ["-i", "0"]
-			: ["-i", String(indentation.width)];
+		return tab ? ["-i", "0"] : ["-i", String(indentation.width)];
 	if (tool === "prettier") {
-		return [
-			indentation.style === "tab" ? "--use-tabs" : "--no-use-tabs",
-			"--tab-width",
-			String(indentation.width),
-		];
+		return tab
+			? ["--use-tabs"]
+			: ["--no-use-tabs", "--tab-width", String(indentation.width)];
 	}
 	if (tool === "ruff") {
 		// `ruff format` has NO --indent-style/--indent-width flags (it errors with
 		// "unexpected argument" and exits 2, which formatFile reported as a silent
 		// clean no-op back when exit-code strictness was opt-in). Style is pinned
 		// through inline TOML overrides instead (#1144 follow-up).
-		return [
-			"--config",
-			`indent-width=${indentation.width}`,
-			"--config",
-			`format.indent-style='${indentation.style}'`,
-		];
+		return tab
+			? ["--config", "format.indent-style='tab'"]
+			: [
+					"--config",
+					`indent-width=${indentation.width}`,
+					"--config",
+					"format.indent-style='space'",
+				];
 	}
-	return [
-		"--indent-style",
-		indentation.style,
-		"--indent-width",
-		String(indentation.width),
-	];
+	return tab
+		? ["--indent-style", "tab"]
+		: ["--indent-style", "space", "--indent-width", String(indentation.width)];
 }
 
 /**
@@ -1809,11 +1818,17 @@ const FILENAME_FORMATTER_BASENAMES = new Set(
 	ALL_FORMATTERS.flatMap((f) => f.filenames ?? []),
 );
 
-// Cache for detection results - stores array of enabled formatter names per cwd+ext
-const detectionCache = new BoundedLruCache<
-	string,
-	{ signature: string; entries: Map<string, string[]> }
->(32);
+// Cache for detection results - stores array of enabled formatter names per cwd+ext.
+// #4530 (#4776): a selection answers for the pi trust answer of the lookup that
+// created it, because a lookup into the project is refused only while trust is
+// not `trusted`. An object stamped with an older trust generation is dropped at
+// the next read, including entries a detection still in flight writes into it.
+type FormatterDetectionEntry = {
+	signature: string;
+	trustGeneration: number;
+	entries: Map<string, string[]>;
+};
+const detectionCache = new BoundedLruCache<string, FormatterDetectionEntry>(32);
 // The signature is immutable for a cache generation. This memo is separate
 // from detectionCache because a cwd can have several extension entries, and a
 // warm lookup must not repeat the ancestor walk or stat matched configs.
@@ -1968,7 +1983,12 @@ export async function getFormattersForFile(
 	// polling while still reacting immediately to pi-authored create/remove/
 	// change events. External editor changes remain a documented session-boundary
 	// limitation, like other write-result-owned freshness seams.
+	const trustGeneration = getProjectTrustGeneration();
 	let cached = detectionCache.get(normalizedCwd);
+	if (cached && cached.trustGeneration !== trustGeneration) {
+		detectionCache.delete(normalizedCwd);
+		cached = undefined;
+	}
 	if (cached?.entries.has(cacheKey)) {
 		const enabledNames = cached.entries.get(cacheKey);
 		const selectedFormatterName =
@@ -2006,7 +2026,11 @@ export async function getFormattersForFile(
 		// the earlier entry.
 		cached = detectionCache.get(normalizedCwd);
 		if (!cached) {
-			cached = { signature: configSignature, entries: new Map() };
+			cached = {
+				signature: configSignature,
+				trustGeneration,
+				entries: new Map(),
+			};
 			detectionCache.set(normalizedCwd, cached);
 		}
 	}
@@ -2232,10 +2256,7 @@ export function _getFormatterResetStateForTests(): {
 	>;
 	whichTransientCommands: Set<string>;
 	cooldownRecordedForRetryAtMs: Map<string, number>;
-	detectionCache: BoundedLruCache<
-		string,
-		{ signature: string; entries: Map<string, string[]> }
-	>;
+	detectionCache: BoundedLruCache<string, FormatterDetectionEntry>;
 	formatterSignatureFlights: BoundedLruCache<
 		string,
 		{ promise: Promise<string> }
@@ -2421,7 +2442,9 @@ export async function formatFile(
 	enter?: () => Promise<void>,
 ): Promise<FormatterResult> {
 	try {
-		const absolutePath = path.resolve(filePath);
+		// A symlink is never handed to a formatter (Prettier rejects an
+		// explicitly named link): format the file it resolves to (#4689).
+		const absolutePath = realpathOrResolve(filePath);
 		const cwd = path.dirname(absolutePath);
 		const formatterCwd = resolveToolCwd(
 			"formatter",

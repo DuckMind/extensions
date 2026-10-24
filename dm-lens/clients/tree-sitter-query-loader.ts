@@ -19,6 +19,7 @@ import {
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
 import yaml from "./deps/js-yaml.js";
+import { logLatency } from "./latency-logger.js";
 import { resolvePackagePath } from "./package-root.js";
 import {
 	getUserRuleRoot,
@@ -66,8 +67,19 @@ export function getBundledQueriesRootHealth(): BundledResourceHealth {
 		cachedBundledQueriesRootHealthGeneration !== generation
 	) {
 		cachedBundledQueriesRootHealthGeneration = generation;
-		cachedBundledQueriesRootHealth =
-			classifyBundledResourceDir(BUNDLED_QUERIES_ROOT);
+		const health = classifyBundledResourceDir(BUNDLED_QUERIES_ROOT);
+		cachedBundledQueriesRootHealth = health;
+		// #2678: one check record per ledger generation, including healthy roots.
+		logLatency({
+			type: "phase",
+			phase: "tree_sitter_queries_root_checked",
+			filePath: BUNDLED_QUERIES_ROOT,
+			durationMs: 0,
+			metadata: {
+				status: health.status,
+				entryCount: health.status === "healthy" ? health.entryCount : 0,
+			},
+		});
 	}
 	return cachedBundledQueriesRootHealth;
 }
@@ -164,18 +176,9 @@ export function ruleFilesForLanguage(
 	// when the root is actually unhealthy — one of the seven by-design-empty
 	// languages is touched routinely (any `.sh`/`.lua` edit).
 	//
-	// #2636 review round 2, F2: NO separate phase/latency row here (unlike
-	// the ast-grep/skills sibling sites, which log one PER CONSTRUCTION or
-	// PER REQUEST — a bounded cardinality). This branch runs on EVERY
-	// dispatched file while the root stays broken (AGENTS.md's "no raw
-	// per-occurrence log for repeats"): 200 touches of a by-design-empty
-	// language against a broken root would otherwise write 200 raw
-	// `latency.log` rows. `reportBundledResourceDirHealth`'s
-	// `incrementDegradationCount` already answers "did this run" AND "how
-	// many times" in a BOUNDED way — one row per session at count 1, then
-	// only at power-of-two milestones (1, 2, 4, 8, … so 200 occurrences write
-	// exactly 8 durable rows) — so a second, unbounded record here would add
-	// nothing the ledger row lacks.
+	// #2636/#2678: no per-file phase row here. The health memo records its
+	// check once per ledger generation; repeated failures stay counted by
+	// reportBundledResourceDirHealth at power-of-two milestones.
 	if (files.size === 0) {
 		const health = getBundledQueriesRootHealth();
 		if (health.status !== "healthy") {

@@ -181,7 +181,7 @@ export async function getBrowserCookiesForHosts(
 			}
 			sawCookieDatabase = true;
 
-			const tempDir = mkdtempSync(join(tmpdir(), "pi-chrome-cookies-"));
+			const tempDir = mkdtempSync(join(tmpdir(), "dm-chrome-cookies-"));
 			try {
 				const tempDb = join(tempDir, "Cookies");
 				copyFileSync(cookiesPath, tempDb);

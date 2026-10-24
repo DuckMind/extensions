@@ -358,6 +358,7 @@ export async function initializeMcp(
     const resident = (definition.lifecycle ?? "lazy") !== "lazy" || getEffectiveIdleTimeoutMinutes(state, name) === 0;
     try {
       const connection = await manager.connect(name, definition, runtimeSignal);
+      owner.throwIfInactive();
       if (connection.status === "needs-auth") {
         const error = typeof definition.auth === "object"
           ? providerSignInMessage(name, definition.auth.provider)
@@ -488,6 +489,7 @@ export async function initializeMcp(
             const definition = config.mcpServers[name];
             if (!definition) throw new Error(`MCP server "${name}" is not configured`);
             const connection = await manager.connect(name, definition, runtimeSignal);
+      owner.throwIfInactive();
             if (connection.status === "needs-auth") {
               return { name, ok: false };
             }

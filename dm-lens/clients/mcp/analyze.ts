@@ -12,7 +12,7 @@
  * + perf impact first-hand rather than inferring it from pasted logs.
  */
 
-import { resolveAnalysisRoot } from "../analysis-root.js";
+import { canWriteAnalysisRoot, resolveAnalysisRoot } from "../analysis-root.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CacheManager, MCP_TURN_STATE_OWNER_ID } from "../cache-manager.js";
@@ -20,6 +20,7 @@ import {
 	CASCADE_GRAPH_KINDS,
 	dispatchLintWithResult,
 } from "../dispatch/integration.js";
+import { emitBounded } from "../bounded-telemetry.js";
 import { FactStore } from "../dispatch/fact-store.js";
 import type { Diagnostic, DispatchResult } from "../dispatch/types.js";
 import { detectFileKind } from "../file-kinds.js";
@@ -34,9 +35,11 @@ import {
 	deserializeWordIndex,
 	removeWordIndexDocumentAsync,
 	scheduleWordIndexPersist,
+	setWordIndexPublishedListener,
 	updateWordIndexDocumentForEdit,
 	WORD_INDEX_MAX_BYTES,
 	type WordIndex,
+	type WordIndexPublishTrigger,
 } from "../word-index.js";
 import { logWordIndex } from "../word-index-logger.js";
 import { createMcpHost } from "./host-shim.js";
@@ -149,6 +152,17 @@ export interface WarmWordIndexLease {
 }
 
 /**
+ * The predicate an entry caches: a queryable index needs the forward map the
+ * per-edit seam replaces postings through. Shared by creation and by the
+ * post-build adoption below so both admit exactly the same shape.
+ */
+function usableWarmWordIndex(
+	index: WordIndex | undefined,
+): WordIndex | undefined {
+	return index?.forward ? index : undefined;
+}
+
+/**
  * Look up (loading from the persisted snapshot on first use per cwd) the warm
  * in-memory word index this analyze facade keeps mutated in place. Exported so
  * `symbolSearch()` (clients/lens-engine.ts) can prefer this live copy over a
@@ -161,9 +175,11 @@ export function acquireWarmWordIndex(cwd: string): WarmWordIndexLease {
 	let entry = warmWordIndexes.get(key);
 	if (!entry) {
 		const snapshot = loadProjectSnapshot(key);
-		const index = deserializeWordIndex(snapshot?.wordIndex) ?? undefined;
+		const index = usableWarmWordIndex(
+			deserializeWordIndex(snapshot?.wordIndex) ?? undefined,
+		);
 		entry = {
-			index: index?.forward ? index : undefined,
+			index,
 			timer: undefined,
 			leases: 0,
 			lastUsedAt: Date.now(),
@@ -190,6 +206,42 @@ export function acquireWarmWordIndex(cwd: string): WarmWordIndexLease {
 		},
 	};
 }
+
+/**
+ * #4583: adopt a just-published index into the warm entry that was created
+ * while that build was still running. Two guards, both load-bearing:
+ *  - only an entry with NO index changes. A live entry is the copy every
+ *    `dmlens_analyze` edit is applied to in place and re-persisted on a
+ *    debounce, so replacing it would drop edits that have not landed yet.
+ *  - only the entry for the publishing root changes (the map key), so a build
+ *    for one project never fills another project's empty entry.
+ */
+function adoptPublishedWarmWordIndex(
+	cwd: string,
+	published: WordIndex,
+	trigger: WordIndexPublishTrigger,
+): void {
+	const index = usableWarmWordIndex(published);
+	if (!index) return;
+	const key = path.resolve(cwd);
+	const entry = warmWordIndexes.get(key);
+	if (!entry || entry.index) return;
+	entry.index = index;
+	entry.lastUsedAt = Date.now();
+	scheduleWarmWordIndexIdleEviction(key, entry);
+	logWordIndex({
+		phase: "warm_cache_adopted",
+		cwd: key,
+		trigger,
+		indexedFileCount: index.docCount,
+		tokens: index.postings.size,
+	});
+}
+
+// #4583: the cache owner subscribes to the builders' publish seam at module
+// load, mirroring the NDJSON loggers' own self-registration. A process that
+// never loads this module holds no warm entry, so it has nothing to adopt.
+setWordIndexPublishedListener(adoptPublishedWarmWordIndex);
 
 /**
  * Test-only reset — the module-level warm cache otherwise survives across
@@ -442,6 +494,12 @@ async function warmLspForFile(
 			maxClientWaitMs: WARMUP_CLIENT_WAIT_MS,
 			maxDiagnosticsWaitMs: WARMUP_DIAGNOSTICS_WAIT_MS,
 			source: "mcp-warmup",
+			// #3405: every caller of `analyzeFile` (the MCP hosts' post-write hooks,
+			// warm and cold, and `dmlens_analyze`) asks about the bytes on disk now,
+			// and this is the analysis's first push of them, so it is the save. A
+			// save-triggered server (Expert compiles on didSave and on nothing else)
+			// answers an MCP host's edit only because of it.
+			saved: true,
 		});
 	} catch {
 		// Best-effort warm-up; the dispatch runner still tries on its own.
@@ -477,6 +535,10 @@ export async function analyzeFile(
 	// analysis's first read (the warm-up's, whose diagnostics the dispatch can
 	// serve), so a write that lands while the analysis runs is newer than it.
 	const observedAt = Date.now();
+	// #4242: the file's analysis-root class, asked once. It decides the dispatch
+	// plan below, and whether this call may write SESSION state for the file —
+	// an adopted (foreign) root is served read-only here too.
+	const analysisRootMode = resolveAnalysisRoot(absPath, cwd);
 	if (options.warmLsp !== false) {
 		await warmLspForFile(absPath, host);
 	}
@@ -494,7 +556,7 @@ export async function analyzeFile(
 		undefined,
 		{
 			blockingOnly: options.blockingOnly ?? false,
-			analysisRootMode: resolveAnalysisRoot(absPath, cwd),
+			analysisRootMode,
 			// #3791: this is a pull surface. Each call is an independent question,
 			// so the synthetic coverage notice must come back on every call rather
 			// than being latched once per session by the dispatcher — otherwise a
@@ -577,29 +639,52 @@ export async function analyzeFile(
 		// (#2067 AC4), so this seam no longer holds the event loop for a whole
 		// replacement either; a successful update schedules the SAME debounced persist
 		// (`scheduleWordIndexPersist`, `DM_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS`)
-		// pi's path uses — no second persist mechanism.
+		// pi's path uses — no second persist mechanism. And (#4242) the index is
+		// SESSION state, so `canWriteAnalysisRoot` refuses an adopted root's file
+		// exactly as the pi cascade seam does — the class is resolved against
+		// `cwd`, the workspace this warm index belongs to, never against what
+		// `dmlens_analyze` was pointed at.
 		//
 		// Key shape: `absPath` (`path.resolve` of the tool-input path). Since #1025
 		// the word index's path maps fold every key through `wordIndexKey`
 		// INTERNALLY (PathKeyedMap), so this edit-form key and the build path's
 		// walk-derived key converge on the same entry regardless of casing/
 		// separator — the old duplicate-orphan hazard is gone at the map layer.
+		// The refusal is recorded only once a write was otherwise going to happen:
+		// no warm index, or unreadable content, return first (the cascade seam's
+		// order), so a cold process never logs a skipped write that had no target.
 		const warmLease = acquireWarmWordIndex(cwd);
 		const warmIndex = warmLease.index;
 		try {
 			if (warmIndex) {
 				try {
 					const content = fs.readFileSync(absPath, "utf8");
-					const byteLength = Buffer.byteLength(content, "utf-8");
-					if (byteLength > WORD_INDEX_MAX_BYTES) {
-						await removeWordIndexDocumentAsync(warmIndex, absPath);
+					if (!canWriteAnalysisRoot(analysisRootMode)) {
+						emitBounded(
+							"adopted_root_writer_skipped",
+							`${absPath}:word-index`,
+							{
+								filePath: absPath,
+								durationMs: 0,
+								metadata: { writer: "word-index" },
+							},
+							{
+								ledgerKind: "adopted-root-writer-skipped",
+								risingEdgePer: "identity",
+							},
+						);
 					} else {
-						await updateWordIndexDocumentForEdit(warmIndex, {
-							path: absPath,
-							content,
-						});
+						const byteLength = Buffer.byteLength(content, "utf-8");
+						if (byteLength > WORD_INDEX_MAX_BYTES) {
+							await removeWordIndexDocumentAsync(warmIndex, absPath);
+						} else {
+							await updateWordIndexDocumentForEdit(warmIndex, {
+								path: absPath,
+								content,
+							});
+						}
+						scheduleWordIndexPersist(cwd, warmIndex);
 					}
-					scheduleWordIndexPersist(cwd, warmIndex);
 				} catch {
 					// unreadable/deleted, or an update failure — best-effort, same as the
 					// graph update above.

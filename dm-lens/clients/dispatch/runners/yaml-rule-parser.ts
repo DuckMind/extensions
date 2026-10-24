@@ -41,6 +41,8 @@ export interface YamlRuleCondition {
 	inside?: YamlRuleCondition;
 	follows?: YamlRuleCondition;
 	precedes?: YamlRuleCondition;
+	/** Name of a rule in the same document's `utils`. */
+	matches?: string;
 	stopBy?: unknown;
 	field?: string;
 	nthChild?: unknown;

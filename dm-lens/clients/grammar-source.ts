@@ -528,11 +528,17 @@ function shortHash(hash: string): string {
 export async function downloadGrammarDetailed(
 	destDir: string,
 	filename: string,
+	options: GrammarDownloadOptions = {},
 ): Promise<GrammarDownloadResult> {
 	if (isVendoredGrammar(filename)) return vendoredGrammarRefusal(filename);
+	const stall =
+		options.stallMs === undefined ? undefined : armStallBound(options.stallMs);
 	try {
 		fs.mkdirSync(destDir, { recursive: true });
-		const res = await fetch(grammarSourceUrl(filename));
+		const res = await fetch(
+			grammarSourceUrl(filename),
+			stall ? { signal: stall.signal } : undefined,
+		);
 		if (!res.ok) {
 			// 404/410: the CDN has authoritatively answered "this wasm does not
 			// exist at this URL" — a retry hits the same answer. Every other
@@ -542,7 +548,7 @@ export async function downloadGrammarDetailed(
 			const retryable = res.status !== 404 && res.status !== 410;
 			return { ok: false, retryable };
 		}
-		const data = Buffer.from(await res.arrayBuffer());
+		const data = await readResponseBody(res, stall);
 		// #1548: `res.ok` says the transport succeeded, NOT that the body is a
 		// grammar. A captive portal (airport wifi, corporate proxy) answers 200
 		// with its own login page; writing that to disk as tree-sitter-<lang>.wasm
@@ -599,15 +605,90 @@ export async function downloadGrammarDetailed(
 	} catch {
 		// A thrown fetch (offline, DNS failure, aborted, ECONNRESET) or a write
 		// failure is transient by construction — the CDN never got to answer.
+		if (stall?.signal.aborted) {
+			return {
+				ok: false,
+				retryable: true,
+				reason: `No bytes arrived for ${options.stallMs} ms — a stalled transfer.`,
+			};
+		}
 		return { ok: false, retryable: true };
+	} finally {
+		stall?.dispose();
 	}
 }
 
-/** Back-compat boolean-only wrapper for callers that only need pass/fail
- * (the postinstall script, prewarm-grammars test helper). */
-export async function downloadGrammar(
-	destDir: string,
-	filename: string,
-): Promise<boolean> {
-	return (await downloadGrammarDetailed(destDir, filename)).ok;
+/**
+ * A grammar fetch that receives no bytes for this long is aborted. A healthy
+ * unpkg response starts within a second or two, and 26 parallel streams on a
+ * 5 Mbps link still deliver a chunk every few milliseconds each (#4342).
+ * Without a bound a black-holed CDN holds the fetch for undici's 300 s headers
+ * timeout (#4425). Shared by the runtime fetch, the install script's mirror
+ * (`scripts/download-grammars.ts`, pinned by `tests/clients/grammar-source.test.ts`)
+ * and the test-setup prefetch.
+ */
+export const GRAMMAR_STALL_MS = 15_000;
+
+/**
+ * A `Language.load` that has not settled after this long is abandoned (#4224).
+ * A healthy load is a local file read plus a wasm compile and takes well under
+ * a second, so this is a ceiling for a hung load, not a latency target: a
+ * loaded host must not trip it. Without a bound, a load that never settles
+ * holds every caller for that language, and the in-flight batch build that
+ * later callers join.
+ */
+export const GRAMMAR_LOAD_TIMEOUT_MS = 30_000;
+
+export interface GrammarDownloadOptions {
+	/**
+	 * Abort the transfer once this many ms pass with no response bytes,
+	 * headers included. Each body chunk restarts the count, so a slow link
+	 * that keeps delivering completes and a stalled one fails fast. Unset: no
+	 * bound of dm-lens's own. The runtime fetch, the install script and the
+	 * test-setup prefetch pass `GRAMMAR_STALL_MS`.
+	 */
+	stallMs?: number;
+}
+
+interface StallBound {
+	signal: AbortSignal;
+	/** Bytes arrived: restart the count. */
+	touch(): void;
+	dispose(): void;
+}
+
+/**
+ * One timer per download, restarted with `refresh()` on every chunk rather
+ * than a new timer per chunk; unref'd so it never holds the process open, and
+ * cleared on every settle path by `downloadGrammarDetailed`'s `finally`.
+ * Aborting the fetch's signal errors a pending header wait or body read,
+ * which lands in the catch as a stalled transfer.
+ */
+function armStallBound(ms: number): StallBound {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), ms);
+	timer.unref();
+	return {
+		signal: controller.signal,
+		touch: () => {
+			timer.refresh();
+		},
+		dispose: () => clearTimeout(timer),
+	};
+}
+
+/** The whole body; with a stall bound, read chunk by chunk so each restarts it. */
+async function readResponseBody(
+	res: Response,
+	stall: StallBound | undefined,
+): Promise<Buffer> {
+	if (!stall || !res.body) return Buffer.from(await res.arrayBuffer());
+	const reader = res.body.getReader();
+	const chunks: Uint8Array[] = [];
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) return Buffer.concat(chunks);
+		stall.touch();
+		chunks.push(value);
+	}
 }

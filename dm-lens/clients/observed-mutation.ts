@@ -474,6 +474,22 @@ export function hasPendingObservation(toolCallId: string | undefined): boolean {
 	return toolCallId !== undefined && state().pending.has(toolCallId);
 }
 
+/**
+ * #4732: the paths this session's armed observation of a call watches (the
+ * target it named, or a directory target's entries). The opaque diff of the
+ * same call leaves them to the settle, which answers for them with the tool's
+ * own attribution; dispatching them from the diff as well recorded the bytes
+ * twice and taught the net nothing. Empty when nothing is armed.
+ */
+export function pendingObservationPaths(
+	toolCallId: string | undefined,
+	sessionGeneration: number,
+): readonly string[] {
+	if (toolCallId === undefined) return [];
+	const pending = state().pending.get(toolCallId);
+	return pending?.sessionGeneration === sessionGeneration ? pending.paths : [];
+}
+
 /** The net's state with `turnIndex`'s spend in the budget slot. */
 function budgetFor(
 	turnIndex: number,
@@ -1069,11 +1085,13 @@ export async function settleObservedMutation(
 			reason: "no-pending-baseline",
 		};
 	}
-	state().pending.delete(key);
 	if (pending.sessionGeneration !== args.sessionGeneration) {
-		// Catalog shape 22: the baseline belongs to a session that has since
-		// ended. Diffing across that boundary would attribute another session's
-		// world to this call.
+		// Catalog shape 22: the baseline belongs to another session. Diffing
+		// across that boundary would attribute another session's world to this
+		// call. #4737 r2: and it stays where it is. A host that numbers call ids
+		// per session reuses this id in the session that replaced this one, and
+		// that session's own result settles its baseline; a stale one leaves with
+		// the session reset or the pending cap.
 		return {
 			settled: false,
 			changedPaths: [],
@@ -1084,6 +1102,7 @@ export async function settleObservedMutation(
 			reason: "session-generation-advanced",
 		};
 	}
+	state().pending.delete(key);
 
 	const started = Date.now();
 	const settleDeadlineMs =

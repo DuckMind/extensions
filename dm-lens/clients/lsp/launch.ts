@@ -10,7 +10,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	type ChildProcess,
-	execFileSync,
 	spawn as nodeSpawn,
 	type SpawnOptions,
 } from "node:child_process";
@@ -23,6 +22,11 @@ import { getGlobalDmLensLogDir } from "../probe-home-state.js";
 import { isFullyQualified } from "../path-utils.js";
 import { findGlobalBinary, isProjectLocalBinPath } from "../package-manager.js";
 import {
+	isSessionRepositoryPath,
+	isUntrustedProjectPath,
+	recordProjectCommandRefusal,
+} from "../session-repository.js";
+import {
 	getDegradationLedgerGeneration,
 	recordDegradationOnce,
 } from "../degradation-ledger.js";
@@ -34,8 +38,13 @@ import {
 	classifySpawnFailure,
 	holdOwnChildPid,
 	isOwnLiveChild,
+	mergeWindowsEnvironment,
+	resolveSearchPathCommand,
 	resolveWindowsCommandForEnvironment,
 	SpawnFailureError,
+	safeSpawn,
+	statIsFile,
+	trustScopedEnvironment,
 } from "../safe-spawn.js";
 import { getRubyVersionDirNamesAsync } from "./ruby-drive-dirs.js";
 
@@ -170,31 +179,24 @@ function resolvePathValue(env: NodeJS.ProcessEnv): string {
 }
 
 /**
- * Run an `execFileSync` probe with the #2095 stderr guard applied, returning
- * `""` on any failure. Exported as a small test seam: production always calls
- * it with the fixed `powershell.exe` command/args below, but a test can pass
- * a command guaranteed to fail with real stderr output (no real Windows or
+ * Run a probe with the #2095 stderr guard applied, returning `""` on any
+ * failure. Exported as a small test seam: production always calls it with the
+ * fixed `powershell.exe` command/args below, but a test can pass a command
+ * guaranteed to fail with real stderr output (no real Windows or
  * powershell.exe required) to prove the guard is actually reached and not
  * vacuous.
+ *
+ * #4530: the probe starts through the spawn seam. A raw `execFileSync` of the
+ * bare `powershell.exe` was a lookup Windows answers from the cwd FIRST, so a
+ * project's own `powershell.exe` ran before any PATH entry; the seam resolves
+ * PATH only and judges the result against project trust. The seam also pipes
+ * stderr (#2095 sibling: an inherited stderr printed powershell's raw
+ * diagnostics into the pi TUI) and bounds the run.
  */
 export function runStderrGuardedProbe(command: string, args: string[]): string {
-	try {
-		const { execFileSync } =
-			require("node:child_process") as typeof import("node:child_process");
-		const out = execFileSync(command, args, {
-			timeout: 3000,
-			encoding: "utf8",
-			// #2095 sibling: execFileSync inherits stderr to the parent by
-			// default (only stdout is captured into `out`), so a failed
-			// powershell.exe launch would print raw diagnostics into the pi
-			// TUI even though the surrounding catch already returns "" (read as
-			// "unknown" PATH by every caller). Pipe stderr instead of inheriting it.
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		return out.trim();
-	} catch {
-		return "";
-	}
+	const result = safeSpawn(command, args, { timeout: 3000 });
+	if (result.error || result.status !== 0) return "";
+	return result.stdout.trim();
 }
 
 /** Read live system+user PATH from Windows registry (bypasses stale process.env.PATH). */
@@ -297,26 +299,72 @@ export function isCmdShimValid(cmdPath: string): boolean {
 }
 
 /**
+ * Whether the launcher ESTABLISHED that the program it spawned exists
+ * (#4263, #4532 round 4 — the caller reads this, it is not re-derived).
+ *
+ * The evidence depends on the spelling. A BARE command is found by a search:
+ * `present` when the launcher's in-process PATH scan returned a path, or a
+ * managed/global fallback replaced the spelling, and `absent` only when that
+ * search came back empty. An EXPLICIT spelling (absolute, or relative to the
+ * cwd) names one file and no search applies, so its presence is that file on
+ * disk, read before the spawn: the file itself, or the file cmd.exe would run
+ * under PATHEXT (`resolveWindowsCommandForEnvironment`, the rule the pre-#4532
+ * classifier asked). Round 5 (review F1): this arm used to read "the spelling
+ * changed" for both, so an installed absolute `gopls.exe` that exited 1 read
+ * `absent` and went to the installer, and a relative spelling that did not
+ * exist read `present`. A `.cmd`/`.bat` shim whose npm target the launcher read
+ * on disk is present under either spelling.
+ *
+ * The distinction is the whole rule: the exit code answers "the program
+ * failed", never "the program is absent". Windows' shell-backed launches report
+ * exit code 1 both for a command cmd.exe never found and for a present tool
+ * that failed at startup, and a present binary classified absent is handed to
+ * the installer.
+ */
+function windowsCommandPresence(evidence: {
+	command: string;
+	spawnCommand: string;
+	isBareCommand: boolean;
+	scannedCommandPath: string | undefined;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+}): "present" | "absent" {
+	const { command, spawnCommand } = evidence;
+	// The shim's own target was read on disk before the spawn.
+	if (/\.(cmd|bat)$/i.test(spawnCommand) && isCmdShimValid(spawnCommand)) {
+		return "present";
+	}
+	if (evidence.isBareCommand) {
+		// The scan resolved this spelling, or a managed/global fallback replaced it.
+		return evidence.scannedCommandPath !== undefined || spawnCommand !== command
+			? "present"
+			: "absent";
+	}
+	return statIsFile(spawnCommand) ||
+		resolveWindowsCommandForEnvironment(
+			spawnCommand,
+			evidence.cwd,
+			evidence.env,
+		)
+		? "present"
+		: "absent";
+}
+
+/**
  * Windows' shell-backed missing commands report exit code 1 instead of ENOENT.
- * Only classify that startup shape as repairable when the shared Windows
- * resolver cannot find the command, or an npm shim's target is absent. A
+ * Only classify that startup shape as repairable when an npm shim's target is
+ * absent, or when the launcher's own search for the command came back empty. A
  * present executable that exits 1 remains a runtime failure (#4263, #1199).
  */
 function isMissingWindowsStartupCommand(
-	command: string,
 	spawnCommand: string,
-	cwd: string,
-	env: NodeJS.ProcessEnv,
+	presence: "present" | "absent",
 ): boolean {
 	if (!isWindows) return false;
 	if (/\.(cmd|bat)$/i.test(spawnCommand) && !isCmdShimValid(spawnCommand)) {
 		return true;
 	}
-	// `findBinaryOnPath`/the global-bin fallback already proved a bare command
-	// resolves to this path. Do not re-resolve the original spelling against a
-	// possibly different PATH representation and misclassify a real binary.
-	if (spawnCommand !== command) return false;
-	return resolveWindowsCommandForEnvironment(command, cwd, env) === null;
+	return presence === "absent";
 }
 
 /**
@@ -363,36 +411,47 @@ function bypassPs1OnWindows(
 	return undefined;
 }
 
+/**
+ * Resolve a bare command name against the effective child PATH, IN PROCESS.
+ *
+ * #4532 round 3 (HIGH-2): this used to spawn `which`/`where`. A spawn resolves
+ * its OWN program through the same PATH it is asked to judge, from the cwd the
+ * server child is spawned with — so an adopted root that ships
+ * `node_modules/.bin/which` executed its own copy of the probe, wrote its
+ * marker, and could answer anything. A resolver the classified program can
+ * supply classifies nothing. The scan below runs in this process, over the
+ * PATH and the child cwd `launchLSP` already resolved, and consults no program
+ * the project can put on PATH.
+ *
+ * The kernel's rule (`execvp`) is the model: entries are searched in order, a
+ * RELATIVE entry is resolved against the CHILD's cwd (husky's generated
+ * `.husky/_/h` exports exactly `node_modules/.bin` for every git hook, and a
+ * caller's own `PATH=bin:$PATH` reaches it too), the first entry holding an
+ * executable file wins, and the result is absolute. Classifying where the
+ * child will exec is exactly what the analysis-root permission gate below
+ * needs; a resolution this function did not perform is one the child performs
+ * unclassified (#4248, #4299 R2-F1).
+ *
+ * Windows keeps its PATHEXT-aware in-process resolver
+ * (`resolveWindowsCommandForEnvironment`, the same `where`-equivalent
+ * `computeNeedsShell` already asks), so the `.cmd`/`.exe` suffix rules are
+ * unchanged. The in-process scan also removes the 5 s child-process bound the
+ * spawn needed (#1980): there is no probe binary left to hang.
+ */
 function findBinaryOnPath(
 	command: string,
 	env: NodeJS.ProcessEnv,
+	cwd: string,
 ): string | undefined {
-	try {
-		const result = execFileSync(isWindows ? "where" : "which", [command], {
-			encoding: "utf-8",
-			stdio: ["ignore", "pipe", "ignore"],
-			env,
-			// #1980 population sweep: this was the one synchronous
-			// child-process site in the repo with no bound at all. It runs on
-			// the LSP server spawn path, so an unresponsive `where`/`which` — a
-			// stale network PATH entry is the classic cause — parked the event
-			// loop with no ceiling, and read as ordinary compute in
-			// `loop_block`. 5s matches `isCommandAvailable`/`findCommand` in
-			// clients/safe-spawn.ts, which run these same two binaries.
-			timeout: 5000,
-		})
-			.split(/\r?\n/)
-			.map((line) => line.trim())
-			.filter(Boolean);
-		for (const candidate of result) {
-			if (fs.existsSync(candidate)) {
-				return candidate;
-			}
-		}
-	} catch {
-		// ignore lookup failures
+	if (isWindows) {
+		return resolveWindowsCommandForEnvironment(command, cwd, env)?.resolvedPath;
 	}
-	return undefined;
+	// The kernel's rule, shared with the spawn seam's lookup judgment (#4530):
+	// a relative entry is joined to the cwd as text, so `link/..` reaches the
+	// filesystem unfolded, as it reaches the kernel. An EMPTY entry never
+	// reaches this scan: `resolvePathValue`'s `combinePathValuesForPlatform`
+	// drops empty entries upstream (#4532 round 4, LOW-1).
+	return resolveSearchPathCommand(command, env.PATH, cwd);
 }
 
 // #4299 R2-F1: every launcher in one service spawn inherits its file's
@@ -485,8 +544,10 @@ export function refuseUntrustedLspExecution(
 
 	if (request.kind === "project-code-server")
 		recordUntrustedLspExecution(request, trust);
+	// #4515: a refused project-local candidate is skipped, not terminal: the
+	// resolver still owes the managed and global candidates their turn.
 	throw new SpawnFailureError(
-		"spawn-failed",
+		request.kind === "project-local-binary" ? "trust-refused" : "spawn-failed",
 		`LSP ${request.kind === "project-code-server" ? "project-code server" : "project-local binary"} refused: project trust is ${trust}`,
 		new Error(`project trust is ${trust}`),
 	);
@@ -511,19 +572,69 @@ export function admitProjectSuppliedTsserver(
 		(!projectSupplied || (projectCodeAllowed && trust === "trusted"))
 	)
 		return tsserverPath;
+	if (!tsserverPath) {
+		recordUnresolvedTypeScriptCompiler(cwd, trust);
+		return undefined;
+	}
 	recordUntrustedLspExecution(
 		{
 			kind: "project-local-binary",
-			command: tsserverPath ?? "tsserver.js",
-			resolvedCommand: tsserverPath ?? "tsserver.js",
+			command: tsserverPath,
+			resolvedCommand: tsserverPath,
 			cwd,
-			reason: tsserverPath
-				? "LSP execution refused: project compiler requires trusted session ownership"
-				: "LSP execution refused: no admitted absolute TypeScript compiler",
+			reason:
+				"LSP execution refused: project compiler requires trusted session ownership",
 		},
 		trust,
 	);
 	return undefined;
+}
+
+/**
+ * #4414: no admitted absolute compiler is a resolution miss, not a trust
+ * refusal (a trusted project with only a PATH `tsc` was told to "mark the
+ * project trusted"). The ledger row is per root per generation. The warn shares
+ * `unknownProjectLocalNoticeGeneration` with the trust notice, so a generation
+ * prints one notice: a genuine trust refusal is never followed by this one.
+ */
+function recordUnresolvedTypeScriptCompiler(
+	cwd: string,
+	trust: ReturnType<typeof getProjectTrustState>,
+): void {
+	const generation = getDegradationLedgerGeneration();
+	recordDegradationOnce({
+		kind: "lsp-registry-decision",
+		subject: `typescript-compiler:g${generation}:${cwd}`,
+		reason:
+			"LSP not started: no absolute TypeScript compiler (tsserver.js) was resolved",
+		metadata: { field: "typescript-compiler", trust },
+	});
+	if (unknownProjectLocalNoticeGeneration === generation) return;
+	unknownProjectLocalNoticeGeneration = generation;
+	// #4530: a lookup that refused the project's own compiler (a project PATH
+	// entry dropped, a resolved answer refused) already told the user, in this
+	// session, that trust is the cause; a resolution notice after it would
+	// blame resolution for a compiler pi found and refused (#4414 F1).
+	if (trust !== "trusted" && sessionRepositoryHoldsCompiler(cwd)) return;
+	logExtension({
+		subsystem: "lsp-registry",
+		level: "warn",
+		message:
+			"TypeScript language server not started: no absolute TypeScript compiler (tsserver.js) could be resolved; install typescript in the project or let dm-lens install it",
+		metadata: { field: "typescript-compiler" },
+	});
+}
+
+/**
+ * Whether the bare `tsc` lookup, through the search path before trust scoping,
+ * answers with the session repository's bytes: the refusal that explains a
+ * missing compiler. Any other trust refusal (a project scripts dir dropped
+ * from the search path) says nothing about TypeScript, so it never hides the
+ * notice (#4776 review F3).
+ */
+function sessionRepositoryHoldsCompiler(cwd: string): boolean {
+	const found = findBinaryOnPath("tsc", process.env, cwd);
+	return found !== undefined && isSessionRepositoryPath(found);
 }
 
 /**
@@ -537,6 +648,42 @@ export function isProjectLocalLspBinary(
 	cwd: string,
 ): boolean {
 	return isProjectLocalBinPath(resolvedCommand, cwd);
+}
+
+/**
+ * #4530: refuse a bare launch whose answer is the session repository's bytes
+ * while pi has not trusted the project, with the typed `trust-refused` failure
+ * the resolver skips past to its next candidate (#4515).
+ *
+ * Two answers can be: the file the PATH scan or global-bin lookup resolved
+ * (a global entry holding a link into the project, judged by its real
+ * target), and, on Windows, the command left unresolved. Windows starts an
+ * unresolved bare command through `cmd.exe`, which searches the child's cwd
+ * BEFORE PATH: when the scoped PATH answered nothing, the only file that
+ * search can find is the cwd's own, so an owned cwd refuses the start.
+ */
+function refuseProjectLookup(
+	command: string,
+	spawnCommand: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): void {
+	const unresolved = spawnCommand === command;
+	if (unresolved && !isWindows) return;
+	const owned = unresolved
+		? resolveWindowsCommandForEnvironment(
+				command,
+				cwd,
+				mergeWindowsEnvironment(env, { PATH: cwd }),
+			)?.resolvedPath
+		: spawnCommand;
+	if (owned === undefined || !isUntrustedProjectPath(owned)) return;
+	recordProjectCommandRefusal(owned);
+	throw new SpawnFailureError(
+		"trust-refused",
+		`LSP lookup refused: ${command} resolved inside the project and project trust is ${getProjectTrustState()}`,
+		new Error(`project trust is ${getProjectTrustState()}`),
+	);
 }
 
 /**
@@ -743,11 +890,16 @@ export async function launchLSP(
 	// host's inherited DM_LENS_OWNER may name a dead foreign owner, and an
 	// untagged server is spared where a wrongly tagged one is reaped.
 	const ownerTag = await ownerTagForChildren({ timeoutMs: OWNER_TAG_READ_MS });
-	const env: NodeJS.ProcessEnv = {
-		...mergedEnv,
-		PATH: augmentedPath,
-		...(isWindows ? { Path: augmentedPath } : {}),
-	};
+	// #4530: the child's search path, and the scan below that reads it, lose
+	// the session repository's own directories until pi trusts the project.
+	const env: NodeJS.ProcessEnv = trustScopedEnvironment(
+		{
+			...mergedEnv,
+			PATH: augmentedPath,
+			...(isWindows ? { Path: augmentedPath } : {}),
+		},
+		cwd,
+	);
 	if (ownerTag === undefined) delete env[OWNER_TAG_ENV];
 	else env[OWNER_TAG_ENV] = ownerTag;
 
@@ -755,16 +907,21 @@ export async function launchLSP(
 	// - If already absolute, use as-is
 	// - If it's a simple command (no path separators), let system find it via PATH
 	// - Otherwise, resolve relative to cwd
+	// `isBareCommand` is computed ONCE: the scan, the global-bin fallback and the
+	// presence the exit-code classifier reads must all agree on which spelling
+	// the launcher is judging (#4532 round 4).
+	const isBareCommand =
+		!isFullyQualified(command) &&
+		!command.includes(path.sep) &&
+		!command.includes("/");
 	const isRelativePath =
 		!isFullyQualified(command) &&
 		(command.includes(path.sep) || command.includes("/"));
 	const explicitCommand = isRelativePath ? path.resolve(cwd, command) : command;
-	const resolvedCommand =
-		!isFullyQualified(command) &&
-		!command.includes(path.sep) &&
-		!command.includes("/")
-			? (findBinaryOnPath(command, env) ?? explicitCommand)
-			: explicitCommand;
+	const scannedCommandPath = isBareCommand
+		? findBinaryOnPath(command, env, cwd)
+		: undefined;
+	const resolvedCommand = scannedCommandPath ?? explicitCommand;
 
 	// Compute needsShell based on command
 	// On Windows, shell: true is needed for .cmd/.bat files and extensionless binaries
@@ -776,11 +933,7 @@ export async function launchLSP(
 	let spawnCommand = resolvedCommand;
 
 	// First, try to find in npm global if it's a simple command name
-	if (
-		!isFullyQualified(command) &&
-		!command.includes(path.sep) &&
-		!command.includes("/")
-	) {
+	if (isBareCommand) {
 		const globalBinPath = await findGlobalBinary(command);
 		if (globalBinPath) {
 			spawnCommand = globalBinPath;
@@ -788,6 +941,21 @@ export async function launchLSP(
 			needsShell = computeNeedsShell(spawnCommand);
 		}
 	}
+
+	// AGENTS.md defect shape 58 — a known identity is carried, not re-derived:
+	// the presence the exit-code classifier asks about is resolved HERE, once,
+	// from the evidence this launch holds, and both classification sites below
+	// read it. Nothing re-reads the PATH or the cwd after the spawn.
+	const commandPresence: "present" | "absent" = isWindows
+		? windowsCommandPresence({
+				command,
+				spawnCommand,
+				isBareCommand,
+				scannedCommandPath,
+				cwd,
+				env,
+			})
+		: "absent";
 
 	// Built-in server commands have no config provenance to carry into the
 	// registry. Once PATH resolution selects a project-local installed binary,
@@ -801,6 +969,12 @@ export async function launchLSP(
 			cwd,
 		});
 	}
+
+	// #4530: a bare command is a lookup, and a lookup never answers with the
+	// session repository's bytes until pi trusts the project. The scoped PATH
+	// already holds no project entry, so what is left is a global entry or
+	// global bin dir holding a link into the project: judged by the target.
+	if (isBareCommand) refuseProjectLookup(command, spawnCommand, cwd, env);
 
 	// Pre-validate .cmd shims only after trust has admitted the candidate: if the
 	// underlying script is missing the shim will exit with code 1 after a 500ms
@@ -845,11 +1019,7 @@ export async function launchLSP(
 		proc = trySpawn(spawnCommand, args, cwd, env, needsShell);
 	} catch (err) {
 		// If spawn failed with simple command, try npm global
-		if (
-			!isFullyQualified(command) &&
-			!command.includes(path.sep) &&
-			!command.includes("/")
-		) {
+		if (isBareCommand) {
 			const globalBinPath = await findGlobalBinary(command);
 			if (globalBinPath && globalBinPath !== spawnCommand) {
 				// Recompute needsShell for the resolved global path
@@ -875,7 +1045,7 @@ export async function launchLSP(
 		const failure = new Error(message);
 		if (
 			proc.exitCode === 1 &&
-			isMissingWindowsStartupCommand(command, spawnCommand, cwd, env)
+			isMissingWindowsStartupCommand(spawnCommand, commandPresence)
 		) {
 			throw new SpawnFailureError("tool-not-found", message, failure);
 		}
@@ -939,7 +1109,7 @@ export async function launchLSP(
 					const failure = new Error(message);
 					if (
 						code === 1 &&
-						isMissingWindowsStartupCommand(command, spawnCommand, cwd, env)
+						isMissingWindowsStartupCommand(spawnCommand, commandPresence)
 					) {
 						reject(new SpawnFailureError("tool-not-found", message, failure));
 						return;

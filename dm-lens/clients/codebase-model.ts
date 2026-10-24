@@ -18,7 +18,7 @@ import { writeFileAtomic } from "./atomic-write.js";
 import { parseSymbolKey } from "./call-graph.js";
 import type { CallGraphCacheIdentity } from "./call-graph.js";
 import { detectFileRole } from "./file-role.js";
-import { isExternalOrVendorFile } from "./path-utils.js";
+import { isExternalOrVendorFile, toProjectRelativePath } from "./path-utils.js";
 import { isBuildArtifact } from "./source-filter.js";
 import type { FunctionCallGraph, SymbolKey } from "./call-graph.js";
 
@@ -150,9 +150,9 @@ export function buildCodebaseModel(
 			.filter((n) => !n.startsWith("file:"))
 			.slice(0, MAX_CALLS_PER_SYMBOL);
 
-		const file = filePath
-			? path.relative(cwd, filePath).replace(/\\/g, "/")
-			: "unknown";
+		// A graph key is a path identity and `cwd` the session root's spelling:
+		// the owner answers on one axis (#4689 r2).
+		const file = filePath ? toProjectRelativePath(filePath, cwd) : "unknown";
 
 		const draft: Omit<ModelEntry, "tokens"> = {
 			file,

@@ -69,7 +69,7 @@ export const DEFAULT_PDF_MAX_SIZE_MB = 20;
 export const MAX_PDF_MAX_SIZE_MB = 50;
 export const MAX_DATALAB_TIMEOUT_MS = 300_000;
 const DEFAULT_MAX_PAGES = 100;
-const DEFAULT_OUTPUT_DIR = join(tmpdir(), "pi-web-pdf");
+const DEFAULT_OUTPUT_DIR = join(tmpdir(), "dm-web-pdf");
 const CONFIG_PATH = getWebSearchConfigPath();
 const PAGE_MARKER_PATTERN = /^<!-- Page (\d+) -->$/gm;
 

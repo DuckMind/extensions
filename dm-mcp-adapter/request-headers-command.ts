@@ -224,9 +224,15 @@ async function invokeRequestHeadersCommand(
       if (result.status === "error") reject(result.error);
       else resolve(result.headers);
     };
+    let cleanupCompleted = false;
+    const cleanupOnce = () => {
+      if (cleanupCompleted) return;
+      cleanupCompleted = true;
+      killRequestHeadersCommand(child, trackedPosixDescendantPids, cleanupToken);
+    };
     const finishAfterKill = (result: CommandResult) => {
       try {
-        killRequestHeadersCommand(child, trackedPosixDescendantPids, cleanupToken);
+        cleanupOnce();
         finish(result);
       } catch (cleanupError) {
         finish({ status: "error", error: cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)) });
@@ -254,6 +260,16 @@ async function invokeRequestHeadersCommand(
       stdout = Buffer.concat([stdout, Buffer.from(chunk)]);
       if (stdout.byteLength > MAX_OUTPUT_BYTES) {
         failAfterKill("HTTP request headers command output exceeded 64 KiB");
+      }
+    });
+    // A helper may inherit stdout. Kill owned descendants at exit so EOF
+    // cannot wait on a helper that outlives the command.
+    child.on("exit", () => {
+      if (!USE_PROCESS_GROUP || child.pid === undefined || settled) return;
+      try {
+        cleanupOnce();
+      } catch (error) {
+        finishAfterKill({ status: "error", error: error instanceof Error ? error : new Error(String(error)) });
       }
     });
     child.on("close", code => {

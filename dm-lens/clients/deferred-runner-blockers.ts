@@ -32,15 +32,18 @@
  * commit while a 5 s+ runner runs would block the agent on nothing it can fix.
  */
 
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import { resolve } from "node:path";
 import { gateFindingsByPathFreshness } from "./advisory-provenance.js";
+import { hashContentBytes } from "./content-stamp.js";
 import {
 	peekSettledRunnerFindings,
 	type PendingRunnerFindings,
 } from "./dispatch/pending-runner-findings.js";
 import { applyPushedFindingPolicy } from "./dispatch/finding-policy.js";
-import type { Diagnostic } from "./dispatch/types.js";
+import { laneCopyStandsFor } from "./dispatch/lane-copies.js";
+import { type Diagnostic, reachedNoVerdict } from "./dispatch/types.js";
+import { stampLineHashes } from "./line-alignment.js";
 import { logLatency } from "./latency-logger.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 
@@ -50,6 +53,10 @@ const MAX_LOGGED_RUNNER_IDS = 5;
 export interface DeferredBlockerRecording {
 	/** Findings new to the blocker map (0 = nothing blocking, or a replay). */
 	recorded: number;
+	/** #4484 r2: recorded blockers a settled run of their runner retired. */
+	retired: number;
+	/** #4484 r2: the files those retired blockers were recorded on. */
+	retiredFiles: string[];
 	runnerIds: string[];
 	fileCount: number;
 }
@@ -130,8 +137,18 @@ export function recordDeferredRunnerBlockers(
 	survivors: readonly Diagnostic[],
 	bytes: Buffer | undefined,
 ): number {
-	const blocking = survivors.flatMap((d) =>
-		d.semantic === "blocking" ? [d] : [],
+	// #4484 r2: stamped with the runner, as the dispatcher stamps its own, so
+	// the next write carries the blocker while this runner is in flight again.
+	// Round 5: and with its line's text in the settled bytes, as the pipeline
+	// stamps its record (`stampLineHashes`).
+	const blocking = stampLineHashes(
+		withoutLaneCopies(runtime, pending, survivors).flatMap((d) =>
+			d.semantic === "blocking"
+				? [{ ...d, runnerId: d.runnerId ?? pending.runnerId }]
+				: [],
+		),
+		bytes?.toString("utf-8"),
+		(d) => !d.filePath || resolve(d.filePath) === resolve(pending.filePath),
 	);
 	if (blocking.length === 0) return 0;
 	const recorded = runtime.recordDeferredInlineBlockers(
@@ -143,7 +160,7 @@ export function recordDeferredRunnerBlockers(
 				? {
 						contentBaseline: {
 							size: bytes.byteLength,
-							sha256: createHash("sha256").update(bytes).digest("hex"),
+							sha256: hashContentBytes(bytes),
 						},
 					}
 				: {}),
@@ -152,6 +169,77 @@ export function recordDeferredRunnerBlockers(
 	// Same recompute every recording seam does: the latch re-derives from the map.
 	if (recorded > 0) runtime.updateGitGuardStatus(false, "");
 	return recorded;
+}
+
+/**
+ * #4484 round 2: retire the blockers a settled run of their own runner no
+ * longer observes. `kept` is the run's policy survivors from
+ * {@link judgeDeferredRunnerFindings}. A run that reached no verdict retires
+ * nothing. The coordinator requires the run to be about the recorded bytes
+ * (read time and content hash), which also refuses an answer about older
+ * bytes.
+ *
+ * @returns how many recorded blockers the run retired.
+ */
+export function retireSettledRunnerBlockers(
+	runtime: RuntimeCoordinator,
+	pending: PendingRunnerFindings,
+	verdict: Pick<DeferredRunnerVerdict, "kept">,
+): number {
+	const result = pending.result;
+	// #4484 round 7: a settled skip that defers to a covering lane retires
+	// nothing. That lane's answer for these bytes is not known here, and its
+	// evidence may cover only the edit; the next inline write judges.
+	// #4509: a covered run read the bytes itself, so it retires as any run.
+	if (
+		!result ||
+		reachedNoVerdict(result) ||
+		(result.coveredBy !== undefined &&
+			result.skipReason === "covered-by-primary")
+	)
+		return 0;
+	const bytes = readBytes(pending.filePath);
+	const retired = runtime.retireUnobservedRunnerBlockers(pending.filePath, {
+		runnerId: pending.runnerId,
+		// #4484 round 3: what the run's edit-range gate withheld is still
+		// observed, at its own line.
+		observed: [
+			...withoutLaneCopies(runtime, pending, verdict.kept),
+			...(result.outOfEditScope ?? []),
+		].flatMap((d) => (d.semantic === "blocking" ? [d] : [])),
+		markedAtMs: pending.markedAtMs,
+		sha256: bytes ? hashContentBytes(bytes) : undefined,
+		...(result.unconfirmedServerIds !== undefined && {
+			unconfirmedServerIds: result.unconfirmedServerIds,
+		}),
+	});
+	if (retired > 0) runtime.updateGitGuardStatus(false, "");
+	return retired;
+}
+
+/**
+ * #4529 review R3: a settled covered run's findings, less those its lane's
+ * recorded copies stand for (`laneCopyStandsFor`), as the dispatcher drops
+ * them from a run it waited for. Such a finding is neither recorded nor
+ * observed, so the run's own entry for it retires and the lane's copy stands.
+ */
+function withoutLaneCopies(
+	runtime: RuntimeCoordinator,
+	pending: PendingRunnerFindings,
+	findings: readonly Diagnostic[],
+): readonly Diagnostic[] {
+	const lane = pending.result?.coveredBy;
+	if (lane === undefined) return findings;
+	const standsFor = laneCopyStandsFor(
+		(runtime.getInlineBlockerDiagnostics(pending.filePath) ?? []).flatMap(
+			(d) =>
+				d.runnerId === lane.runnerId &&
+				(lane.serverId === undefined || d.serverId === lane.serverId)
+					? [d]
+					: [],
+		),
+	);
+	return findings.flatMap((d) => (standsFor(d) ? [] : [d]));
 }
 
 function readBytes(filePath: string): Buffer | undefined {
@@ -176,6 +264,8 @@ export function absorbSettledRunnerBlockers(
 ): DeferredBlockerRecording {
 	const total: DeferredBlockerRecording = {
 		recorded: 0,
+		retired: 0,
+		retiredFiles: [],
 		runnerIds: [],
 		fileCount: 0,
 	};
@@ -188,8 +278,13 @@ export function absorbSettledRunnerBlockers(
 			verdict.kept,
 			verdict.bytes,
 		);
-		if (recorded === 0) continue;
+		const retired = retireSettledRunnerBlockers(runtime, pending, verdict);
+		if (recorded === 0 && retired === 0) continue;
 		total.recorded += recorded;
+		total.retired += retired;
+		if (retired > 0 && !total.retiredFiles.includes(pending.filePath)) {
+			total.retiredFiles.push(pending.filePath);
+		}
 		files.add(pending.filePath);
 		if (
 			!total.runnerIds.includes(pending.runnerId) &&
@@ -199,9 +294,9 @@ export function absorbSettledRunnerBlockers(
 		}
 	}
 	total.fileCount = files.size;
-	if (total.recorded > 0) {
-		// One row per gate consult that recorded something new; a repeat consult
-		// finds every finding recorded and writes nothing.
+	if (total.recorded > 0 || total.retired > 0) {
+		// One row per gate consult that recorded or retired something; a repeat
+		// consult finds every finding recorded and nothing left to retire.
 		logLatency({
 			type: "phase",
 			toolName: "git-guard",
@@ -211,6 +306,7 @@ export function absorbSettledRunnerBlockers(
 			metadata: {
 				site: "commit_gate",
 				recorded: total.recorded,
+				retired: total.retired,
 				runnerIds: total.runnerIds,
 				fileCount: total.fileCount,
 			},

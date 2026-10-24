@@ -22,6 +22,7 @@ import {
 	startHostStallSampler,
 } from "../dispatch/runners/utils/availability-policy.js";
 import { getGlobalDmLensDir } from "../file-utils.js";
+import { getProjectTrustGeneration } from "../project-trust.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
 
 const JAVA_EXE = process.platform === "win32" ? "java.exe" : "java";
@@ -148,7 +149,14 @@ export function discoverJdkHome(
 	return usable[0].home;
 }
 
-let _cachedEnv: { value: NodeJS.ProcessEnv | undefined } | undefined;
+/**
+ * The resolved Java environment and the project-trust generation it was
+ * resolved under (#4530): the PATH probe behind it searches a different path
+ * under different trust, so another generation resolves again.
+ */
+let _cachedEnv:
+	| { value: NodeJS.ProcessEnv | undefined; trustGeneration: number }
+	| undefined;
 
 /**
  * Availability latch for the `java` PATH probe (#1538, the #1467 latch family's
@@ -167,7 +175,11 @@ const javaAvailabilityLatch = createAvailabilityLatch();
  * every expired cooldown reopens that window for the process's whole
  * lifetime, not just at startup.
  */
-let inFlightJavaProbe: Promise<boolean | undefined> | null = null;
+let inFlightJavaProbe: {
+	/** #4776: the probe answers for this trust; a later one never joins it. */
+	trustGeneration: number;
+	promise: Promise<boolean | undefined>;
+} | null = null;
 
 export function _resetJvmRuntimeCacheForTests(): void {
 	_cachedEnv = undefined;
@@ -194,6 +206,7 @@ export function _resetJvmRuntimeCacheForTests(): void {
  * `outcome` distinguishes the two; a durable verdict is never `"transient"`.
  */
 function probeJavaOnPath(): Promise<boolean | undefined> {
+	const trustGeneration = getProjectTrustGeneration();
 	const memo = javaAvailabilityLatch.read();
 	if (memo !== null) {
 		if (javaAvailabilityLatch.getOutcome() === "transient") {
@@ -222,11 +235,13 @@ function probeJavaOnPath(): Promise<boolean | undefined> {
 		return Promise.resolve(memo);
 	}
 
-	if (inFlightJavaProbe) return inFlightJavaProbe;
-	inFlightJavaProbe = runJavaProbe().finally(() => {
-		inFlightJavaProbe = null;
+	if (inFlightJavaProbe?.trustGeneration === trustGeneration)
+		return inFlightJavaProbe.promise;
+	const promise = runJavaProbe().finally(() => {
+		if (inFlightJavaProbe?.promise === promise) inFlightJavaProbe = null;
 	});
-	return inFlightJavaProbe;
+	inFlightJavaProbe = { trustGeneration, promise };
+	return promise;
 }
 
 /** The actual `where`/`which java` spawn + classification. Never call this
@@ -300,12 +315,14 @@ async function runJavaProbe(): Promise<boolean | undefined> {
 export async function resolveJavaRuntimeEnv(): Promise<
 	NodeJS.ProcessEnv | undefined
 > {
-	if (_cachedEnv) return _cachedEnv.value;
+	if (_cachedEnv?.trustGeneration === getProjectTrustGeneration())
+		return _cachedEnv.value;
+	const trustGeneration = getProjectTrustGeneration();
 
 	// `java` already on PATH — nothing to inject; defer to the user's runtime.
 	const javaOnPath = await probeJavaOnPath();
 	if (javaOnPath === true) {
-		_cachedEnv = { value: undefined };
+		_cachedEnv = { value: undefined, trustGeneration };
 		return undefined;
 	}
 
@@ -318,6 +335,7 @@ export async function resolveJavaRuntimeEnv(): Promise<
 				JAVA_HOME: home,
 				PATH: binDir + path.delimiter + currentPath,
 			},
+			trustGeneration,
 		};
 		return _cachedEnv.value;
 	}
@@ -326,7 +344,7 @@ export async function resolveJavaRuntimeEnv(): Promise<
 	// durable "not found" — a transient probe (timeout/host-stall) must not
 	// pin this session to `undefined` forever.
 	if (javaOnPath === false) {
-		_cachedEnv = { value: undefined };
+		_cachedEnv = { value: undefined, trustGeneration };
 	}
 	return undefined;
 }

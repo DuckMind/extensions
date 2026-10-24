@@ -22,8 +22,10 @@
  *     through `resolveAdoptedRootCommand`, which refuses executable paths
  *     inside the adopted or session root, including PATH and symlink targets.
  *   - `fish-indent` — `fish_indent --check <file>` compares one file against
- *     fish's built-in formatter; it reads no config and executes no project
- *     code, and uses the same adopted-root executable containment seam.
+ *     fish's built-in formatter, and `fish --no-config --no-execute <file>`
+ *     parses it without running anything; neither reads config or executes
+ *     project code, and both resolve their executable through the same
+ *     adopted-root containment seam.
  *
  * Everything else stays refused: config-as-code linters (eslint, oxlint,
  * biome-check-json), config-file linters (yamllint, markdownlint, hadolint, shellcheck,

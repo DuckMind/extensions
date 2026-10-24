@@ -37,15 +37,27 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import type { ToolCallEvent } from "@duckmind/dm-coding-agent";
+import {
+	resolveGitCheckout,
+	resolveGitIdentity,
+	sameCheckoutOtherRoot,
+} from "./review-graph/git-identity.js";
 import { collectSourceFilesWithBudgetAsync } from "./source-filter.js";
 import { createHash } from "node:crypto";
 
 import { BoundedFifoMap } from "./bounded-cache.js";
-import { incrementDegradationCount } from "./degradation-ledger.js";
+import { scanShellWriteScopes } from "./bash-file-access.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { createSingleFlight } from "./single-flight.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
+import { isDmLensToolName } from "./tool-config.js";
 
 interface FileStatEntry {
 	mtimeMs: number;
@@ -101,6 +113,71 @@ export interface PendingOpaqueBaseline {
 	strategy: "git" | "stat-diff";
 	stats?: FileStatsSnapshot;
 	statsUnknownReason?: OpaqueUnknownReason;
+	/**
+	 * #4502: the working-tree paths that were dirty when the command started,
+	 * so a same-HEAD discard (`git stash`, `git checkout .`, `git restore`) can
+	 * be seen at all: those commands move no HEAD and leave no dirty entry, and
+	 * both of the head-move detector's signals are therefore silent while an
+	 * open document keeps bytes the disk no longer has. `undefined` when git
+	 * could not answer: an empty array would read as "the tree was clean",
+	 * which is a different fact.
+	 */
+	dirtyPaths?: readonly string[];
+}
+
+/** A literal tool name of one member of pi's typed `tool_call` union. */
+type LiteralToolName<E> = E extends { toolName: infer N extends string }
+	? string extends N
+		? never
+		: N
+	: never;
+
+/**
+ * #4732: what each of pi's built-in tools can write. Typed against the host's
+ * own `ToolCallEvent` union, so a pi release that adds a built-in tool fails to
+ * compile here until the tool is placed, and a name pi drops fails too.
+ *
+ * - `opaque`: a shell, which writes whatever its command does.
+ * - `named`: a structured writer; the classified chain records the one path
+ *   it names (`classifyMutatingTool`).
+ * - `none`: read-only.
+ */
+const PI_BUILTIN_TOOL_WRITES = new Map<string, "opaque" | "named" | "none">(
+	Object.entries({
+		bash: "opaque",
+		write: "named",
+		edit: "named",
+		read: "none",
+		grep: "none",
+		find: "none",
+		ls: "none",
+	} as const satisfies Record<
+		LiteralToolName<ToolCallEvent>,
+		"opaque" | "named" | "none"
+	>),
+);
+
+/**
+ * Opaque recovery feeds dispatch and LSP resync; it is not read evidence.
+ * Keep its lifecycle gate shared by the pre-call baseline and post-call take.
+ *
+ * #4732: fail closed. A tool is diffed unless its name is known not to write a
+ * path dm-lens does not already record: DM's read-only and structured built-ins
+ * ({@link PI_BUILTIN_TOOL_WRITES}) and dm-lens's own pi tools
+ * ({@link isDmLensToolName}), which are read-only or record every write through the
+ * mutation bridge. Every other name (another extension's tool, an MCP tool
+ * routed through pi, the outer codemode call) is opaque. A tool whose EVENT the
+ * structured classifier recognizes is excluded at the record site, which has
+ * the event.
+ */
+export function shouldRunOpaqueRecovery(
+	toolName: string,
+	workspaceRoot: string | undefined,
+): workspaceRoot is string {
+	if (workspaceRoot === undefined) return false;
+	const builtin = PI_BUILTIN_TOOL_WRITES.get(toolName);
+	if (builtin !== undefined) return builtin === "opaque";
+	return !isDmLensToolName(toolName);
 }
 
 /**
@@ -291,10 +368,165 @@ export function diffFileContent(
 }
 
 /**
+ * The ONE root a prescan record is captured and consumed against: the session's
+ * own working directory, which is where the host runs the bash command and so
+ * the tree its writes land in.
+ *
+ * Both hooks ask this function, because a record written under one root and
+ * looked up under another reports `no-pending-snapshot` for a command that did
+ * write (#4504). `ctx.cwd` is per-session and frozen: it projects the same
+ * `_cwd` field the tools are constructed with and is never reassigned
+ * (`tests/clients/pi-host-contract.test.ts`), so one session's two hooks
+ * resolve the same value. The fallback is the coordinator's `projectRoot`, the
+ * only answer a host that offers no cwd leaves, and it is the same answer at
+ * both hooks. The root that differs between the two hooks in production is a
+ * concurrent secondary session's (#473): it is declined by the #2129 guard, so
+ * the coordinator keeps the live primary's root while `ctx.cwd` is its own.
+ */
+export function opaquePrescanRoot(
+	sessionCwd: string | undefined,
+	/** The coordinator's `projectRoot`, resolved by the caller for its host. */
+	projectRoot: string,
+): string {
+	return sessionCwd ?? projectRoot;
+}
+
+/**
+ * Extra checkouts one bash command may be recovered from, beside the session
+ * root. Bounded because the population comes from the command's own text: a
+ * generated `cd` chain cannot turn one bash call into a repository sweep. A
+ * target past the cap is REFUSED and recorded, never silently dropped.
+ */
+export const OPAQUE_RECOVERY_ROOT_CAP = 4;
+
+/** Why a checkout the command named is not a recovery root (#2050). */
+export type OpaqueRootRefusal =
+	/** A checkout of a DIFFERENT repository: #4242's re-root lane, not this one. */
+	| "different-repository"
+	/** The session root is not a checkout, so no `commonDir` can be compared. */
+	| "session-root-not-a-checkout";
+
+export interface OpaqueRecoveryRoots {
+	/** Roots this call's writes are recovered from: the session root first. */
+	roots: string[];
+	/** Named checkouts that were NOT admitted, with the reason. */
+	refused: Array<{ root: string; reason: OpaqueRootRefusal }>;
+	/** Named checkouts past {@link OPAQUE_RECOVERY_ROOT_CAP}. */
+	capped: string[];
+}
+
+/**
+ * The checkouts one bash command's writes are recovered from (#2050).
+ *
+ * The session root is always first, because the host runs the command there.
+ * Every further root comes from the command's OWN text — a `cd`/`pushd`
+ * target, or a recognised write operand — and is admitted only when its
+ * checkout is a linked worktree of the SESSION's repository, the #3871
+ * `sameCheckoutOtherRoot` rule (equal `commonDir`, different top level). A
+ * sibling checkout, a nested worktree under the session root, and a worktree
+ * reached only by an absolute operand all qualify; another repository does
+ * not, and is reported rather than scanned.
+ *
+ * Deliberately NOT a scan of every registered worktree: the command must name
+ * the tree, so the cost stays one `git status` per named root and the answer
+ * never widens beyond what the command demonstrably touched.
+ *
+ * Pure filesystem reads (`resolveGitCheckout` spawns nothing), so the `tool_call`
+ * and `tool_result` hooks derive the same list from one command text and one
+ * session root — the #4504 rule, now per root.
+ */
+export function resolveOpaqueRecoveryRoots(
+	command: string,
+	sessionRoot: string,
+): OpaqueRecoveryRoots {
+	const roots = [sessionRoot];
+	const refused: OpaqueRecoveryRoots["refused"] = [];
+	const capped: string[] = [];
+	const session = resolveGitCheckout(sessionRoot);
+	const admitted = new Set<string>([
+		normalizeMapKey(path.resolve(sessionRoot)),
+	]);
+	if (session) admitted.add(normalizeMapKey(session.root));
+	const scan = scanShellWriteScopes(command, sessionRoot);
+	// `cd` targets first: they name a tree directly. A recognised write names a
+	// FILE, so its checkout is resolved at the file's directory.
+	const candidates: Array<{ owner: string; lookup: string }> = [
+		...scan.cdTargets.map((dir) => ({ owner: dir, lookup: dir })),
+		...scan.written.map((file) => ({
+			owner: file,
+			lookup: path.dirname(file),
+		})),
+	];
+	const considered = new Set<string>();
+	let extra = 0;
+	for (const candidate of candidates) {
+		const candidateKey = normalizeMapKey(path.resolve(candidate.owner));
+		if (considered.has(candidateKey)) continue;
+		considered.add(candidateKey);
+		if (admitted.has(candidateKey)) continue;
+		const checkout = resolveGitCheckout(candidate.lookup);
+		// Not a checkout: there is no checkout identity to recover against, and
+		// nothing here can claim anything about it.
+		if (!checkout) continue;
+		const rootKey = normalizeMapKey(checkout.root);
+		if (admitted.has(rootKey)) continue;
+		if (!session) {
+			// Nothing to compare a commondir against. Say so once rather than
+			// treating an unrelated tree as if it were this session's.
+			refused.push({
+				root: checkout.root,
+				reason: "session-root-not-a-checkout",
+			});
+			continue;
+		}
+		if (!sameCheckoutOtherRoot(session, checkout)) {
+			refused.push({ root: checkout.root, reason: "different-repository" });
+			continue;
+		}
+		if (extra >= OPAQUE_RECOVERY_ROOT_CAP) {
+			capped.push(checkout.root);
+			continue;
+		}
+		extra += 1;
+		admitted.add(rootKey);
+		roots.push(checkout.root);
+	}
+	return { roots, refused, capped };
+}
+
+const ROOT_REFUSAL_REASONS: Record<OpaqueRootRefusal, string> = {
+	"different-repository":
+		"a bash command named a git checkout in another repository; its writes were not observed (only a linked worktree of the session's own repository is recovered, #2050)",
+	"session-root-not-a-checkout":
+		"a bash command named a git checkout, but the session root is not one, so no commonDir could be compared and its writes were not observed",
+};
+
+/**
+ * Record, once per root and session, every checkout a bash command named that
+ * no baseline was taken for (#2050): a refusal is visible rather than read as
+ * "that command wrote nothing". The cap is one record per session, because it
+ * describes the bound, not a tree.
+ */
+export function recordOpaqueRootRefusals(scopes: OpaqueRecoveryRoots): void {
+	for (const { root, reason } of scopes.refused)
+		recordDegradationOnce({
+			kind: "opaque-recovery-root-refused",
+			subject: normalizeMapKey(root),
+			reason: ROOT_REFUSAL_REASONS[reason],
+		});
+	if (scopes.capped.length > 0)
+		recordDegradationOnce({
+			kind: "opaque-recovery-root-refused",
+			subject: "cap",
+			reason: `a bash command named more than ${OPAQUE_RECOVERY_ROOT_CAP} checkouts of this repository; the ones past the cap had no baseline taken and their writes were not observed`,
+		});
+}
+
+/**
  * The session-stamped slot (`<cwd>:<generation>`) a baseline lives in, derived
  * once for the `tool_call` record and the `tool_result` take (shape 19). The
  * generation keeps a concurrent-secondary session (#473) from consuming another
- * session's baseline.
+ * session's baseline; the root half is {@link opaquePrescanRoot}.
  */
 export function opaqueBaselineSlot(
 	scanRoot: string,
@@ -363,6 +595,15 @@ export class OpaqueBaselineStore {
 		if (evicted.length > 0) recordBaselineLoss("cap");
 	}
 
+	/**
+	 * #4732: whether `tool_call` recorded a baseline for this call. A tool other
+	 * than bash recovers only then, so its `tool_result` follows the decision its
+	 * own `tool_call` made instead of re-deriving it (shape 19).
+	 */
+	has(slot: string, callId: string): boolean {
+		return this.pending.has(OpaqueBaselineStore.keyOf(slot, callId));
+	}
+
 	take(
 		slot: string,
 		callId: string | undefined,
@@ -381,11 +622,32 @@ export class OpaqueBaselineStore {
 
 const BASELINE_LOSS_REASONS = {
 	overwrite:
-		"a pending bash baseline was replaced before its tool_result took it; that call reports partial-recognition-no-baseline and withholds blockers (host without distinct tool-call ids, or a reused id)",
-	cap: `more than ${OPAQUE_BASELINE_PENDING_CAP} bash baselines awaited a tool_result; the oldest was dropped`,
+		"a pending opaque baseline (bash or another captured tool) was replaced before its tool_result took it; that call reports partial-recognition-no-baseline and withholds blockers (host without distinct tool-call ids, or a reused id)",
+	cap: `more than ${OPAQUE_BASELINE_PENDING_CAP} opaque baselines (bash or other captured tools) awaited a tool_result; the oldest was dropped`,
 	unsettled:
-		"a bash baseline outlived its turn with no tool_result (the call was blocked or aborted before it ran) and was retired; a result that still arrives reports partial-recognition-no-baseline",
+		"an opaque baseline (bash or another captured tool) outlived its turn with no tool_result (the call was blocked or aborted before it ran) and was retired; a result that still arrives reports partial-recognition-no-baseline",
 } as const;
+
+/**
+ * #4732: record, once per cause and session, that a tool other than bash was
+ * not diffed or its diff could not answer, so its writes went unobserved.
+ * Subject `no-tool-call-id`: the host gave the call no id, and a shared slot
+ * would let it take a bash call's baseline. Any other subject is the recovery's
+ * unknown verdict (`git-failed`, `file-cap-exceeded`, ...).
+ */
+export function recordOpaqueCaptureRefused(
+	cause: string,
+	toolName: string,
+): void {
+	recordDegradationOnce({
+		kind: "opaque-capture-refused",
+		subject: cause,
+		reason:
+			cause === "no-tool-call-id"
+				? `a call of ${toolName} carried no tool-call id, so its writes were not diffed (a shared slot would take a bash call's baseline)`
+				: `the opaque diff of a ${toolName} call could not answer (${cause}); the files it wrote were not observed`,
+	});
+}
 
 function recordBaselineLoss(cause: keyof typeof BASELINE_LOSS_REASONS): void {
 	incrementDegradationCount({
@@ -422,6 +684,168 @@ export function resetOpaqueMutationState(): void {
 	getOpaqueBaselineStore().takeAllForTest();
 	gitRepoMemo.clear();
 	gitToplevelMemo.clear();
+	headRecords.clear();
+	headLooks.clear();
+	pendingHeadDiscards.clear();
+}
+
+/**
+ * #4493: the HEAD each session last saw in a scan slot, so a clean-tree HEAD
+ * move (checkout, reset --hard, a completed rebase or cherry-pick, or one made
+ * outside DM) is seen at all: `git status` is empty after one. Keyed by
+ * {@link headRecordKey}, so one session never reads or writes another's.
+ * Cleared with the rest of this module at the session boundary, where the LSP
+ * service resets too, so no held document outlives its record.
+ */
+const HEAD_RECORD_CAP = 64;
+const headRecords = new BoundedFifoMap<string, string>(HEAD_RECORD_CAP);
+
+/** One session's HEAD record key in a scan slot ({@link opaqueBaselineSlot}). */
+export function headRecordKey(
+	slot: string,
+	sessionId: string | undefined,
+): string {
+	return `${slot}|${sessionId ?? ""}`;
+}
+
+/**
+ * The same-HEAD discard paths a look of `key` still owes a publish (#4612 r4).
+ * The bash `tool_result` reads its own discard set from its own baseline, then
+ * hands it to a look; a look that arrives while another of its key is in
+ * flight JOINS it ({@link serializeHeadLook} coalescing), so its own closure
+ * never runs and its set would be dropped on the floor. Each caller adds its
+ * paths here in the same synchronous step as its join, and a pass drains its
+ * key first, before any await: the running pass has either not drained yet
+ * (it takes the paths) or has (the join earned a trailing pass, which takes
+ * them).
+ *
+ * Keyed by the look key ({@link headRecordKey}, which carries the session id
+ * and the generation, so a late pass never drains another session's set),
+ * bounded by {@link HEAD_RECORD_CAP} keys, each holding only what arrived
+ * during one pass, and cleared with the rest of this module at the session
+ * boundary.
+ */
+const pendingHeadDiscards = new BoundedFifoMap<string, Set<string>>(
+	HEAD_RECORD_CAP,
+);
+
+/** Hand this call's discard paths to the look of `key` that will publish them. */
+export function addHeadDiscards(
+	key: string,
+	paths: readonly string[] | undefined,
+): void {
+	if (!paths || paths.length === 0) return;
+	const pending = pendingHeadDiscards.get(key) ?? new Set<string>();
+	for (const filePath of paths) pending.add(filePath);
+	pendingHeadDiscards.set(key, pending);
+}
+
+/** Every discard path owed to `key`, in arrival order, and forget them. */
+export function takeHeadDiscards(key: string): string[] {
+	const pending = pendingHeadDiscards.get(key);
+	if (!pending) return [];
+	pendingHeadDiscards.delete(key);
+	return [...pending];
+}
+
+/**
+ * Test and diagnostic probe (#4612 r4): does a look of `key` in flight owe a
+ * trailing pass? A joining caller's own closure never runs, so a join is
+ * otherwise unobservable before the flight settles.
+ */
+export function headLookPendingRerun(key: string): boolean {
+	return headLooks.hasPendingRerun(key);
+}
+
+/**
+ * Record `head` for `key` and return the HEAD it replaces when that differs:
+ * the move to resync. A first observation returns `undefined`. Synchronous, so
+ * two looks cannot both claim a move; {@link serializeHeadLook} keeps the
+ * looks of one key in order.
+ */
+export function observeGitHead(key: string, head: string): string | undefined {
+	const previous = headRecords.get(key);
+	headRecords.delete(key);
+	headRecords.set(key, head);
+	return previous !== undefined && previous !== head ? previous : undefined;
+}
+
+/**
+ * #4493: one HEAD look per record key at a time. A session's parallel tool
+ * calls look concurrently. A look that arrives mid-flight joins it: it returns
+ * only once the flight has sent the move's bytes to the primary servers, so a
+ * parallel read or edit never runs against the stale view (review r1 F1). It
+ * also gets one trailing look of its own, which reads HEAD after the flight,
+ * so a move made after the flight read HEAD is seen before it returns (review
+ * r1 F2, #1687's shape). An entry lives while its flight runs.
+ */
+const headLooks = createSingleFlight<void>({ coalesceTrailing: true });
+
+/** Run `look` as the only HEAD look of `key` in flight. */
+export function serializeHeadLook(
+	key: string,
+	look: () => Promise<void>,
+): Promise<void> {
+	return headLooks.run(key, look);
+}
+
+const COMMIT_ID = /^[0-9a-f]{40,64}$/;
+
+/**
+ * HEAD's commit id, or `undefined` for an unborn HEAD or a failed read. Every
+ * non-bash tool_call looks, so the common case reads the files git keeps
+ * (`resolveGitIdentity`: HEAD, the loose ref, packed-refs; about 0.05 ms)
+ * and spawns `git rev-parse` only when those cannot answer: a reftable ref
+ * store, a SHA-256 detached HEAD, or anything else they do not resolve.
+ */
+export async function readGitHead(root: string): Promise<string | undefined> {
+	const fromFiles = resolveGitIdentity(root)?.headCommit;
+	if (fromFiles && COMMIT_ID.test(fromFiles)) return fromFiles;
+	const result = await safeSpawnAsync(
+		"git",
+		["rev-parse", "--verify", "-q", "HEAD"],
+		{ cwd: root, timeout: 3000 },
+	);
+	const head =
+		!result.error && result.status === 0 ? result.stdout?.trim() : undefined;
+	return head && COMMIT_ID.test(head) ? head : undefined;
+}
+
+/**
+ * The directory git prints porcelain and diff paths relative to: the top of
+ * the checkout `root` is in, in `root`'s own spelling (git's own toplevel is
+ * a real path). Read from files; `root` itself when that cannot answer.
+ *
+ * The walk skips a `.git` directory with no HEAD as git does (a stray
+ * `/tmp/.git` once sent every path to `/tmp`).
+ */
+function gitPathBase(root: string): string {
+	return resolveGitCheckout(root)?.spelledRoot ?? root;
+}
+
+/**
+ * The files that differ between commits `from` and `to`, as map keys, or
+ * `undefined` when git failed or the listing was cut. The whole checkout's
+ * delta, so a held document outside a subdirectory cwd is in it too;
+ * `--no-renames` lists both sides of a rename.
+ */
+export async function listGitHeadDelta(
+	root: string,
+	from: string,
+	to: string,
+): Promise<string[] | undefined> {
+	const result = await safeSpawnAsync(
+		"git",
+		["diff", "--name-only", "--no-renames", "-z", from, to],
+		{ cwd: root, timeout: 5000, maxOutputBytes: MAX_GIT_STATUS_OUTPUT_BYTES },
+	);
+	if (truncatedByOutputCap(result) || result.error || result.status !== 0)
+		return undefined;
+	const base = gitPathBase(root);
+	return (result.stdout ?? "")
+		.split("\0")
+		.filter(Boolean)
+		.map((relPath) => normalizeMapKey(path.resolve(base, relPath)));
 }
 
 /** Cached git-worktree probe (repos don't stop being git mid-session). */
@@ -512,6 +936,16 @@ export interface GitRecoveryOptions {
 interface GitStatusEntry {
 	status: string;
 	absPath: string;
+	/**
+	 * A rename's or copy's SOURCE side (#4612 r4). Porcelain v1 `-z` gives such
+	 * an entry as two NUL-separated tokens, `XY <new>` then `<old>`, so the
+	 * destination alone is one side of one entry. Recovery keeps using
+	 * `absPath` only (the bytes on disk are the destination's), while the
+	 * same-HEAD discard baseline needs both sides: `git reset --hard HEAD`
+	 * restores the source and removes the destination, which leaves the
+	 * destination absent from the tree and the source never named.
+	 */
+	renamedFrom?: string;
 }
 
 const UNMERGED_PORCELAIN_STATUSES = new Set([
@@ -595,20 +1029,27 @@ function isStructurallyValidStatus(status: string): boolean {
 }
 
 /**
- * Files dirty in the working tree whose mtime falls inside
- * [startedAt - tolerance, now]. Porcelain -z parsing handles renames
- * (the NEW path is reported; the old path token is skipped before filtering).
+ * One `git status --porcelain -z` read, parsed into typed entries, or the
+ * reason it could not be trusted. Extracted so the two consumers of the same
+ * bytes share one parser: {@link recoverOpaqueChangesViaGit} filters these
+ * entries through its mtime window, and {@link captureGitDirtyPaths} /
+ * {@link readSameHeadDiscards} compare the set before and after a command
+ * (#4502). A second hand-rolled porcelain parser is a second chance to disagree
+ * about a rename, a `!!` entry or an untrusted pair.
  */
-export async function recoverOpaqueChangesViaGit(
-	root: string,
-	startedAt: number,
-	options: GitRecoveryOptions = {},
-): Promise<GitRecoveryOutcome> {
+async function readGitStatusEntries({
+	cwd,
+}: {
+	cwd: string;
+}): Promise<
+	| { verdict: "ok"; entries: GitStatusEntry[]; unknownStatusCount: number }
+	| { verdict: "unknown"; unknownReason: OpaqueUnknownReason }
+> {
 	const result = await safeSpawnAsync(
 		"git",
 		["status", "--porcelain", "-z", "--untracked-files=all"],
 		{
-			cwd: root,
+			cwd,
 			timeout: 5000,
 			maxOutputBytes: MAX_GIT_STATUS_OUTPUT_BYTES,
 		},
@@ -623,71 +1064,157 @@ export async function recoverOpaqueChangesViaGit(
 	// "git-failed" and this guard could never speak. `truncatedByOutputCap`
 	// leaves a timed-out or aborted read to the git-failed branch below, which
 	// is the honest answer for those.
-	if (truncatedByOutputCap(result)) {
-		return {
-			verdict: "unknown",
-			paths: [],
-			unknownReason: "git-status-parse-failed",
-			scannedCount: 0,
-		};
-	}
-	if (result.error || (result.status !== 0 && result.status !== null)) {
-		return {
-			verdict: "unknown",
-			paths: [],
-			unknownReason: "git-failed",
-			scannedCount: 0,
-		};
-	}
+	if (truncatedByOutputCap(result))
+		return { verdict: "unknown", unknownReason: "git-status-parse-failed" };
+	if (result.error || (result.status !== 0 && result.status !== null))
+		return { verdict: "unknown", unknownReason: "git-failed" };
 	const raw = result.stdout ?? "";
-	if (raw && !raw.endsWith("\0")) {
-		return {
-			verdict: "unknown",
-			paths: [],
-			unknownReason: "git-status-parse-failed",
-			scannedCount: 0,
-		};
-	}
+	if (raw && !raw.endsWith("\0"))
+		return { verdict: "unknown", unknownReason: "git-status-parse-failed" };
+	// Porcelain paths are relative to the top of the checkout, not to `cwd`
+	// (#4493 residual 3): from a subdirectory each one pointed below itself.
+	const base = gitPathBase(cwd);
 	const entries: GitStatusEntry[] = [];
 	let unknownStatusCount = 0;
-	let skipNext = false; // rename's OLD path follows its NEW path
+	// A rename's or copy's OLD path follows its NEW path as the next token; this
+	// is the entry still waiting for it.
+	let awaitingSource: GitStatusEntry | undefined;
 	for (const token of raw.split("\0")) {
 		if (!token) continue;
-		if (skipNext) {
-			skipNext = false;
+		if (awaitingSource) {
+			awaitingSource.renamedFrom = path.resolve(base, token);
+			awaitingSource = undefined;
 			continue;
 		}
 		// Each entry: two status chars, one space, then the path.
-		if (token.length < 4 || token[2] !== " ") {
-			return {
-				verdict: "unknown",
-				paths: [],
-				unknownReason: "git-status-parse-failed",
-				scannedCount: 0,
-			};
-		}
+		if (token.length < 4 || token[2] !== " ")
+			return { verdict: "unknown", unknownReason: "git-status-parse-failed" };
 		const status = token.slice(0, 2);
 		const relPath = token.slice(3);
-		if (!isStructurallyValidStatus(status) || !relPath) {
-			return {
-				verdict: "unknown",
-				paths: [],
-				unknownReason: "git-status-parse-failed",
-				scannedCount: 0,
-			};
-		}
+		if (!isStructurallyValidStatus(status) || !relPath)
+			return { verdict: "unknown", unknownReason: "git-status-parse-failed" };
 		if (!isKnownPorcelainStatus(status)) unknownStatusCount += 1;
-		if (status.includes("R") || status.includes("C")) skipNext = true;
-		entries.push({ status, absPath: path.resolve(root, relPath) });
+		const entry: GitStatusEntry = {
+			status,
+			absPath: path.resolve(base, relPath),
+		};
+		entries.push(entry);
+		if (status.includes("R") || status.includes("C")) awaitingSource = entry;
 	}
-	if (skipNext) {
+	if (awaitingSource)
+		return { verdict: "unknown", unknownReason: "git-status-parse-failed" };
+	return { verdict: "ok", entries, unknownStatusCount };
+}
+
+/**
+ * The cap on the dirty set one bash call records before it runs (#4502). A
+ * discard restores at most the working tree, and an open document set is far
+ * smaller than a checkout, so the bound costs nothing real while keeping the
+ * pending baseline's memory and the post-command comparison bounded.
+ */
+export const SAME_HEAD_DIRTY_SET_CAP = 512;
+
+/**
+ * The working-tree paths that are dirty NOW, as map keys, or `undefined` when
+ * git could not answer. Recorded before a bash command so a same-HEAD discard
+ * (`git stash`, `git checkout .`, `git restore`) can be seen at all: those
+ * commands leave `git status` clean and HEAD unmoved, so the delta and the
+ * dirty set AFTER the command both name nothing.
+ *
+ * Bounded twice: the porcelain read by `MAX_GIT_STATUS_OUTPUT_BYTES`, and the
+ * recorded set by {@link SAME_HEAD_DIRTY_SET_CAP}. A cut set keeps its first
+ * `SAME_HEAD_DIRTY_SET_CAP` entries and reports itself, never silently.
+ */
+export async function captureGitDirtyPaths(
+	root: string,
+): Promise<string[] | undefined> {
+	const read = await readGitStatusEntries({ cwd: root });
+	if (read.verdict === "unknown") return undefined;
+	// BOTH sides of a rename or copy (#4612 r4). `git reset --hard HEAD`
+	// restores the source and removes the destination without moving HEAD, so a
+	// baseline that recorded only the destination names a path the discard
+	// removed and never the one it rewrote: the restored source kept its
+	// pre-discard server copy. Recovery keeps using the destination alone
+	// ({@link recoverOpaqueChangesViaGit}) — the bytes on disk are its subject.
+	const named: string[] = [];
+	for (const entry of read.entries) {
+		// `!!` is an ignored path, not a change a discard could revert; every
+		// other status names bytes a discard can rewrite or remove.
+		if (entry.status === "!!") continue;
+		named.push(entry.absPath);
+		if (entry.renamedFrom !== undefined) named.push(entry.renamedFrom);
+	}
+	const dirty: string[] = [];
+	const seen = new Set<string>();
+	for (const side of named) {
+		const key = normalizeMapKey(side);
+		if (seen.has(key)) continue;
+		if (dirty.length === SAME_HEAD_DIRTY_SET_CAP) {
+			incrementDegradationCount({
+				kind: "same-head-discard-set-capped",
+				subject: normalizeMapKey(path.resolve(root)),
+				reason: `more than ${SAME_HEAD_DIRTY_SET_CAP} working-tree paths were dirty before a bash call; a same-HEAD discard that reverts one of the rest is not detected for this call`,
+			});
+			break;
+		}
+		seen.add(key);
+		dirty.push(key);
+	}
+	return dirty;
+}
+
+/**
+ * The paths that were dirty before a command and are clean after it (#4502):
+ * the files a same-HEAD discard reverted. `undefined` when git could not answer
+ * now, so the caller resyncs nothing rather than guessing.
+ *
+ * A path that is merely absent from the new status is not a discard — a
+ * rejected command, an unreadable subtree — but the read itself proves the
+ * file is clean, and a clean file whose MTime moved is exactly what the drift
+ * pass can still check: the publish this feeds compares the server's bytes with
+ * the disk's, so a path whose bytes did not change costs one read and sends
+ * nothing.
+ */
+export async function readSameHeadDiscards(
+	root: string,
+	dirtyBefore: readonly string[],
+): Promise<string[] | undefined> {
+	if (dirtyBefore.length === 0) return [];
+	const read = await readGitStatusEntries({ cwd: root });
+	if (read.verdict === "unknown") return undefined;
+	// Both sides of a rename or copy count as still-dirty (#4612 r4): a baseline
+	// that named a rename's source would otherwise read it as discarded on every
+	// call of a rename that is still staged.
+	const dirtyNow = new Set<string>();
+	for (const entry of read.entries) {
+		dirtyNow.add(normalizeMapKey(entry.absPath));
+		if (entry.renamedFrom !== undefined)
+			dirtyNow.add(normalizeMapKey(entry.renamedFrom));
+	}
+	return dirtyBefore.filter((filePath) => !dirtyNow.has(filePath));
+}
+
+/**
+ * Files dirty in the working tree whose mtime falls inside
+ * [startedAt - tolerance, now]. Porcelain -z parsing handles renames: the NEW
+ * path is the one filtered, and the entry's source side (`renamedFrom`) is
+ * ignored here.
+ */
+export async function recoverOpaqueChangesViaGit(
+	root: string,
+	startedAt: number,
+	options: GitRecoveryOptions = {},
+): Promise<GitRecoveryOutcome> {
+	const read = await readGitStatusEntries({ cwd: root });
+	if (read.verdict === "unknown") {
 		return {
 			verdict: "unknown",
 			paths: [],
-			unknownReason: "git-status-parse-failed",
+			unknownReason: read.unknownReason,
 			scannedCount: 0,
 		};
 	}
+	const { entries, unknownStatusCount } = read;
 
 	const hasUnmerged = entries.some((entry) => isUnmergedStatus(entry.status));
 	const floorMs = startedAt - OPAQUE_MTIME_TOLERANCE_MS;

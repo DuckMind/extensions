@@ -2,8 +2,10 @@
  * Normalize a rule id to the form a user typically writes in a
  * `dm-lens-ignore` comment, an inline suppression, or a project-level
  * `disable`/`select` list. Strips the LSP source prefixes (`ast-grep:`;
- * `shuck:` for the shuck LSP's native `C/S/P/X/K` codes, #3968) and the
- * language suffix used by the rule catalogs.
+ * `shuck:` for the shuck LSP's native `C/S/P/X/K` codes, #3968; `Pyright:` and
+ * `basedpyright:` for the Pyright language servers, whose analyzer the
+ * `pyright` CLI runner also runs, #4629) and the language suffix used by the
+ * rule catalogs.
  */
 
 import * as fs from "node:fs";
@@ -55,8 +57,19 @@ if (bundledCodeRabbitRules) {
  * policy, inline-suppression and matcher comparisons run. Anchored at the
  * start (only the rendered `<source>:` form), so a code that merely CONTAINS
  * the token keeps matching raw.
+ *
+ * The list is closed, and each entry is spelled as its server publishes it
+ * (`pyright-langserver`: `source: "Pyright"`; `basedpyright-langserver`:
+ * `source: "basedpyright"`). A server not on it keeps its prefix: another
+ * analyzer's same-named code is another finding, and stripping every
+ * `<source>:` would merge them (#4629).
  */
-const LSP_SOURCE_PREFIXES = ["ast-grep:", "shuck:"];
+const LSP_SOURCE_PREFIXES = [
+	"ast-grep:",
+	"shuck:",
+	"Pyright:",
+	"basedpyright:",
+];
 
 export function normalizeRuleId(ruleId: string): string {
 	let normalized = ruleId;

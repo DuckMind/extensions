@@ -30,6 +30,7 @@ describe("startup discovery", () => {
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   let dir: string;
   let connected: string[];
+  let originalConnect: McpServerManager["connect"];
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "pi-mcp-startup-discovery-"));
@@ -37,6 +38,7 @@ describe("startup discovery", () => {
     fs.cacheWrites = [];
     connected = [];
     const connect = McpServerManager.prototype.connect;
+    originalConnect = connect;
     vi.spyOn(McpServerManager.prototype, "connect").mockImplementation(function (this: McpServerManager, name, ...rest) {
       connected.push(name);
       return connect.call(this, name, ...rest);
@@ -201,10 +203,10 @@ describe("startup discovery", () => {
   it("leaves nothing open and writes nothing when the runtime is replaced during discovery", async () => {
     const owner = createMcpRuntimeOwner();
     let manager: McpServerManager | undefined;
-    const connect = vi.mocked(McpServerManager.prototype.connect).getMockImplementation()!;
+    const connect = McpServerManager.prototype.connect;
     vi.spyOn(McpServerManager.prototype, "connect").mockImplementation(async function (this: McpServerManager, name, ...rest) {
       manager = this;
-      const connection = await connect.call(this, name, ...rest);
+      const connection = await originalConnect.call(this, name, ...rest);
       void owner.stop("MCP extension session restarted");
       return connection;
     });

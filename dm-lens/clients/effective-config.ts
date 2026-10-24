@@ -347,10 +347,12 @@ function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
  * explicit argument. Same gate, same answer, no write.
  *
  * ONE RESOLUTION ANSWERS THE WHOLE QUERY (#2427 review round 5, F-R4-1), taken
- * at the FILE's own directory whenever a file is asked about — matching what
- * the runtime registers via `ensureLSPConfigInitialized(path.dirname(filePath))`,
- * because a nested `repo/sub/.dm-lens.json` layer (config.ts header point 3)
- * reaches the runtime's decision no other way (round 4, F1).
+ * at the FILE's own directory whenever a file is asked about. The runtime
+ * registers the nearest config owner (any `PROJECT_CONFIG_LOCATIONS` file) at or above the file
+ * (`resolveSessionConfigRoot`, #2657), because a nested
+ * `repo/sub/.dm-lens.json` layer (config.ts header point 3) reaches the
+ * runtime's decision only through a registered root at or below it (round 4,
+ * F1).
  *
  * Round 4 moved the GATES to that root and left the rest — the redacted spec,
  * every `decidedBy`, the `documents` list — reading a SECOND resolution taken
@@ -434,12 +436,12 @@ export async function effectiveConfig(
 	// and its root is the FILE's own directory whenever a CONFINED file is
 	// asked about.
 	//
-	// The runtime registers LSP config at that directory —
-	// `ensureLSPConfigInitialized(path.dirname(filePath))` in
-	// `runtime-tool-call.ts` — and `getConfigForFile` answers with the deepest
-	// registered ancestor, so a nested `repo/sub/.dm-lens.json` (config.ts
-	// header point 3) only reaches the runtime's decision through the file's
-	// own directory. Round 4 fixed the GATES that way but left every other fact
+	// The runtime registers LSP config at the nearest config owner (any `PROJECT_CONFIG_LOCATIONS` file)
+	// at or above the file (`resolveSessionConfigRoot` in
+	// `runtime-tool-call.ts`, #2657), and `getConfigForFile` answers with the
+	// deepest registered ancestor, so a nested `repo/sub/.dm-lens.json`
+	// (config.ts header point 3) only reaches the runtime's decision through a
+	// registered root at or below it. Round 4 fixed the GATES that way but left every other fact
 	// — the redacted spec, every `decidedBy`, the `documents` list — read off a
 	// second resolution taken at the workspace root, so the query had two
 	// resolution roots and they disagreed: it reported the root's definition of

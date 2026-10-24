@@ -89,7 +89,12 @@ export type TurnStatePartition = Omit<TurnState, "sessions">;
 
 // --- Defaults ---
 
-const DEFAULT_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+/**
+ * The freshness window every scanner cache read applies by default (30
+ * minutes). The commit gate trusts the `turn-end-findings` record only inside
+ * it, and a carried section no file owns expires by it (#4750).
+ */
+export const DEFAULT_MAX_AGE_MS = 30 * 60 * 1000;
 const DEFAULT_TURN_STATE: TurnState = {
 	files: {},
 	turnCycles: 0,
@@ -442,6 +447,76 @@ export class CacheManager {
 			},
 			cwd,
 		);
+	}
+
+	/**
+	 * #4751: the primary's half of the turn_start role mirror above. The
+	 * envelope's owner is the identity `resolveTurnStatePartition` reads the
+	 * role from, so it must name the live primary. A departing primary keeps
+	 * its worklist for successor replay, which left its id there: its
+	 * in-process successor (pi's newSession, fork, clone, a resume of another
+	 * session) was read as a secondary, wrote a partition no turn end of its
+	 * own reads, and its turn end found no files. The claim admits two forms
+	 * and refuses every other: a pi owner of THIS process with another id (an
+	 * in-process predecessor, whose files the successor's turn end replays),
+	 * and an envelope with no owner and no files. A predecessor past the
+	 * #2504 stale bound (`isTurnStateOwnerStale`) is still claimed, or the
+	 * successor's write would be stranded again, but its files are evicted
+	 * here, as the turn end would evict them: they are not this turn's work.
+	 * Files under another process's owner, or under no owner, stay for the
+	 * liveness rule and the #2504 eviction at turn end.
+	 */
+	claimPrimaryTurnState(
+		cwd: string,
+		sessionId: string,
+	):
+		| {
+				from: string | undefined;
+				arm: "predecessor" | "empty";
+				filesKept: number;
+		  }
+		| {
+				from: string | undefined;
+				arm: "evicted";
+				filesKept: 0;
+				filesDropped: number;
+		  }
+		| undefined {
+		const envelope = this.readTurnStateEnvelope(cwd);
+		const owner = envelope.owner;
+		const filesKept = Object.keys(envelope.files ?? {}).length;
+		const predecessor =
+			owner?.kind === "pi" &&
+			owner.pid === process.pid &&
+			owner.id !== sessionId;
+		const arm = predecessor
+			? this.isTurnStateOwnerStale(owner)
+				? "evicted"
+				: "predecessor"
+			: owner === undefined && filesKept === 0
+				? "empty"
+				: undefined;
+		if (arm === undefined) return undefined;
+		const base =
+			arm === "evicted"
+				? { ...envelope, ...DEFAULT_TURN_STATE, files: {} }
+				: envelope;
+		this.writeTurnState(
+			{
+				...base,
+				sessionId,
+				owner: {
+					kind: "pi",
+					id: sessionId,
+					pid: process.pid,
+					lastSeen: new Date().toISOString(),
+				},
+			},
+			cwd,
+		);
+		return arm === "evicted"
+			? { from: owner?.id, arm, filesKept: 0, filesDropped: filesKept }
+			: { from: owner?.id, arm, filesKept };
 	}
 
 	/** Resolve the persisted primary/secondary turn-state partition. */

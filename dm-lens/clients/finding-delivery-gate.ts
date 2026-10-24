@@ -68,11 +68,22 @@
  * of that line — and WEAK (no line hash) for defer/flagged/suppress, which
  * are intent-level judgments that must survive incidental nearby edits.
  * `formatFullMode` (tools/lens-diagnostics.ts) applies this on every
- * mode=full pass; the per-edit dispatch path applies the identical filter
- * before writing into widget-state, so mode=all and the footer inherit
- * disposition state for any file that has gone through a live edit this
- * session WITHOUT re-computing it (kept cache-only and instant, #1634
- * criterion 5's documented exception — see "Explicit lag labels" below).
+ * mode=full pass and states how many findings it dropped. Every scan writer
+ * hands widget-state the POST-policy set: the per-edit dispatch path, and both
+ * mode=full writes (#4459 review F2: its first write used to hand over the raw
+ * sweep, so a re-reported marked finding replaced its tagged row under #3158
+ * retention rule 2 and the mark's count vanished on the next mode=full). A
+ * mark made later is reconciled into the store at mark time
+ * (`reconcileWidgetDisposition` tags the row rather than deleting it), and
+ * the tagged row survives later scans that no longer report the finding.
+ * `mode=all` re-applies the cached dispositions (`applyCachedDispositions`)
+ * without a scan, so it stays cache-only and instant. It counts both, the
+ * tagged rows (the footer's `suppressed: N`) and what its own filter dropped,
+ * and states the count, so a file whose findings were marked after a
+ * mode=full reads "No issues" only with that count beside it (#1634
+ * criterion 4). A mark made while the store held no row for the finding
+ * leaves no tagged row: mode=full states that drop, and mode=all, which lists
+ * the same rows, states none.
  *
  * ── Demotion rendering (#1419) ─────────────────────────────────────────────
  * A demoted finding is never silently dropped and never re-asserted at full
@@ -141,6 +152,45 @@
  * every labeled surface in `DELIVERY_SURFACES` calls it instead of hand-
  * rolling an age string. This is the "(b)" arm of #1634's contract: every
  * agent-facing surface is EITHER gated OR explicitly labeled — never neither.
+ *
+ * ── Per-lane traces ────────────────────────────────────────────────────────
+ * Each gate leaves one bounded record per delivery when it changes what the
+ * agent sees, never one per finding:
+ *   - `finding_dead_path_drop` and `finding_stale_line_demote` (latency phases,
+ *     `clients/advisory-provenance.ts`): a freshness gate dropped a finding
+ *     for a missing path or demoted one for drift. `quiet: true` judges
+ *     without writing them, for a caller that only peeks at an answer
+ *     another surface delivers. Pinned by
+ *     `tests/clients/advisory-provenance-finding-paths.test.ts` and
+ *     `tests/clients/advisory-provenance-finding-freshness.test.ts`.
+ *   - `lsp_probe_disposition_filter` (latency phase, `tools/lsp-diagnostics.ts`
+ *     `applyProbeFindingPolicy`): one per file whose stored dispositions or
+ *     rule policy dropped a finding, on the `lens_diagnostics source=lsp` probe
+ *     and on both `lsp_navigation workspaceDiagnostics` arms. A throwing
+ *     filter writes the `lsp-probe-finding-policy` degradation instead and
+ *     keeps every finding. Pinned by
+ *     `tests/tools/lens-diagnostics-lsp-dispositions.test.ts`,
+ *     `tests/tools/lens-diagnostics-lsp-policy-fail-open.test.ts` and
+ *     `tests/tools/lsp-navigation.test.ts`.
+ *   - `late_auxiliary_findings` (latency phase, `clients/runtime-turn.ts`):
+ *     the collect-later probe's delivered and dropped counts, one per turn.
+ *     Pinned by `tests/clients/lsp/late-auxiliary-findings.test.ts`.
+ *   - `demoted-finding-retired` (degradation ledger): every retirement above.
+ *     Pinned by `tests/clients/demoted-blocker-render-retirement.test.ts` and
+ *     `tests/clients/widget-dependency-drift-delivery-cap.test.ts`.
+ *   - What a disposition dropped is also told to the agent, never only
+ *     logged: "suppressed by disposition: N finding(s)". The tool results
+ *     that filter at delivery word it through `dispositionSuppressedLine`
+ *     below: the `lsp_diagnostics` probe, `lsp_navigation`,
+ *     `lens_diagnostics` mode=full and mode=all, and `dmlens_project_scan`.
+ *     The turn-end tiers (`dispositionSuppressedTotal`), the cascade runs
+ *     (`clients/cascade-format.ts`, `clients/dispatch/integration.ts`) and the
+ *     actionable-warnings advisory keep their own inline forms;
+ *     `clients/git-guard.ts` parses the runtime-turn one. Pinned by
+ *     `tests/index-3246-turn-end-delivery.test.ts`,
+ *     `tests/tools/lsp-navigation.test.ts`,
+ *     `tests/tools/lens-diagnostics-mode-all-full-agreement.test.ts` and
+ *     `tests/mcp/server.smoke.test.ts`.
  */
 
 const MS_PER_MINUTE = 60_000;
@@ -181,6 +231,32 @@ export function formatCacheAgeLabel(
 	return remMinutes === 0
 		? `scanned ${ageHours}h ago`
 		: `scanned ${ageHours}h ${remMinutes}m ago`;
+}
+
+/**
+ * #3088/#1634: the rendering of a finding-policy drop shared by the tool
+ * results that filter findings at delivery (the `lsp_diagnostics` probe's
+ * single-file, batch and directory renders, `lsp_navigation
+ * workspaceDiagnostics`, `lens_diagnostics` mode=full and mode=all,
+ * `dmlens_project_scan`), so none of them words the same fact differently.
+ * The turn-end and cascade forms are listed in the module doc above. Returns
+ * `undefined` when nothing was dropped: the #1616 rule asks for a count when
+ * there IS one, not a "0 suppressed" line on every clean result.
+ */
+export function dispositionSuppressedLine(
+	suppressed: number,
+	/** Per-lane attribution, e.g. "analyzer lanes: knip 2" (mode=full, #1625). */
+	breakdown?: string,
+): string | undefined {
+	if (suppressed <= 0) return undefined;
+	const lanes = breakdown ? ` (${breakdown})` : "";
+	return (
+		`suppressed by disposition: ${suppressed} finding(s)${lanes} dropped from this ` +
+		"result because they're marked false-positive/won't-fix, disabled by " +
+		"`.dm-lens.json` rule policy, or suppressed by an inline `dm-lens-ignore` " +
+		"comment. Not a clean verdict for those locations — they were found, " +
+		"then intentionally hidden."
+	);
 }
 
 interface DeliverySurfaceBase {
@@ -260,26 +336,24 @@ export function admitsProjectWideFindings(
 
 /**
  * The enumeration (#1634 criterion 1): every surface that renders findings to
- * the agent. Two DIFFERENT seam shapes, each derived structurally rather than
- * hand-listed (#1634 review round F2):
+ * the agent. `tests/clients/finding-delivery-gate.test.ts` derives it from the
+ * source three ways, so a new surface fails a test instead of waiting for a
+ * reader of this list:
  *
- *   - `clients/runtime-turn.ts`: every `blockerParts.push`/`advisoryParts.push`/
- *     `staleSecretParts.push` call site carries an `@delivery-surface: <id>`
- *     comment naming its entry here. `tests/clients/finding-delivery-gate.test.ts`
- *     scans the file for every such push call (comments/strings stripped, so a
- *     commented-out or string-embedded false match can't hide a REAL untagged
- *     seam) and fails if one has no tag, or a tag names an id not in this
- *     registry — a brand-new ungated `advisoryParts.push` cannot pass silently.
- *   - `tools/lens-diagnostics.ts`: each `mode=` report is its own function
- *     (`formatFullMode`/`formatAllMode`/`formatDeltaMode`), tagged the same way
- *     immediately above its `function` line.
- *   - `clients/widget-state.ts` (the footer) and `clients/agent-nudge.ts` are
- *     hand-registered below — one surface each, not a push-site pattern the
- *     scan can derive structurally, so a coverage test asserts these two
- *     files are not silently untouched by other tests in the same run.
- *
- * Single source of truth: adding a new render seam without adding/tagging an
- * entry here fails the coverage test, not a human re-reading a hand list.
+ *   - Tagged render seams (#3165). Every production file under clients/,
+ *     tools/ and mcp/, plus index.ts, is scanned (comments and strings
+ *     blanked) for the seam shapes: a `blockerParts`/`advisoryParts`/
+ *     `staleSecretParts` push, a `format*Mode` report function, and a
+ *     `formatCascadeNeighborDiagnostics` call. Each one needs an
+ *     `@delivery-surface: <id>` tag on the line above, naming an entry here
+ *     whose `file` is the seam's own file.
+ *   - Sink census. Every production file holding an agent-facing sink (a tool
+ *     result text block, a user-role or hook context message, a tool_call
+ *     block, a custom entry, a status or widget line) is either some entry's
+ *     `file` or classified in the test with the surfaces it carries or why
+ *     it carries none.
+ *   - Tool census. Every `TOOL_REGISTRY` tool names the surfaces it renders
+ *     or why it renders no findings.
  */
 /**
  * Factory for a `gated` entry. #1634 review round (SonarCloud): 20+ entries
@@ -514,6 +588,22 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 		["cascadeCarrySuffix("],
 		{ evidenceMin: 1 },
 	),
+	// #4487: cascade neighbour errors a cascade showed in an EARLIER turn and
+	// no later cascade or edit has shown gone. A cached claim, not a fresh
+	// observation, so each entry passes the freshness gate against its own
+	// read bound (`checkedAt`) before it renders (#4495 review F1, round 3):
+	// a deleted neighbour is forgotten; one written after the check by
+	// something pi never saw is named once as changed and not re-checked.
+	// Survivors carry the `(scanned Xm ago)` age of that read. The evidence is
+	// the two RENDERED lists, so the binding chain walks each back to the gate
+	// call's own arms (a render of the ungated candidates reds, #4495 r2
+	// verify census note).
+	"runtime-turn:cascade-pending-errors": gated(
+		RUNTIME_TURN_FILE,
+		"Turn-end 📐 list of cascade neighbour errors shown in an earlier turn and not re-checked since.",
+		["gateFindingsByPathFreshness"],
+		["unresolvedNeighbors", "changedShown"],
+	),
 	"runtime-turn:cascade-coverage-advisory": labeled(
 		RUNTIME_TURN_FILE,
 		"Turn-end cascade-coverage-gap advisories (graph/binding/budget).",
@@ -745,6 +835,70 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 		"In-result thrashing/blind-write detection notice.",
 		"Ephemeral notice computed at detection time inside the same tool result — " +
 			"no persistence and no cache, so nothing can be stale.",
+		"live",
+	),
+
+	// ── #1634 enumeration round: the rest of the agent-facing sinks ─────────
+	// Found by the sink census in `tests/clients/finding-delivery-gate.test.ts`,
+	// which derives every production file holding an agent-facing sink (a tool
+	// result's text block, a context or hook message, a tool_call block, a
+	// custom entry, a status/widget line) and fails on one that is neither a
+	// surface `file` here nor classified there.
+	"lsp-navigation:workspace-diagnostics-path": gated(
+		"tools/lsp-navigation.ts",
+		"`lsp_navigation workspaceDiagnostics` with a path: the server's answer " +
+			"for that file, read after a touch that waits for diagnostics.",
+		["applyProbeFindingPolicy"],
+		// The path read and the tracked snapshot below are the two calls.
+		["applyProbeFindingPolicy("],
+		{ evidenceMin: 2 },
+	),
+	"lsp-navigation:tracked-snapshot": labeled(
+		"tools/lsp-navigation.ts",
+		"`lsp_navigation workspaceDiagnostics` with no path: each tracked file's " +
+			"last client publish.",
+		"A replay of what each language client last published, with no re-check " +
+			"of the file, so every row states its age. The rows also pass the same " +
+			"finding policy as the path read (`readFileContent` supplies the " +
+			"current content), so the label and the disposition filter compose.",
+		"LSP client publish ts",
+		["lag: formatCacheAgeLabel(ts)", "readFileContent(trackedFile)"],
+	),
+	"runtime-context:persisted-findings": gated(
+		"clients/runtime-context.ts",
+		"Persisted turn-end and test-runner findings replayed into the next " +
+			"context message, the MCP turn_end tool and the Stop hook.",
+		["validateAdvisoryProvenance"],
+		// peekTurnEndFindings, consumeTurnEndFindings, peekTestFindings.
+		["validateAdvisoryProvenance(findings.data, cwd, runtime)"],
+		{ evidenceMin: 3 },
+	),
+	"index:turn-summary": labeled(
+		"index.ts",
+		"One-line turn summary custom entry (`--lens-turn-summary`).",
+		"Counts drained from this turn's own accumulator " +
+			"(`runtime.turnSummary.consume`) at the quiet window; nothing is " +
+			"replayed from a cache.",
+		"live",
+	),
+	"lens-engine:project-scan": gated(
+		"clients/lens-engine.ts",
+		"`dmlens_project_scan` (MCP): a fresh cheap project scan.",
+		["applyPushedFindingPolicyByFile"],
+		["applyPushedFindingPolicyByFile(scan.diagnostics, cwd)"],
+	),
+	"mcp-server:analyze": labeled(
+		"mcp/server.ts",
+		"`dmlens_analyze` (MCP): one file's dispatch result.",
+		"A dispatch run for this call, warm or in a fresh worker; the " +
+			"dispatcher applies the finding policy before it returns.",
+		"live",
+	),
+	"mcp-analyze-cli:post-edit-report": labeled(
+		"mcp/analyze-cli.ts",
+		"Claude Code PostToolUse hook report (`analyze-cli --hook`).",
+		"Same per-call dispatch as `dmlens_analyze`; its Stop-hook output is the " +
+			"`runtime-context:persisted-findings` replay or a fresh turn-end pass.",
 		"live",
 	),
 };

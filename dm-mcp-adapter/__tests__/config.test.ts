@@ -45,7 +45,6 @@ describe("config discovery", () => {
       vi.stubEnv("HOME", home);
       vi.stubEnv("PI_PACKAGE_DIR", "");
       vi.stubEnv("PI_CODING_AGENT_DIR", "");
-      vi.stubEnv("DM_CODING_AGENT_DIR", "");
       vi.stubEnv("PI_MCP_CONFIG_MODE", "merge");
     });
 

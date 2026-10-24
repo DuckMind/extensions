@@ -73,6 +73,7 @@ import {
 } from "./clients/read-guard-branch.js";
 import {
 	adoptHandoff,
+	asManager,
 	beginScope,
 	discardHandoff,
 	forwardHandoff,
@@ -139,7 +140,10 @@ import {
 	resolveDmLensFlag,
 	resolveDmLensFlagWithSource,
 } from "./clients/lens-config.js";
-import { LENS_FLAGS } from "./clients/lens-flag-registry.js";
+import {
+	LENS_FLAGS,
+	readLazyToolsSetting,
+} from "./clients/lens-flag-registry.js";
 import {
 	LENS_TOOL_NAMES,
 	resolveLensToolEnabled,
@@ -173,7 +177,10 @@ import {
 	readCrossProcessTouchesForTurnStart,
 } from "./clients/recent-touches.js";
 import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js";
-import { buildResolvedFoundCascadeRun } from "./clients/cascade-format.js";
+import {
+	buildResolvedFoundCascadeRun,
+	forgetCascadePendingNeighbor,
+} from "./clients/cascade-format.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/capabilities.js";
 import { shouldInitializeSessionRoot } from "./clients/lsp/session-roots.js";
@@ -186,6 +193,7 @@ import {
 	deregisterInstance,
 	deregisterInstanceRoot,
 	readInstanceRegistry,
+	recordRootDeregistrationFailure,
 	registerInstance,
 	registerInstanceRoot,
 } from "./clients/instance-registry.js";
@@ -193,9 +201,12 @@ import { logVanishedInstances } from "./clients/vanished-instance-marker.js";
 import {
 	buildMemorySample,
 	formatMemoryHealthLine,
+	type MemorySample,
 	recordMemorySampleOutcome,
+	recordMemoryTurnEnd,
 	resetMemorySamplerCadence,
 	shouldEmitMemorySampleAdaptive,
+	takeMemoryIdleGapMs,
 } from "./clients/memory-sampler.js";
 import { dumpActiveHandles } from "./clients/debug-handles.js";
 import {
@@ -238,11 +249,16 @@ import {
 	decideSessionStart,
 	decrementSecondarySessionCount,
 	getActivePrimaryRoot,
+	hasLiveSessionInProcess,
+	hasPrimaryRegistration,
+	isLiveSessionMember,
+	isPrimarySessionOwner,
 	namedSuccessorReason,
 	expiredSuccessorReason,
 	noteSessionShutdown,
 	releasePrimarySession,
 	probeCtxActive,
+	trackLiveSessionMembers,
 } from "./clients/session-lifecycle.js";
 import {
 	clearLastAnalyzedStateCache,
@@ -300,10 +316,14 @@ const LOOP_BLOCK_IDENTITY = "<dm-lens>";
 import {
 	isFreshSessionStart,
 	getRememberedLazyTools,
+	lazyToolsApply,
 	planToolSet,
+	recordToolSetDecision,
 	recordToolSetMutation,
 	rememberLazyTools,
+	resolveLazyToolsMode,
 	supportsDeferredTools,
+	supportsMidConvoSystemMessages,
 } from "./clients/tool-set-policy.js";
 import {
 	endSituationalToolTelemetry,
@@ -312,8 +332,10 @@ import {
 	startSituationalToolTelemetrySession,
 } from "./clients/situational-tool-telemetry.js";
 import {
+	type CacheContextInjectionHook,
 	type CacheContextInjectionSlice,
 	type CacheContextPlacement,
+	type CacheContextRetention,
 	clearCachePrefixSession,
 	emitCacheUsageSummaryAtSessionEnd,
 	logCacheUsage,
@@ -323,6 +345,10 @@ import {
 	resetCacheFindingIdentitiesSession,
 	recordTurnEndAdvisoryBytes,
 } from "./clients/cache-observability.js";
+import {
+	createInjectionLedger,
+	retainedSnapshotLabel,
+} from "./clients/context-injection-ledger.js";
 import {
 	buildStartupTimingRecords,
 	getDmLensEvalMs,
@@ -352,6 +378,7 @@ import { logSessionStart } from "./clients/sessionstart-logger.js";
 import {
 	emitConcurrentSessionBindRollupAtSessionEnd,
 	logConcurrentSessionBind,
+	logSharedTeardownForSecondarySession,
 	resetConcurrentSessionBindRollupCounts,
 } from "./clients/session-start-observability.js";
 import { normalizeToolDefinition } from "./clients/tool-definition.js";
@@ -797,10 +824,130 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// eviction or an add that found no entry cannot free another holder's root.
 	const secondaryRootHolder = `secondary:${randomUUID()}`;
 	let ownedSecondaryRoot: string | undefined;
-	// #3611: the session scope THIS activation serves, set once at its
-	// session_start and retired at its session_shutdown. Activation equals
-	// session (pi re-runs this factory on every transition except /tree).
+	// #4554: ONE activation can serve SEVERAL live sessions. pi re-runs this
+	// factory per session, but a host (and pi's own in-process handling) can also
+	// deliver several `session_start` events to one activation: M, then S1, S2…,
+	// same root and M live, so M is `primary` and each S is a declined
+	// `concurrent-secondary`. `ownedSessionRole` above is last-write-wins, so a
+	// secondary's start overwrote the primary's role and EVERY later shutdown —
+	// M's included — took the local-only branch: `cancelLSPIdleReset`,
+	// `resetLSPService`, `deregisterInstance` and `releasePrimarySession` never
+	// ran for the process, which kept its `instances.json` entry and its stale
+	// primary registration. Membership, not the stored role, decides the shared
+	// teardown: it runs once, when the LAST live member leaves.
+	// #4704: last in the PROCESS, not in this activation. pi 1.3.0 runs this
+	// factory once per session load, so an in-process subagent is ANOTHER
+	// activation, and reading only this list tore the shared infra down under
+	// it. The list stays this activation's own; `trackLiveSessionMembers`
+	// makes it readable to the others, and `hasLiveSessionInProcess` merges
+	// every list at read. `ctx` is the start's context, which that read probes.
+	const liveSessionMembers: Array<{
+		sessionId: string | undefined;
+		role: "primary" | "concurrent-secondary";
+		ctx: unknown;
+		scope?: SessionScope;
+	}> = [];
+	// Whether this activation ever ran a full admission (#4106: an activation
+	// that admitted none keeps the classifier's answer for an unmatched leave).
+	let admittedPrimary = false;
+	const enterLiveSession = (
+		sessionId: string | undefined,
+		role: "primary" | "concurrent-secondary",
+		ctx: unknown,
+	): (typeof liveSessionMembers)[number] => {
+		trackLiveSessionMembers(liveSessionMembers);
+		// A session re-announcing its own id in one activation is one member, not
+		// two: its single shutdown must still be able to be the last leave.
+		const known = liveSessionMembers.find(
+			(member) => sessionId !== undefined && member.sessionId === sessionId,
+		);
+		if (known) {
+			known.role = role;
+			// The registration is keyed by the context its admission used, so a
+			// re-admission's context is the one this member's leave must hold.
+			known.ctx = ctx;
+			return known;
+		}
+		const member = { sessionId, role, ctx };
+		liveSessionMembers.push(member);
+		return member;
+	};
+	/**
+	 * End this leave's membership, answering whether it was the activation's
+	 * LAST live member and which role THAT member's own start recorded.
+	 *
+	 * The member's own record, not `ownedSessionRole`, is what a leave is
+	 * labelled with: that closure field is overwritten by every later start, so
+	 * after a sibling's start it named the sibling rather than this session
+	 * (#4554).
+	 *
+	 * An unmatched leave — a shutdown whose id is unreadable, or one whose start
+	 * this activation never recorded or already retired — is not the last leave
+	 * while a member this activation DID record is still live (#4554 r6). It
+	 * answers `isLast` only when no live member remains, and no role: the caller
+	 * falls back to the shared classifier for its own labelling. When membership
+	 * is empty the fail-safe direction still holds — skipping the teardown is the
+	 * #472 orphan class (a leaked LSP fleet and registry entry), so an unmatched
+	 * leave with nothing left is treated as the last one.
+	 *
+	 * `isLast` is this activation's answer, which retires its own scope.
+	 * `isLastInProcess` is the process's (#4704): no activation, this one
+	 * included, still holds a live session, which is when the shared teardown
+	 * may run.
+	 */
+	const leaveLiveSession = (
+		sessionId: string | undefined,
+	): {
+		isLast: boolean;
+		isLastInProcess: boolean;
+		role: "primary" | "concurrent-secondary" | undefined;
+		ctx: unknown;
+		scope: SessionScope | undefined;
+		matched: boolean;
+	} => {
+		const memberIndex = liveSessionMembers.findIndex(
+			(member) => member.sessionId === sessionId,
+		);
+		const member =
+			memberIndex >= 0
+				? liveSessionMembers.splice(memberIndex, 1)[0]
+				: undefined;
+		return {
+			// Last means NO live member remains, matched or not. A leave this
+			// activation cannot place is still not the last leave while a member it
+			// did record is live: the superseded primary's delayed shutdown is
+			// exactly that leave (its record left at the replacement's full
+			// admission), and reading it as last reset the shared LSP fleet and the
+			// registry entry under the live replacement, and retired that
+			// replacement's scope in the `finally` (#4554 r6).
+			// #4704: a member pi disposed with no shutdown never leaves, so it is
+			// not live here either (the process read's own predicate).
+			isLast: !liveSessionMembers.some(isLiveSessionMember),
+			isLastInProcess: !hasLiveSessionInProcess(),
+			role: member?.role,
+			ctx: member?.ctx,
+			scope: member?.scope,
+			matched: member !== undefined,
+		};
+	};
+	// Most recent event scope for existing delivery handlers. Shutdown reads
+	// the departing member's scope, since an activation can serve siblings.
 	let scope: SessionScope | undefined;
+	/**
+	 * The scope of the session an event came from: the member that session's
+	 * own start recorded (#4554), by pi's stable id. `scope` names only the
+	 * session that started LAST, so a request or a tool call from an earlier
+	 * live sibling on this activation read or wrote that sibling's state
+	 * (#4631 r5, #4723 r4). An id this activation never recorded falls back to
+	 * `scope`, the only answer left.
+	 */
+	const scopeOfSession = (
+		sessionId: string | undefined,
+	): SessionScope | undefined =>
+		(sessionId === undefined
+			? undefined
+			: liveSessionMembers.find((member) => member.sessionId === sessionId)
+					?.scope) ?? scope;
 	// #3613: turn_end can deliver after another in-process activation has
 	// started its next session and changed the live coordinator scope. Keep the
 	// identity that owned this turn, rather than resolving ownership at delivery
@@ -1199,6 +1346,13 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// env override → CLI flag → global config, all resolved inside getLensFlag
 	// from the registry's DM_LENS_NO_CONTEXT_INJECTION env binding (#166).
 	let contextInjectionEnabled = !getLensFlag("no-lens-context");
+	// #4743: opt-in retained injections. The ledger belongs to this activation,
+	// and pi re-runs this factory for every new, resumed, forked or switched
+	// session and for /reload, so each of those starts with an empty ledger.
+	// The flag is read per request because pi applies extension flag values
+	// after the factory runs; its CLI value and the global config are fixed per
+	// load.
+	const injectionLedger = createInjectionLedger();
 	let lensWidgetVisible = globalConfig?.widget?.visible !== false;
 	let mountedLensWidgetUi: LensWidgetUi | undefined;
 	let widgetMountFailureLogged = false;
@@ -1529,7 +1683,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			if (disabledTools.length > 0) {
 				lines.push(`Tools disabled: ${formatDisabledToolNames(disabledTools)}`);
 			}
-			lines.push("Skills: managed by pi package filters");
+			lines.push("Skills: managed by DM package filters");
 			const slopScoreLine = dispatchIntegration.getDispatchSlopScoreLine();
 
 			if (crashEntries.length > 0) {
@@ -1897,6 +2051,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 			captureLspStatusRepaint,
 			() => runtime,
 			() => Boolean(getLensFlag("lens-guard")),
+			// #4323: `--no-opengrep` / `opengrep.enabled=false` keep the explicit
+			// `source=lsp` probe from starting Opengrep, as they do for dispatch.
+			(name) => getLensFlag(name),
 		),
 		createSymbolSearchTool(() => runtime.projectRoot),
 		createEffectiveConfigTool(() => runtime.projectRoot, noToolFlag),
@@ -1988,10 +2145,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 		}
 	};
 	// #3819: a file-less hand-off slot's ticket is bound to pi's session
-	// manager. A stale ctx throws on the read.
-	const getSessionManager = (ctx: unknown): unknown => {
+	// manager. A stale ctx throws on the read. The domain type is the one
+	// `clients/session-scope.ts` owns: only an object can key the slot's
+	// WeakMap, and every consumer narrows with the same `asManager`.
+	const getSessionManager = (ctx: unknown): object | undefined => {
 		try {
-			return (ctx as { sessionManager?: unknown }).sessionManager;
+			return asManager((ctx as { sessionManager?: unknown }).sessionManager);
 		} catch {
 			return undefined;
 		}
@@ -2003,10 +2162,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 		},
 		filteredLazyCatalog,
 		{
-			onActivated: (names) => {
+			onActivated: (names, ctx) => {
 				observeSituationalToolActivation(names);
-				// #3612: this activation's session scope owns its activations.
-				rememberLazyTools(scope, names);
+				// #3612: the calling session's scope owns its activations (#4723 r4).
+				rememberLazyTools(scopeOfSession(getStableSessionId(ctx)), names);
 			},
 			onRejected: (name) => {
 				if (
@@ -2179,42 +2338,69 @@ function activateExtension(hostPi: ExtensionAPI) {
 	//
 	// Feature-detected: `pi.getActiveTools`/`setActiveTools` aren't guaranteed
 	// present on every host the broad `@duckmind/dm-coding-agent` peer
-	// dependency allows. Under `--no-lazy-tools` nothing is touched at all:
-	// all-active IS the requested posture.
-	const applyToolSetPlan = (ctx: unknown, reason: string | undefined): void => {
+	// dependency allows. Under `--no-lazy-tools` the plan is the eager one,
+	// which keeps every enabled tool active (a no-op on a host start).
+	//
+	// #4687 item 7: whether the lazy tools start inactive follows `tools.lazy`
+	// (`lazyToolsApply`): lazy on every model by default; under `"auto"`, a
+	// model that folds system messages into one head gets every tool from the
+	// start, because each later tool-set change would rewrite the whole cached
+	// prefix. The plan runs at session_start and
+	// on a model switch only, so the set never flips within one model. An
+	// eager plan is the lazy one with every enabled lazy tool remembered: it
+	// re-activates what a lazy model left inactive and changes nothing on a
+	// host start, where every registered tool is already active.
+	const applyToolSetPlan = (
+		ctx: unknown,
+		reason: string | undefined,
+		trigger: "session_start" | "model_select" = "session_start",
+	): void => {
 		try {
 			const piWithActiveTools = pi as unknown as {
 				getActiveTools?: () => string[];
 				setActiveTools?: (names: string[]) => void;
 			};
 			if (
-				getLensFlag("no-lazy-tools") === true ||
 				typeof piWithActiveTools.getActiveTools !== "function" ||
 				typeof piWithActiveTools.setActiveTools !== "function"
 			)
 				return;
+			const model = (
+				ctx as { model?: Parameters<typeof lazyToolsApply>[1] } | undefined
+			)?.model;
+			const mode = resolveLazyToolsMode(
+				getLensFlag("no-lazy-tools") === true,
+				readLazyToolsSetting(globalConfig),
+			);
+			const lazy = lazyToolsApply(mode, model);
+			recordToolSetDecision({
+				trigger,
+				mode,
+				lazy,
+				supportsMidConvoSystemMessages: supportsMidConvoSystemMessages(model),
+			});
 			const lazyNames = new Set(enabledLazyTools);
 			const plan = planToolSet(
 				piWithActiveTools.getActiveTools(),
 				lazyNames,
-				getRememberedLazyTools(scope),
+				lazy ? getRememberedLazyTools(scope) : lazyNames,
 			);
 			if (!plan.changed) return;
 			piWithActiveTools.setActiveTools(plan.desired);
 			recordToolSetMutation({
 				addedCount: plan.addedCount,
 				removedCount: plan.removedCount,
-				reason: isFreshSessionStart(reason)
-					? "fresh_session_lazy_deactivation"
-					: "session_rebuild_restore",
-				deferralApplies: supportsDeferredTools(
-					(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })
-						?.model,
-				),
+				reason:
+					trigger === "model_select"
+						? "model_switch"
+						: isFreshSessionStart(reason)
+							? "fresh_session_lazy_deactivation"
+							: "session_rebuild_restore",
+				deferralApplies: supportsDeferredTools(model),
 			});
 		} catch (toolSetErr) {
 			dbg(
-				`dynamic tool set restore failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
+				`dynamic tool set restore failed (older DM host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
 			);
 		}
 	};
@@ -2293,13 +2479,21 @@ function activateExtension(hostPi: ExtensionAPI) {
 				}
 				const sessionStartMonotonicAt = performance.now();
 				warmDispatchAtSessionStart();
-				void warmLspService().catch((err) =>
-					logExtension({
-						subsystem: "lsp",
-						level: "warn",
-						message: `LSP warm failed: ${err}`,
-					}),
-				);
+				void warmLspService()
+					.then(() =>
+						logExtension({
+							subsystem: "lsp",
+							level: "debug",
+							message: "LSP warm resolved",
+						}),
+					)
+					.catch((err) =>
+						logExtension({
+							subsystem: "lsp",
+							level: "warn",
+							message: `LSP warm failed: ${err}`,
+						}),
+					);
 				void warmFormatters().catch((err) =>
 					logExtension({
 						subsystem: "format",
@@ -2400,6 +2594,23 @@ function activateExtension(hostPi: ExtensionAPI) {
 					ownedSessionRole = sessionStartDecision.runFullSessionStart
 						? "primary"
 						: "concurrent-secondary";
+					// #4554: every start of this activation is one live member, declined
+					// or not; the full start is also what makes the shared teardown this
+					// activation's to run.
+					if (sessionStartDecision.runFullSessionStart) {
+						admittedPrimary = true;
+						// Full admission supersedes the previous primary, even when
+						// its stale host never delivered session_shutdown (#4554 r5).
+						for (let i = liveSessionMembers.length - 1; i >= 0; i--) {
+							if (liveSessionMembers[i]!.role === "primary")
+								liveSessionMembers.splice(i, 1);
+						}
+					}
+					const startingMember = enterLiveSession(
+						stableSessionId,
+						ownedSessionRole,
+						ctx,
+					);
 					if (!sessionStartDecision.runFullSessionStart) {
 						dbg(
 							`session_start: ${sessionStartDecision.classification} detected (count=${sessionStartDecision.secondaryCount}, sameRoot=${sessionStartDecision.sameRoot}) — skipping handleSessionStart`,
@@ -2453,6 +2664,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 						// #3611: a secondary's own scope. The coordinator, and so the
 						// primary's generation, stays untouched (#473).
 						scope = beginScope({ role: "secondary" });
+						startingMember.scope = scope;
 						logScopeTransition(scope, {
 							transition: "start",
 							reason: sessionReason,
@@ -2656,6 +2868,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 						sessionStartBasis: sessionStartDecision.basis,
 						sessionStartGapMs: sessionStartDecision.gapMs,
 						sessionStartLineageMatch: sessionStartDecision.lineageMatch,
+						// #4704: another live session in the process (an in-process
+						// subagent) still drives the shared LSP fleet, so this full
+						// start must not reset it under that session.
+						keepSharedLsp: hasLiveSessionInProcess(startingMember),
 						getFlag: (name: string) => getLensFlag(name),
 						notify: (msg, level) => notifyUi(ctx, msg, level),
 						dbg,
@@ -2674,6 +2890,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// scope before its first await. Take it now (#3612): a throw later
 					// in the handler must not leave this activation without its scope.
 					scope = runtime.sessionScope;
+					startingMember.scope = scope;
 					registerPrimaryBridges(scope);
 					_turnSummaryEmitCtxGetter = rebindableProcessBridgeDeps(
 						"turn-summary-emit-context",
@@ -2791,6 +3008,16 @@ function activateExtension(hostPi: ExtensionAPI) {
 		),
 	);
 
+	// #4687 item 7: a model switch re-decides the lazy-tools posture for the
+	// new model. pi's switch already starts a fresh prompt cache, so the one
+	// tool-set write it may cause costs no extra prefix rewrite. pi emits this
+	// only when the model really changed (`modelsAreEqual`), and the plan is
+	// idempotent, so a switch between two models with the same capability
+	// writes nothing.
+	pi.on("model_select", (event) => {
+		applyToolSetPlan({ model: event.model }, undefined, "model_select");
+	});
+
 	// #3521: `/tree` moves the conversation inside this activation. Keep only
 	// the reads whose tool result is on the new branch. A concurrent secondary
 	// shares the module-level runtime, so its tree moves never touch the
@@ -2840,6 +3067,14 @@ function activateExtension(hostPi: ExtensionAPI) {
 		);
 		if (toolEntry && "situational" in toolEntry && toolEntry.situational) {
 			observeSituationalToolCall(toolEntry.name);
+			// #4723 F3: a tool the model called is a tool the conversation asked
+			// for, whichever posture made it active. Remembering it keeps a later
+			// switch to the lazy posture (or a reload) from hiding a tool in use.
+			// A disabled tool is never registered, so pi never delivers its call.
+			// r4: into the CALLING session's memory, not the last-started one's.
+			rememberLazyTools(scopeOfSession(getStableSessionId(ctx)), [
+				toolEntry.name,
+			]);
 		}
 		return handleToolCall({
 			event: event as unknown as Parameters<typeof handleToolCall>[0]["event"],
@@ -2957,6 +3192,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 						ownedSessionRole === "concurrent-secondary"
 							? "secondary"
 							: "primary",
+					// #4504: the same per-session cwd the `tool_call` hook hands the
+					// opaque prescan. A concurrent secondary's ctx carries ITS root while
+					// the shared coordinator keeps the primary's, and the prescan's two
+					// lookups must agree on one root.
+					cwd: ctx?.cwd,
 				}),
 				{
 					ms: editClass
@@ -3002,6 +3242,44 @@ function activateExtension(hostPi: ExtensionAPI) {
 		handleToolExecutionEnd(event, runtime.readGuard);
 	});
 
+	/** #1123 item 2 / #1332: one `memory_sample` latency record. `idleGapMs` is
+	 *  the post-idle tag (#1332); null for the periodic cadence sample. Returns
+	 *  the sample, or null when the observability failed; it never fails the
+	 *  turn it rides on. */
+	const emitMemorySample = (idleGapMs: number | null): MemorySample | null => {
+		try {
+			const sample = buildMemorySample(
+				runtime.wordIndex,
+				undefined,
+				undefined,
+				{
+					sessionAgeMs: Math.max(0, Date.now() - runtime.sessionStartedAt),
+					sessionStartedAt: runtime.sessionStartedAt,
+					turnCount: runtime.turnIndex,
+					// #2130: root discriminator. Two roots in one host emitted
+					// the same turnIndex with nothing to separate them.
+					root: getActivePrimaryRoot(),
+				},
+			);
+			logLatency({
+				type: "phase",
+				filePath: "<dm-lens>",
+				phase: "memory_sample",
+				durationMs: 0,
+				metadata: {
+					turnIndex: runtime.turnIndex,
+					...sample,
+					...(idleGapMs === null
+						? { idle: false }
+						: { idle: true, idleMs: idleGapMs }),
+				},
+			});
+			return sample;
+		} catch {
+			return null;
+		}
+	};
+
 	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
 	// Clear cascade snapshot at start of each new turn so stale data never leaks
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
@@ -3021,6 +3299,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// advances only its own turn identity and per-turn records; the
 		// coordinator's turn state is the primary's.
 		runtime.beginTurn(getStableSessionId(ctx));
+		// #1332: post-idle heap reading. Bounded by this session's turn-end marker:
+		// at most one idle sample per idle period.
+		const idleGapMs = takeMemoryIdleGapMs(getStableSessionId(ctx), Date.now());
+		if (idleGapMs !== null) emitMemorySample(idleGapMs);
 		// Capture before any awaited turn-end work can let a sibling session start.
 		turnStartScope = scope ?? runtime.sessionScope;
 		if (
@@ -3031,6 +3313,24 @@ function activateExtension(hostPi: ExtensionAPI) {
 				(ctx as { cwd?: string })?.cwd ?? process.cwd(),
 				getStableSessionId(ctx)!,
 			);
+		}
+		// #4751: the primary's half. The worklist writer reads the role from the
+		// envelope's owner, so the live primary takes it over from an in-process
+		// predecessor, under the id its writers and its turn end use.
+		if (ownedSessionRole === "primary") {
+			const turnStateCwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
+			const to = getStableSessionId(ctx) ?? runtime.telemetrySessionId;
+			const claim = cacheManager.claimPrimaryTurnState(turnStateCwd, to);
+			// One row per hand-off: the claim writes only while another id owns it.
+			if (claim)
+				logLatency({
+					type: "phase",
+					toolName: "turn_start",
+					filePath: turnStateCwd,
+					phase: "session_handoff_turn_state",
+					durationMs: 0,
+					metadata: { ...claim, to },
+				});
 		}
 		// Every turn, a secondary's too: clearing only re-runs a duplicate
 		// same-state analysis, while keeping it would skip a secondary's next
@@ -3324,6 +3624,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	const onTurnEnd = async (_event: any, ctx: any) => {
 		if (!lensEnabled) return;
+		// #1332: the idle gap is measured from here to this session's next turn
+		// start; another session's turn never reads it (#4761 review F1).
+		recordMemoryTurnEnd(getStableSessionId(ctx), Date.now());
 		// Esc/abort during the turn-end flush (knip/madge/tests + debounced
 		// dispatch) kills in-flight children instead of waiting out their timeout.
 		try {
@@ -3459,31 +3762,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// turn), and a subagent's fractional turn key never meets `% N`.
 			const cadenceTurn = runtime.turnStartCount;
 			if (shouldEmitMemorySampleAdaptive(cadenceTurn)) {
-				try {
-					const sample = buildMemorySample(
-						runtime.wordIndex,
-						undefined,
-						undefined,
-						{
-							sessionAgeMs: Math.max(0, Date.now() - runtime.sessionStartedAt),
-							sessionStartedAt: runtime.sessionStartedAt,
-							turnCount: runtime.turnIndex,
-							// #2130: root discriminator. Two roots in one host emitted
-							// the same turnIndex with nothing to separate them.
-							root: getActivePrimaryRoot(),
-						},
-					);
-					logLatency({
-						type: "phase",
-						filePath: "<dm-lens>",
-						phase: "memory_sample",
-						durationMs: 0,
-						metadata: { turnIndex: runtime.turnIndex, ...sample },
-					});
+				const sample = emitMemorySample(null);
+				if (sample)
 					recordMemorySampleOutcome(sample.process.heapUsedBytes, cadenceTurn);
-				} catch {
-					// best-effort observability — never fail turn_end over this
-				}
 			}
 
 			// #1123 item 3: bounded smells re-check, same cadence style as the memory
@@ -3596,7 +3877,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// so the next turn sees fresh state; this is a second, more generous
 	// attempt for anything still carried over, plus other deferrable work.
 	//
-	// Registration is safe on older pi hosts with no `agent_settled` event:
+	// Registration is safe on older DM hosts with no `agent_settled` event:
 	// the SDK's `pi.on` pushes onto a plain Map keyed by the event string with
 	// no validation, so an unknown event name is simply never looked up on
 	// emit — this handler would just never fire. try/catch below is
@@ -3620,12 +3901,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// next turn_end merges), reusing the existing neighbor→turn-end formatting —
 	// previously this outcome was logs-only, a silent under-report (#533).
 	registerCascadeTierReconcileTask(() => getLSPService(), {
-		onResolvedFound: ({ filePath, diagnostics, publishedAt }) => {
-			const run = buildResolvedFoundCascadeRun(runtime.projectRoot, {
-				filePath,
-				diagnostics,
-				publishedAt,
-			});
+		// #4495 round 3: the whole neighbour goes through, so its read bound
+		// (`touchedAt`) reaches the run with its publish stamp.
+		onResolvedFound: (neighbor) => {
+			const run = buildResolvedFoundCascadeRun(runtime.projectRoot, neighbor);
 			// #1443: the appended run outlives this turn's consumption —
 			// `beginTurn` carries it into the next turn_end exactly once instead
 			// of wiping it (which used to dead-end this whole delivery path).
@@ -3641,8 +3920,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// Scope caveat: the touch was `clientScope: "primary"`, so this clears the
 		// LSP-error entries of a multi-primary-server file on one server's clean —
 		// the same errors-only tradeoff the in-lane reconcile documents.
+		// #4487: the same clean also clears the neighbour's pending cascade
+		// errors, when it is newer than the observation that recorded them.
 		onResolvedClean: ({ filePath, publishedAt }) => {
 			reconcileCascadeNeighborLspErrors(filePath, [], undefined, publishedAt);
+			forgetCascadePendingNeighbor(filePath, publishedAt);
 		},
 	});
 	// #484: emit the opt-in run summary entry HERE, not at turn_end. The SDK's
@@ -3883,19 +4165,20 @@ function activateExtension(hostPi: ExtensionAPI) {
 			wrapSessionEventHandler("agent_settled", onAgentSettled, { dbg }),
 		);
 	} catch (registerErr) {
-		dbg(`agent_settled registration failed (older pi host?): ${registerErr}`);
+		dbg(`agent_settled registration failed (older DM host?): ${registerErr}`);
 	}
 
 	// #3611: retire this activation's scope once, with pi's shutdown reason.
 	const retireOwnScope = (
 		reason: string | undefined,
 		sessionId: string | undefined,
+		endingScope = scope,
 	): void => {
-		if (!scope) return;
-		retireScope(scope, reason);
-		logScopeTransition(scope, {
+		if (!endingScope) return;
+		retireScope(endingScope, reason);
+		logScopeTransition(endingScope, {
 			transition: "shutdown",
-			reason: scope.retiredBy(),
+			reason: endingScope.retiredBy(),
 			sessionId,
 			cwd: runtime.projectRoot,
 		});
@@ -3931,85 +4214,52 @@ function activateExtension(hostPi: ExtensionAPI) {
 				return undefined;
 			}
 		})();
-		const shutdownClassification = classifyOwnedSessionShutdown(
-			ctx,
-			stableSessionId,
-			shutdownCwd,
-		);
-		if (shutdownClassification === "secondary") {
-			if (stableSessionId !== undefined && shutdownCwd !== undefined) {
-				cacheManager.clearTurnState(
-					shutdownCwd,
-					{
-						kind: "pi",
-						id: stableSessionId,
-					},
-					stableSessionId,
-				);
-			}
-			emitCacheUsageSummaryAtSessionEnd(
-				stableSessionId,
-				"concurrent-secondary",
-			);
-			clearCachePrefixSession(stableSessionId, "concurrent-secondary");
-			// #3613: its per-turn records end with it.
-			runtime.forgetTurnSession(stableSessionId);
-			decrementSecondarySessionCount();
-			// #2130: scoped deregistration. A secondary's shutdown must never run
-			// `deregisterInstance()` — the process lives on and the primary still
-			// owns the entry. End only THIS activation's own hold (#3849): the
-			// root leaves the entry only when no other holder, the host's
-			// primary record included, still lists it. A secondary in the
-			// primary's own directory added nothing and removes nothing, and a
-			// hold the registry already ended is a documented no-op inside
-			// `deregisterInstanceRoot`.
-			//
-			// #2130 round 2: the call is now QUEUED, so it lands behind this
-			// session's own `void registerInstanceRoot(cwd)` from the declined
-			// start above rather than racing ahead of it and leaving the temp
-			// root behind. Fire and forget is still correct — the tail owns the
-			// ordering, and teardown must not block on a registry write.
-			if (ownedSecondaryRoot !== undefined) {
-				void deregisterInstanceRoot(
-					ownedSecondaryRoot,
-					secondaryRootHolder,
-				).catch(() => {
-					// best-effort bookkeeping — never fail teardown
-				});
-			}
-			// #3611: only this secondary's own scope retires.
-			retireOwnScope(
-				(event as { reason?: string } | undefined)?.reason,
-				stableSessionId,
-			);
-			dbg(
-				"session_shutdown: concurrent secondary — skipping shared-infra teardown",
-			);
-			return;
-		}
+		// #4554: the membership answers which session this leave is, and the shared
+		// teardown belongs to the LAST one, whatever role each was classified as.
+		// The stored role said `secondary` for every member here, so the primary's
+		// own shutdown skipped it and nothing ever released the process's shared
+		// infra.
+		const leave = leaveLiveSession(stableSessionId);
+		const isLastLiveMember = leave.isLast;
+		const shutdownScope = leave.matched ? leave.scope : scope;
+		// The member's own recorded role wins: the one this activation's start
+		// classified IT as, not the last start's. The classifier's answer stands
+		// for a leave this activation never recorded (a gap shutdown, #4106).
+		const shutdownClassification: "primary" | "secondary" =
+			leave.role === undefined
+				? classifyOwnedSessionShutdown(ctx, stableSessionId, shutdownCwd)
+				: leave.role === "primary"
+					? "primary"
+					: "secondary";
+		// #4704: two facts with two owners. The primary REGISTRATION is per
+		// primary: the leave of the session that holds it releases it, whatever
+		// else is live, so its successor (a cross-root `/resume` included) is
+		// admitted rather than declined behind a dead registration. A
+		// superseded activation never holds its successor's (#4554 r5); one
+		// that admitted none keeps the classifier's answer (#4106, #4113). The
+		// process's shared INFRA is per process: only a leave that leaves no
+		// session live in ANY activation tears it down. Every step of that
+		// teardown is a no-op with nothing up, so a delayed leave after the
+		// last one repeats nothing harmful.
+		// The holder is the member whose start context the registration was
+		// admitted with: the ownership identity, not the stable session id,
+		// which a reload can re-register in another activation (#4554 r5).
+		const holdsRegistration = leave.matched
+			? isPrimarySessionOwner(leave.ctx)
+			: !admittedPrimary && shutdownClassification === "primary";
+		const runsSharedTeardown = leave.isLastInProcess;
+		// The last live leave also releases a registration still held by a
+		// session that can no longer leave (pi disposed it with no shutdown).
+		const releasesRegistration =
+			holdsRegistration || (leave.isLastInProcess && hasPrimaryRegistration());
+
 		const shutdownEvent = event as
 			| { reason?: string; targetSessionFile?: string }
 			| undefined;
 		const shutdownReason = shutdownEvent?.reason;
-		const shutdownBudgetKey =
-			shutdownReason === "quit" ? "session_shutdown_quit" : "session_shutdown";
-		// Start this before synchronous teardown so writes emitted by the teardown
-		// itself join the same serialized writer drain. Returning the promise keeps
-		// pi's awaited shutdown boundary without delaying synchronous lifecycle work
-		// for existing embedders that call handlers directly.
-		const ndjsonDrain = bounded(flushAllNdjsonWriters(), {
-			ms: HOOK_WALL_BUDGET_MS[shutdownBudgetKey],
-			signal: undefined,
-			hook: "session_shutdown",
-			label: "ndjson-writers",
-		});
-		// #3611 r2: the retire runs in `finally`. After a /reload that
-		// re-evaluated the entry nothing else ever ends this scope, so a throw
-		// from a teardown step below must not skip it.
+		// #3611/#4554 r5: handoff and member cleanup share the teardown's
+		// existing retirement boundary, including a throwing store snapshot.
 		try {
-			// Graceful quit or replacement is awaited by pi before it closes the
-			// process/stdin. The returned drain promise keeps the at-exit replay from
-			// seeing an in-flight batch (#935). Hard exits skip this hook.
 			// #3612 (D3): hand this scope's stores to the successor that
 			// continues its conversation (`/reload`, `/fork`, `/clone`), before
 			// any teardown below. This portion stays synchronous; the hook returns
@@ -4022,37 +4272,166 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// (#4106), so the gap's name is the start reason it never saw. A
 			// started activation holds its scope and stashes it, even in a gap
 			// it does not own (a same-file second primary, R2: verify X1).
-			const unstartedReason =
-				startInFlight || scope !== undefined
-					? undefined
-					: (namedSuccessorReason() ?? expiredSuccessorReason());
-			if (startInFlight || unstartedReason !== undefined) {
-				if (startInFlight) startInFlight.shutDown = true;
-				forwardHandoff({
-					startReason: startInFlight ? startInFlight.reason : unstartedReason,
-					reason: shutdownReason,
-					sessionFile: getSessionFile(ctx),
-					targetSessionFile: shutdownEvent?.targetSessionFile,
-					sessionManager: getSessionManager(ctx),
-				});
-			} else if (
-				scope &&
-				stashHandoff(scope, {
-					reason: shutdownReason,
-					sessionFile: getSessionFile(ctx),
-					targetSessionFile: shutdownEvent?.targetSessionFile,
-					// #3819: a file-less successor finds this slot's ticket through
-					// the session manager pi hands it.
-					sessionManager: getSessionManager(ctx),
-				}) &&
-				runtime.hasStableSessionId
+			// Handoff belongs to the departing primary, even with live siblings.
+			// Handoff remains per activation even after shared ownership transfers.
+			if (shutdownClassification === "primary") {
+				const unstartedReason =
+					startInFlight || shutdownScope !== undefined
+						? undefined
+						: (namedSuccessorReason() ?? expiredSuccessorReason());
+				if (startInFlight || unstartedReason !== undefined) {
+					if (startInFlight) startInFlight.shutDown = true;
+					forwardHandoff({
+						startReason: startInFlight ? startInFlight.reason : unstartedReason,
+						reason: shutdownReason,
+						sessionFile: getSessionFile(ctx),
+						targetSessionFile: shutdownEvent?.targetSessionFile,
+						sessionManager: getSessionManager(ctx),
+					});
+				} else if (
+					shutdownScope &&
+					stashHandoff(shutdownScope, {
+						reason: shutdownReason,
+						sessionFile: getSessionFile(ctx),
+						targetSessionFile: shutdownEvent?.targetSessionFile,
+						// #3819: a file-less successor finds this slot's ticket through
+						// the session manager pi hands it.
+						sessionManager: getSessionManager(ctx),
+					}) &&
+					// #4554 r6: the DEPARTING member's identity names its sidecar.
+					// `runtime` is this module's process-wide coordinator, so its
+					// telemetry identity is last-write-wins: once another activation
+					// admitted a replacement it named THAT session, and this leave's
+					// stores were written into the replacement's file. A leave this
+					// activation recorded is the only one with a scope of its own to
+					// save, which is the same membership identity the shared-teardown
+					// decision uses.
+					stableSessionId !== undefined &&
+					leave.matched
+				) {
+					persistScope(
+						shutdownCwd ?? process.cwd(),
+						stableSessionId,
+						shutdownScope,
+					);
+				}
+			}
+
+			// `primary` here means this session really was the primary — it left
+			// while a sibling it never tore down was still live — so its own cache
+			// records are labelled for what it was, never as a secondary's.
+			const localRole =
+				shutdownClassification === "secondary"
+					? "concurrent-secondary"
+					: "primary";
+			// A departing primary leaves its persisted work for successor replay;
+			// every other leave clears its turn partition (#3676). #4704: that is
+			// the registration holder, whether or not the shared infra goes too.
+			if (
+				stableSessionId !== undefined &&
+				shutdownCwd !== undefined &&
+				!holdsRegistration
 			) {
-				persistScope(
-					shutdownCwd ?? process.cwd(),
-					runtime.telemetrySessionId,
-					scope,
+				cacheManager.clearTurnState(
+					shutdownCwd,
+					{
+						kind: "pi",
+						id: stableSessionId,
+					},
+					stableSessionId,
 				);
 			}
+			emitCacheUsageSummaryAtSessionEnd(stableSessionId, localRole);
+			clearCachePrefixSession(stableSessionId, localRole);
+			// #3613: its per-turn records end with it.
+			runtime.forgetTurnSession(stableSessionId);
+			// The counter counts LIVE secondaries; a primary leaving first is not a
+			// secondary departure.
+			if (shutdownClassification === "secondary")
+				decrementSecondarySessionCount();
+			// #2129 review F3: a departed primary's registration must not outlive
+			// it. Root identity made a stale `activeRoot` decisive: without this,
+			// once root A's primary ended, every later start in root B would
+			// classify `secondary-root` forever. #3662: a replacement reason
+			// leaves the slot pending for its successor. #3855: and names it by
+			// the key its start will compute. Read after the stash or forward
+			// above, which bind a file-less successor's ticket.
+			if (releasesRegistration)
+				releasePrimarySession(
+					shutdownReason,
+					successorStartKey({
+						reason: shutdownReason,
+						sessionFile: getSessionFile(ctx),
+						targetSessionFile: shutdownEvent?.targetSessionFile,
+						sessionManager: getSessionManager(ctx),
+					}),
+				);
+			if (!runsSharedTeardown) {
+				// #2130: scoped deregistration. A secondary's shutdown must never run
+				// `deregisterInstance()` — the process lives on and the primary still
+				// owns the entry. End only THIS activation's own hold (#3849): the
+				// root leaves the entry only when no other holder, the host's
+				// primary record included, still lists it. A secondary in the
+				// primary's own directory added nothing and removes nothing, and a
+				// hold the registry already ended is a documented no-op inside
+				// `deregisterInstanceRoot`.
+				//
+				// #2130 round 2: the call is now QUEUED, so it lands behind this
+				// session's own `void registerInstanceRoot(cwd)` from the declined
+				// start above rather than racing ahead of it and leaving the temp
+				// root behind. Fire and forget is still correct — the tail owns the
+				// ordering, and teardown must not block on a registry write.
+				if (
+					ownedSecondaryRoot !== undefined &&
+					shutdownClassification === "secondary"
+				) {
+					const releasedRoot = ownedSecondaryRoot;
+					// #4596: the queued deregistration can still reject (the residual
+					// the registry's own fs failures do not cover). Teardown must not
+					// fail on it, and the root then stays registered, so the rejection
+					// is recorded at the registry's owner with the root it held rather
+					// than swallowed.
+					void deregisterInstanceRoot(releasedRoot, secondaryRootHolder).catch(
+						(err: unknown) => {
+							recordRootDeregistrationFailure(
+								releasedRoot,
+								secondaryRootHolder,
+								err,
+							);
+						},
+					);
+				}
+				dbg(
+					shutdownClassification === "secondary"
+						? "session_shutdown: concurrent secondary — skipping shared-infra teardown"
+						: "session_shutdown: not the last live session — skipping shared-infra teardown",
+				);
+				return;
+			}
+			if (shutdownClassification === "secondary") {
+				// #4554: the last member is a session classified secondary, so the
+				// shared teardown runs on its behalf. One bounded record names that
+				// (the shared branch's own records describe the PRIMARY's infra).
+				logSharedTeardownForSecondarySession({
+					sessionId: stableSessionId,
+					cwd: shutdownCwd ?? runtime.projectRoot,
+				});
+			}
+			const shutdownBudgetKey =
+				shutdownReason === "quit"
+					? "session_shutdown_quit"
+					: "session_shutdown";
+			// Start this before synchronous teardown so writes emitted by the teardown
+			// itself join the same serialized writer drain. Returning the promise keeps
+			// pi's awaited shutdown boundary without delaying synchronous lifecycle work
+			// for existing embedders that call handlers directly.
+			const ndjsonDrain = bounded(flushAllNdjsonWriters(), {
+				ms: HOOK_WALL_BUDGET_MS[shutdownBudgetKey],
+				signal: undefined,
+				hook: "session_shutdown",
+				label: "ndjson-writers",
+			});
+
 			const switchesSessionFile =
 				typeof shutdownEvent?.targetSessionFile === "string" &&
 				shutdownEvent.targetSessionFile.length > 0;
@@ -4064,35 +4443,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 				endSituationalToolTelemetry();
 			}
 
-			// #1018/#1996: emit the bounded primary cache summary, then drop this
-			// session's prefix/attribution state. The secondary path did the same for
-			// its role-local bucket before returning above.
-			emitCacheUsageSummaryAtSessionEnd(stableSessionId, "primary");
-			clearCachePrefixSession(stableSessionId, "primary");
-
 			cancelLSPIdleReset();
 			// #449 slice 1: SYNC-only deregistration (no child spawns — see the
 			// processExiting note below); safe to call unconditionally here.
 			deregisterInstance();
-			// #2129 review F3: release the primary registration at the same boundary
-			// the registry entry is released. Root identity made a stale `activeRoot`
-			// decisive: without this, once root A's primary ended, every later start
-			// in root B would classify `secondary-root` forever — never primary,
-			// never a full start, no re-arm. This is the process-lifetime-latch shape
-			// the catalog names. Only the PRIMARY path reaches here; a secondary
-			// returned above precisely because the primary is still live.
-			// #3662: a replacement reason leaves the slot pending for its successor.
-			// #3855: and names it by the key its start will compute. Read after the
-			// stash or forward above, which bind a file-less successor's ticket.
-			releasePrimarySession(
-				shutdownReason,
-				successorStartKey({
-					reason: shutdownReason,
-					sessionFile: getSessionFile(ctx),
-					targetSessionFile: shutdownEvent?.targetSessionFile,
-					sessionManager: getSessionManager(ctx),
-				}),
-			);
 			// #2467: no analyzer bootstrap may START loading from here on. A demand
 			// already in flight keeps its promise and still settles — the gate is
 			// checked only when no flight exists. Nothing is spawned, which is what
@@ -4133,19 +4487,19 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// process from exiting (the #1097 lesson: what survives IS the leak).
 			// No-op unless DM_LENS_DEBUG_HANDLES=1.
 			dumpActiveHandles("session_shutdown");
+			return ndjsonDrain;
 		} finally {
-			// #3611: last, so nothing above runs under a retired scope. Every
-			// handle this session issued stops being current (design §3.4).
-			retireOwnScope(shutdownReason, stableSessionId);
+			// A non-last leave keeps the activation current for its siblings.
+			if (isLastLiveMember)
+				retireOwnScope(shutdownReason, stableSessionId, shutdownScope);
 		}
-		return ndjsonDrain;
 	});
 
 	// --- Prompt-cache response-side usage observability (#1018) ---
 	// On each assistant message_end, append ONE `cache_usage` latency record with
 	// the provider-reported token/cost breakdown. `message_end` is a newer host
 	// event; register defensively (clients/agent-nudge.ts pattern) — guard `pi.on`,
-	// wrap in try/catch, and never throw out of the handler — so an older pi host
+	// wrap in try/catch, and never throw out of the handler — so an older DM host
 	// that never fires it simply produces no records rather than crashing wireup.
 	try {
 		// biome-ignore lint/suspicious/noExplicitAny: message_end overload absent on older host types
@@ -4201,7 +4555,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// an older host that has no `message_end` event, so it must keep
 		// swallowing under the runner too — a host-capability probe is not a
 		// handler crash. Same for the `agent_settled` registration above.
-		dbg(`message_end subscribe failed (older pi host?): ${err}`);
+		dbg(`message_end subscribe failed (older DM host?): ${err}`);
 	}
 
 	// --- Inject turn-end findings into next agent turn ---
@@ -4244,7 +4598,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 	const appendToUserPromptContent = (
 		content: string | unknown[],
 		injectedText: string,
-	): unknown => {
+	): string | unknown[] => {
 		if (typeof content === "string") {
 			return content.length > 0
 				? `${content}\n\n${injectedText}`
@@ -4252,189 +4606,342 @@ function activateExtension(hostPi: ExtensionAPI) {
 		}
 		return [...content, { type: "text", text: injectedText }];
 	};
+	// #4631: pi 0.87+ splits the request transform in two. A `context` handler
+	// sees the conversation WITHOUT its system messages, and a changed list makes
+	// pi rebuild one merged system head from every system message
+	// (`restoreSystemMessages` in the host's core/extensions/runner). A transcript
+	// carrying a mid-list system message — pi appends one whenever prompt sections
+	// or tools change, which `dm_lens_activate_tools` and a reload both do — then
+	// got a head the provider had never cached, so every injecting turn missed the
+	// prompt cache (#4631: 22.8k cacheRead on injecting turns against 212k+ on
+	// quiet ones). `context_with_system` runs later in the SAME request, receives
+	// the full transcript, and its returned list is used verbatim, so the head
+	// stays byte-identical.
+	//
+	// The host generation is read from the EVENT, never from a version string: a
+	// `context` event whose first message is a system message is a pre-0.87 host
+	// (there the handler's return is assigned verbatim, so injecting is safe); one
+	// without it is 0.87+, and this hook then contributes NOTHING so the later
+	// `context_with_system` is the only injector. `pi.on` stores an unknown event
+	// name silently, so registering both is inert on an older host.
+	type ContextEventMessages = Array<{ role: string; content: unknown }>;
+	const carriesSystemHead = (messages: ContextEventMessages): boolean =>
+		messages[0]?.role === "system";
+	const injectIntoRequest = async (
+		event: { messages?: ContextEventMessages } | unknown,
+		ctx: { cwd?: string },
+		injectionHook: CacheContextInjectionHook,
+	) => {
+		// #1018: context telemetry deliberately runs even when the lens or its
+		// injection toggle is off, so an A/B run has a no-injection observation.
+		const existingMessages =
+			(event as { messages?: ContextEventMessages })?.messages ?? [];
+		const prefixSessionId = getStableSessionId(ctx);
+		const sessionRole = classifyOwnedSessionEmission(ctx, prefixSessionId);
+		// #1938: `observeCachePrefix` still owns the unbounded, always-accurate
+		// `cache_prefix_break` signal below. Its return value used to be threaded
+		// into `observeCacheContext` as `prefixObservation`, but that field was
+		// removed there (see the cache-observability.ts module doc) — the call
+		// stays for its `cache_prefix_break` side effect only.
+		observeCachePrefix(
+			existingMessages,
+			runtime.turnIndex,
+			prefixSessionId,
+			sessionRole,
+			dbg,
+		);
+		const effectiveInjectionEnabled = lensEnabled && contextInjectionEnabled;
+		let telemetryLogged = false;
+		const logContextObservation = (
+			resultMessages: Array<{ role: string; content: unknown }>,
+			placement: CacheContextPlacement,
+			// #1071: the per-source slices ARE the telemetry input. The source
+			// name list and the flat message list are both derived from them
+			// inside observeCacheContext, so this call site cannot report a
+			// source that contributed nothing.
+			injectionSlices: ReadonlyArray<CacheContextInjectionSlice>,
+			// #4743: where dm-lens spans begin in `resultMessages`, new or
+			// retained, so the next request's divergence can name a dropped one.
+			injectedPositions: readonly number[] = [],
+			retention?: CacheContextRetention,
+		) => {
+			if (telemetryLogged) return;
+			telemetryLogged = true;
+			observeCacheContext({
+				existingMessages,
+				resultMessages,
+				sessionId: prefixSessionId,
+				sessionRole,
+				turnIndex: runtime.turnIndex,
+				injectionEnabled: effectiveInjectionEnabled,
+				injectionSlices,
+				placement,
+				// #4631: which request hook delivered this observation, so a
+				// reader can tell a 0.87+ full-transcript observation from a
+				// pre-0.87 one without guessing from the host version.
+				injectionHook,
+				injectedPositions,
+				...(retention ? { retention } : {}),
+				dbg,
+			});
+		};
+		try {
+			const cwd = ctx.cwd ?? process.cwd();
+
+			// #4743: off, the ledger is neither read nor written, and the request is
+			// exactly what it was without the flag.
+			const ledger = getLensFlag("lens-retain-injections")
+				? injectionLedger
+				: undefined;
+			if (!effectiveInjectionEnabled) {
+				// #4743: injection switched off mid-session also stops re-sending
+				// what was retained, so no request carries dm-lens bytes while off.
+				ledger?.clearSession(prefixSessionId);
+				logContextObservation(existingMessages, "none", []);
+				return;
+			}
+
+			// #4743 (`--lens-retain-injections`): put back what earlier requests of
+			// this session injected, byte for byte and where it sat, BEFORE this
+			// request adds anything. Rendered text only: no record is read or
+			// consumed for it. Off, `base` is pi's own list.
+			const rebuilt = ledger?.rebuild(
+				prefixSessionId,
+				existingMessages,
+				appendToUserPromptContent,
+			);
+			const base = rebuilt?.messages ?? existingMessages;
+			const retention = (
+				retainedNew: boolean,
+				declined?: string,
+			): CacheContextRetention | undefined =>
+				rebuilt
+					? {
+							reemitted: rebuilt.reemitted,
+							reemittedBytes: rebuilt.reemittedBytes,
+							pruned: rebuilt.pruned,
+							retainedNew,
+							...((declined ?? rebuilt.declined)
+								? { declined: declined ?? rebuilt.declined }
+								: {}),
+						}
+					: undefined;
+			const retainedPositions = rebuilt?.retainedPositions ?? [];
+			const contributeBase = () =>
+				base === existingMessages ? undefined : { messages: base };
+
+			const turnEndFindings = consumeTurnEndFindings(
+				cacheManager,
+				cwd,
+				runtime,
+			);
+			const sessionGuidance = consumeSessionStartGuidance(cacheManager, cwd);
+			const testFindings = consumeStagedTestRunnerFindings({
+				cwd,
+				sessionId: runtime.telemetrySessionId,
+				ownerId: testRunnerDeliveryOwnerId,
+				cacheManager,
+				runtime,
+			});
+			// #4631 round 5 (F3): drain the nudge for the scope THIS request
+			// belongs to, not the activation-wide `scope` above. `session_start`
+			// reassigns that variable (both the primary and the declined-secondary
+			// arms), and on 0.87+ this consume runs in `context_with_system` — the
+			// LAST phase of the host's `emitContext`, after every other extension's
+			// `context` handler has been awaited. A concurrent in-process session
+			// start (#473) landing in that window used to reassign `scope`, so this
+			// request drained the OTHER session's advisories into its own messages
+			// and the owning session lost them. `liveSessionMembers` records each
+			// session's own scope at its start (#4554), and this is the same
+			// identity `leaveLiveSession` reads; `scopeOfSession` keeps the
+			// activation-wide scope as the fallback for a session it never recorded.
+			const agentNudge = consumeAgentNudge(
+				dbg,
+				scopeOfSession(prefixSessionId),
+			);
+			const sourceMessages = [
+				{
+					source: "session-guidance" as const,
+					messages: sessionGuidance?.messages ?? [],
+				},
+				{
+					source: "turn-findings" as const,
+					messages: turnEndFindings?.messages ?? [],
+				},
+				{
+					source: "test-findings" as const,
+					messages: testFindings?.messages ?? [],
+				},
+				{
+					source: "agent-nudge" as const,
+					messages: agentNudge?.messages ?? [],
+				},
+			].filter((source) => source.messages.length > 0);
+			const injectedMessages = sourceMessages.flatMap(
+				(source) => source.messages,
+			);
+			if (injectedMessages.length === 0) {
+				logContextObservation(
+					base,
+					"none",
+					[],
+					retainedPositions,
+					retention(false),
+				);
+				return contributeBase();
+			}
+
+			// Empty transcript (no turns yet): fall back to prepend semantics —
+			// there is no trailing user message to sit before, and we must never
+			// emit empty input (fe0ed5da: OpenAI Responses fails on empty input).
+			if (existingMessages.length === 0) {
+				const resultMessages = [...injectedMessages];
+				logContextObservation(resultMessages, "prepend", sourceMessages, [0]);
+				return { messages: resultMessages };
+			}
+
+			// The placement rule reads pi's own last message. With retention on,
+			// `base` ends with that same message too: a retained span after it is
+			// an "after" entry, which only a non-prompt last message gets, so the
+			// prompt path below never meets one.
+			const lastMessage = existingMessages[existingMessages.length - 1];
+			const lastPosition = base.length - 1;
+			// #4743: a retained injection says in its own bytes that it is a
+			// snapshot, so the label is part of what every later request repeats.
+			const snapshotLabel = ledger ? retainedSnapshotLabel() : undefined;
+
+			// Mid-loop the tail can be a tool_result (or assistant/tool) message;
+			// inserting before it would break tool_use↔tool_result adjacency. Only
+			// splice before the last message when it is a plain user prompt.
+			if (!isPlainUserPrompt(lastMessage)) {
+				// Append after the whole transcript — pure append preserves the
+				// adjacency AND leaves the entire prior transcript as an untouched
+				// cache prefix.
+				const labelled = snapshotLabel
+					? injectedMessages.map((message, index) =>
+							index === injectedMessages.length - 1
+								? {
+										...message,
+										content: `${message.content}\n\n${snapshotLabel}`,
+									}
+								: message,
+						)
+					: injectedMessages;
+				const declined = rebuilt?.retain({
+					kind: "after",
+					messages: labelled,
+				});
+				// A declined injection is not repeated, so it must not say it is.
+				const delivered = declined ? injectedMessages : labelled;
+				const resultMessages = [...base, ...delivered];
+				logContextObservation(
+					resultMessages,
+					"append",
+					sourceMessages,
+					[...retainedPositions, base.length],
+					retention(rebuilt !== undefined && declined === undefined, declined),
+				);
+				return { messages: resultMessages };
+			}
+
+			const joinedText = injectedMessages.map((m) => m.content).join("\n\n");
+			if (!joinedText) {
+				logContextObservation(
+					base,
+					"none",
+					[],
+					retainedPositions,
+					retention(false),
+				);
+				return contributeBase();
+			}
+			const labelledText = snapshotLabel
+				? `${joinedText}\n\n${snapshotLabel}`
+				: joinedText;
+			const declined = rebuilt?.retain({
+				kind: "user-text",
+				text: labelledText,
+			});
+			// A declined injection is not repeated, so it must not say it is.
+			const injectedText = declined ? joinedText : labelledText;
+
+			const lastBaseMessage = base[lastPosition] ?? lastMessage;
+			const updatedLastMessage = {
+				...lastBaseMessage,
+				content: appendToUserPromptContent(
+					lastBaseMessage.content as string | unknown[],
+					injectedText,
+				),
+			};
+
+			const resultMessages = [...base.slice(0, -1), updatedLastMessage];
+			logContextObservation(
+				resultMessages,
+				"append-to-last-user",
+				sourceMessages,
+				[...retainedPositions, lastPosition],
+				retention(rebuilt !== undefined && declined === undefined, declined),
+			);
+			return { messages: resultMessages };
+		} catch (err) {
+			// The stale-ctx class has ONE classifier and one record, in
+			// clients/session-event-guard.ts. Rethrow BEFORE the fallback
+			// observation (#1929): a session that no longer exists must not
+			// leave a "no injection" cache-context row behind, and the
+			// wrapper's own record is the accurate one.
+			if (isStaleExtensionCtxError(err)) throw err;
+			if (!telemetryLogged) logContextObservation(existingMessages, "none", []);
+			dbg(`context event error: ${err}`);
+		}
+	};
+	// #1929: `context` and `context_with_system` are reachable with a ctx the SDK
+	// already invalidated, exactly like the five handlers #1925 wrapped. They
+	// cannot use the void wrapper because the host CONSUMES their return value on
+	// the live path, so they use the value-returning variant and state their own
+	// stale-path answer below. Before this, a stale ctx surfaced as
+	// `context event error: …`, indistinguishable from a real handler bug, and
+	// counted nothing.
+	const contextInjectionGuard = {
+		dbg,
+		// #1929: a dead ctx means dm-lens contributes NOTHING to this request.
+		// `undefined` is that answer, and is what the non-injecting paths above
+		// already return, so the host keeps its own message list byte-for-byte.
+		// Never a half-built injection: the consume* calls that feed one have side
+		// effects and may not have run.
+		onStaleResult: () => undefined,
+	};
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context") overload has TS resolution bug
 	(pi as any).on(
 		"context",
-		// #1929: `context` is reachable with a ctx the SDK already invalidated,
-		// exactly like the five handlers #1925 wrapped. It could not use the void
-		// wrapper because the host CONSUMES its return value on the live path, so
-		// it uses the value-returning variant and states its own stale-path answer
-		// below. Before this, a stale ctx surfaced as `context event error: …`,
-		// indistinguishable from a real handler bug, and counted nothing.
 		wrapSessionEventHandlerWithResult(
 			"context",
 			async (
-				event:
-					| { messages?: Array<{ role: string; content: unknown }> }
-					| unknown,
+				event: { messages?: ContextEventMessages } | unknown,
 				ctx: { cwd?: string },
 			) => {
-				// #1018: context telemetry deliberately runs even when the lens or its
-				// injection toggle is off, so an A/B run has a no-injection observation.
-				const existingMessages =
-					(event as { messages?: Array<{ role: string; content: unknown }> })
-						?.messages ?? [];
-				const prefixSessionId = getStableSessionId(ctx);
-				const sessionRole = classifyOwnedSessionEmission(ctx, prefixSessionId);
-				// #1938: `observeCachePrefix` still owns the unbounded, always-accurate
-				// `cache_prefix_break` signal below. Its return value used to be threaded
-				// into `observeCacheContext` as `prefixObservation`, but that field was
-				// removed there (see the cache-observability.ts module doc) — the call
-				// stays for its `cache_prefix_break` side effect only.
-				observeCachePrefix(
-					existingMessages,
-					runtime.turnIndex,
-					prefixSessionId,
-					sessionRole,
-					dbg,
-				);
-				const effectiveInjectionEnabled =
-					lensEnabled && contextInjectionEnabled;
-				let telemetryLogged = false;
-				const logContextObservation = (
-					resultMessages: Array<{ role: string; content: unknown }>,
-					placement: CacheContextPlacement,
-					// #1071: the per-source slices ARE the telemetry input. The source
-					// name list and the flat message list are both derived from them
-					// inside observeCacheContext, so this call site cannot report a
-					// source that contributed nothing.
-					injectionSlices: ReadonlyArray<CacheContextInjectionSlice>,
-				) => {
-					if (telemetryLogged) return;
-					telemetryLogged = true;
-					observeCacheContext({
-						existingMessages,
-						resultMessages,
-						sessionId: prefixSessionId,
-						sessionRole,
-						turnIndex: runtime.turnIndex,
-						injectionEnabled: effectiveInjectionEnabled,
-						injectionSlices,
-						placement,
-						dbg,
-					});
-				};
-				try {
-					const cwd = ctx.cwd ?? process.cwd();
-
-					if (!effectiveInjectionEnabled) {
-						logContextObservation(existingMessages, "none", []);
-						return;
-					}
-
-					const turnEndFindings = consumeTurnEndFindings(
-						cacheManager,
-						cwd,
-						runtime,
-					);
-					const sessionGuidance = consumeSessionStartGuidance(
-						cacheManager,
-						cwd,
-					);
-					const testFindings = consumeStagedTestRunnerFindings({
-						cwd,
-						sessionId: runtime.telemetrySessionId,
-						ownerId: testRunnerDeliveryOwnerId,
-						cacheManager,
-						runtime,
-					});
-					const agentNudge = consumeAgentNudge(dbg, scope);
-					const sourceMessages = [
-						{
-							source: "session-guidance" as const,
-							messages: sessionGuidance?.messages ?? [],
-						},
-						{
-							source: "turn-findings" as const,
-							messages: turnEndFindings?.messages ?? [],
-						},
-						{
-							source: "test-findings" as const,
-							messages: testFindings?.messages ?? [],
-						},
-						{
-							source: "agent-nudge" as const,
-							messages: agentNudge?.messages ?? [],
-						},
-					].filter((source) => source.messages.length > 0);
-					const injectedMessages = sourceMessages.flatMap(
-						(source) => source.messages,
-					);
-					if (injectedMessages.length === 0) {
-						logContextObservation(existingMessages, "none", []);
-						return;
-					}
-
-					// Empty transcript (no turns yet): fall back to prepend semantics —
-					// there is no trailing user message to sit before, and we must never
-					// emit empty input (fe0ed5da: OpenAI Responses fails on empty input).
-					if (existingMessages.length === 0) {
-						const resultMessages = [...injectedMessages];
-						logContextObservation(resultMessages, "prepend", sourceMessages);
-						return { messages: resultMessages };
-					}
-
-					const lastMessage = existingMessages[existingMessages.length - 1];
-
-					// Mid-loop the tail can be a tool_result (or assistant/tool) message;
-					// inserting before it would break tool_use↔tool_result adjacency. Only
-					// splice before the last message when it is a plain user prompt.
-					if (!isPlainUserPrompt(lastMessage)) {
-						// Append after the whole transcript — pure append preserves the
-						// adjacency AND leaves the entire prior transcript as an untouched
-						// cache prefix.
-						const resultMessages = [...existingMessages, ...injectedMessages];
-						logContextObservation(resultMessages, "append", sourceMessages);
-						return { messages: resultMessages };
-					}
-
-					const injectedText = injectedMessages
-						.map((m) => m.content)
-						.join("\n\n");
-					if (!injectedText) {
-						logContextObservation(existingMessages, "none", []);
-						return;
-					}
-
-					const updatedLastMessage = {
-						...lastMessage,
-						content: appendToUserPromptContent(
-							lastMessage.content as string | unknown[],
-							injectedText,
-						),
-					};
-
-					const resultMessages = [
-						...existingMessages.slice(0, -1),
-						updatedLastMessage,
-					];
-					logContextObservation(
-						resultMessages,
-						"append-to-last-user",
-						sourceMessages,
-					);
-					return { messages: resultMessages };
-				} catch (err) {
-					// The stale-ctx class has ONE classifier and one record, in
-					// clients/session-event-guard.ts. Rethrow BEFORE the fallback
-					// observation (#1929): a session that no longer exists must not
-					// leave a "no injection" cache-context row behind, and the
-					// wrapper's own record is the accurate one.
-					if (isStaleExtensionCtxError(err)) throw err;
-					if (!telemetryLogged)
-						logContextObservation(existingMessages, "none", []);
-					dbg(`context event error: ${err}`);
-				}
+				const messages =
+					(event as { messages?: ContextEventMessages })?.messages ?? [];
+				// #4631 gate: a `context` event that carries the transcript's system
+				// head is a pre-0.87 host. On 0.87+ the head is filtered out here and
+				// the full transcript arrives at `context_with_system` later in this
+				// same request, so this hook must return `undefined` (pi's "this
+				// extension contributed nothing") and leave pi's list untouched.
+				if (!carriesSystemHead(messages)) return undefined;
+				return injectIntoRequest(event, ctx, "context");
 			},
-			{
-				dbg,
-				// #1929: a dead ctx means dm-lens contributes NOTHING to this
-				// request. `undefined` is that answer, and is what the four
-				// non-injecting paths above already return, so the host keeps its
-				// own message list byte-for-byte. Never a half-built injection: the
-				// consume* calls that feed one have side effects and may not have run.
-				onStaleResult: () => undefined,
-			},
+			contextInjectionGuard,
+		),
+	);
+	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context_with_system") overload has TS resolution bug
+	(pi as any).on(
+		"context_with_system",
+		wrapSessionEventHandlerWithResult(
+			"context_with_system",
+			(
+				event: { messages?: ContextEventMessages } | unknown,
+				ctx: { cwd?: string },
+			) => injectIntoRequest(event, ctx, "context_with_system"),
+			contextInjectionGuard,
 		),
 	);
 }

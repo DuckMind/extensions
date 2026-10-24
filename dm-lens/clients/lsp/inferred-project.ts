@@ -30,6 +30,10 @@ import {
 	type TsserverSyncCapableService,
 } from "./tsserver-sync.js";
 import { toProjectRelativePath } from "../path-utils.js";
+import {
+	demoteEnvironmentGapDiagnostics,
+	isTypeScriptSourcedDiagnostic,
+} from "./environment-gap.js";
 import { logLatency } from "../latency-logger.js";
 
 /**
@@ -55,20 +59,8 @@ const TS_PROJECT_EXTENSIONS = new Set([
 	".cjs",
 ]);
 
-/**
- * `source` values the classic typescript-language-server stamps on its own
- * diagnostics. Auxiliary servers sharing the same result (opengrep, typos,
- * zizmor, ast-grep) carry their own source and are NOT affected by a tsconfig
- * gap, so they keep their severity.
- */
-const TYPESCRIPT_DIAGNOSTIC_SOURCES = new Set(["typescript", "ts", "tsserver"]);
-
 export function isTsProjectFile(filePath: string): boolean {
 	return TS_PROJECT_EXTENSIONS.has(path.extname(filePath).toLowerCase());
-}
-
-function isTypeScriptSourcedDiagnostic(d: LSPDiagnostic): boolean {
-	return TYPESCRIPT_DIAGNOSTIC_SOURCES.has((d.source ?? "").toLowerCase());
 }
 
 /**
@@ -121,10 +113,28 @@ function isDemotableDiagnostic(d: LSPDiagnostic): boolean {
 	return d.severity === 1 && isTypeScriptSourcedDiagnostic(d);
 }
 
+/**
+ * Whether the membership verdict could change any of these rows: a file
+ * tsserver owns, carrying a TypeScript-sourced error. The probe's own
+ * precondition, so a caller that sends the probe itself (the warm incumbent,
+ * #4645) asks exactly when this module would.
+ */
+export function hasInferredProjectCandidates(
+	diagnostics: LSPDiagnostic[],
+	filePath: string,
+): boolean {
+	return isTsProjectFile(filePath) && diagnostics.some(isDemotableDiagnostic);
+}
+
 export interface InferredProjectDemotionOptions {
 	filePath: string;
 	cwd: string;
-	service: TsserverSyncCapableService;
+	/**
+	 * The service the probe asks. Omitted: no probe is sent, and only an answer
+	 * already in `identityCache` applies (#4645: a warm-attached reader seeds it
+	 * with the incumbent's own answer, since asking here would spawn).
+	 */
+	service?: TsserverSyncCapableService;
 	/**
 	 * Per-call-batch memo so one sweep probes each file once. Deliberately
 	 * caller-owned and short-lived: a module-level cache would pin turn one's
@@ -156,8 +166,7 @@ export async function demoteInferredProjectDiagnostics(
 	options: InferredProjectDemotionOptions,
 ): Promise<LSPDiagnostic[]> {
 	const { filePath, cwd, service } = options;
-	if (!isTsProjectFile(filePath)) return diagnostics;
-	if (!diagnostics.some(isDemotableDiagnostic)) return diagnostics;
+	if (!hasInferredProjectCandidates(diagnostics, filePath)) return diagnostics;
 	if (options.signal?.aborted) return diagnostics;
 
 	const fetchIdentity = options.fetchIdentity ?? fetchTsserverProjectIdentity;
@@ -165,6 +174,8 @@ export async function demoteInferredProjectDiagnostics(
 	let identity: TsserverProjectIdentity | undefined;
 	if (cache?.has(filePath)) {
 		identity = cache.get(filePath);
+	} else if (service === undefined) {
+		return diagnostics;
 	} else {
 		identity = await fetchIdentity(service, filePath);
 		cache?.set(filePath, identity);
@@ -179,6 +190,72 @@ export async function demoteInferredProjectDiagnostics(
 }
 
 /**
+ * The ONE demotion pipeline for a TypeScript server's raw rows (#4532 round 5,
+ * review F3; AGENTS.md shape 71, one signal wired consumer by consumer). The
+ * environment-gap rule (`environment-gap.ts`, a bounded walk of `stat` calls,
+ * no server request) runs first, so the membership probe, which only looks at
+ * severity-1 rows, pays nothing for a row it already demoted. The per-edit
+ * runner and every `lsp_diagnostics` route call this; the `mode=full` sweep
+ * runs the same two rules in `demoteInferredProjectSweepResults`, and the
+ * cascade's synchronous seams run the environment rule alone (they have no
+ * membership probe; see `applyCascadeDisplayPolicy` and
+ * `cascadeReconcilableLspErrors`). Every writer of the widget store routes its
+ * rows through it, so an orphan file never blocks or not depending on which
+ * tool ran last (#1645 review F3, the #1633-V1 lesson).
+ *
+ * `service` omitted skips the membership probe and keeps the environment rule:
+ * a warm-attached session's rows came from a remote fleet this process does
+ * not own, so the probe would have to spawn one to answer (#1645 review F2).
+ * The incumbent that owns that fleet asks instead and sends its answer beside
+ * the raw rows; the reader seeds `identityCache` with it, so both outputs below
+ * are what a local read of the same rows gives (#4645).
+ *
+ * `rows` is what a consumer renders. `replayable()` is what a cache entry
+ * stores, and the two rules differ in what a replay can re-derive (#4532
+ * round 6, r5 verify NEW-1, shape 6). The environment verdict depends on the
+ * install state, which no entry key carries, so it is never baked in: the
+ * replay re-runs it (review F5). The membership verdict needs a live tsserver,
+ * which a replay often lacks (a new session reading the on-disk cache, an
+ * evicted server), so it IS baked in: an unknown answer on the replay must not
+ * undo a known one from the serve. `replayable()` is therefore the membership
+ * rule over the RAW rows. When the environment rule changed nothing that is
+ * `rows` itself; otherwise it is one more membership pass sharing the identity
+ * memo, which sends a probe only when every severity-1 row was an environment
+ * gap. It is lazy, so a consumer that caches nothing pays nothing.
+ *
+ * Both outputs are index-aligned with the input, one entry per row, in order,
+ * and `rows` is the SAME array when nothing changed.
+ */
+export interface LanguageServerRowDemotion {
+	rows: LSPDiagnostic[];
+	replayable(): Promise<LSPDiagnostic[]>;
+}
+
+export async function demoteLanguageServerRows(
+	diagnostics: LSPDiagnostic[],
+	options: InferredProjectDemotionOptions,
+): Promise<LanguageServerRowDemotion> {
+	const environmentChecked = demoteEnvironmentGapDiagnostics(diagnostics, {
+		filePath: options.filePath,
+	});
+	const membership = {
+		...options,
+		identityCache: options.identityCache ?? new Map(),
+	};
+	const rows = await demoteInferredProjectDiagnostics(
+		environmentChecked,
+		membership,
+	);
+	return {
+		rows,
+		replayable: async () =>
+			environmentChecked === diagnostics
+				? rows
+				: demoteInferredProjectDiagnostics(diagnostics, membership),
+	};
+}
+
+/**
  * Cap on how many `projectInfo` probes one sweep may issue. Only files that
  * actually carry a TypeScript error probe at all, so on a healthy project this
  * is never approached. Past the cap, membership stays UNKNOWN and nothing is
@@ -188,8 +265,10 @@ export async function demoteInferredProjectDiagnostics(
 export const INFERRED_PROJECT_PROBE_BUDGET = 300;
 
 /**
- * Sweep-wide entry point: demote every result whose file tsserver owns only
- * through an inferred project. Sequential on purpose — the probes run against a
+ * Sweep-wide entry point: the two rules of `demoteLanguageServerRows` over a
+ * sweep's results. The environment-gap rule runs on every result; the
+ * membership probe demotes every result whose file tsserver owns only through
+ * an inferred project. Sequential on purpose — the probes run against a
  * single-threaded tsserver, so fanning out would only queue behind itself.
  *
  * The identity memo is local to this call. A module-level cache would pin the
@@ -208,23 +287,29 @@ export async function demoteInferredProjectSweepResults<
 	service: TsserverSyncCapableService,
 	signal?: AbortSignal,
 ): Promise<T[]> {
-	if (typeof service?.executeReadOnlyCommandOnLiveClient !== "function") {
-		return results;
-	}
 	const startedAt = Date.now();
 	const identityCache = new Map<string, TsserverProjectIdentity | undefined>();
 	const out: T[] = [];
+	let changed = false;
 	let demotedFiles = 0;
 	let demotedDiagnostics = 0;
 	let budgetExhausted = false;
 	let aborted = false;
 	for (const result of results) {
-		const diagnostics = result.diagnostics ?? [];
+		// #4532 round 5 (review F3): the environment rule of
+		// `demoteLanguageServerRows` asks no server, so it runs on EVERY result,
+		// the aborted and over-budget ones included; only the probe is skipped.
+		const raw = result.diagnostics ?? [];
+		const diagnostics = demoteEnvironmentGapDiagnostics(raw, {
+			filePath: result.filePath,
+		});
+		const checked = diagnostics === raw ? result : { ...result, diagnostics };
+		if (checked !== result) changed = true;
 		if (signal?.aborted) {
 			// Carry the remaining results through UNCHANGED rather than dropping
 			// them — an abort must cost the demotion, never a finding.
 			aborted = true;
-			out.push(result);
+			out.push(checked);
 			continue;
 		}
 		if (
@@ -232,7 +317,7 @@ export async function demoteInferredProjectSweepResults<
 			!identityCache.has(result.filePath)
 		) {
 			budgetExhausted = true;
-			out.push(result);
+			out.push(checked);
 			continue;
 		}
 		const demoted = await demoteInferredProjectDiagnostics(diagnostics, {
@@ -243,9 +328,10 @@ export async function demoteInferredProjectSweepResults<
 			signal,
 		});
 		if (demoted === diagnostics) {
-			out.push(result);
+			out.push(checked);
 			continue;
 		}
+		changed = true;
 		demotedFiles += 1;
 		demotedDiagnostics += demoted.filter((d, i) => d !== diagnostics[i]).length;
 		out.push({ ...result, diagnostics: demoted });
@@ -266,5 +352,6 @@ export async function demoteInferredProjectSweepResults<
 			},
 		});
 	}
-	return out;
+	// The SAME array when no result changed, as the per-file transforms return.
+	return changed ? out : results;
 }

@@ -6,8 +6,6 @@
 
 Adapted from [upstream source](https://github.com/nicobailon/pi-web-access) (MIT-licensed).
 
-Adapted from [upstream source](https://github.com/DuckMind/extensions/tree/main/dm-web-access) (MIT-licensed).
-
 **Web search, content extraction, and video understanding for DM agent. OpenAI/Codex search, zero-config Exa search, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, AnySearch, XCrawl, Valyu, xAI/Grok, Mistral, Bright Data SERP, SerpBase, SerpApi, Serper, explicit-only Serply, self-hosted SearXNG, degoog metasearch, self-hosted Crawl4AI extraction, keyless DuckDuckGo, keyless Keenable, optional browser-cookie Gemini Web, Kimi Code Plan search, or bring your own API keys.**
 
 [![npm version](https://img.shields.io/npm/v/dm-web-access?style=for-the-badge)](https://www.npmjs.com/package/dm-web-access)
@@ -336,7 +334,7 @@ Requires `ffmpeg` (and `yt-dlp` for YouTube). Timestamps accept `H:MM:SS`, `MM:S
 
 With `mode: "answer"`, the answer model receives the extracted PDF Markdown rather than the saved-file notice. The Markdown file is still saved, and the original extracted content remains available through `get_search_content`; ordinary readable-mode PDF fetches continue to return the file path.
 
-PDF URLs are converted to Markdown and saved under the temporary `pi-web-pdf` directory by default so the agent can `read` specific sections without loading the full document into context. Four engines are available, selected with `pdf.provider` (`"auto"` is the default):
+PDF URLs are converted to Markdown and saved under the temporary `dm-web-pdf` directory by default so the agent can `read` specific sections without loading the full document into context. Four engines are available, selected with `pdf.provider` (`"auto"` is the default):
 
 | Provider | Engine | Trade-offs |
 | --- | --- | --- |
@@ -418,7 +416,7 @@ fetch_content(url)
   → Video file?  Gemini API (Files API) → Gemini Web (if browser cookies enabled)
   → GitHub URL?  Clone repo, return file contents + local path
   → YouTube URL? Gemini Web (if browser cookies enabled) → Gemini API → Perplexity
-  → HTTP fetch (asks for markdown first; raw mode does not) → PDF? Datalab → Gemini API → local text extraction, save to temp pi-web-pdf
+  → HTTP fetch (asks for markdown first; raw mode does not) → PDF? Datalab → Gemini API → local text extraction, save to temp dm-web-pdf
                → HTML? Readability (+ declared Link/rel discovery) → RSC parser → Firecrawl → Crawl4AI (each if configured) → third-party hosted fallbacks only when fetchRouting.allowRemoteHostedProviders is enabled
                → Text/JSON/Markdown? Return directly
 ```
@@ -591,7 +589,7 @@ Config defaults to `~/.dm/agent/web-search.json` when neither `DM_CODING_AGENT_D
     "enabled": true,
     "maxRepoSizeMB": 350,
     "cloneTimeoutSeconds": 30,
-    "clonePath": "/tmp/pi-github-repos"
+    "clonePath": "/tmp/dm-github-repos"
   },
   "githubPrIssue": {
     "enabled": true

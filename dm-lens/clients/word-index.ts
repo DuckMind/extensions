@@ -2557,6 +2557,46 @@ export function deserializeWordIndex(
 	return index;
 }
 
+// --- Published-index notification (#4583) -----------------------------------
+//
+// The MCP-side warm cache (`acquireWarmWordIndex`, clients/mcp/analyze.ts)
+// caches "checked, nothing usable" per root so a query does not re-read the
+// snapshot on every call. A build that finishes AFTER that entry was created
+// publishes a usable index, and nothing told the cache: every later
+// `symbol_search` in the process kept answering "building" over an index that
+// was already on disk (#4583). Every publisher of a usable index hands it here;
+// the cache owner adopts it into an entry that holds none, which costs one
+// assignment instead of a re-deserialize of the index it just built.
+
+export type WordIndexPublishTrigger = "cold_query" | "session_start";
+
+export type WordIndexPublishedListener = (
+	cwd: string,
+	index: WordIndex,
+	trigger: WordIndexPublishTrigger,
+) => void;
+
+let wordIndexPublishedListener: WordIndexPublishedListener | undefined;
+
+/**
+ * Install the warm-cache subscriber (clients/mcp/analyze.ts); `undefined`
+ * clears it. One slot, because one cache owner exists per process.
+ */
+export function setWordIndexPublishedListener(
+	listener: WordIndexPublishedListener | undefined,
+): void {
+	wordIndexPublishedListener = listener;
+}
+
+/** Hand a just-published index to the warm cache, when one subscribed. */
+export function notifyWordIndexPublished(
+	cwd: string,
+	index: WordIndex,
+	trigger: WordIndexPublishTrigger,
+): void {
+	wordIndexPublishedListener?.(cwd, index, trigger);
+}
+
 // --- Cold-query background build trigger (#348) -------------------------------
 //
 // `symbol_search` (pi tool) / `dmlens_symbol_search` (MCP) are stateless callers:
@@ -2647,6 +2687,7 @@ export function triggerBackgroundWordIndexBuild(
 			snapshot.generatedAt = new Date().toISOString();
 			snapshot.wordIndex = serializeWordIndex(index);
 			saveProjectSnapshot(key, snapshot);
+			notifyWordIndexPublished(key, index, "cold_query");
 			dbg?.(
 				`word-index cold-build: ${index.docCount} files, ${index.postings.size} tokens (${Date.now() - startMs}ms)`,
 			);

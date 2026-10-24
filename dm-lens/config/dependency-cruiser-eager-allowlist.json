@@ -12,6 +12,7 @@
   "./clients/cache-observability.js",
   "./clients/cascade-format.js",
   "./clients/console-guard-install.js",
+  "./clients/context-injection-ledger.js",
 	"./clients/deadline-utils.js",
   "./clients/debug-handles.js",
   "./clients/debug-heap.js",

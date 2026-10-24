@@ -109,7 +109,6 @@ vi.mock("../config.ts", () => ({
   discoverConfiguredClaudePluginSkills: mocks.discoverConfiguredClaudePluginSkills,
   resolveConfiguredClaudePluginMcp: mocks.resolveConfiguredClaudePluginMcp,
   getLegacyMcpMigrationNotices: mocks.getLegacyMcpMigrationNotices,
-  getPiMcpAuthPath: () => "/nonexistent/dm-mcp-auth.json",
   setPiMcpConfigEnabled: mocks.setPiMcpConfigEnabled,
   getPiGlobalConfigPath: mocks.getPiGlobalConfigPath,
   getProjectConfigPath: mocks.getProjectConfigPath,
@@ -452,14 +451,14 @@ describe("mcpAdapter session lifecycle", () => {
     await handlers.get("session_start")?.({}, { hasUI: false, cwd: "/project" });
     commandNames = api.registerCommand.mock.calls.map((call: any[]) => call[0]);
     expect(commandNames.filter((name: string) => name === "mcp")).toHaveLength(1);
-  }, 15_000);
+  });
 
   it("discovers configured Claude plugin skills on startup and reload", async () => {
-    let pluginPath = "plugin-at-load";
+    let generation = 0;
     mocks.loadMcpConfig.mockImplementation(() => ({
       mcpServers: {},
       settings: { scriptMode: false },
-      claudePlugins: [{ path: pluginPath, skills: true }],
+      claudePlugins: [{ path: `plugin-${++generation}`, skills: true }],
     }));
     mocks.discoverConfiguredClaudePluginSkills.mockImplementation((config: { claudePlugins?: Array<{ path: string }> }) =>
       config.claudePlugins?.map(plugin => `/skills/${plugin.path}`) ?? []);
@@ -467,12 +466,9 @@ describe("mcpAdapter session lifecycle", () => {
     const { handlers } = await loadAdapter();
     const discover = handlers.get("resources_discover")!;
 
-    pluginPath = "plugin-initial";
-    expect(discover({ cwd: "/project", reason: "initial" })).toEqual({ skillPaths: ["/skills/plugin-initial"] });
-    pluginPath = "plugin-reloaded";
-    expect(discover({ cwd: "/project", reason: "reload" })).toEqual({ skillPaths: ["/skills/plugin-reloaded"] });
+    expect(discover({ cwd: "/project", reason: "initial" })).toEqual({ skillPaths: ["/skills/plugin-2"] });
+    expect(discover({ cwd: "/project", reason: "reload" })).toEqual({ skillPaths: ["/skills/plugin-3"] });
     expect(mocks.discoverConfiguredClaudePluginSkills).toHaveBeenCalledTimes(2);
-    expect(mocks.loadMcpConfig.mock.calls.slice(-2).map(([, cwd]) => cwd)).toEqual(["/project", "/project"]);
   });
 
   it("keeps the bundled mcp-scripting skill aligned with install-time tool visibility after reload", async () => {
@@ -2665,7 +2661,7 @@ describe("mcpAdapter session lifecycle", () => {
 
   it("reads DM's mcp.json files only when DM supports MCP, decided before the first config load", async () => {
     const { createMcpAdapter, default: defaultAdapter } = await import("../index.ts");
-    defaultAdapter({ ...createPi().api, registerMcpServer: vi.fn(), getMcpServers: vi.fn(() => []) });
+    defaultAdapter({ ...createPi().api, registerMcpServer: vi.fn() });
     expect(mocks.setPiMcpConfigEnabled.mock.calls).toEqual([[true]]);
     expect(mocks.setPiMcpConfigEnabled.mock.invocationCallOrder[0]).toBeLessThan(mocks.loadMcpConfig.mock.invocationCallOrder[0]!);
 

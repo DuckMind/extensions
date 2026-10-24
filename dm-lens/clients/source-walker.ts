@@ -153,6 +153,40 @@ export function shouldRecurseIntoDir(
 // ---------------------------------------------------------------------------
 
 /**
+ * One directory's entries, as the walk read them (#1979). Lives exactly as long
+ * as the walk's snapshot of that directory; nothing outlives the visit.
+ */
+export class DirectoryListing {
+	readonly #entries: readonly fs.Dirent[];
+	#foldedNames: Set<string> | undefined;
+
+	constructor(entries: readonly fs.Dirent[]) {
+		this.#entries = entries;
+	}
+
+	/**
+	 * False only when no entry of this directory could be the file at `target`
+	 * on any filesystem, so a caller may treat it as absent without asking the
+	 * filesystem. True means "possibly present": the caller still asks, which
+	 * keeps the exact verdict for a directory-named twin, a broken symlink or a
+	 * name that matches only case-sensitively. Names are case-folded and
+	 * NFC-normalized so a case-insensitive filesystem (Windows, default macOS)
+	 * or a normalization-insensitive one (macOS) never reports a real entry
+	 * absent. `target` must lie directly in the listed directory.
+	 */
+	mayContain(target: string): boolean {
+		this.#foldedNames ??= new Set(
+			this.#entries.map((entry) => foldEntryName(entry.name)),
+		);
+		return this.#foldedNames.has(foldEntryName(path.basename(target)));
+	}
+}
+
+function foldEntryName(name: string): string {
+	return name.normalize("NFC").toLowerCase();
+}
+
+/**
  * What a {@link WalkVisitor} tells the driver to do with one directory entry
  * after it has classified (and bound-charged) it:
  *  - `"recurse"`: this entry is a directory to descend into. The driver owns
@@ -175,6 +209,13 @@ export type WalkDisposition = "recurse" | "skip" | "stop";
 export type WalkVisitor = (
 	entry: fs.Dirent,
 	fullPath: string,
+	/**
+	 * The listing of the directory `entry` was read from (#1979): the driver
+	 * already holds it, so a visitor that needs a sibling's existence can answer
+	 * from memory instead of a filesystem probe per entry. The same instance is
+	 * passed for every entry of one directory.
+	 */
+	siblings: DirectoryListing,
 ) => WalkDisposition;
 
 export interface StackWalkOptions {
@@ -234,10 +275,11 @@ function* walkTreeStackSteps(
 		// WITHOUT forking the traversal into two implementations that can
 		// drift (the invariant this generator exists to protect).
 		const entries = (yield dir) ?? [];
+		const listing = new DirectoryListing(entries);
 		const subDirs: string[] = [];
 		for (const entry of entries) {
 			const fullPath = path.join(dir, entry.name);
-			const disposition = visit(entry, fullPath);
+			const disposition = visit(entry, fullPath, listing);
 			if (disposition === "stop") return true;
 			if (disposition === "recurse") subDirs.push(fullPath);
 			// Per-entry yield point: `undefined` distinguishes it from a
@@ -317,9 +359,11 @@ export function walkTreeRecursiveSync(
 	visit: WalkVisitor,
 ): boolean {
 	function scan(currentDir: string): boolean {
-		for (const entry of readDirEntriesSafe(currentDir)) {
+		const entries = readDirEntriesSafe(currentDir);
+		const listing = new DirectoryListing(entries);
+		for (const entry of entries) {
 			const fullPath = path.join(currentDir, entry.name);
-			const disposition = visit(entry, fullPath);
+			const disposition = visit(entry, fullPath, listing);
 			if (disposition === "stop") return true;
 			if (disposition === "recurse" && scan(fullPath)) return true;
 		}

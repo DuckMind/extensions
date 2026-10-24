@@ -107,9 +107,14 @@ import { launchLSP } from "./launch.js";
 import {
 	registerSessionRoot,
 	resetSessionRootsForTests,
-	sessionRootConfigEntries,
+	sessionRootConfigForFile,
 	setSessionRootConfig,
 } from "./session-roots.js";
+import {
+	fileMatchKeys,
+	fileMatchReason,
+	registeredServers,
+} from "./file-server-match.js";
 import {
 	LSP_SERVERS,
 	resetLSPCaseSensitivityState,
@@ -850,6 +855,11 @@ function normalizeWorkspacePath(cwd: string): string {
 type ProvenanceMap = ReadonlyMap<string, Provenance>;
 let unknownTrustNoticeGeneration = -1;
 
+type ServersForFile = (filePath: string) => LSPServerInfo[];
+
+/** The test-only selection `_setServersForFileForTests` arms (#4709). */
+let serversForFileOverride: ServersForFile | undefined;
+
 function sourceFor(
 	provenance: ProvenanceMap,
 	key: string,
@@ -905,28 +915,8 @@ function registryDecision(
 	}
 }
 
-function isSameOrChildPath(filePath: string, candidateRoot: string): boolean {
-	if (filePath === candidateRoot) return true;
-	return filePath.startsWith(`${candidateRoot}${path.sep}`);
-}
-
 function getConfigForFile(filePath: string): RegisteredLSPConfig {
-	const resolvedFilePath = path.resolve(filePath);
-	let bestMatch: { root: string; config: RegisteredLSPConfig } | undefined;
-
-	// #2518: the per-root configs ARE the session-root registry's values, so
-	// this walk sees a config for exactly the roots that registry still serves.
-	// `undefined` is a root whose first load is still in flight — the same
-	// "no entry yet" state this walk skipped before the two stores merged.
-	for (const [root, config] of sessionRootConfigEntries()) {
-		if (config === undefined) continue;
-		if (!isSameOrChildPath(resolvedFilePath, root)) continue;
-		if (!bestMatch || root.length > bestMatch.root.length) {
-			bestMatch = { root, config };
-		}
-	}
-
-	return bestMatch?.config ?? EMPTY_CONFIG;
+	return sessionRootConfigForFile(filePath) ?? EMPTY_CONFIG;
 }
 
 /**
@@ -1061,9 +1051,24 @@ export function compileLspRegistry(
 		}
 	}
 
+	// #3952: the CATALOG ENTRY ITSELF for a server with no command override,
+	// never a copy. `compileLspRegistry`'s list is what
+	// `getServersForFileWithConfig` hands the service, and the service keeps
+	// that object for the client's whole lifetime (`SpawnedServer.info` →
+	// `scheduleIdleEviction`, `spawn`). A copy makes the list a second registry
+	// whose entries look identical but answer for nothing: the nightly
+	// idle-eviction probe arms `server.idleEviction` on
+	// the object `LSP_SERVERS`/`getServerById` exposes (#3645), and from
+	// 2026-10-10 (when this branch began copying) that arm never reached
+	// `scheduleIdleEviction`, so every candidate read `not-evicted` and no server
+	// could earn a promotion night. Repairing the identity here is what makes
+	// "the registry object the service reads" true again.
+	//
+	// An OVERRIDDEN server keeps its copy below: that one carries the
+	// override's `spawn` and `trustAllowed`, which must stay out of the catalog.
 	const overriddenBuiltins = LSP_SERVERS.map((server) => {
 		const override = serverOverrides.get(server.id);
-		if (!override?.command) return { ...server };
+		if (!override?.command) return server;
 		const argv = Array.isArray(override.command)
 			? override.command
 			: [override.command, "--stdio"];
@@ -1166,27 +1171,11 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 }
 
 /**
- * Every server a workspace knows about, in registry-then-custom order and
- * BEFORE any gate is applied.
- *
- * Spelled once because two callers need the same list for opposite purposes:
- * `getAllServers` DROPS the disabled ones, `explainServersForFile` REPORTS
- * them. A custom server that only one of the two composed would be a server
- * the runtime runs and the introspection cannot see, or the reverse.
- */
-function registeredServers(config: RegisteredLSPConfig): LSPServerInfo[] {
-	const builtins = config.registeredServers.length
-		? config.registeredServers
-		: LSP_SERVERS;
-	return [...builtins, ...config.customServers];
-}
-
-/**
  * Get all available servers (built-in + custom, minus disabled)
  */
 export function getAllServers(filePath?: string): LSPServerInfo[] {
 	const config = filePath ? getConfigForFile(filePath) : EMPTY_CONFIG;
-	return registeredServers(config).filter(
+	return registeredServers(config, LSP_SERVERS).filter(
 		(s) => !config.disabledServerIds.has(s.id),
 	);
 }
@@ -1249,21 +1238,7 @@ function selectionReason(
 	base: string,
 ): ServerSelectionReason {
 	if (config.disabledServerIds.has(server.id)) return "disabled-by-config";
-	let matched = false;
-	for (const value of server.extensions) {
-		const lower = value.toLowerCase();
-		if (lower === ext || lower === base) {
-			matched = true;
-			break;
-		}
-	}
-	if (!matched) return "extension-mismatch";
-	// #636: a server's extension match can be intentionally broader than what
-	// it can usefully act on (zizmor attaches to "yaml" but only ever reports
-	// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
-	// present, is an ADDITIONAL narrowing gate — never a widening one.
-	if (server.pathFilter && !server.pathFilter(filePath)) return "path-filter";
-	return "selected";
+	return fileMatchReason(server, filePath, ext, base);
 }
 
 /**
@@ -1280,19 +1255,18 @@ export function explainServersForFile(
 	filePath: string,
 	config: RegisteredLSPConfig = getConfigForFile(filePath),
 ): ServerSelection[] {
-	const ext = path.extname(filePath).toLowerCase();
-	const base = path.basename(filePath).toLowerCase();
-	return registeredServers(config).map((server) => {
+	const { ext, base } = fileMatchKeys(filePath);
+	return registeredServers(config, LSP_SERVERS).map((server) => {
 		const reason = selectionReason(server, config, filePath, ext, base);
 		return { server, selected: reason === "selected", reason };
 	});
 }
 
 export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
+	if (serversForFileOverride) return serversForFileOverride(filePath);
 	const config = getConfigForFile(filePath);
-	const ext = path.extname(filePath).toLowerCase();
-	const base = path.basename(filePath).toLowerCase();
-	return registeredServers(config).filter(
+	const { ext, base } = fileMatchKeys(filePath);
+	return registeredServers(config, LSP_SERVERS).filter(
 		(server) =>
 			selectionReason(server, config, filePath, ext, base) === "selected",
 	);
@@ -1376,7 +1350,29 @@ export function getServerInitOverride(
 	return getConfigForFile(filePath).serverOverrides.get(serverId);
 }
 
+/**
+ * Test-only server selection (#4709). Replaces `getServersForFileWithConfig`'s
+ * answer (and so `primaryServerId`, `resolveLspCwdForFile`, which derive from
+ * it) with `select(filePath)` until `resetLSPConfigStateForTests` runs.
+ * A suite that needs a per-test server list calls this instead of
+ * `vi.mock`-ing this module, so every other export stays the real one.
+ *
+ * Product paths never reach it: nothing under `clients/`, `tools/`, `mcp/` or
+ * `index.ts` imports the name (`tests/clients/lsp/config-selection-setter.test.ts`
+ * scans for that), and the setter ignores an arm outside a Vitest process.
+ * Pass `undefined` to drop the injection without resetting the rest.
+ */
+export function _setServersForFileForTests(
+	select: ServersForFile | undefined,
+): void {
+	if (select && !process.env.VITEST) return;
+	serversForFileOverride = select;
+}
+
 export function resetLSPConfigStateForTests(): void {
+	// #4709: the injected selection is test state too; a later case that
+	// resets must see the real registry's answer, not the last case's list.
+	serversForFileOverride = undefined;
 	resetLSPCaseSensitivityState();
 	// One call clears both the served roots and their configs: since #2518 they
 	// are one store, so a reset cannot leave a cleared config store beside a

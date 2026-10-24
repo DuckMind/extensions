@@ -28,6 +28,10 @@ import {
 	spawnFailedWithNoOutput,
 } from "./dispatch/runners/utils/spawn-outcome.js";
 import { assertInstallAllowed } from "./project-trust.js";
+import {
+	isUntrustedProjectPath,
+	recordProjectCommandRefusal,
+} from "./session-repository.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 import {
 	classifyProbeFailure,
@@ -356,6 +360,13 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 		for (const candidate of candidates) {
 			try {
 				if (fs.existsSync(candidate)) {
+					// #4530 (#4776): `$GOBIN` and `$GOPATH/bin` are global, and the
+					// scan starts this path by name, so an entry that is the session
+					// repository's bytes is no answer until pi trusts the project.
+					if (isUntrustedProjectPath(candidate)) {
+						recordProjectCommandRefusal(candidate);
+						continue;
+					}
 					this.binaryPath = candidate;
 					this.available = true;
 					this.log(`govulncheck auto-installed at ${candidate}`);

@@ -172,6 +172,9 @@ export class JscpdClient {
 	// its own cwd via findNodeToolBinary.
 	private jscpdManagedPath: string | null = null;
 	private inFlight = new Map<string, Promise<JscpdResult>>();
+	// Pending availability probes. A scan holds no `inFlight` entry until its
+	// own probe settles, so `shutdown()` must see the probe too (#4505).
+	private probing = new Set<Promise<boolean>>();
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
@@ -182,9 +185,20 @@ export class JscpdClient {
 	 * Wait for scans already started by this client to settle. Test owners use
 	 * this as the lifecycle barrier before removing fixture roots; the scan
 	 * promise includes the jscpd child and its report-directory cleanup.
+	 *
+	 * A scan registers in `inFlight` only after its availability probe settles,
+	 * and the session_start task probes once before `scan()` probes again. The
+	 * loop therefore repeats until a pass finds no probe and no scan. Both sets
+	 * drop an entry before its promise settles, so an empty pass ends the loop
+	 * and a pass over pending work never spins. The wait is bounded by the work
+	 * already started: each probe by `probeTimeout` (1.5 s, tool install off in
+	 * tests) and each scan by `SCAN_TIMEOUT_MS` (30 s); the loop adds none of its
+	 * own and ends once the client is idle.
 	 */
 	async shutdown(): Promise<void> {
-		await Promise.allSettled(this.inFlight.values());
+		do {
+			await Promise.allSettled([...this.probing, ...this.inFlight.values()]);
+		} while (this.probing.size > 0 || this.inFlight.size > 0);
 	}
 
 	/**
@@ -250,7 +264,15 @@ export class JscpdClient {
 	/**
 	 * Check if jscpd is available, auto-install if not
 	 */
-	async ensureAvailable(): Promise<boolean> {
+	ensureAvailable(): Promise<boolean> {
+		const probe: Promise<boolean> = this.probeAvailable().finally(() => {
+			this.probing.delete(probe);
+		});
+		this.probing.add(probe);
+		return probe;
+	}
+
+	private async probeAvailable(): Promise<boolean> {
 		const resolved = await resolveAvailableOrInstall(
 			jscpdAvailability,
 			"jscpd",

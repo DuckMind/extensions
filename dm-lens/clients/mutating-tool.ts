@@ -787,6 +787,23 @@ function readToolName(event: unknown): string | undefined {
 export const DM_LENS_SYNTHETIC_MUTATION_FIELD = "piLensSyntheticMutation";
 
 /**
+ * Whether `event` is a per-file `tool_result` dm-lens synthesized from a bash
+ * command (the marker's value is exactly `"bash"`), not a call the host made.
+ *
+ * This module owns what the marker's value means, so every consumer asks here
+ * instead of comparing the field itself: {@link classifyMutatingTool} maps it
+ * to `"bash-derived"` provenance, and `runtime-tool-result.ts` keeps such a
+ * replay out of the agent-behavior history (#4623, after #4619).
+ */
+export function isBashDerivedReplay(event: unknown): boolean {
+	return (
+		(event as Record<string, unknown> | undefined)?.[
+			DM_LENS_SYNTHETIC_MUTATION_FIELD
+		] === "bash"
+	);
+}
+
+/**
  * Classify an inbound `tool_call` or `tool_result` event.
  *
  * Returns `undefined` for every event that is not a file mutation dm-lens
@@ -804,11 +821,9 @@ export function classifyMutatingTool(
 	if (toolName === undefined) return undefined;
 	const input = asRecord((event as { input?: unknown }).input);
 	const builtinKind = BUILTIN_MUTATING_TOOLS.get(toolName);
-	const syntheticSource = (event as Record<string, unknown>)[
-		DM_LENS_SYNTHETIC_MUTATION_FIELD
-	];
-	const builtinProvenance: MutationProvenance =
-		syntheticSource === "bash" ? "bash-derived" : "builtin";
+	const builtinProvenance: MutationProvenance = isBashDerivedReplay(event)
+		? "bash-derived"
+		: "builtin";
 
 	// A full-file write has no shape ambiguity, so it never pays for the
 	// adapter probes.

@@ -59,12 +59,3 @@ export function convertCharacterOffset(
 	// utf-32: number of Unicode code points (spread iterates by code point).
 	return [...prefix].length;
 }
-
-/** Extract the text of a single 0-based line from full file content. */
-export function lineTextAt(content: string, line: number): string {
-	if (line < 0) return "";
-	// Split on \n; trailing \r is irrelevant to offset math (it's after the
-	// character columns the caller cares about, and never multibyte).
-	const lines = content.split("\n");
-	return lines[line] ?? "";
-}

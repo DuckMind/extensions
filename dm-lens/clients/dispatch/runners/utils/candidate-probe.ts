@@ -12,6 +12,10 @@
  */
 
 import * as fs from "node:fs";
+import {
+	isUntrustedProjectPath,
+	recordProjectCommandRefusal,
+} from "../../../session-repository.js";
 import { probeToolAsync } from "../../../tool-probe.js";
 import {
 	type AvailabilityCause,
@@ -58,6 +62,14 @@ export async function probeAvailabilityCandidates(
 		try {
 			if (candidate.includes("\\") || candidate.includes("/")) {
 				if (fs.existsSync(candidate)) {
+					// #4530 (#4776): the toolchain dirs (`~/.cargo/bin`, a system
+					// prefix) are global, and the caller starts the answer by path,
+					// so an entry that is the session repository's bytes is no
+					// answer until pi trusts the project.
+					if (isUntrustedProjectPath(candidate)) {
+						recordProjectCommandRefusal(candidate);
+						continue;
+					}
 					return {
 						foundPath: candidate,
 						sawTransient,

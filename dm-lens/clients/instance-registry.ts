@@ -1141,6 +1141,45 @@ export function deregisterInstanceRoot(
 }
 
 /**
+ * #4596 (#4563): record a rejected root release. `deregisterInstanceRoot`
+ * itself swallows every filesystem failure it can classify (`-landed`,
+ * `-corrupt`, `-lock-failed`), so this arm is the residual: the queued
+ * mutation rejected anyway, which means the root stays listed in the
+ * process-wide registry until the process exits, and the next session's
+ * registry walk reads a root no live session owns. The record belongs here,
+ * at the registry's owner, so every caller inherits it; the caller only
+ * decides whether to rethrow.
+ *
+ * Counted, not once-per-root: each failed release is a separate leaked root.
+ *
+ * The arm cannot be driven end to end today — every `fs` path inside
+ * `deregisterInstanceRootNow` catches its own error, so only a defect can make
+ * the queued op reject. Its test (`tests/clients/
+ * instance-registry-root-release-record-4596.test.ts`) therefore drives this
+ * function directly, and `tests/config/silent-catch-sweep.test.ts` is what
+ * keeps `index.ts`'s `.catch` calling it instead of `() => {}`.
+ */
+export function recordRootDeregistrationFailure(
+	projectRoot: string,
+	holder: string,
+	err: unknown,
+): void {
+	incrementDegradationCount({
+		kind: "instance-registry-deregister-root-failed",
+		subject: projectRoot,
+		reason: `root \`${projectRoot}\` could not be released from the process-wide instance registry for holder \`${holder}\` (${err instanceof Error ? err.message : String(err)}); it stays listed until this process exits`,
+		// `logDurableDegradation` persists this metadata but not the reason, so
+		// the error travels here too: a monitor reading `latency.log` must see
+		// WHY the root leaked, not only that it did (#4603 F6).
+		metadata: {
+			root: projectRoot,
+			holder,
+			err: err instanceof Error ? err.message : String(err),
+		},
+	});
+}
+
+/**
  * The write this root removal must make (or none), plus the intent-cell side
  * effect, from a fresh read (#3587). The single lease-waiting lock path calls
  * this once under the lock, so a holder cannot force a second, stale decision.

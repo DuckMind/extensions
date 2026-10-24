@@ -297,8 +297,11 @@ export function shouldLogEvent(event: string): boolean {
 		event === "read_file_evicted" ||
 		event === "edits_cap_trimmed" ||
 		// #4131: a file's authorship ended because another writer changed its
-		// bytes. Once per authorship episode: the retired file needs a read or
-		// a known-content write before a writer can author it again.
+		// bytes, or a mutation-bridge write with no pre-write check landed on
+		// it (`writer: "bridge"`, #4187). Since #4387 an UNKNOWN-range credit
+		// never retires one. Once per authorship episode: the retired file
+		// needs a read or a known-content write before a writer can author it
+		// again.
 		event === "authorship_retired"
 	);
 }

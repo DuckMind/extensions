@@ -9,6 +9,7 @@ import {
 	restoreLineEndings,
 } from "./host-edit-normalize.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
+import { noteAtomicReplace } from "./path-birth.js";
 import { normalizeMapKey } from "./path-utils.js";
 import {
 	boundedEditIndexes,
@@ -442,11 +443,20 @@ export async function applyPartiallyApplicableEdits(args: {
 		const targetPath = fs.lstatSync(args.filePath).isSymbolicLink()
 			? fs.realpathSync(args.filePath)
 			: args.filePath;
-		const mode = fs.statSync(args.filePath).mode & 0o7777;
+		const before = fs.statSync(args.filePath);
 		writeFileAtomic(targetPath, output, {
 			bestEffort: false,
-			mode,
+			mode: before.mode & 0o7777,
 		});
+		// #4320: the rename installs a new inode, born now. It stands for a file
+		// that already existed, so a language server must hear Changed for it.
+		// Best-effort: the write has landed, and a missed record costs at most
+		// one Created for an edited file.
+		try {
+			noteAtomicReplace(before, fs.statSync(targetPath));
+		} catch {
+			// the file vanished after the rename; nothing to carry
+		}
 		return hashBytes(Buffer.from(output, "utf8"));
 	};
 
@@ -553,6 +563,10 @@ export async function applyPartiallyApplicableEdits(args: {
 			// The write is committed. Preserve the existing caller behavior for
 			// uninstrumented callers; the read-guard path records and handles it.
 			postEditStatus = "failed";
+			// none: the committed bytes are explained, not swallowed: the
+			// instrumented caller reads `postEditStatus: "failed"` and blocks with
+			// the agent-visible reason (clients/runtime-tool-call.ts); an
+			// uninstrumented caller gets this throw.
 			if (!summaryRef && !correlationId) throw error;
 		}
 	}

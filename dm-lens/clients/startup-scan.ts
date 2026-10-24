@@ -28,15 +28,7 @@ import {
 	getDirectoryMarkers,
 	registerWorkspaceTopologyReset,
 } from "./workspace-topology.js";
-
-const PROJECT_ROOT_MARKERS = [
-	".git",
-	"package.json",
-	"pyproject.toml",
-	"Cargo.toml",
-	"go.mod",
-	"composer.json",
-];
+import { PROJECT_ROOT_MARKERS } from "./project-root-markers.js";
 
 // #758: hard ceiling on the number of directory entries the startup source
 // count walk will visit before it gives up and declares the tree too big to

@@ -15,9 +15,19 @@
 import { logExtension } from "../../extension-log.js";
 import { getLspCapableKinds } from "../../language-policy.js";
 import { exceedsLspSyncLimits } from "../../lsp/content-limits.js";
-import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
+import {
+	primaryUnavailableCause,
+	touchCoverageGap,
+} from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/capabilities.js";
+import { disabledPrimaries } from "../../lsp/session-roots.js";
 import { LSP_SERVERS } from "../../lsp/server.js";
+import {
+	describePythonCompileWithheld,
+	detectPythonTargetVersion,
+	partitionOutrankedPythonCompileVerdicts,
+	recordPythonCompileVerdictDrop,
+} from "../../python-environment.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
 import { PRIORITY } from "../priorities.js";
 import { resolveRunnerPath } from "../runner-context.js";
@@ -27,9 +37,10 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult } from "../types.js";
+import { findingsResult, spanOverlapsModifiedRanges } from "../types.js";
 import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
-import { demoteInferredProjectDiagnostics } from "../../lsp/inferred-project.js";
+import { demoteLanguageServerRows } from "../../lsp/inferred-project.js";
+import type { TsserverProjectIdentity } from "../../lsp/tsserver-sync.js";
 import {
 	enabledAuxiliaryLspServerIds,
 	retagAuxiliaryDiagnostics,
@@ -138,7 +149,20 @@ const lspRunner: RunnerDefinition = {
 		// Fast capability check only — actual client creation happens when we
 		// open the file below.
 		if (!lspService.supportsLSP(ctx.filePath)) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			// #4403: no server is selected, but a primary the operator disabled
+			// would have served the file. Say so; it is not "no LSP here".
+			const { disabledServerIds: disabledPrimaryServerIds } = disabledPrimaries(
+				ctx.filePath,
+			);
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				...(disabledPrimaryServerIds.length > 0 && {
+					primaryUnavailableCause: "disabled" as const,
+					disabledPrimaryServerIds,
+				}),
+			};
 		}
 
 		// Always sync current file content before reading diagnostics so dispatch
@@ -155,6 +179,13 @@ const lspRunner: RunnerDefinition = {
 		// confirmed clean result and must not be reported as one (#570).
 		let diagnosticsInconclusive = false;
 		let inconclusiveServerIds: readonly string[] = [];
+		// #4403: set when the touch says no primary answered (`primary-unavailable`).
+		let primaryUnavailable:
+			| Pick<
+					RunnerResult,
+					"primaryUnavailableCause" | "disabledPrimaryServerIds"
+			  >
+			| undefined;
 		// #1470/#1493: server ids the touch carries no evidence for — an auxiliary
 		// whose push wait our aux grace timer cut off (#1470), or one that stayed
 		// silent with no stored publication for this content (#1493). The touch is
@@ -164,6 +195,9 @@ const lspRunner: RunnerDefinition = {
 		let unconfirmedServerIds: readonly string[] = [];
 		let deferredServerIds: readonly string[] = [];
 		let usedWarmAttach = false;
+		// #4645: the warm incumbent's answer to the membership probe this runner
+		// may not send itself; it stands in for that probe below.
+		let incumbentProjectIdentity: TsserverProjectIdentity | undefined;
 		let failureReason = "";
 		// #3481: when the synced bytes were read, for the notify queue's order.
 		const readStamp = performance.now();
@@ -193,6 +227,9 @@ const lspRunner: RunnerDefinition = {
 				Math.max(LSP_SPAWN_BUDGET_MS, LSP_DIAGNOSTICS_WAIT_MS),
 			);
 			usedWarmAttach = attached?.available === true;
+			if (attached?.available) {
+				incumbentProjectIdentity = attached.response.projectIdentity;
+			}
 			// #1179 (shape-5 structural fix): both branches normalize to the
 			// `touchFile` wrapper shape. The warm-attach IPC branch resolves a plain
 			// diagnostics array — `available` no longer implies a fully confirmed
@@ -230,6 +267,21 @@ const lspRunner: RunnerDefinition = {
 				lspDiags = touched.diags;
 				diagnosticsInconclusive = touched.inconclusive === true;
 				inconclusiveServerIds = touched.inconclusiveServerIds ?? [];
+				if (touched.inconclusiveReason === "primary-unavailable") {
+					const disabledPrimaryServerIds =
+						touched.disabledPrimaryServerIds ?? [];
+					primaryUnavailable = {
+						primaryUnavailableCause:
+							touched.primaryUnavailableCause ??
+							primaryUnavailableCause(
+								inconclusiveServerIds,
+								disabledPrimaryServerIds,
+							),
+						...(disabledPrimaryServerIds.length > 0 && {
+							disabledPrimaryServerIds,
+						}),
+					};
+				}
 				unconfirmedServerIds = [
 					...new Set([
 						...touchCoverageGap(touched),
@@ -277,6 +329,28 @@ const lspRunner: RunnerDefinition = {
 			}
 		}
 
+		// #4638: the project's declared syntax level outranks jedi's own `compile`
+		// verdict on this lane exactly as it does on the probe. The rule and its
+		// record belong to the declaration's owner, so the two lanes cannot disagree
+		// about which rows are evidence.
+		// The drop is disclosed on this lane (#4638 r3 N2): with the only row
+		// withheld the result would otherwise be `succeeded` with no diagnostics, an
+		// edit that reads clean while the ledger alone knows better. The dispatcher
+		// renders the sentence inline beside the blocker output.
+		let withheldNotice: string | undefined;
+		if (lspDiags.length > 0) {
+			const declared = await detectPythonTargetVersion(diagnosticPath);
+			const { kept, dropped } = partitionOutrankedPythonCompileVerdicts(
+				lspDiags,
+				declared,
+			);
+			if (dropped > 0 && declared) {
+				recordPythonCompileVerdictDrop(diagnosticPath, declared, dropped);
+				lspDiags = kept;
+				withheldNotice = describePythonCompileWithheld(dropped, declared);
+			}
+		}
+
 		if (serverFailed) {
 			return {
 				status: "failed",
@@ -304,7 +378,14 @@ const lspRunner: RunnerDefinition = {
 			// reply. Report "skipped" so the coverage notice can flag the gap and
 			// the next edit re-checks once the server has warmed; any diagnostics
 			// published late still land in the client cache and surface then.
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			// #4403: no client was ready, and a disabled primary would have made
+			// the touch say so, so the language server could not start in time.
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				primaryUnavailableCause: "unstarted",
+			};
 		}
 
 		if (diagnosticsInconclusive && lspDiags.length === 0) {
@@ -312,7 +393,16 @@ const lspRunner: RunnerDefinition = {
 			// diagnostics wait hit their deadline without any collected findings.
 			// With no answered diagnostics, report "skipped" so the coverage notice
 			// flags the gap instead of reading this as a confirmed clean result (#570).
-			return { status: "skipped", diagnostics: [], semantic: "none" };
+			// #4403: when no primary answered at all, the result says why.
+			// #4484: a skip without a stated reason reaches no verdict
+			// (`reachedNoVerdict`), so this empty result never retires a recorded
+			// blocker.
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				...primaryUnavailable,
+			};
 		}
 
 		if (lspDiags.length === 0) {
@@ -348,6 +438,7 @@ const lspRunner: RunnerDefinition = {
 				diagnostics: [],
 				semantic: "none",
 				rawOutput: "no-diagnostics",
+				...(withheldNotice !== undefined && { withheldNotice }),
 			};
 		}
 
@@ -361,23 +452,36 @@ const lspRunner: RunnerDefinition = {
 		// request, and only when the file already has a TypeScript ERROR — an edit
 		// that type-checks clean pays nothing.
 		//
-		// #1645 review F2: NOT under warm attach. There, diagnostics came from an
-		// already-running remote session over IPC and no local client exists — so
-		// the probe would have to spawn a whole tsserver fleet to answer, breaking
-		// this branch's spawn-free contract (see the comment below), and the
-		// answer it spawned for would be the NEW server's project resolution, not
-		// the warm session's. A meaningless answer bought with a process is worse
-		// than no answer, so the warm-attach path keeps pre-#1640 rendering. This
-		// is a known gap, recorded on the issue rather than papered over with an
-		// "unverified" label that would fire on every warm-attach file including
-		// the properly configured majority.
-		const validLspDiags = usedWarmAttach
-			? rawValidLspDiags
-			: await demoteInferredProjectDiagnostics(rawValidLspDiags, {
-					filePath: diagnosticPath,
-					cwd: ctx.cwd,
-					service: lspService,
-				});
+		// #1645 review F2: this runner does NOT probe under warm attach. There,
+		// diagnostics came from an already-running remote session over IPC and no
+		// local client exists — so the probe would have to spawn a whole tsserver
+		// fleet to answer, breaking this branch's spawn-free contract (see the
+		// comment below), and the answer it spawned for would be the NEW server's
+		// project resolution, not the warm session's. A meaningless answer bought
+		// with a process is worse than no answer.
+		// #4645: the probe is asked where the answer lives instead. The incumbent
+		// owns the live client, sends its `projectIdentity` beside the server's
+		// raw rows, and this reader seeds the pipeline's identity memo with it, so
+		// the one pipeline runs here exactly as on a local read: the environment
+		// rule first, then membership. This reader still passes no `service`.
+		// Against an incumbent built before #4645 no answer arrives and the rows
+		// render as they did before #1640 (the mixed-build gap).
+		// #4532: the environment-gap rule rides the same pipeline and is NOT
+		// gated on warm attach: it asks one filesystem question about the file's
+		// own directory, needs nothing from the remote session, and left behind
+		// `usedWarmAttach` it kept the reported `🔴 STOP` on this route (round 4).
+		// `demoteLanguageServerRows` runs it on every route and the membership
+		// probe only where a local client may answer (round 5, review F3).
+		const validLspDiags = (
+			await demoteLanguageServerRows(rawValidLspDiags, {
+				filePath: diagnosticPath,
+				cwd: ctx.cwd,
+				...(!usedWarmAttach && { service: lspService }),
+				...(incumbentProjectIdentity !== undefined && {
+					identityCache: new Map([[diagnosticPath, incumbentProjectIdentity]]),
+				}),
+			})
+		).rows;
 		const fixSuggestionByIndex = new Map<number, string>();
 
 		// #1640: read severity off the RAW list. A demoted diagnostic is still
@@ -447,12 +551,42 @@ const lspRunner: RunnerDefinition = {
 		// #692: shared with the scan/sweep reconcile paths (`retagAuxiliaryDiagnostics`
 		// in `../auxiliary-lsp.js`) so a scan-reconciled aux finding gets identical
 		// tool/semantic/defectClass tagging instead of keeping tool "lsp".
-		const keptDiagnostics = retagAuxiliaryDiagnostics(
+		// #4481 r2: each converted diagnostic's raw LSP range (1:1, as above),
+		// captured before the re-tag drops suppressed entries, so the edit-scope
+		// filter below reads the match's full span, not only its start line.
+		const rawRangeByDiagnostic = new Map(
+			diagnostics.map((d, i) => [d, validLspDiags[i]?.range]),
+		);
+		const retaggedDiagnostics = retagAuxiliaryDiagnostics(
 			diagnostics,
 			validLspDiags,
 			content,
 			{ cwd: ctx.cwd, fileRole: ctx.fileRole },
 		);
+		// #4481: the ast-grep LSP runs the same rule catalog as the
+		// ast-grep-napi runner, so on the per-edit pass its blocker whose span
+		// does not overlap the edited lines is dropped, as napi and tree-sitter
+		// drop theirs. Language-server diagnostics (tool "lsp") and every other
+		// auxiliary stay unscoped by design: an edit can cause a type error or a
+		// finding at a line it never touched.
+		// #4484 r2: the gate decides delivery only; what it withholds rides out
+		// as `outOfEditScope`, still observed, for the recorded-blocker carry.
+		const keptDiagnostics: Diagnostic[] = [];
+		const outOfEditScope: Diagnostic[] = [];
+		for (const d of retaggedDiagnostics) {
+			const range =
+				ctx.blockingOnly && d.tool === "ast-grep" && d.semantic === "blocking"
+					? rawRangeByDiagnostic.get(d)
+					: undefined;
+			const inScope =
+				range === undefined ||
+				spanOverlapsModifiedRanges(
+					range.start.line + 1,
+					(range.end?.line ?? range.start.line) + 1,
+					ctx.modifiedRanges,
+				);
+			(inScope ? keptDiagnostics : outOfEditScope).push(d);
+		}
 
 		const hasErrors = keptDiagnostics.some((d) => d.semantic === "blocking");
 		const resultSemantic = hasErrors
@@ -478,6 +612,8 @@ const lspRunner: RunnerDefinition = {
 			...(deferredServerIds.length > 0 && {
 				deferredServerIds: [...deferredServerIds],
 			}),
+			...(outOfEditScope.length > 0 && { outOfEditScope }),
+			...(withheldNotice !== undefined && { withheldNotice }),
 		};
 	},
 };

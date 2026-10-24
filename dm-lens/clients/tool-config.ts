@@ -156,6 +156,16 @@ export const DM_LENS_TOOL_NAMES = TOOL_REGISTRY.flatMap((tool) =>
 	tool.piName === undefined ? [] : [tool.piName],
 ) as readonly string[];
 
+/**
+ * Whether dm-lens registers this tool on pi. Its mixed read/write operations
+ * are never promoted by the third-party learning mechanism (#4139), and it is
+ * never diffed as an opaque call (#4732): each is read-only or records its
+ * writes through the mutation bridge.
+ */
+export function isDmLensToolName(toolName: string): boolean {
+	return DM_LENS_TOOL_NAMES.includes(toolName);
+}
+
 export type ToolRegistryEntry = (typeof TOOL_REGISTRY)[number];
 
 export type LensToolHost = "pi" | "mcp";
@@ -223,7 +233,11 @@ export function translateGuidanceToolNames(
 			entry.mcpName,
 		);
 	}
-	return text.replace("activate via dm_lens_activate_tools", "call directly");
+	// #4682 (PR #4730 F1): the longer qualified clause first, so MCP never
+	// renders a condition it cannot satisfy ("if unlisted" with every tool listed).
+	return text
+		.replace("activate via dm_lens_activate_tools if unlisted", "call directly")
+		.replace("activate via dm_lens_activate_tools", "call directly");
 }
 
 export function toolRegistryEntryForPi(
@@ -281,7 +295,7 @@ export function readToolConfig(
 		}
 		if (!entry.disableable) {
 			warnInvalid(
-				`key "tools.${name}.enabled" cannot be disabled because it is required for the ${entry.mcpName ? "MCP session" : "pi tool activation"} contract`,
+				`key "tools.${name}.enabled" cannot be disabled because it is required for the ${entry.mcpName ? "MCP session" : "DM tool activation"} contract`,
 				"PILENS_CFG_0009",
 			);
 			continue;
