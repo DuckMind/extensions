@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, test } from "node:test";
 
 import { extractContent, fetchAllContent } from "../extract.ts";
@@ -17,6 +21,45 @@ test("local HTTP fetch sends the compatible User-Agent", async () => {
 
 	await extractContent("https://example.com/article", undefined, { mode: "raw", lookup });
 	assert.equal(userAgent, "OpenAI File Downloader, XaiImageApiFetch/1.0");
+});
+
+// The config path is captured at module load, so configured cases run in a child
+// process with DM_CODING_AGENT_DIR pointed at a fresh temp dir.
+async function fetchWithConfig(config, mode) {
+	const root = await mkdtemp(join(tmpdir(), "pi-fetch-user-agent-"));
+	const agentDir = join(root, "agent");
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(join(agentDir, "web-search.json"), JSON.stringify(config), "utf8");
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+			const userAgents = [];
+			globalThis.fetch = async (_url, init) => {
+				userAgents.push(new Headers(init.headers).get("user-agent"));
+				return new Response("body", { headers: { "content-type": "text/plain" } });
+			};
+			const { extractContent } = await import(${JSON.stringify(new URL("../extract.ts", import.meta.url).href)});
+			const result = await extractContent("https://example.com/article", undefined, { mode: ${JSON.stringify(mode)}, lookup: async () => [{ address: "93.184.216.34", family: 4 }] });
+			console.log(JSON.stringify({ userAgents, error: result.error }));
+		`,
+		encoding: "utf8",
+		env: { ...process.env, DM_CODING_AGENT_DIR: agentDir, HOME: join(root, "home"), USERPROFILE: join(root, "home") },
+	});
+	assert.equal(child.status, 0, child.stderr);
+	return JSON.parse(child.stdout.trim().split("\n").at(-1));
+}
+
+test("local HTTP fetch sends a configured fetchContent.userAgent", async () => {
+	const browser = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+	const output = await fetchWithConfig({ fetchContent: { userAgent: ` ${browser} ` } }, "raw");
+	assert.deepEqual(output, { userAgents: [browser], error: null });
+});
+
+test("an invalid fetchContent.userAgent fails the fetch before the direct fetch or any fallback provider", async () => {
+	for (const userAgent of ["", "  ", "agent\nInjected: 1", "agent\u0000x", "agent 😀", 42]) {
+		const output = await fetchWithConfig({ fetchContent: { userAgent }, fetchRouting: { allowRemoteHostedProviders: true } }, "readable");
+		assert.deepEqual(output.userAgents, [], JSON.stringify(userAgent));
+		assert.match(output.error, /^fetchContent\.userAgent in .*web-search\.json must be a non-empty string of printable ASCII characters$/);
+	}
 });
 
 test("readable fetch prefers server markdown while raw mode keeps the normal representation", async () => {
@@ -143,8 +186,7 @@ test("raw mode rejects PDF bodies with a hint toward Markdown extraction", async
 	globalThis.fetch = async () => new Response("%PDF-1.4 junk", { headers: { "content-type": "application/pdf" } });
 
 	const result = await extractContent("https://example.com/compatibility_list_AMD", undefined, { mode: "raw", lookup });
-	assert.match(result.error, /Unsupported content type in raw mode: application\/pdf/);
-	assert.match(result.error, /raw mode does not decode PDFs; retry without mode .*mode "answer"/);
+	assert.match(result.error, /Unsupported content type in raw mode: application\/pdf; retry without mode for Markdown, or with mode "answer"/);
 });
 
 test("raw mode keeps data URIs in the exact HTTP body", async () => {
@@ -163,4 +205,26 @@ test("readable mode returns supported image content", async () => {
 	assert.equal(result.mimeType, "image/png");
 	assert.equal(result.thumbnail?.mimeType, "image/png");
 	assert.match(result.content, /Image fetched \(1×1, image\/png\)/);
+});
+
+test("readable mode accepts a complete short page and reports a partial extraction with counts", async () => {
+	const fetchHtml = async (html) => {
+		globalThis.fetch = async () => new Response(html, { headers: { "content-type": "text/html" } });
+		return extractContent("https://example.com/page", undefined, { lookup });
+	};
+
+	const dataBlocks = '<script type="application/ld+json">{"@type":"Article"}</script>'.repeat(4) + '<script type="text/template"><p>row</p></script>';
+	const short = await fetchHtml(`<html><head><title>Short Note</title>${dataBlocks}</head><body><h1>Short Note</h1><p>This page is intentionally short and complete.</p></body></html>`);
+	assert.equal(short.error, null);
+	assert.equal(short.title, "Short Note");
+	assert.match(short.content, /intentionally short and complete/);
+
+	const scripted = await fetchHtml('<html><head><title>Short Note</title><script src="/app.js"></script></head><body><h1>Short Note</h1><p>This page is intentionally short and complete.</p></body></html>');
+	assert.match(scripted.error, /^Extracted content appears incomplete: the page has only \d+ characters of visible text and runs scripts/);
+	const legacyType = await fetchHtml('<html><head><title>Short Note</title><script type="text/jscript" src="/app.js"></script></head><body><h1>Short Note</h1><p>This page is intentionally short and complete.</p></body></html>');
+	assert.match(legacyType.error, /runs scripts/);
+
+	const links = Array.from({ length: 40 }, (_, i) => `<li><a href="/section-${i}">Navigation section number ${i}</a></li>`).join("");
+	const teaser = await fetchHtml(`<html><head><title>Teaser</title></head><body><nav><ul>${links}</ul></nav><article><h1>Teaser</h1><p>Only the first paragraph of this story is shown here.</p></article><footer><ul>${links}</ul></footer></body></html>`);
+	assert.match(teaser.error, /^Extracted content appears incomplete: extracted 53 characters from a page with \d{4} characters of visible text/);
 });

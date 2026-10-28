@@ -10,7 +10,7 @@ import {
 } from "./host-edit-normalize.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { noteAtomicReplace } from "./path-birth.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { normalizeMapKey, realpathOrResolve } from "./path-utils.js";
 import {
 	boundedEditIndexes,
 	createReadGuardEditBatchSummary,
@@ -440,8 +440,11 @@ export async function applyPartiallyApplicableEdits(args: {
 		}
 
 		const output = restoreLineEndings(committed, ending);
+		// A link is written through to its target. The seam resolves the spelling
+		// as written: `fs.realpathSync` folds `link/..` lexically first, so it
+		// named a file the read above never opened (#4689 batch 8).
 		const targetPath = fs.lstatSync(args.filePath).isSymbolicLink()
-			? fs.realpathSync(args.filePath)
+			? realpathOrResolve(args.filePath)
 			: args.filePath;
 		const before = fs.statSync(args.filePath);
 		writeFileAtomic(targetPath, output, {

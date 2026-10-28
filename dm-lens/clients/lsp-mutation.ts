@@ -417,7 +417,7 @@ function bookkeepLspMutation(
 					reason:
 						"workspace/applyEdit bookkeeping fell back to the mutation " +
 						"bridge, but no bridge is mounted in this process (e.g. the " +
-						"MCP server, which never runs pi's extension activation) — " +
+						"MCP server, which never runs DM's extension activation) — " +
 						"the write is unrecorded (no read-guard stamp, no turn-state " +
 						"entry, no change-log receipt).",
 				});

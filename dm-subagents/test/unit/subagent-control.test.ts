@@ -11,16 +11,60 @@ import {
 	shouldEmitOpenToolAttention,
 	shouldNotifyControlEvent,
 } from "../../src/runs/shared/subagent-control.ts";
-import { nextLongRunningTrigger } from "../../src/runs/shared/long-running-guard.ts";
+import { didMutatingToolFail, isMutatingTool, nextLongRunningTrigger, resolveCurrentPath } from "../../src/runs/shared/long-running-guard.ts";
 
 const config = resolveControlConfig(undefined, {
 	needsAttentionAfterMs: 300,
 });
 
+describe("mutating tool supervision", () => {
+	it("exempts only exact /dev/null redirect targets while retaining real writes", () => {
+		for (const command of [
+			"grep x index.ts 2>/dev/null", "grep x index.ts >/dev/null", "grep x index.ts &>/dev/null",
+			"grep x index.ts 2>>/dev/null", "grep x index.ts >/dev/null 2>&1", "grep x index.ts > /dev/null",
+			"grep x index.ts >/dev/null && ls", "grep x index.ts >/dev/null | cat",
+			"echo 'a > b'", "grep x index.ts 2>&1", "grep x index.ts 2>&2", "grep -rn mimeType index.ts 2>/dev/null; ls *.ts",
+		]) {
+			assert.equal(isMutatingTool("bash", { command }), false, command);
+		}
+		for (const command of [
+			"echo hi >/dev/nullish", "echo hi > /dev/null.bak", "echo hi > out.txt",
+			"rm old.txt", "sed s/a/b/ -i file.txt", "git apply fix.patch",
+		]) {
+			assert.equal(isMutatingTool("bash", { command }), true, command);
+		}
+		assert.equal(isMutatingTool("edit", { path: "file.txt" }), true);
+		assert.equal(isMutatingTool("write", { path: "file.txt" }), true);
+	});
+
+	it("uses only the tool result's isError flag to judge a failure", () => {
+		assert.equal(didMutatingToolFail({ isError: false, content: [{ type: "text", text: 'return { error: "failed" }' }] }), false);
+		assert.equal(didMutatingToolFail({ isError: true, content: [{ type: "text", text: "No exact match found" }] }), true);
+		assert.equal(didMutatingToolFail({ isError: "true" }), false);
+		assert.equal(didMutatingToolFail({ content: [{ type: "text", text: "error" }] }), false);
+	});
+
+	it("reports the file a bash command writes, not an fd duplication or /dev/null", () => {
+		assert.equal(resolveCurrentPath("bash", { command: "npm test > /tmp/t.log 2>&1; tail /tmp/t.log" }), "/tmp/t.log");
+		assert.equal(resolveCurrentPath("bash", { command: "grep -rn x src 2>/dev/null >out.txt" }), "out.txt");
+		assert.equal(resolveCurrentPath("bash", { command: "npm test 2>&1; echo done" }), undefined);
+		assert.equal(resolveCurrentPath("bash", { command: "grep x index.ts &>/dev/null" }), undefined);
+		assert.equal(resolveCurrentPath("bash", { command: "npm test 2>&1>out.log" }), "out.log");
+		assert.equal(resolveCurrentPath("bash", { command: "npm test >'test-results(1).log'" }), "test-results(1).log");
+		assert.equal(resolveCurrentPath("bash", { command: 'npm test > "my log.txt" 2>&1' }), "my log.txt");
+		assert.equal(resolveCurrentPath("bash", { command: "printf 'value > label' >out.log" }), "out.log");
+		assert.equal(resolveCurrentPath("bash", { command: 'echo "a > b" && echo \\> c' }), undefined);
+		assert.equal(resolveCurrentPath("bash", { command: "npm test | tee -a run.log" }), "run.log");
+		assert.equal(resolveCurrentPath("bash", { command: "npm test | tee /dev/null run.log" }), "run.log");
+		assert.equal(resolveCurrentPath("bash", { command: "npm test | tee /dev/null\necho done >out.log" }), "out.log");
+		assert.equal(resolveCurrentPath("bash", { command: 'echo hi >"my\\_file \\"x\\".log"' }), 'my\\_file "x".log');
+	});
+});
+
 describe("subagent control attention state", () => {
 	it("notifies once for each distinct long-open tool call even when notice text matches", () => {
 		const seen = new Set<string>();
-		const event = buildControlEvent({ to: "needs_attention", runId: "run", agent: "worker", reason: "tool_open_threshold", currentTool: "bash", toolCallId: "first" });
+		const event = buildControlEvent({ to: "needs_attention", runId: "run", agent: "worker", reason: "tool_open_threshold", currentTool: "bash", toolCallId: "first", hasCommandController: true });
 		assert.equal(claimControlNotification(resolveControlConfig(), event, seen), true);
 		assert.equal(claimControlNotification(resolveControlConfig(), { ...event, ts: event.ts + 1000 }, seen), false);
 		assert.equal(claimControlNotification(resolveControlConfig(), { ...event, toolCallId: "second" }, seen), true);
@@ -243,6 +287,29 @@ describe("subagent control attention state", () => {
 		assert.match(message, /Transcript: subagent\(\{ action: "status", id: "78f659a3", options: \{ view: "transcript" \} \}\)/);
 		assert.doesNotMatch(message, /live async nudge|live nested nudge|Interrupt:|Direct intercom target:/);
 		assert.match(formatControlIntercomMessage(event), /A queued steer does not cancel an in-flight bash call/);
+	});
+
+	it("only suggests command controls when the child has a command controller", () => {
+		const base = {
+			to: "needs_attention" as const,
+			runId: "78f659a3",
+			agent: "worker",
+			reason: "tool_open_threshold" as const,
+			currentTool: "bash",
+			toolCallId: "call-1",
+		};
+		const omitted = formatControlNoticeMessage(buildControlEvent(base));
+		assert.doesNotMatch(omitted, /"action":"command\.(status|yield|cancel)"/);
+		assert.match(omitted, /Transcript: subagent\(/);
+		assert.match(omitted, /Recovery: For a local DM child explicitly granted subagent_command/);
+
+		const unavailable = formatControlNoticeMessage(buildControlEvent({ ...base, hasCommandController: false }));
+		assert.doesNotMatch(unavailable, /"action":"command\.(status|yield|cancel)"/);
+
+		const available = formatControlNoticeMessage(buildControlEvent({ ...base, hasCommandController: true }));
+		assert.match(available, /"action":"command\.status","id":"78f659a3"/);
+		assert.match(available, /"action":"command\.yield"/);
+		assert.match(available, /"action":"command\.cancel"/);
 	});
 
 	it("scopes open-bash transcript inspection to the selected child without suggesting a run-wide interrupt", () => {

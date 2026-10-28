@@ -51,6 +51,13 @@ import { dropStaleFiles } from "./session-state-store.js";
  * this does; on-disk canonical casing is irrelevant for merely deduplicating a
  * process-local footer cache. The human-readable path is preserved separately
  * on the record's `filePath` (see `toDisplayPath`) for rendering/summaries.
+ *
+ * The key is syntactic, so a link spelling and its target are one record only
+ * when every writer hands this module the file's path identity (#4689 item 3,
+ * maintainer decision 2026-10-24): the identity is resolved ONCE where a path
+ * enters (a tool or write event, `createDispatchContext`, `FormatService`), by
+ * `normalizeMapKey`, and this key is applied to a path that already is one.
+ * No filesystem call is made here per diagnostic write.
  */
 function fileMapKey(filePath: string): string {
 	return normalizeEphemeralMapKey(filePath);

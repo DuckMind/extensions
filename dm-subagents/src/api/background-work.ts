@@ -19,11 +19,15 @@ export interface BackgroundWorkItem {
 
 export interface BackgroundWorkReconcileContext {
 	sessionId: string;
+	/** All identities for this session, including its file path and runtime session id. */
+	sessionIds: readonly string[];
 	nowMs: number;
 }
 
 export interface BackgroundWorkListContext {
 	sessionId: string;
+	/** All identities for this session, including its file path and runtime session id. */
+	sessionIds: readonly string[];
 	nowMs: number;
 }
 
@@ -159,15 +163,17 @@ export function listBackgroundWorkWakeChannels(): readonly string[] {
 	return [...channels];
 }
 
-/** Reconcile and snapshot active provider work owned by one exact DM session. */
-export function snapshotBackgroundWork(sessionId: string, nowMs = Date.now()): BackgroundWorkSnapshot {
-	validateString(sessionId, "Background-work snapshot sessionId", MAX_SESSION_ID_LENGTH);
+/** Reconcile once per provider and retain work matching any identity of this DM session. */
+export function snapshotBackgroundWork(sessionIds: readonly string[], nowMs = Date.now()): BackgroundWorkSnapshot {
+	const accepted = [...new Set(sessionIds.map((id) => validateString(id, "Background-work snapshot sessionId", MAX_SESSION_ID_LENGTH)))];
+	const sessionId = accepted[0];
+	if (sessionId === undefined) throw new Error("Background-work snapshot needs at least one session id.");
 	const providers = listBackgroundWorkProviders();
 	const items: RegisteredBackgroundWorkItem[] = [];
 	const identities = new Set<string>();
 	for (const provider of providers) {
 		try {
-			provider.reconcile?.({ sessionId, nowMs });
+			provider.reconcile?.({ sessionId, sessionIds: [...accepted], nowMs });
 		} catch (error) {
 			throw new Error(
 				`Background-work provider '${provider.name}' reconcile failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -176,7 +182,7 @@ export function snapshotBackgroundWork(sessionId: string, nowMs = Date.now()): B
 		}
 		let active: readonly BackgroundWorkItem[];
 		try {
-			active = provider.listActiveWork({ sessionId, nowMs });
+			active = provider.listActiveWork({ sessionId, sessionIds: [...accepted], nowMs });
 		} catch (error) {
 			throw new Error(
 				`Background-work provider '${provider.name}' listActiveWork failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -196,7 +202,7 @@ export function snapshotBackgroundWork(sessionId: string, nowMs = Date.now()): B
 				throw new Error(`Background-work provider '${provider.name}' returned duplicate item '${item.id}' for session '${item.sessionId}'.`);
 			}
 			identities.add(identity);
-			if (item.sessionId === sessionId) items.push({ provider: provider.name, ...item });
+			if (accepted.includes(item.sessionId)) items.push({ provider: provider.name, ...item });
 		});
 	}
 	return {

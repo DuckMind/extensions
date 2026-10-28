@@ -1,6 +1,6 @@
 import { Agent, type AgentTool, type StreamFn, type ThinkingLevel } from "@duckmind/dm-agent-core";
 import { createReadOnlyTools, convertToLlm, type ExtensionContext } from "@duckmind/dm-coding-agent";
-import type { Model, ProviderHeaders } from "@duckmind/dm-ai";
+import type { Model, ProviderHeaders, SystemMessage } from "@duckmind/dm-ai";
 import { streamSimple } from "@duckmind/dm-ai/compat";
 import { Type, type Static } from "typebox";
 import { resolveModelCandidate } from "../runs/shared/model-resolution.ts";
@@ -283,11 +283,21 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 		? (model, context, streamOptions) => registryStream.call(ctx.modelRegistry, model, context, streamOptions)
 		: (model, context, streamOptions) => streamSimple(model, context, streamOptions));
 	const sessionId = ctx.sessionManager.getSessionId();
+	let declaration: SystemMessage | undefined;
 	const streamFn: StreamFn = (model, context, streamOptions) => {
 		// Agent may enter one final loop iteration after an aborted mixed tool batch.
 		// Never send that iteration to the provider after an intentional yield.
 		if (clarification) throw new Error("Watchdog review yielded for clarification.");
-		return baseStreamFn(model, context, {
+		declaration ??= {
+			role: "system",
+			content: context.systemPrompt ?? "",
+			toolsAdded: (context.tools ?? []).map(({ name, description, parameters }) => ({ name, description, parameters })),
+			timestamp: Date.now(),
+		};
+		const modelContext = options.streamFn
+			? { ...context, messages: [declaration, ...context.messages] }
+			: context;
+		return baseStreamFn(model, modelContext, {
 			...streamOptions,
 			...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
 			env: auth.env || streamOptions?.env ? { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } : undefined,

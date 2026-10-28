@@ -28,7 +28,7 @@ A command-runner agent with a plain `command` (no adapter) is also how a classif
 
 ### External job profiles
 
-An agent may set `runner.type: external-job` with a non-empty `provider` and optional JSON `options`. When `surf-cli` is installed and loaded, Surf can optionally expose a `gpt-pro` package agent through provider `surf-oracle`. Surf maps `model: pro` to its configured pro web mode. dm-subagents does not own that package agent or model mapping. Remove any old `agentOverrides.gpt-pro.disabled` workaround before using Surf's package agent. The provider must be registered in the host DM process through `dm-subagents/external-job-provider`; the async runner talks to that parent-owned registry through a local operation bridge.
+An agent may set `runner.type: external-job` with a non-empty `provider` and optional JSON `options`. When `surf-cli` is installed and loaded, Surf can optionally expose a `gpt-pro` package agent through provider `surf-oracle`. Surf maps `model: pro` to its configured pro web mode. dm-subagents does not own that package agent or model mapping. Remove any old `agentOverrides.gpt-pro.disabled` workaround before using Surf's package agent. Register the provider in the host DM process through the external-job-provider module's `registerExternalJobProvider` export (see the `extension-api` guide topic and [external-job provider details](../../../docs/extension-api.md)); the async runner talks to that parent-owned registry through a local operation bridge.
 
 External job profiles are async-only. The provider owns the remote job and DM owns the async run record. Status persists provider name, provider job id, prompt digest, provider options, handle/conversation URLs when supplied, result artifact path, last known state, and provider failure code/message. Recovery uses existing provider job metadata to call `reattach` and `result`; it refuses to redispatch a prompt when the persisted provider job does not match the prompt digest.
 
@@ -182,7 +182,8 @@ then wait on its id; do not resume or launch a replacement while it remains
 detached. Headless sessions also auto-drain exact current-session work at
 `agent_end` as a final safeguard.
 
-Providers are discovered through the `dm-subagents/background-work` registry and
+Providers are discovered through the dm-subagents/background-work registry
+([background-work provider API](../../../docs/extension-api.md)); they
 must expose a stable item id and owning session id. Load a provider through the
 child’s `extensions` or `subagentOnlyExtensions` and allow `bg_wait` in its
 tools. For
@@ -267,7 +268,7 @@ A failure in the subagent workflow, child launch, prompt runtime, extension load
 
 Use native `subagent` runs for unattended implementation, review, and gate work that needs managed isolation, durable artifacts, and process controls. Use `interactive_shell` for visible terminal work, alternate CLIs, trust prompts, or recovery only when the user explicitly requests that mode or the task is outside the governed subagent protocol; it is not an implicit replacement for a failed `subagent` lane.
 
-A cooperating terminal runtime can register read-only external records through `dm-subagents/external-runs`. Records include the source, session, state, optional report path, and completion reason. They are observations only: dm-subagents does not start, stop, steer, or otherwise own the foreign process. Run unattended raw terminal agents in an explicit isolated cwd or worktree; do not use a live project checkout as disposable review space.
+A cooperating terminal runtime can register read-only external records through the dm-subagents/external-runs module (see the `extension-api` guide topic and [external-job observation API](../../../docs/extension-api.md)). Records include the source, session, state, optional report path, and completion reason. They are observations only: dm-subagents does not start, stop, steer, or otherwise own the foreign process. Run unattended raw terminal agents in an explicit isolated cwd or worktree; do not use a live project checkout as disposable review space.
 
 ### Scheduled subagent runs
 

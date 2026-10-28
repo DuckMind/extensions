@@ -12,9 +12,10 @@ note: |
 
   The rule matches a `function_definition` that contains BOTH a
   `yield` node AND a `return_statement` with a value (`return\s+\S`).
-  Each `has:` uses `stopBy: {kind: function_definition}` (not the
-  plain `stopBy: end` this rule shipped with originally) — it needs
-  to search past the `block` wrapper (the function body isn't a
+  Each `has:` stops at a nested `function_definition` (not the
+  plain `stopBy: end` this rule shipped with originally); the `yield`
+  clause also stops at a `lambda`, since `lambda: (yield)` is its own
+  generator (#4840). The search has to go past the `block` wrapper (the function body isn't a
   direct child of `function_definition`), but must NOT cross into a
   nested `function_definition`. A bare `stopBy: end` searches every
   descendant regardless of depth, so a `yield` in an outer
@@ -38,8 +39,12 @@ rule:
     - kind: function_definition
     - has:
         kind: yield
+        # A nested def or a generator lambda (`lambda: (yield)`) is its own
+        # generator; its yield does not make the enclosing function one (#4840).
         stopBy:
-          kind: function_definition
+          any:
+            - kind: function_definition
+            - kind: lambda
     - has:
         kind: return_statement
         regex: 'return\s+\S'

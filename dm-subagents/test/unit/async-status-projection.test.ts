@@ -426,6 +426,47 @@ describe("async status projection", () => {
 		assert.equal(forward.omitted.children, 1);
 	});
 
+	it("reports the model and thinking level each step runs on", () => {
+		const snapshot = projectAsyncStatusSnapshot([
+			job({
+				asyncId: "fanout",
+				status: "running",
+				steps: [
+					{ agent: "worker", status: "running", model: "openai-codex/gpt-6.1-sol:medium", thinking: "medium" },
+					{ agent: "scout", status: "pending" },
+					{ agent: "planner", status: "running", model: "dm-claude-cli/claude-haiku-4-5:low" },
+				],
+			}),
+			materializedWorkflow,
+			job({ ...materializedRunningChild, steps: [{ agent: "reviewer", status: "running", model: "anthropic/claude-haiku-4-5" }] }),
+		], { generatedAt: 5_000 });
+
+		const fanout = snapshot.runs.find((run) => run.id === "fanout");
+		assert.deepEqual(fanout?.children?.map(({ model, thinking }) => ({ model, thinking })), [
+			{ model: "openai-codex/gpt-6.1-sol", thinking: "medium" },
+			{ model: undefined, thinking: undefined },
+			{ model: "dm-claude-cli/claude-haiku-4-5", thinking: "low" },
+		]);
+		const lane = snapshot.runs.find((run) => run.id === "wf-1")?.children?.find((child) => child.id === "rev-r");
+		assert.equal(lane?.model, "anthropic/claude-haiku-4-5");
+		assert.equal(fanout?.model, undefined);
+	});
+
+	it("reports the agent each step runs as", () => {
+		const snapshot = projectAsyncStatusSnapshot([
+			job({ asyncId: "fanout", status: "running", steps: [{ agent: "worker", status: "running" }, { agent: "scout", status: "pending" }] }),
+			materializedWorkflow,
+			job({ ...materializedRunningChild, steps: [{ agent: "reviewer-strict", status: "running" }] }),
+		], { generatedAt: 5_000 });
+
+		const fanout = snapshot.runs.find((run) => run.id === "fanout");
+		assert.deepEqual(fanout?.children?.map(({ agent }) => agent), ["worker", "scout"]);
+		assert.equal(fanout?.agent, undefined);
+		const lanes = snapshot.runs.find((run) => run.id === "wf-1")?.children;
+		assert.equal(lanes?.find((child) => child.id === "rev-r")?.agent, "reviewer-strict");
+		assert.equal(lanes?.find((child) => child.id === "rev-parity")?.agent, "reviewer");
+	});
+
 	it("derives safe end times only for terminal steps", () => {
 		const snapshot = projectAsyncStatusSnapshot([job({
 			asyncId: "step-times",

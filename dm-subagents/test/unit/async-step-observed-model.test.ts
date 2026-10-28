@@ -6,15 +6,6 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { runSubagent, type SubagentRunConfig } from "../../src/runs/background/subagent-runner.ts";
 import { createFakeChildSessions } from "../support/fake-child-session.ts";
 
-// A child can run on a model other than the one it was launched with: a host
-// extension (for example a model router) may switch it on the child's first
-// input. The async status must report the model each assistant message
-// actually used, not the launch candidate, or the run display and metadata
-// name a model the child never ran on.
-//
-// The foreground path already does this (`progress.model = observedModel`);
-// these tests pin the async equivalent.
-
 let previousAgentDir: string | undefined;
 let agentDir: string;
 
@@ -46,15 +37,15 @@ function baseConfig(root: string, id: string, steps: SubagentRunConfig["steps"])
 	};
 }
 
-function readStatus(config: SubagentRunConfig): Record<string, unknown> {
-	const statusPath = path.join(config.asyncDir!, "status.json");
-	assert.ok(fs.existsSync(statusPath), `status.json must exist at ${statusPath}`);
-	return JSON.parse(fs.readFileSync(statusPath, "utf-8")) as Record<string, unknown>;
+type StepModels = { model?: string; launchModel?: string; resolvedModel?: { provider: string; model: string } };
+
+function stepModels(config: SubagentRunConfig): StepModels[] {
+	const status = JSON.parse(fs.readFileSync(path.join(config.asyncDir!, "status.json"), "utf-8")) as { steps: StepModels[] };
+	return status.steps.map(({ model, launchModel, resolvedModel }) => ({ model, launchModel, resolvedModel }));
 }
 
-function stepModels(status: Record<string, unknown>): Array<{ model?: string; launchModel?: string }> {
-	const steps = (status.steps ?? []) as Array<{ model?: string; launchModel?: string }>;
-	return steps.map((step) => ({ model: step.model, launchModel: step.launchModel }));
+function assistantReply(provider: string, model: string): unknown {
+	return { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], provider, model, stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } };
 }
 
 describe("async step reports the observed child model", () => {
@@ -62,8 +53,6 @@ describe("async step reports the observed child model", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-observed-model-switch-"));
 		const queue = path.join(root, "queue");
 		fs.mkdirSync(queue, { recursive: true });
-		// The child launches on llama-swap but every assistant turn reports the
-		// rerouted provider, standing in for a host model router's switch.
 		fs.writeFileSync(path.join(queue, "default-response.json"), JSON.stringify({
 			output: "done on the rerouted model",
 			reportedModel: "openai-codex/gpt-6-sol",
@@ -75,10 +64,10 @@ describe("async step reports the observed child model", () => {
 		try {
 			await runSubagent(config, fake.factory);
 			assert.equal(fake.sessions.length, 1, "the child session must launch");
-			const models = stepModels(readStatus(config));
+			const models = stepModels(config);
 			assert.deepEqual(
 				models,
-				[{ model: "openai-codex/gpt-6-sol", launchModel: "llama-swap/qwen3.5:9b" }],
+				[{ model: "openai-codex/gpt-6-sol", launchModel: "llama-swap/qwen3.5:9b", resolvedModel: undefined }],
 				"the step must report the observed model and keep the launch model for revival",
 			);
 		} finally {
@@ -100,8 +89,30 @@ describe("async step reports the observed child model", () => {
 		]);
 		try {
 			await runSubagent(config, fake.factory);
-			const models = stepModels(readStatus(config));
-			assert.deepEqual(models, [{ model: "llama-swap/qwen3.5:9b", launchModel: undefined }], "a stable model must be reported unchanged");
+			const models = stepModels(config);
+			assert.deepEqual(models, [{ model: "llama-swap/qwen3.5:9b", launchModel: undefined, resolvedModel: undefined }], "a stable model must be reported unchanged; a reply without a provider records no resolved model");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("records the provider and model of the child's own reply, not the requested model or a forked parent's records", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-observed-model-resolved-"));
+		const queue = path.join(root, "queue");
+		fs.mkdirSync(queue, { recursive: true });
+		fs.writeFileSync(path.join(queue, "default-response.json"), JSON.stringify({ jsonl: [assistantReply("openai-codex", "gpt-6-sol")] }));
+		const sessionFile = path.join(root, "fork.jsonl");
+		fs.writeFileSync(sessionFile, [
+			{ type: "session", id: "parent", cwd: root, timestamp: new Date(0).toISOString() },
+			{ type: "message", id: "m1", message: { role: "assistant", content: [{ type: "text", text: "parent" }], provider: "anthropic", model: "claude-parent" } },
+		].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+		const fake = createFakeChildSessions(() => queue);
+		const config = baseConfig(root, "observed-resolved", [
+			{ agent: "worker", task: "do the work", model: "llama-swap/qwen3.5:9b", context: "fork", sessionFile },
+		]);
+		try {
+			await runSubagent(config, fake.factory);
+			assert.deepEqual(stepModels(config)[0]?.resolvedModel, { provider: "openai-codex", model: "gpt-6-sol" });
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

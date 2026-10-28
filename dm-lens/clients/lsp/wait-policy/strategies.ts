@@ -14,6 +14,10 @@
  */
 
 import { createRequire } from "node:module";
+import {
+	isTsgoLaunchVariant,
+	type LspLaunchVariant,
+} from "../server-traits.js";
 
 const _require = createRequire(import.meta.url);
 
@@ -652,12 +656,130 @@ const DEFAULT_STRATEGY: DiagnosticStrategy = {
 	expectSemanticSecondPush: false,
 };
 
+/** One strategy field's treatment on a command-override launch (#4833). */
+interface OverrideStrategyDecision {
+	/**
+	 * `inherit` = the override keeps the row's value; `reset` = the default;
+	 * `longer` = the longer of the row's budget and the default.
+	 */
+	readonly keep: "inherit" | "reset" | "longer";
+	readonly why: string;
+}
+
+/**
+ * #4833: what a `serverOverrides.<id>.command` launch does with EVERY
+ * {@link DiagnosticStrategy} field of the row keyed by its catalog server id.
+ * The row was measured on the catalog binary, but `DEFAULT_STRATEGY` is the
+ * default for a server nobody measured, not the fail-safe value of each field:
+ * resetting a protocol workaround reads a file sooner (a false clean).
+ *
+ * Direction of the default, per field. FAIL-SAFE = it waits longer or reads
+ * unconfirmed; FAIL-OPEN = it reads clean sooner.
+ *   - `inherit` = the row's value is the restrictive direction (it adds work, a
+ *     hold or a drop whose worst case is a timeout); resetting would be
+ *     fail-open.
+ *   - `longer` = a wait budget: never shorter than the default.
+ *   - `reset` = an optimistic claim (skip a wait, trust a first push); the
+ *     default is fail-safe.
+ *
+ * Mapped over `keyof DiagnosticStrategy`, so a new field fails to compile until
+ * decided; `tests/config/lsp-override-copy-census.test.ts` reads the interface
+ * and checks the effect of each decision on every catalog row.
+ */
+export const OVERRIDE_STRATEGY_FIELDS: {
+	readonly [K in keyof DiagnosticStrategy]-?: OverrideStrategyDecision;
+} = {
+	seedFirstPush: {
+		keep: "reset",
+		why: "True takes the first push as complete (optimistic); the default waits for the settle.",
+	},
+	pullRetryBudgetMs: {
+		keep: "longer",
+		why: "A retry budget; zero skips the pull retry, so never shorter than the default.",
+	},
+	debounceMs: {
+		keep: "longer",
+		why: "A settle window; a shorter one reads sooner, so never shorter than the default.",
+	},
+	aggregateWaitMs: {
+		keep: "longer",
+		why: "A wait budget measured on the catalog binary (opengrep cold scan 3.5 s); never shorter than the default.",
+	},
+	expectSemanticSecondPush: {
+		keep: "inherit",
+		why: "Adds a second pull after an empty fast first pull; the default reads that empty answer.",
+	},
+	reopenOnResync: {
+		keep: "inherit",
+		why: "Re-opens an edited document for a scanner that ignores didChange; dropping it loses every later finding.",
+	},
+	rescansOnSave: {
+		keep: "inherit",
+		why: "Expects the publish a save triggers; at worst the wait times out as unconfirmed.",
+	},
+	emptyUntilRulesRefreshed: {
+		keep: "inherit",
+		why: "Holds the empty publish before the rules load; dropping it reads that empty as clean.",
+	},
+	publishesOnClose: {
+		keep: "inherit",
+		why: "Drops the version-less close-time empty publish; dropping it lets a stale empty overwrite a real answer.",
+	},
+	emptyFirstPublish: {
+		keep: "inherit",
+		why: "Holds the empty pre-index first publish (#3310); dropping it reads that empty as clean.",
+	},
+	diagnosticsFence: {
+		keep: "inherit",
+		why: "Drops version-less publishes that predate the edit; the worst case is a timeout, never a false clean.",
+	},
+	silentOnClean: {
+		keep: "reset",
+		why: "True skips the in-lane wait on a clean transition (optimistic); the default waits in full.",
+	},
+	workspaceIndexing: {
+		keep: "reset",
+		why: "True shortens later same-sweep waits (optimistic); the default pays the full budget every touch.",
+	},
+	workspaceIndexingWarmWaitMs: {
+		keep: "reset",
+		why: "Read only with workspaceIndexing, so it resets with it.",
+	},
+};
+
+/**
+ * The row for a command-override launch: the default strategy with the row's
+ * `inherit` fields and the longer of its `longer` budgets applied. A field the
+ * table does not name resets (fail closed); an id with no row is the default.
+ */
+function overrideStrategy(serverId: string): DiagnosticStrategy {
+	const row = SERVER_DIAGNOSTIC_STRATEGIES[serverId];
+	if (!row) return DEFAULT_STRATEGY;
+	const strategy: DiagnosticStrategy = { ...DEFAULT_STRATEGY };
+	for (const [field, value] of Object.entries(row)) {
+		if (!Object.hasOwn(OVERRIDE_STRATEGY_FIELDS, field)) continue;
+		const keep =
+			OVERRIDE_STRATEGY_FIELDS[field as keyof DiagnosticStrategy].keep;
+		if (keep === "inherit") Object.assign(strategy, { [field]: value });
+		else if (keep === "longer" && typeof value === "number") {
+			const floor = DEFAULT_STRATEGY[field as keyof DiagnosticStrategy];
+			if (typeof floor === "number") {
+				Object.assign(strategy, { [field]: Math.max(value, floor) });
+			}
+		}
+	}
+	return strategy;
+}
+
 export function getStrategy(
 	serverId: string,
-	launchVariant?: "classic" | "native-ts7",
+	launchVariant?: LspLaunchVariant,
 ): DiagnosticStrategy {
-	if (serverId === "typescript" && launchVariant === "native-ts7") {
+	if (serverId === "typescript" && isTsgoLaunchVariant(launchVariant)) {
 		return NATIVE_TS7_DIAGNOSTIC_STRATEGY;
 	}
+	// #4833: a `serverOverrides.<id>.command` launch runs another binary, so the
+	// catalog row's optimistic claims reset and its restrictive fields stay.
+	if (launchVariant === "override") return overrideStrategy(serverId);
 	return SERVER_DIAGNOSTIC_STRATEGIES[serverId] ?? DEFAULT_STRATEGY;
 }

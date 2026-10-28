@@ -312,6 +312,9 @@ export function startCuratorServer(
 		if (provider === "valyu") return availableProviders.valyu;
 		if (provider === "keenable") return availableProviders.keenable;
 		if (provider === "ceramic") return availableProviders.ceramic;
+		if (provider === "linkup") return availableProviders.linkup;
+		if (provider === "ninerouter") return availableProviders.ninerouter;
+		if (provider === "deepseek") return availableProviders.deepseek;
 		return false;
 	}
 

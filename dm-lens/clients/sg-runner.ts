@@ -14,6 +14,7 @@ import {
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
+import { walkUpDirs } from "./path-utils.js";
 import { getProjectTrustState } from "./project-trust.js";
 import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
@@ -557,12 +558,8 @@ export class SgRunner {
 
 		// Search roots: local node_modules and any parent node_modules directories.
 		const searchRoots: string[] = [];
-		let dir = process.cwd();
-		for (let depth = 0; depth < 5; depth++) {
+		for (const dir of walkUpDirs(process.cwd(), { maxDepth: 5 })) {
 			searchRoots.push(path.join(dir, "node_modules"));
-			const parent = path.dirname(dir);
-			if (parent === dir) break;
-			dir = parent;
 		}
 
 		for (const suffix of pkgSuffixes) {

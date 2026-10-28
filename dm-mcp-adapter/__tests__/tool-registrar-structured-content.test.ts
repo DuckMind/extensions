@@ -371,6 +371,18 @@ describe("resolveMcpResultContent", () => {
     ]);
   });
 
+  it("leaves structuredContent out after real content when the server opts out", () => {
+    const result = { content: [{ type: "text", text: "real" }], structuredContent: { status: "ok" } };
+
+    expect(resolveMcpResultContent(result, undefined, false)).toEqual([{ type: "text", text: "real" }]);
+  });
+
+  it("still falls back to structuredContent when an opted-out server sends no content", () => {
+    expect(resolveMcpResultContent({ content: [], structuredContent: { value: 42 } }, undefined, false)).toEqual([
+      { type: "text", text: JSON.stringify({ value: 42 }, null, 2) },
+    ]);
+  });
+
   it("preserves empty and non-serializable structuredContent during coexistence", () => {
     expect(resolveMcpResultContent({
       content: [{ type: "text", text: "real" }],

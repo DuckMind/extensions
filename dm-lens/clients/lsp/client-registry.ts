@@ -51,6 +51,7 @@ import {
 } from "./launch.js";
 import {
 	declinesLooseFileRoot,
+	declinesProjectlessRoot,
 	enforceLspRootCeiling,
 	getServerById,
 	hasProjectBoundaryMarker,
@@ -1411,6 +1412,19 @@ export class ClientRegistry {
 			this.noteSpawnVerdict(key, "declined");
 			return undefined;
 		}
+		// #4806: a server whose process aborts without a project file below its
+		// root (csharp-ls, SIGABRT) is declined BEFORE any process starts, on the
+		// policy path like `declinesLooseFileRoot`: no `spawn_failed`, no failure
+		// ladder, no breaker, and one record per (server, root) per session.
+		if (await declinesProjectlessRoot(server, root)) {
+			recordDegradationOnce({
+				kind: "lsp-root-declined",
+				subject: key,
+				reason: `LSP spawn declined for ${server.id}: no project file at or below ${root}`,
+			});
+			this.noteSpawnVerdict(key, "declined");
+			return undefined;
+		}
 		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
 		const startedAt = Date.now();
 		logSessionStart(
@@ -1525,6 +1539,7 @@ export class ClientRegistry {
 				initialization: mergedInit,
 				initializeTimeoutMs: server.initializeTimeoutMs,
 				launchVariant: spawned.launchVariant,
+				settingsSection: server.settingsSection,
 				// #4764: the declared role travels with the client, so a failed server
 				// config can gate an auxiliary scanner's empty publications only.
 				role: server.role,

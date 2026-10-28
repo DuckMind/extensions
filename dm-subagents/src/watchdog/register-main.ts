@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@duckmind/dm-coding-agent";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
-import { SLASH_TEXT_RESULT_TYPE } from "../shared/types.ts";
+import { SLASH_TEXT_RESULT_TYPE, SLASH_TEXT_VIEW_ONLY_DETAILS } from "../shared/types.ts";
 import { startWatchdogDiffBaselineCapture, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { formatWatchdogRecommendation, recommendWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput } from "./model-selection.ts";
 import { createMainWatchdogReview } from "./review.ts";
@@ -16,10 +16,12 @@ import { createWatchdogWarningMessage } from "./warning-format.ts";
 interface RegisterMainWatchdogOptions {
 	runtime?: MainWatchdogRuntime;
 	review?: WatchdogReviewFunction;
+	/** config.enableSlashCommands: false leaves out /subagents-watchdog. */
+	slashCommand?: boolean;
 }
 
 function sendSlashText(dm: ExtensionAPI, text: string): void {
-	dm.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true });
+	dm.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true, details: SLASH_TEXT_VIEW_ONLY_DETAILS });
 }
 
 function messageFromError(error: unknown): string {
@@ -382,7 +384,7 @@ export function registerMainWatchdog(dm: ExtensionAPI, options: RegisterMainWatc
 		displayClarification: (content) => dm.sendMessage({ customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: true }),
 	});
 
-	dm.registerCommand("subagents-watchdog", {
+	if (options.slashCommand !== false) dm.registerCommand("subagents-watchdog", {
 		description: "Show or toggle the default-off subagent watchdog",
 		handler: (args, ctx) => {
 			rememberContext(ctx);

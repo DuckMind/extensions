@@ -1,6 +1,6 @@
 {
   "name": "dm-lens",
-  "version": "4.4.4",
+  "version": "4.4.6",
   "description": "Real-time code feedback for DM \u2014 LSP, linters, formatters, type-checking, and structural analysis.",
   "type": "module",
   "main": "./index.ts",

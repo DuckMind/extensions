@@ -9,7 +9,8 @@ import type { JevErrorCode, JevEvaluateInput, JevEvaluationEnvelope } from "./je
 import { executeCall, findTools, resolveDescribeTarget, unscopedCallReachesServer } from "./proxy-modes.ts";
 import { combineAbortSignals } from "./runtime-owner.ts";
 import { paginate } from "./search-ranking.ts";
-import type { SemanticSearchEvaluator } from "./semantic-search.ts";
+import type { SemanticSearchEvaluator } from "./jev-semantic-search.ts";
+import { semanticSearch as jevSemanticSearch } from "./jev-semantic-search.ts";
 import type { McpExtensionState } from "./state.ts";
 import { formatSchema, hasSchemaDescriptions } from "./tool-metadata.ts";
 import { renderTsShape } from "./ts-shape.ts";
@@ -214,7 +215,7 @@ export async function runMcpScript(
     if (details.error !== undefined) {
       const errorCode = String(details.error);
       const suggestions = Array.isArray(details.suggestions)
-        ? details.suggestions.filter((suggestion): suggestion is string => typeof suggestion === "string")
+        ? details.suggestions.filter((suggestion: unknown): suggestion is string => typeof suggestion === "string")
         : [];
       const message = errorCode === "tool_not_found"
         ? `Tool "${path}" not found. Use await tools.search({ query: "..." }) inside mcpScript.${suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}` : ""}`
@@ -311,20 +312,27 @@ export async function runMcpScript(
     const index = calls.push({ operation: "search", query, ok: false, error: "incomplete", durationMs: 0, startedAt }) - 1;
     let error: unknown;
     try {
-      const outcome = await findTools(state, {
+      const searchInput = {
         query,
         regex: input?.regex === true,
         server: typeof input?.server === "string" ? input.server : undefined,
         searchMode: input?.searchMode,
         signal: callSignal,
-        semanticEvaluator: async (semanticState, semanticInput, options) => {
+      };
+      const jevOutcome = input?.searchMode === "semantic" && state.config.settings?.jev && state.config.settings.jev.semanticSearch
+        && state.config.settings.semanticSearch === undefined
+        ? await jevSemanticSearch(state, query, searchInput.server, callSignal, async (semanticState, semanticInput, options) => {
           const rejected = admitEvaluation(semanticInput);
           if (rejected) return rejected;
           const envelope = await (semanticEvaluator ?? evaluateJev)(semanticState, semanticInput, options);
           return chargeEvaluationTokens(envelope);
-        },
-        observedSources: [...observedSources],
-      });
+        }, [...observedSources])
+        : undefined;
+      const outcome = jevOutcome
+        ? jevOutcome.ok
+          ? { matches: jevOutcome.matches, backend: jevOutcome.backend }
+          : { error: { content: [{ type: "text" as const, text: jevOutcome.error.message }], details: { error: jevOutcome.error.code } } }
+        : await findTools(state, searchInput);
       if ("error" in outcome) {
         error = String(outcome.error.details.error);
         return { items: [], total: 0, hasMore: false, nextOffset: null, error: { code: error, message: resultErrorMessage(outcome.error) } };

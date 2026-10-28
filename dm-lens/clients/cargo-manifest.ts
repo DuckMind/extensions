@@ -46,7 +46,7 @@ import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logExtension } from "./extension-log.js";
-import { findNearestMarkerRoot, isAtOrAboveHomeDir } from "./path-utils.js";
+import { findNearestMarkerRoot, walkUpDirs } from "./path-utils.js";
 
 export async function readTextFileOrUndefined(
 	filePath: string,
@@ -482,9 +482,14 @@ export async function resolveCargoPackageEdition(
 		);
 	}
 
-	let current = path.dirname(packageDir);
-	for (let depth = 0; depth < 64; depth++) {
-		if (isAtOrAboveHomeDir(current, homeDir)) return undefined;
+	// #4689 item 6: the climb and its home ceiling are both path identities
+	// (`walkUpDirs`), as `findNearestMarkerRoot`'s are, so `packageDir` and the
+	// ancestors it climbs to sit on one axis; a home that is itself a link
+	// still stops the climb.
+	for (const current of walkUpDirs(path.dirname(packageDir), {
+		homeDir,
+		maxDepth: 64,
+	})) {
 		const ancestorContent = await readTextFileOrUndefined(
 			path.join(current, "Cargo.toml"),
 		);
@@ -502,9 +507,6 @@ export async function resolveCargoPackageEdition(
 				filePath,
 			);
 		}
-		const parent = path.dirname(current);
-		if (parent === current) return undefined;
-		current = parent;
 	}
 	return undefined;
 }

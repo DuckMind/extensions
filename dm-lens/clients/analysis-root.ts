@@ -239,7 +239,9 @@ function configRootOnFileSpelling(
 	root: string,
 ): string | undefined {
 	let entry: string | undefined;
-	for (const dir of walkUpDirs(nodePath.dirname(nodePath.resolve(filePath)))) {
+	for (const dir of walkUpDirs(nodePath.dirname(nodePath.resolve(filePath)), {
+		spelling: true,
+	})) {
 		if (!isUnderDir(dir, root)) return entry;
 		if (holdsProjectConfig(dir)) return dir;
 		entry = dir;

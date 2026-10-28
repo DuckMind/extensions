@@ -28,7 +28,7 @@ async function main(): Promise<void> {
 		subsystem: "project-trust",
 		level: "debug",
 		message:
-			"mcp-worker: workspace trust belongs to the MCP client; pi trust not consulted",
+			"mcp-worker: workspace trust belongs to the MCP client; DM trust not consulted",
 	});
 
 	const file = arg("file");

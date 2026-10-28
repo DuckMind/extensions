@@ -1,9 +1,14 @@
-// Forking a parent transcript into a child must drop Anthropic's signed and redacted
-// thinking blocks: a thinking signature is bound to the session that produced it and
-// cannot be replayed into a branch. Stripping them is required; disabling the child's
-// thinking is not. DM >= 0.85.0 recovers from signed-thinking mismatches on the
-// transport, so a sanitized transcript is safe to resume with thinking enabled and the
-// child keeps the level it asked for, reasoning fresh from its first turn.
+// Forking a parent transcript into a child copies the parent's assistant messages verbatim, signed
+// Anthropic thinking included. A signature covers its block's content, not a session, so a
+// verbatim copy stays valid in the branch, and keeping it lets the child's first request start
+// with its parent's prompt-cached bytes. dm-ai replays a signed block only to the model that
+// signed it and turns it into text or drops it for any other model, and DM >= 0.85.0 recovers
+// from signed-thinking mismatches on the transport. Two kinds of block are still dropped: raw
+// `redacted_thinking` blocks, which are not DM's own transcript shape, and signed thinking in a
+// `context_edit` replacement, whose content no longer has to match its signature. A pruned fork
+// rewrites inherited content, thinking included, so it still drops every signed or redacted
+// Anthropic thinking block. Dropping them never disables the child's thinking: it keeps the level
+// it asked for.
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SessionManager } from "@duckmind/dm-coding-agent";
@@ -15,6 +20,7 @@ interface BranchSessionEntry {
 	id?: string;
 	cwd?: string;
 	parentId?: string | null;
+	parentSession?: string;
 	timestamp?: string;
 	targetId?: string;
 	replacement?: { content?: unknown } | null;
@@ -29,8 +35,6 @@ interface BranchSessionEntry {
 
 interface BranchSessionManager {
 	createBranchedSession(leafId: string): string | undefined;
-	createDetachedBranchedSession?(leafId: string): string | undefined;
-	dispose?(): void;
 	createDetachedBranchedSession?(leafId: string): string | undefined;
 	dispose?(): void;
 	getHeader?: () => BranchSessionEntry | null;
@@ -48,6 +52,8 @@ interface ForkContextResolverOptions {
 	openSession?: (path: string, sessionDir?: string) => BranchSessionManager;
 	/** Rewrite a created fork before its path can be used to spawn a child. */
 	pruneSession?: (sessionFile: string) => Promise<void>;
+	/** Run id that names this launch's fork directory, read when the first fork is created. */
+	runDirName: () => string;
 }
 
 interface ForkContextResolver {
@@ -101,8 +107,9 @@ export function canPreferForkFromSnapshot(input: PreferredForkSnapshot): boolean
 	}
 }
 
-function isUnsafeAnthropicThinkingBlock(message: BranchSessionEntry["message"], block: unknown): boolean {
+function isUnsafeAnthropicThinkingBlock(message: BranchSessionEntry["message"], block: unknown, verbatim: boolean): boolean {
 	if (!message || !block || typeof block !== "object" || !("type" in block)) return false;
+	if (verbatim) return block.type === "redacted_thinking";
 	const provider = typeof message.provider === "string" ? message.provider.toLowerCase() : "";
 	const api = typeof message.api === "string" ? message.api.toLowerCase() : "";
 	const model = typeof message.model === "string" ? message.model.toLowerCase() : "";
@@ -114,7 +121,7 @@ function isUnsafeAnthropicThinkingBlock(message: BranchSessionEntry["message"], 
 	return record.redacted === true || (typeof signature === "string" && signature.length > 0);
 }
 
-function sanitizeUnsafeThinkingBlocks(entries: BranchSessionEntry[]): boolean {
+function sanitizeUnsafeThinkingBlocks(entries: BranchSessionEntry[], rewritten: boolean): boolean {
 	let sanitized = false;
 	const entriesById = new Map(entries.flatMap((entry) => entry.id ? [[entry.id, entry] as const] : []));
 	for (const entry of entries) {
@@ -123,7 +130,8 @@ function sanitizeUnsafeThinkingBlocks(entries: BranchSessionEntry[]): boolean {
 			: entry.message;
 		const contentOwner = entry.type === "context_edit" ? entry.replacement : targetMessage;
 		if (targetMessage?.role !== "assistant" || !contentOwner || !Array.isArray(contentOwner.content)) continue;
-		const filtered = contentOwner.content.filter((block) => !isUnsafeAnthropicThinkingBlock(targetMessage, block));
+		const verbatim = !rewritten && entry.type !== "context_edit";
+		const filtered = contentOwner.content.filter((block) => !isUnsafeAnthropicThinkingBlock(targetMessage, block, verbatim));
 		if (filtered.length === contentOwner.content.length) continue;
 		contentOwner.content = filtered;
 		sanitized = true;
@@ -146,7 +154,7 @@ function readSessionEntries(sessionFile: string): BranchSessionEntry[] {
 export function createForkContextResolver(
 	sessionManager: ForkableSessionManager,
 	requestedContext: unknown,
-	options: ForkContextResolverOptions = {},
+	options: ForkContextResolverOptions,
 ): ForkContextResolver {
 	if (resolveSubagentContext(requestedContext) !== "fork") {
 		return {
@@ -180,7 +188,7 @@ export function createForkContextResolver(
 	// loose next to run-N/ result directories. Derived from the file path
 	// rather than getSessionDir() so it also works when the manager cannot
 	// report its directory.
-	const sessionDir = path.join(
+	const forksDir = path.join(
 		path.dirname(parentSessionFile),
 		path.basename(parentSessionFile, ".jsonl"),
 		"forks",
@@ -196,6 +204,8 @@ export function createForkContextResolver(
 			if (!fs.existsSync(parentSessionFile)) {
 				throw new Error(`Parent session file does not exist: ${parentSessionFile}. DM has not persisted enough history to fork yet.`);
 			}
+			// Nested resume accepts a session file only under a directory named by the run's id.
+			const sessionDir = path.join(forksDir, options.runDirName());
 			let sourceManager: BranchSessionManager;
 			let snapshotDir: string | undefined;
 			if (!options.openSession && !sessionManager.openSession) {
@@ -228,15 +238,24 @@ export function createForkContextResolver(
 				if (!header || !entries) {
 					throw new Error(`Session manager returned a forked session file that does not exist and cannot be persisted by fallback: ${sessionFile}`);
 				}
-				sanitizeUnsafeThinkingBlocks(entries);
+				if (snapshotDir) {
+					if (header.parentSession !== path.join(snapshotDir, "parent.jsonl")) {
+						throw new Error("Forked session did not retain its snapshot parent identity.");
+					}
+					header.parentSession = parentSessionFile;
+				}
+				sanitizeUnsafeThinkingBlocks(entries, Boolean(options.pruneSession));
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
 				fs.writeFileSync(sessionFile, `${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf-8");
 			} else {
 				const entries = readSessionEntries(sessionFile);
-				if (snapshotDir && entries[0]?.type === "session") {
-					(entries[0] as BranchSessionEntry & { parentSession?: string }).parentSession = parentSessionFile;
+				if (snapshotDir) {
+					if (entries[0]?.parentSession !== path.join(snapshotDir, "parent.jsonl")) {
+						throw new Error("Forked session did not retain its snapshot parent identity.");
+					}
+					entries[0].parentSession = parentSessionFile;
 				}
-				if (snapshotDir || sanitizeUnsafeThinkingBlocks(entries)) {
+				if (sanitizeUnsafeThinkingBlocks(entries, Boolean(options.pruneSession)) || snapshotDir) {
 					fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf-8");
 				}
 			}

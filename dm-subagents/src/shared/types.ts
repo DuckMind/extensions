@@ -5,6 +5,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@duckmind/dm-ai";
+import type { SubagentDelegationProviderDiagnostics } from "../api/delegation.ts";
 import type { AgentConfig } from "../agents/agents.ts";
 import type { FSWatcher } from "node:fs";
 import type { ExtensionContext } from "@duckmind/dm-coding-agent";
@@ -18,6 +19,8 @@ import type { ExtensionBindings } from "../runs/shared/extension-bindings.ts";
 import type { WorkflowChildPermitContext } from "./workflow-child-permit.ts";
 import type { WatchdogWarningDetails } from "../watchdog/types.ts";
 import type { RequiredChildExtensionSnapshot } from "./required-child-extensions.ts";
+import type { RecordedPid } from "../runs/background/stale-run-reconciler.ts";
+import type { WorkflowStopCause } from "../workflows/workflow-stop-cause.ts";
 
 // ============================================================================
 // Basic Types
@@ -279,7 +282,7 @@ export interface ResolvedToolBudget {
 	block: string[] | "*";
 }
 
-export type ToolBudgetOutcome = "within-budget" | "soft-reached" | "hard-blocked";
+export type ToolBudgetOutcome = "within-budget" | "soft-reached" | "hard-reached" | "hard-blocked";
 
 export interface ToolBudgetState extends ResolvedToolBudget {
 	outcome: ToolBudgetOutcome;
@@ -390,6 +393,8 @@ export interface ControlEvent {
 	toolCount?: number;
 	currentTool?: string;
 	toolCallId?: string;
+	/** True only when the child's native command controller manages `toolCallId`; gates command-control suggestions in notices. */
+	hasCommandController?: boolean;
 	currentToolDurationMs?: number;
 	currentPath?: string;
 	elapsedMs?: number;
@@ -630,7 +635,6 @@ export type TimeoutRecoveryProjection = Pick<TimeoutRecoverySummary, "terminatio
 export const SUBAGENT_LIFECYCLE_ARTIFACT_VERSION = 3;
 export type SubagentLifecycleArtifactVersion = typeof SUBAGENT_LIFECYCLE_ARTIFACT_VERSION;
 
-export type ProcessTerminalState = "pending" | "observed" | "unknown" | "not-started";
 export type ProcessTerminalReason =
 	| "observer-unavailable"
 	| "runner-candidate-missing"
@@ -966,6 +970,7 @@ export interface ChildWatchdogProgress {
 }
 
 export interface AgentProgress {
+	providerDiagnostics?: SubagentDelegationProviderDiagnostics;
 	index: number;
 	agent: string;
 	/** Human-readable display name for the child's session, when derived at launch. */
@@ -1304,10 +1309,11 @@ export interface SingleResult {
 	toolBudget?: ToolBudgetState;
 	toolBudgetBlocked?: boolean;
 	messages?: Message[];
+	providerDiagnostics?: SubagentDelegationProviderDiagnostics;
 	usage: Usage;
 	model?: string;
 	/** Authoritative before/after Git evidence captured by a pane-native remote machine. */
-	nativeMachine?: { provider: "herdr"; machineId: string; initialGit?: HerdrRemoteGitStatus; finalGit?: HerdrRemoteGitStatus };
+	nativeMachine?: { provider: PlacementMachineReference["provider"]; machineId: string; initialGit?: HerdrRemoteGitStatus; finalGit?: HerdrRemoteGitStatus };
 	/** Effective thinking level used by this foreground child, when known. */
 	thinking?: string;
 	requestedModel?: string;
@@ -1535,10 +1541,14 @@ export interface Details {
 		argsDigest?: string;
 		/** SHA-256 of the workflow script source (async workflows). */
 		scriptDigest?: string;
-		/** Structured stop cause; set only when the owning extension runtime was replaced. */
-		stopCause?: "runtime-replaced";
-		/** Runtime-replaced workflow run whose finished children this run reused. */
+		/** Structured stop cause: `runtime-replaced` when the owning extension runtime was replaced; `owner-exited` when stale-run reconciliation found the owning DM process dead. */
+		stopCause?: WorkflowStopCause;
+		/** Interrupted workflow run whose finished children this run reused. */
 		reusedFrom?: string;
+		/** Owner-exited runs: the last time the dead DM process updated the run (epoch ms), not the repair time. */
+		ownerExitedAt?: number;
+		/** Set on a run that resumes an interrupted one; `attempt` counts resumes that followed DM exits. */
+		resumeOrigin?: { sourceRunId: string; attempt: number };
 		resource?: WorkflowResourceProvenance;
 		preflightWarnings?: string[];
 		trace: Array<{
@@ -1554,7 +1564,7 @@ export interface Details {
 			generatedLaneKey?: string;
 			warning?: string;
 			error?: string;
-			/** Came from a previous runtime-replaced run of the same script and args; this run launched nothing. */
+			/** Came from a previous runtime-replaced or owner-exited run of the same script (and args, unless named by options.reuseFrom); this run launched nothing. */
 			reused?: boolean;
 		}>;
 		emits: unknown[];
@@ -1667,6 +1677,8 @@ export interface NestedRunSummary extends NestedRunAddress {
 	pid?: number;
 	sessionId?: string;
 	sessionFile?: string;
+	/** Run whose session this resume replacement continues. */
+	revivedFrom?: string;
 	intercomTarget?: string;
 	ownerIntercomTarget?: string;
 	leafIntercomTarget?: string;
@@ -1792,6 +1804,28 @@ export interface HerdrMachineReference {
 	cwd: string;
 }
 
+/** `machine: "local"`: a Rex pane in the parent's own Rex session on this machine. `session` is the Rex session id and `server` the Rex server address, both recorded in the parent at resolution time; `cwd` is the local launch directory. */
+export interface RexLocalMachineReference {
+	provider: "rex";
+	id: "local";
+	session: string;
+	server?: string;
+	cwd: string;
+}
+
+/** A Rex machine reached over SSH, named in user settings (`subagents.machines.<id>.rex.ssh`). The pane opens in that machine's Rex session labeled `subagents`, found or created at launch and recorded with the run; `cwd` is the directory on that machine. */
+export interface RexSshMachineReference {
+	provider: "rex";
+	id: string;
+	target: string;
+	cwd: string;
+}
+
+export type RexMachineReference = RexLocalMachineReference | RexSshMachineReference;
+
+/** Where a placed native DM child runs. */
+export type PlacementMachineReference = HerdrMachineReference | RexMachineReference;
+
 export interface ExternalCliMachineStatus extends HerdrMachineReference {
 	remoteGit?: HerdrRemoteGitStatus;
 }
@@ -1897,11 +1931,15 @@ export interface AsyncStatus {
 	runId: string;
 	/** Parent DM process/window that owns local completion delivery. */
 	completionOwnerId?: string;
+	/** The DM process behind `completionOwnerId`; once it is dead, the session that owns the run delivers it. */
+	completionOwnerProcess?: RecordedPid;
 	/** Host tool-call id retained when it differs from the internal run id. */
 	toolCallId?: string;
 	sessionId?: string;
 	mode: SubagentRunMode;
 	context?: "fresh" | "fork" | "mixed";
+	/** Run whose session this resume replacement continues. */
+	revivedFrom?: string;
 	isNested?: boolean;
 	state: "queued" | "running" | "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 	/** Display-only dismissal marker for a reload-orphaned workflow. */
@@ -1931,6 +1969,8 @@ export interface AsyncStatus {
 	pid?: number;
 	/** Linux PID namespace identity used to scope liveness probes. */
 	pidNamespaceScope?: string;
+	/** Boot id of the machine when `pid` was recorded; a different current boot id proves the pid dead. */
+	bootId?: string;
 	cwd?: string;
 	/** User-configured launcher that wrapped the background runner (argv only, never environment). */
 	launcher?: RunnerLauncher;
@@ -2027,6 +2067,8 @@ export interface AsyncStatus {
 		model?: string;
 		/** Model the child was launched on, recorded when its replies reported a different `model`; revival uses it. */
 		launchModel?: string;
+		/** Provider and model recorded on this child's latest own live assistant reply; never the requested model. */
+		resolvedModel?: { provider: string; model: string };
 		thinking?: string;
 		contextLimit?: number;
 		thinkingCeiling?: ThinkingLevel;
@@ -2201,6 +2243,10 @@ export interface ForegroundResumeRun {
 	sessionId?: string;
 	updatedAt: number;
 	children: ForegroundResumeChild[];
+	/** DM process running this run; only on records whose child is `running`. */
+	owner?: RecordedPid;
+	/** Workflow that launched this foreground child. */
+	parentWorkflowRunId?: string;
 }
 
 export interface ForegroundChildControl {
@@ -2378,6 +2424,8 @@ export interface SubagentState {
 	workflowControllers?: Map<string, AbortController>;
 	/** Live in-process workflow child stoppers keyed by parent workflow run id. */
 	workflowChildStops?: Map<string, (childId: string, message?: string) => boolean>;
+	/** Background children awaited by a blocking workflow call: their parent cannot answer supervisor asks. */
+	blockingWorkflowChildren?: Set<string>;
 }
 
 export interface HerdrProjectPaneSnapshot {
@@ -2497,7 +2545,7 @@ export interface RunSyncOptions {
 	context?: "fresh" | "fork";
 	cwd?: string;
 	/** Resolved pane-native saved-machine placement. */
-	machine?: HerdrMachineReference;
+	machine?: PlacementMachineReference;
 	/** Explicit read override resolved by the remote ambient agent profile. */
 	remoteReads?: string[] | false;
 	/** Original cwd input retained for launch diagnostics. */
@@ -2683,6 +2731,8 @@ export interface ActiveAsyncCapacityConfig {
 
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
+	/** Relaunch this session's interrupted async workflows when the session is reopened or reloaded (default true). */
+	autoResume?: boolean;
 	/** Set the context for launches that omit an explicit context. */
 	defaultSubagentContext?: "fresh" | "fork";
 	/** Configure how every resolved fork session is prepared before child spawn. */
@@ -2703,6 +2753,8 @@ export interface ExtensionConfig {
 	asyncWidgetLayout?: AsyncWidgetLayout;
 	/** Report subagent run state to the terminal with OSC 7501. Defaults to true. */
 	programStatus?: boolean;
+	/** Add a short `active_subagents` system prompt section listing this session's active background runs. Defaults to false. */
+	activeRunsPrompt?: boolean;
 	/** Exact provider/model candidates mapped to operator-declared equivalent response IDs. Empty arrays add no accepted IDs. */
 	modelResponseAliases?: Record<string, string[]>;
 	/** Named argv prefixes for background runners; agents select one with `launcher: <name>`. User config only. */
@@ -2711,6 +2763,10 @@ export interface ExtensionConfig {
 	toolDescriptionMode?: ToolDescriptionMode;
 	/** How a new parent session offers the subagent tool. Defaults to auto. */
 	toolActivation?: ToolActivationMode;
+	/** Keep a resumed session on the dm-subagents tool definitions and prompt text it already declared. Defaults to true. */
+	pinToolDeclarations?: boolean;
+	/** Register the dm-subagents slash commands and the foreground-detach shortcut. Defaults to true. */
+	enableSlashCommands?: boolean;
 	/** Opt-in feature groups removed from the subagent tool schema and rejected at every execution boundary. */
 	disabledFeatures?: SubagentFeature[];
 	/** Inline chat rendering for the subagent tool. Defaults to rich. */
@@ -2870,7 +2926,7 @@ export function resolveTempScopeId(options?: {
 }
 
 const MAX_PARALLEL = 8;
-export const MAX_CONCURRENCY = 4;
+const MAX_CONCURRENCY = 4;
 const configuredTempRoot = process.env.DM_SUBAGENTS_TEMP_ROOT?.trim();
 export const TEMP_ROOT_DIR = configuredTempRoot
 	? path.resolve(configuredTempRoot)
@@ -2889,6 +2945,9 @@ export const DIRS = {
 export const WIDGET_KEY = "subagent-async";
 export const SLASH_RESULT_TYPE = "subagent-slash-result";
 export const SLASH_TEXT_RESULT_TYPE = "subagent-slash-text-result";
+// Only reports carrying this marker leave model context. Reports stored before the marker existed
+// stay in context, so an update does not change an existing session's history or its prompt cache.
+export const SLASH_TEXT_VIEW_ONLY_DETAILS = { viewOnly: true } as const;
 export const SLASH_SUBAGENT_REQUEST_EVENT = "subagent:slash:request";
 export const SLASH_SUBAGENT_STARTED_EVENT = "subagent:slash:started";
 export const SLASH_SUBAGENT_RESPONSE_EVENT = "subagent:slash:response";
@@ -2958,7 +3017,7 @@ export interface SubagentDepthContext {
 }
 
 /** Operator override for the top-level parent; children inherit their limit through their runtime config. */
-export const SUBAGENT_MAX_DEPTH_ENV = "DM_SUBAGENT_MAX_DEPTH";
+const SUBAGENT_MAX_DEPTH_ENV = "DM_SUBAGENT_MAX_DEPTH";
 
 export function resolveCurrentMaxSubagentDepth(configMaxDepth?: number, runtime?: SubagentDepthContext): number {
 	return normalizeMaxSubagentDepth(runtime ? runtime.maxDepth : process.env[SUBAGENT_MAX_DEPTH_ENV])
@@ -2973,7 +3032,7 @@ export function resolveChildMaxSubagentDepth(parentMaxDepth: number, agentMaxDep
 }
 
 /** Depth of the executor itself: 0 for a top-level parent, its own child depth otherwise. */
-export function resolveCurrentSubagentDepth(runtime?: SubagentDepthContext): number {
+function resolveCurrentSubagentDepth(runtime?: SubagentDepthContext): number {
 	const depth = runtime ? runtime.depth : 0;
 	return Number.isFinite(depth) ? depth : 0;
 }
@@ -3004,7 +3063,7 @@ export function resolveMaxSubagentSpawnsPerSession(configMaxSpawns?: number): nu
 	return configuredMaxSpawns === 0 ? undefined : configuredMaxSpawns;
 }
 
-export const DEFAULT_MAX_SUBAGENT_SPAWNS_PER_RUN = 64;
+const DEFAULT_MAX_SUBAGENT_SPAWNS_PER_RUN = 64;
 
 export function normalizeMaxSubagentSpawnsPerRun(value: unknown): number | undefined {
 	const normalized = normalizeNonNegativeInteger(value);

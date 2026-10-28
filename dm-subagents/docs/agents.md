@@ -43,7 +43,7 @@ Builtins load at the lowest priority, so a user or project agent with the same n
 | `researcher` | Web/docs research with sources: official docs, specs, benchmarks, recent changes, and a concise research brief. |
 | `evidence-auditor` | Independent evidence review of important claims in an existing research brief. |
 | `worker` | Implementation work, including approved oracle handoffs. It edits files, validates, and escalates unapproved decisions instead of guessing. |
-| `reviewer` | Code review and small fixes. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |
+| `reviewer` | Read-only code review. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |
 | `oracle` | A second opinion before acting. It challenges assumptions, catches drift, and recommends the safest next move without editing. |
 | `delegate` | A lightweight general delegate when you want a child agent that behaves close to the parent session. |
 
@@ -282,6 +282,36 @@ Placed external profiles are one-shot and stop-only: they cannot steer, resume, 
 
 dm-subagents never clones, pulls, or checks out on the machine. Generic `external-cli` commands and managed worktrees are rejected before launch; saved-machine placement accepts native DM and only the six code-owned external profiles.
 
+## Running a DM child in a Rex pane on this machine
+
+`machine: "local"` runs a native DM child as a visible DM in a new background tab of your own Rex session, labeled `subagent-<run id tail>`. It works wherever `machine` works: frontmatter, settings overrides, the `subagent` tool, workflow `runs.run`, chain, parallel, and dynamic-fanout steps. `local` is reserved and never looks in the Herdr catalog. The parent DM must run inside Rex: with no `REX_SESSION`, or a session the Rex server does not confirm, the launch fails before anything starts.
+
+The parent drives the child through the same bridge as a Herdr-placed DM: prompt, steer, follow-up, abort, `contact_supervisor`, and results. The child DM loads dm-subagents from its own extensions, so it must be installed at the same version. `cwd` is a directory on this machine; a relative path joins the launch directory. dm-subagents finds `rex` in `$REX_BIN_DIR`, then on `PATH`, then in the Rex server app.
+
+A finished child keeps its tab open, with the idle DM, until you close it; an aborted or stopped child's tab is closed. Limits: native DM only (Claude Code, Codex, Cursor, and generic `external-cli` agents are rejected), fresh context only, and the same restrictions as a Herdr-placed DM (no local extension paths, process environment, nested delegation, permission rules, or tool budgets).
+
+## Running a DM child in a Rex pane on another Mac
+
+Name a Mac you reach over SSH in your user settings (`~/.dm/agent/settings.json`), with its repo root:
+
+```json
+{
+  "subagents": {
+    "machines": {
+      "workmac": { "rex": { "ssh": "100.82.67.118" }, "cwd": "~/dev/app" }
+    }
+  }
+}
+```
+
+`machine: "workmac"` then runs a native DM child as a visible DM in a new background tab of the Rex session labeled `subagents` on that Mac. dm-subagents creates the session the first time and reuses it after that; if two sessions there have that label, the launch fails until you close or rename one. Every `rex` command runs on that Mac over SSH, and the bridge socket comes back through an SSH forward, so SSH must work without a prompt (`ssh <target>` once to accept the host key). A name with a `rex` entry never looks in the Herdr catalog, so Herdr does not need to be installed.
+
+Only user settings may name a Rex host: a `rex` entry in a project's `.dm/settings.json` fails the launch, so a cloned repo cannot choose where a task runs. `cwd` can come from project or user settings, as for Herdr machines: a relative step `cwd` joins it, and an absolute or `~` path is used as given. The other Mac needs Rex, DM on its login shell's `PATH`, and dm-subagents installed at the same version. The child edits that Mac's disk, so its changed files come from that Mac's Git state, as for a Herdr-placed child.
+
+Programs in a Rex tab run under the Rex app's macOS privacy permissions. If DM on that Mac reads files in Desktop, Documents, or Downloads (for example a package path in its settings), allow Rex there first: open a Rex tab on that Mac, run `ls ~/Documents`, and accept the prompt. Until then DM waits on the prompt and the launch times out.
+
+To watch the tab, open the `subagents` session in Rex on that Mac. To watch it from this Mac, add that Mac's Rex server to your hosts here once (`rex hosts add workmac <endpoint>`; after `rex server tailscale on` there, `rex whoami` on that Mac shows its Tailscale address). Tab lifecycle and limits are the same as for `machine: "local"`.
+
 ## Sandboxing background children with a launcher
 
 A launcher wraps an agent's background runner in a command you choose, so that agent can run in a different sandbox from the parent session. Define the command in the user config key [`runnerLaunchers`](configuration.md#runnerlaunchers), then name it in the agent file:
@@ -358,6 +388,8 @@ Use these fields when an agent should see more:
 | `defaultContext: fork` | Prefer forked session context when a launch omits `context`; if the parent has no persisted session file or current leaf yet, the implicit default falls back to `fresh` without a failed first attempt. Explicit `context: "fork"` remains strict, and explicit `context: "fresh"` still wins. |
 
 Builtin agents opt into repository instruction inheritance by default so they follow repo-specific rules out of the box, but global context remains excluded unless `inheritGlobalContext: true` is set. This changes the behavior of existing agents that previously received global context as part of `inheritProjectContext: true`. `delegate` also uses append mode because its job is orchestration inside the parent workflow.
+
+These fields and `systemPromptMode` shape a fresh child's system prompt. A forked child (`context: "fork"`) sends its parent's whole system prompt instead, project context, global context, and skills included, and gets its agent prompt in its task message (see [fork context details](tool-reference.md#fork-context-details)).
 
 ## Frontmatter reference
 
@@ -510,6 +542,7 @@ How `tools` behaves:
 - `tools` omitted: the child session gets DM's normal builtin tools.
 - `tools` present: regular tool names become an explicit allowlist.
 - `tools:` empty: the child session gets no tools.
+- `tools: +codemode` or `tools: -write`: rejected. DM's `--tools` and `defaultTools` accept `+name`/`-name` entries that edit the default tool set, but a child's `tools` list replaces that set, so name every tool the child needs, or omit `tools` and use `excludeTools` to drop one. A local agent with such an entry fails before launch. A Herdr- or Rex-placed child resolves its agent on that machine, so an entry only there fails when the pane bridge is configured, before the first prompt.
 - `allowNestedSubagents: true`: explicitly enables child-safe nested fanout without turning omitted `tools` into an allowlist. Depth and inherited capability ceilings still apply.
 - `allowedAgents: scout, reviewer`: if nesting is separately enabled, restricts this agent's descendant launches to those names. `allowedAgents:` denies all descendants and omission is unrestricted except for inherited/runtime policy.
 
@@ -537,7 +570,7 @@ Examples:
 
 ### MCP tools
 
-When [dm-mcp-adapter](https://github.com/DuckMind/extensions/tree/main/dm-mcp-adapter) is not installed and DM has built-in MCP (DM 0.99 or later), `mcp:server` and `mcp:server/tool` entries resolve against DM's built-in MCP. Name the server and tool as the server reports them: `mcp:my-docs/get-item` selects the tool DM registers as `mcp__my_docs__get_item`. The server part may also use the `-`→`_` form of its name that DM's MCP namespace uses, such as `mcp:my_docs`. The child connects the servers in DM's `mcp.json` (the project's `.dm/mcp.json` only when the parent trusts the project) and gets only the selected tools, as direct tools, whatever exposure the server is configured with; tools configured as `hidden` cannot be selected. Servers that an extension adds with `dm.registerMcpServer()` work in background children, because the registering extension loads there too. They do not work in foreground children, which load no ambient extensions, so a foreground launch that selects one fails and says to use `async: true`. The launch fails if a selected tool does not register in the child within 10 seconds.
+When [dm-mcp-adapter](https://github.com/DuckMind/extensions/tree/main/dm-mcp-adapter) is not installed, `mcp:server` and `mcp:server/tool` entries resolve against DM's built-in MCP. Name the server and tool as the server reports them: `mcp:my-docs/get-item` selects the tool DM registers as `mcp__my_docs__get_item`. The server part may also use the `-`→`_` form of its name that DM's MCP namespace uses, such as `mcp:my_docs`. The child connects the servers in DM's `mcp.json` (the project's `.dm/mcp.json` only when the parent trusts the project) and gets only the selected tools, as direct tools, whatever exposure the server is configured with; tools configured as `hidden` cannot be selected. Servers that an extension adds with `dm.registerMcpServer()` work in background children, because the registering extension loads there too. They do not work in foreground children, which load no ambient extensions, so a foreground launch that selects one fails and says to use `async: true`. The child waits for the selected servers' current MCP connection attempts before its first prompt, then rejects the launch if any selected tool is missing or not available as a direct tool. DM's MCP request timeout still bounds each connection; stopping, interrupting, timing out, or shutting down the child cancels the startup wait. An unrelated server does not delay this check.
 
 When dm-mcp-adapter is installed, it keeps priority and provides the direct MCP tools. Subagents only receive direct MCP tools when `mcp:` entries are listed in their frontmatter; global `directTools: true` in the adapter's MCP config is not enough by itself. The generic `mcp` proxy tool can still be used for discovery when available. The adapter caches tool metadata at startup, so after connecting a new MCP server for the first time, restart DM before relying on direct tools. Server `includeTools` and `excludeTools` policies are enforced while resolving cached metadata for children: both accept exact names and `*`/`?` glob patterns against raw, generated-resource, and server/short/mcp/none-prefixed names, with `excludeTools` taking precedence. `mcp:` entries must name servers from the adapter's configuration files. A server that exists only in the adapter's runtime snapshot (registered at runtime, not persisted) cannot be provided to a child: children are dm sessions inside the parent or the runner process, not `dm` processes that could receive an MCP config argument, so such a launch fails with an error saying that MCP tools must come from an ambient adapter extension in a background child. An `mcp:` entry named `subagent` does not authorize nested fanout; declare the builtin `subagent` tool or set `allowNestedSubagents: true`. If a resolved direct MCP name is missing from the child registry, dm-subagents keeps the launch failed under the strict allowlist and reports the registration mismatch; check the resolved names against what the host or dm-mcp-adapter actually registers before child startup.
 
@@ -613,15 +646,14 @@ Agent-local `skillPath` candidates never enter DM's parent/global skills catalog
 
 ## The bundled dm-subagents skill
 
-The package bundles a `dm-subagents` skill that is automatically available to the parent agent when the extension is installed. Availability is not automatic routing or permission to delegate: the parent works directly unless the operator requests delegation in the current request or through applicable user/project instructions. Once authorized, use the smallest bounded child or workflow whose evidence, independent review, specialization, parallelism, or isolation benefit earns its overhead. It is for the orchestrating parent only: child subagents never receive it, and their context is explicitly filtered to strip parent-only orchestration instructions.
+The package bundles a `dm-subagents` skill that is automatically available to the parent agent when the extension is installed. Availability is not automatic routing or permission to delegate: the parent works directly unless the operator requests delegation in the current request or through applicable user/project instructions. Once authorized, use the smallest bounded child or workflow whose evidence, independent review, specialization, parallelism, or isolation benefit earns its overhead. It is for the orchestrating parent only: fresh child subagents never receive it, and a child's own context is filtered to strip parent-only orchestration instructions. A forked child is the exception: it keeps the history, system prompt, and tool declarations it inherited as the parent sent them, so it sees this skill in the parent's skills list and the parent's subagent catalog. It receives its own instructions, including its subagent boundary, in its task message, and its first request reuses the parent's prompt cache (see [fork context details](tool-reference.md#fork-context-details)).
 
 What it covers:
 
-- **Delegation patterns**: how to select a bounded agent and single, parallel, scripted, or async shape after delegation is authorized, including fresh or forked context.
-- **Prompt workflow recipes**: how to apply the packaged techniques directly with `subagent(...)` when the user describes the workflow in natural language instead of invoking a slash command. This includes parallel review, review-loop, parallel research, parallel context-build, parallel handoff-plan, gather-context-and-clarify, and parallel cleanup.
-- **Role-agent prompting guidance**: compact contract prompts instead of long scripts, what to include in role-specific meta prompts, and retrieval budgets for researchers.
-- **Safety boundaries**: child agents must not run subagents unless their resolved builtin tools explicitly include `subagent`, must not invent intercom targets, and must escalate unapproved decisions.
-- **Intercom conventions**: when to ask vs send, and how parent-side supervisor/result delivery works through the native channel.
-- **Control and diagnostics**: attention signals, soft interrupts, status, and the `doctor` action.
+- **Calls**: the common `subagent` calls, workflow script and resume shapes, and async waiting rules.
+- **Delegation rules**: when to delegate at all, what every child brief contains, one writer per worktree, fresh or forked context, and what to do when a lane fails.
+- **Prompt workflow recipes**: how to apply the packaged techniques directly with `subagent(...)` when the user describes the workflow in natural language instead of invoking a slash command: parallel review, review loop, parallel research, gather-context-and-clarify, parallel cleanup, and oracle consultation.
+- **Orchestration**: splitting work into lanes, review loops, finding disposition, and gate-failure triage.
+- **Lookups**: which `guide` section answers each rarer question, so the skill does not copy this reference.
 
 If you are writing an agent that has been asked to orchestrate subagents, the bundled skill helps it behave correctly without guessing the patterns. If you are a human user, you do not need to read it; the README and prompt shortcuts encode the same workflows in user-facing form.

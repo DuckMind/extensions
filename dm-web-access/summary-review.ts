@@ -1,13 +1,13 @@
 import type { ModelThinkingLevel, ThinkingLevel } from "@duckmind/dm-ai";
 import type { complete, Api, Message, Model } from "@duckmind/dm-ai/compat";
 import type { ExtensionContext } from "@duckmind/dm-coding-agent";
-import { findModelWithProviderRouting, getDmScopedModels, isModelInScope, splitThinkingSuffix, type SummaryThinkingLevel } from "./summary-model-scope.ts";
+import { findModelWithProviderRouting, getDmScopedModels, isModelInScope, resolveHelperModelSelector, type SummaryThinkingLevel } from "./summary-model-scope.ts";
 import type { QueryResultData } from "./storage.ts";
 import { openCodeSessionHeaders } from "./opencode-session-headers.ts";
 
 type ProviderHeaders = Record<string, string | null>;
 type CompleteFunction = typeof complete;
-type SummaryModelRegistry = SummaryGenerationContext["modelRegistry"] & { complete?: CompleteFunction };
+type SummaryModelRegistry = SummaryGenerationContext["modelRegistry"] & { complete?: CompleteFunction; streamSimple?: (...args: Parameters<CompleteFunction>) => { result(): ReturnType<CompleteFunction> } };
 
 const PREFERRED_SUMMARY_MODELS = [
 	{ provider: "anthropic", id: "claude-haiku-4-5" },
@@ -38,20 +38,6 @@ function estimateTokens(text: string): number {
 	return Math.max(1, Math.ceil(trimmed.length / 4));
 }
 
-const SNIPPET_BUDGETS = {
-	/** No answer text: the snippets are the only evidence. */
-	evidence: { perSource: 600, perQuery: 12_000 },
-	/** Answer present: snippets only corroborate it. */
-	corroboration: { perSource: 200, perQuery: 3_000 },
-} as const;
-
-function clampSnippet(snippet: string, budgetLeft: number, perSource: number): string {
-	const text = snippet.replace(/\s+/g, " ").trim();
-	const limit = Math.min(perSource, budgetLeft);
-	if (!text || limit <= 0) return "";
-	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
-}
-
 function summarizeQueryResult(result: QueryResultData): string {
 	if (result.error) {
 		return `Query: ${result.query}\nStatus: Error\nError: ${result.error}`;
@@ -69,18 +55,19 @@ function summarizeQueryResult(result: QueryResultData): string {
 	}
 
 	lines.push("Sources:");
-	// Without snippets a provider that returns raw results gives the model
-	// nothing to summarise; with all of them the request overruns its deadline.
-	const budget = result.answer?.trim() ? SNIPPET_BUDGETS.corroboration : SNIPPET_BUDGETS.evidence;
-	let budgetLeft = budget.perQuery;
+	// Snippets are the only evidence when there is no answer, so they get a larger
+	// budget; uncapped, they would overrun the summary deadline.
+	const [perSource, perQuery] = result.answer?.trim() ? [200, 3_000] : [600, 12_000];
+	let budgetLeft = perQuery;
 	for (let i = 0; i < result.results.length; i++) {
 		const source = result.results[i];
 		lines.push(`${i + 1}. ${source.title} — ${source.url}`);
-		const snippet = clampSnippet(source.snippet ?? "", budgetLeft, budget.perSource);
-		if (snippet) {
-			budgetLeft -= snippet.length;
-			lines.push(`   ${snippet}`);
-		}
+		const text = (source.snippet ?? "").replace(/\s+/g, " ").trim();
+		const limit = Math.min(perSource, budgetLeft);
+		if (!text || limit <= 0) continue;
+		const snippet = text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+		budgetLeft -= snippet.length;
+		lines.push(`   ${snippet}`);
 	}
 
 	return lines.join("\n");
@@ -220,20 +207,7 @@ export function buildDeterministicSummary(results: QueryResultData[]): { summary
 	};
 }
 
-function parseModelSelector(value: string): { provider: string; id: string; thinkingLevel?: SummaryThinkingLevel } {
-	const selector = splitThinkingSuffix(value);
-	const slashIndex = selector.value.indexOf("/");
-	if (slashIndex <= 0 || slashIndex >= selector.value.length - 1) {
-		throw new Error(`Invalid summary model: ${value}. Use provider/model-id.`);
-	}
-	return {
-		provider: selector.value.slice(0, slashIndex),
-		id: selector.value.slice(slashIndex + 1),
-		thinkingLevel: selector.thinkingLevel,
-	};
-}
-
-async function resolveThinkingLevel(model: Model<Api>, requested?: SummaryThinkingLevel): Promise<ModelThinkingLevel | undefined> {
+export async function resolveThinkingLevel(model: Model<Api>, requested?: SummaryThinkingLevel): Promise<ModelThinkingLevel | undefined> {
 	if (!requested) return undefined;
 	const { clampThinkingLevel } = await import("@duckmind/dm-ai");
 	return clampThinkingLevel(model, requested as ModelThinkingLevel);
@@ -241,15 +215,20 @@ async function resolveThinkingLevel(model: Model<Api>, requested?: SummaryThinki
 
 async function resolveSummaryModelCandidates(
 	ctx: SummaryGenerationContext,
-	modelOverride?: string,
+	modelOverride: string | undefined,
+	preferredFallback: boolean,
 ): Promise<{ candidates: Array<{ model: Model<Api>; apiKey?: string; headers?: ProviderHeaders; thinkingLevel?: SummaryThinkingLevel }>; errors: string[] }> {
 	const specs: Array<{ provider: string; id: string; thinkingLevel?: SummaryThinkingLevel }> = [];
+	const errors: string[] = [];
 	const normalizedOverride = typeof modelOverride === "string" ? modelOverride.trim() : "";
-	if (normalizedOverride.length > 0) specs.push(parseModelSelector(normalizedOverride));
-	specs.push(...PREFERRED_SUMMARY_MODELS);
+	if (normalizedOverride.length > 0) {
+		const spec = resolveHelperModelSelector(normalizedOverride, "summary model", ctx.model);
+		if (spec) specs.push(spec);
+		else errors.push(`Summary model not found: ${normalizedOverride} (no active DM session model)`);
+	}
+	if (preferredFallback) specs.push(...PREFERRED_SUMMARY_MODELS);
 
 	const candidates: Array<{ model: Model<Api>; apiKey?: string; headers?: ProviderHeaders; thinkingLevel?: SummaryThinkingLevel }> = [];
-	const errors: string[] = [];
 	const seen = new Set<string>();
 	for (const spec of specs) {
 		const value = `${spec.provider}/${spec.id}`;
@@ -321,6 +300,7 @@ export async function generateSummaryDraft(
 	completeFn?: CompleteFunction,
 	deadlineMs = SUMMARY_GENERATION_DEADLINE_MS,
 	instructions?: string,
+	options: { preferredFallback?: boolean } = {},
 ): Promise<{ summary: string; meta: SummaryMeta }> {
 	if (!ctx || !ctx.modelRegistry) {
 		throw new Error("Summary generation context unavailable");
@@ -329,7 +309,9 @@ export async function generateSummaryDraft(
 
 	const registry = ctx.modelRegistry as SummaryModelRegistry;
 	const customCompleteFn = completeFn !== undefined;
-	const usesRegistryComplete = !customCompleteFn && typeof registry.complete === "function";
+	// streamSimple is DM's provider-neutral path and routes virtual models; complete() does not (#574).
+	const usesRegistryStreamSimple = !customCompleteFn && typeof registry.streamSimple === "function";
+	const usesRegistryComplete = !customCompleteFn && !usesRegistryStreamSimple && typeof registry.complete === "function";
 	let piAiCompat: typeof import("@duckmind/dm-ai/compat") | undefined;
 
 	const generationStartedAt = Date.now();
@@ -382,11 +364,11 @@ export async function generateSummaryDraft(
 		let resolved: Awaited<ReturnType<typeof resolveSummaryModelCandidates>>;
 		try {
 			checkSummaryDeadline();
-			if (!customCompleteFn && !usesRegistryComplete) {
+			if (!customCompleteFn && !usesRegistryStreamSimple && !usesRegistryComplete) {
 				piAiCompat = await raceSummaryOperation(import("@duckmind/dm-ai/compat"));
 			}
-			completeFn ??= usesRegistryComplete ? registry.complete!.bind(registry) as CompleteFunction : piAiCompat!.complete;
-			resolved = await raceSummaryOperation(resolveSummaryModelCandidates(ctx, modelOverride));
+			if (!usesRegistryStreamSimple) completeFn ??= usesRegistryComplete ? registry.complete!.bind(registry) as CompleteFunction : piAiCompat!.complete;
+			resolved = await raceSummaryOperation(resolveSummaryModelCandidates(ctx, modelOverride, options.preferredFallback ?? true));
 		} catch (err) {
 			checkSummaryDeadline();
 			const message = err instanceof Error ? err.message : String(err);
@@ -409,6 +391,12 @@ export async function generateSummaryDraft(
 				const enabledThinkingLevel = requestedThinkingLevel && requestedThinkingLevel !== "off"
 					? requestedThinkingLevel as ThinkingLevel
 					: undefined;
+				const simpleOptions = {
+					sessionId,
+					cacheRetention: "none" as const,
+					signal: completionSignal,
+					...(enabledThinkingLevel ? { reasoning: enabledThinkingLevel } : {}),
+				};
 				const attributionHeaders = openCodeSessionHeaders(model, ctx.sessionManager);
 				const mergedHeaders = { ...headers, ...attributionHeaders };
 				const completionOptions = {
@@ -421,9 +409,11 @@ export async function generateSummaryDraft(
 					...(enabledThinkingLevel ? { reasoningEffort: enabledThinkingLevel } : {}),
 				};
 				checkSummaryDeadline();
-				const completion = thinkingLevel !== undefined && !customCompleteFn && !usesRegistryComplete
-					? piAiCompat!.completeSimple(model, { messages: [userMessage] }, { apiKey, headers: mergedHeaders, sessionId, cacheRetention: "none", signal: completionSignal, ...(enabledThinkingLevel ? { reasoning: enabledThinkingLevel } : {}) })
-					: completeFn(model, { messages: [userMessage] }, completionOptions);
+				const completion = usesRegistryStreamSimple
+					? registry.streamSimple!(model, { messages: [userMessage] }, simpleOptions).result()
+					: thinkingLevel !== undefined && !customCompleteFn && !usesRegistryComplete
+						? piAiCompat!.completeSimple(model, { messages: [userMessage] }, { apiKey, headers: mergedHeaders, ...simpleOptions })
+						: completeFn!(model, { messages: [userMessage] }, completionOptions);
 
 				const response = await raceSummaryOperation(Promise.resolve(completion));
 				if (response.stopReason === "aborted") {

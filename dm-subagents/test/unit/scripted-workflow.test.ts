@@ -3421,6 +3421,14 @@ describe("scripted workflow runtime", () => {
 		assert.deepEqual(JSON.parse(result.stdout), { ok: true, value: { output: "pong" } });
 	});
 
+	it("runs Promise.all and other Promise statics when the host freezes Promise", () => {
+		const preload = path.resolve("test/fixtures/frozen-promise-statics-preload.cjs");
+		const fixture = path.resolve("test/fixtures/frozen-promise-statics-workflow.ts");
+		const result = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "--require", preload, fixture], { encoding: "utf-8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.deepEqual(JSON.parse(result.stdout), { ok: true, value: { outputs: ["pong", "pong", "pong"], d: "ready" } });
+	});
+
 	it("rejects an unavailable recovery target without falling back from a stale cwd", {
 		skip: process.platform === "win32" ? "requires deleting a live process cwd, which Windows forbids" : undefined,
 	}, async () => {

@@ -25,7 +25,11 @@ import {
 	inlineBlockerSources,
 } from "./inline-blocker-fields.js";
 import type { MutationKind } from "./mutating-tool.js";
-import { normalizeMapKey, pathsEqual } from "./path-utils.js";
+import {
+	normalizeMapKey,
+	pathsEqual,
+	realpathOrResolve,
+} from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";
 import { type AnalysisAnchor, owedByContentOnly } from "./line-alignment.js";
@@ -380,6 +384,16 @@ export interface InlineBlockerRecord {
 	 * next write then has no alignment and matches on identity alone.
 	 */
 	analysisAnchor?: AnalysisAnchor;
+	/**
+	 * #4921: the turn session whose write recorded this verdict, named only
+	 * when it is not this coordinator's session (a concurrent in-process
+	 * secondary, #473); an unnamed record is the coordinator's
+	 * (`turnSession`'s own default). Turn-end readers admit only their own
+	 * session's records (`getInlineBlockersSnapshot({ sessionId })`); the
+	 * commit gate reads every record. The latest verdict on a file replaces
+	 * the record and its owner.
+	 */
+	session?: string;
 }
 
 /**
@@ -418,6 +432,8 @@ export interface ResolvedBlockerFile {
 	writeIndex: number | undefined;
 	/** Retired by `retireInlineBlockerOnConfirmedClean`, not by a clean write. */
 	confirmedClean: boolean;
+	/** #4921: the retired record's `session`: the turn end that may say it. */
+	session?: string;
 	/**
 	 * `turnIndex` when the retire happened. The composer says "this turn" only
 	 * for an entry from its own turn; a carried entry (a turn_end that delivered
@@ -846,17 +862,22 @@ export class RuntimeCoordinator {
 	 * dispatch replaces the record wholesale (`recordInlineBlockers`), so a NEW
 	 * blocker is never born pre-suppressed (#1198 ordering).
 	 *
+	 * #4921: `of` names the turn session whose pass this is; it rewrites only
+	 * that session's records, the ones its pass judged. Omitted: every record.
+	 *
 	 * @returns how many records this call CHANGED — 0 means the gate's view of
 	 * the map is already what the policy just decided.
 	 */
 	applyInlineBlockerPolicyVerdicts(
 		suppressedFilePaths: readonly string[],
+		of?: { sessionId: string | undefined },
 	): number {
 		const suppressed = new Set(
 			suppressedFilePaths.map((filePath) => path.resolve(filePath)),
 		);
 		let changed = 0;
 		for (const [key, entry] of this._pendingInlineBlockers.entries()) {
+			if (of && !this.ownedBy(entry, of.sessionId)) continue;
 			const policySuppressed = suppressed.has(path.resolve(entry.filePath));
 			if ((entry.policySuppressed ?? false) === policySuppressed) continue;
 			this._pendingInlineBlockers.set(key, { ...entry, policySuppressed });
@@ -939,6 +960,44 @@ export class RuntimeCoordinator {
 	/** Whether this session holds an inline-blocker entry for the file. */
 	hasInlineBlocker(filePath: string): boolean {
 		return this._pendingInlineBlockers.has(filePath);
+	}
+
+	/**
+	 * #4921: the turn session that owns the file's inline-blocker record, or
+	 * undefined when the file has none.
+	 */
+	inlineBlockerOwner(filePath: string): string | undefined {
+		const entry = this._pendingInlineBlockers.get(filePath);
+		return entry ? (entry.session ?? this._telemetrySessionId) : undefined;
+	}
+
+	/**
+	 * #4921: whether `sessionId`'s turn is this coordinator's own session, the
+	 * rule {@link beginTurn} applies: a turn with no session id of its own is
+	 * the coordinator's. A concurrent in-process secondary's is not.
+	 */
+	isCoordinatorSession(sessionId: string | undefined): boolean {
+		return this.turnSession(sessionId) === this._telemetrySessionId;
+	}
+
+	/** #4921: the `session` a record written by `sessionId`'s turn carries. */
+	private recordSession(sessionId: string | undefined): {
+		session?: string;
+	} {
+		return sessionId === undefined || this.isCoordinatorSession(sessionId)
+			? {}
+			: { session: sessionId };
+	}
+
+	/** #4921: whether a record (or its Resolved note) is `sessionId`'s turn's. */
+	private ownedBy(
+		entry: { session?: string },
+		sessionId: string | undefined,
+	): boolean {
+		return (
+			(entry.session ?? this._telemetrySessionId) ===
+			this.turnSession(sessionId)
+		);
 	}
 
 	/**
@@ -1742,6 +1801,8 @@ export class RuntimeCoordinator {
 		diagnostics?: readonly Diagnostic[],
 		orderTurn = this._writeOrderTurn,
 		recordedAtMs = Date.now(),
+		/** #4921: the turn session of the write (`ToolResultDeps.sessionId`). */
+		sessionId?: string,
 	): number | undefined {
 		const writeOrder = writeOrderToken(orderTurn, writeIndex);
 		if (
@@ -1755,7 +1816,7 @@ export class RuntimeCoordinator {
 		// retirement of the same file — the agent is blocked on it again, so a
 		// carried "Resolved" entry would be a false claim.
 		this._resolvedBlockerFilesThisTurn.delete(filePath);
-		this._pendingInlineBlockers.set(path.resolve(filePath), {
+		this._pendingInlineBlockers.set(filePath, {
 			filePath,
 			summary,
 			writeIndex,
@@ -1771,6 +1832,7 @@ export class RuntimeCoordinator {
 						recordedHash: contentBaseline.sha256,
 					}
 				: {}),
+			...this.recordSession(sessionId),
 		});
 		return recordedAtMs;
 	}
@@ -1804,7 +1866,7 @@ export class RuntimeCoordinator {
 			contentBaseline?: { size: number; sha256: string };
 		},
 	): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (existing && !existing.diagnostics) return 0;
 		// #4484 round 5 (K3): not the id. A carry that moves a blocker's line
@@ -1858,7 +1920,7 @@ export class RuntimeCoordinator {
 	getInlineBlockerDiagnostics(
 		filePath: string,
 	): readonly Diagnostic[] | undefined {
-		return this._pendingInlineBlockers.get(path.resolve(filePath))?.diagnostics;
+		return this._pendingInlineBlockers.get(filePath)?.diagnostics;
 	}
 
 	/**
@@ -1892,7 +1954,7 @@ export class RuntimeCoordinator {
 		const existing = this._pendingInlineBlockers.get(filePath);
 		if (existing) {
 			// The display key every record writer uses.
-			const key = path.resolve(filePath);
+			const key = filePath;
 			const { analysisAnchor: _dropped, ...rest } = existing;
 			this._pendingInlineBlockers.set(
 				key,
@@ -1931,7 +1993,7 @@ export class RuntimeCoordinator {
 			unconfirmedServerIds?: readonly string[];
 		},
 	): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (
 			!existing?.diagnostics ||
@@ -2003,6 +2065,7 @@ export class RuntimeCoordinator {
 					: retiringWriteOrder % 2 ** 32,
 			confirmedClean,
 			turnIndex: this._turnIndex,
+			...(record.session === undefined ? {} : { session: record.session }),
 		});
 	}
 
@@ -2035,7 +2098,7 @@ export class RuntimeCoordinator {
 			blocking?: number;
 		},
 	): boolean {
-		const existing = this._pendingInlineBlockers.get(path.resolve(filePath));
+		const existing = this._pendingInlineBlockers.get(filePath);
 		if (existing && (analysis?.blocking ?? 0) > 0) {
 			incrementDegradationCount({
 				kind: "blocker-clear-refused",
@@ -2077,7 +2140,7 @@ export class RuntimeCoordinator {
 				false,
 			);
 		}
-		this._pendingInlineBlockers.delete(path.resolve(filePath));
+		this._pendingInlineBlockers.delete(filePath);
 		return true;
 	}
 
@@ -2095,7 +2158,7 @@ export class RuntimeCoordinator {
 		filePath: string,
 		reason: "dependency-drift" | "past-eof" = "dependency-drift",
 	): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing || existing.stale) return false;
 		this._pendingInlineBlockers.set(key, {
@@ -2118,7 +2181,7 @@ export class RuntimeCoordinator {
 	 * transition, so the caller logs/resyncs exactly once per edge.
 	 */
 	setInlineBlockerPastEofStale(filePath: string, isPastEof: boolean): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (existing.stale && existing.staleReason !== "past-eof") return false;
@@ -2155,7 +2218,7 @@ export class RuntimeCoordinator {
 		filePath: string,
 		isSelfDrift: boolean,
 	): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (existing.stale && existing.staleReason !== "self-drift") return false;
@@ -2232,7 +2295,7 @@ export class RuntimeCoordinator {
 		deadLines: readonly number[],
 	): string | undefined {
 		if (deadLines.length === 0) return undefined;
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return undefined;
 		// Only this gate's own demotion. A dependency-drift demotion (#1631)
@@ -2256,7 +2319,7 @@ export class RuntimeCoordinator {
 	 * content is NOT being suppressed.
 	 */
 	peekInlineBlockerStaleDeliveryCount(filePath: string): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		return this._pendingInlineBlockers.get(key)?.staleDeliveryCount ?? 0;
 	}
 
@@ -2273,7 +2336,7 @@ export class RuntimeCoordinator {
 	 * or never recorded).
 	 */
 	incrementInlineBlockerStaleDelivery(filePath: string): number {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return 0;
 		const next = (existing.staleDeliveryCount ?? 0) + 1;
@@ -2302,7 +2365,7 @@ export class RuntimeCoordinator {
 	 * suppression is never silent (#1432 Gap 1).
 	 */
 	retireDemotedDependencyDriftBlocker(filePath: string): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (!existing.stale) return false;
@@ -2358,7 +2421,7 @@ export class RuntimeCoordinator {
 		confirmedAtWriteOrder?: number,
 		coveredSources?: readonly string[],
 	): boolean {
-		const key = path.resolve(filePath);
+		const key = filePath;
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (
@@ -2398,9 +2461,13 @@ export class RuntimeCoordinator {
 	 * and a line that would not fit the message cap (called in list order).
 	 * The "… and N more" overflow count rides with a batch that lists files and
 	 * is otherwise kept, so a bare tail is never delivered.
+	 *
+	 * #4921: `of` names the consuming turn session; another session's note
+	 * stays for that session's turn end, unseen by `holdBack`.
 	 */
 	consumeResolvedBlockerFiles(
 		holdBack: (entry: ResolvedBlockerFile) => boolean,
+		of?: { sessionId: string | undefined },
 	): {
 		files: ResolvedBlockerFile[];
 		dropped: number;
@@ -2408,7 +2475,8 @@ export class RuntimeCoordinator {
 		const files: ResolvedBlockerFile[] = [];
 		const held: ResolvedBlockerFile[] = [];
 		for (const entry of this._resolvedBlockerFilesThisTurn.values()) {
-			(holdBack(entry) ? held : files).push(entry);
+			if (of && !this.ownedBy(entry, of.sessionId)) held.push(entry);
+			else (holdBack(entry) ? held : files).push(entry);
 		}
 		// Rebuild, never delete-in-place (see `reconcileInlineBlockers`).
 		this._resolvedBlockerFilesThisTurn.clear();
@@ -2453,10 +2521,20 @@ export class RuntimeCoordinator {
 	 * turn or gate a commit. The map is tiny (per-turn blockers) and reads are
 	 * bounded (once per turn_end / tool_result), so the probe cost is
 	 * negligible.
+	 *
+	 * #4921: `of` names a turn session, and the snapshot holds only that
+	 * session's records: what its turn end may deliver, sweep or re-judge.
+	 * Omitted, every record: the commit gate's view, which answers for the
+	 * tree whichever session wrote the blocker.
 	 */
-	getInlineBlockersSnapshot(): InlineBlockerRecord[] {
+	getInlineBlockersSnapshot(of?: {
+		sessionId: string | undefined;
+	}): InlineBlockerRecord[] {
 		this.reconcileInlineBlockers();
-		return [...this._pendingInlineBlockers.values()];
+		const records = [...this._pendingInlineBlockers.values()];
+		return of
+			? records.filter((entry) => this.ownedBy(entry, of.sessionId))
+			: records;
 	}
 
 	consumeInlineBlockers(): InlineBlockerRecord[] {
@@ -2668,7 +2746,7 @@ export class RuntimeCoordinator {
 		analysisRootMode: AnalysisRootMode = "session",
 	): boolean {
 		if (!canWriteAnalysisRoot(analysisRootMode)) return false;
-		const key = path.resolve(filePath);
+		const key = realpathOrResolve(filePath);
 		const now = Date.now();
 		const resolvedOriginCwd = originCwd ?? turnStateCwd;
 		const existing = this._pendingDeferredMutations.get(key);
@@ -2737,7 +2815,7 @@ export class RuntimeCoordinator {
 				batchId: string;
 		  }
 		| undefined {
-		const record = this._pendingDeferredMutations.get(path.resolve(filePath));
+		const record = this._pendingDeferredMutations.get(filePath);
 		if (!record || !record.kinds.has("format")) return undefined;
 		return {
 			ownerSessionId: record.ownerSessionId,
@@ -2850,7 +2928,7 @@ export class RuntimeCoordinator {
 	/** Return claimed records that were never started by an aborted drain. */
 	requeueDeferredFormatFiles(records: DeferredFormatRecord[]): void {
 		for (const record of records) {
-			const key = path.resolve(record.filePath);
+			const key = record.filePath;
 			const existing = this._pendingDeferredMutations.get(key);
 			if (existing) {
 				for (const kind of record.kinds) existing.kinds.add(kind);

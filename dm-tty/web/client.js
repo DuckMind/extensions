@@ -28,6 +28,11 @@ const historyText = document.querySelector("#history-text");
 const historyLines = document.querySelector("#history-lines");
 const historyCopy = document.querySelector("#history-copy");
 const copyStatus = document.querySelector("#copy-status");
+const outputMenu = document.querySelector("#output-menu");
+const outputPaste = document.querySelector("#output-paste");
+const outputSelect = document.querySelector("#output-select");
+const outputSelectAll = document.querySelector("#output-select-all");
+const outputCopy = document.querySelector("#output-copy");
 const accessory = document.querySelector("#accessory");
 const ctrlButton = document.querySelector("#ctrl");
 const altButton = document.querySelector("#alt");
@@ -101,6 +106,9 @@ let streamHistory = "";
 let historyEscape = "text";
 let historyFrozen = false;
 let selectedForCopy = null;
+let outputMenuTimer;
+let outputMenuPointer;
+let outputMenuOpen = false;
 let displayedHistoryLines = MAX_HISTORY_LINES;
 const TOKEN_STORAGE_KEY = "dm-tty-access-token";
 try {
@@ -148,8 +156,65 @@ function outputSelection() {
 function clearOutputSelection() {
 	if (outputSelection()) document.getSelection().removeAllRanges();
 }
+function closeOutputMenu() {
+	clearTimeout(outputMenuTimer);
+	outputMenuTimer = undefined;
+	outputMenuPointer = undefined;
+	outputMenuOpen = false;
+	outputMenu.hidden = true;
+}
+function updateOutputMenu() {
+	const selected = Boolean(outputSelection());
+	outputCopy.hidden = !selected;
+	outputCopy.disabled = !selected;
+}
+function showOutputMenu(clientX, clientY) {
+	if (!openHistory()) return false;
+	const bounds = terminalContainer.getBoundingClientRect();
+	const width = outputMenu.offsetWidth || 148;
+	const height = outputMenu.offsetHeight || 170;
+	const left = Math.max(4, Math.min(clientX - bounds.left, bounds.width - width - 4));
+	const top = Math.max(4, Math.min(clientY - bounds.top, bounds.height - height - 4));
+	outputMenu.style.left = `${left}px`;
+	outputMenu.style.top = `${top}px`;
+	outputMenu.hidden = false;
+	outputMenuOpen = true;
+	updateOutputMenu();
+	return true;
+}
+function pointRange(clientX, clientY) {
+	const range = document.caretRangeFromPoint?.(clientX, clientY);
+	if (range?.startContainer && historyText.contains(range.startContainer)) return range;
+	const position = document.caretPositionFromPoint?.(clientX, clientY);
+	if (!position?.offsetNode || !historyText.contains(position.offsetNode)) return null;
+	const fallback = document.createRange();
+	fallback.setStart(position.offsetNode, position.offset);
+	fallback.setEnd(position.offsetNode, position.offset);
+	return fallback;
+}
+function selectOutputAtPoint(clientX, clientY) {
+	if (!openHistory() || !historyText.textContent) return false;
+	const point = pointRange(clientX, clientY);
+	if (!point || point.startContainer.nodeType !== 3) return selectAllOutput();
+	const text = point.startContainer.textContent ?? "";
+	let start = Math.max(0, Math.min(point.startOffset, text.length));
+	let end = start;
+	while (start > 0 && !/\s/u.test(text[start - 1])) start--;
+	while (end < text.length && !/\s/u.test(text[end])) end++;
+	if (start === end) end = Math.min(text.length, start + 1);
+	const range = document.createRange();
+	range.setStart(point.startContainer, start);
+	range.setEnd(point.startContainer, end);
+	const selection = document.getSelection?.();
+	if (!selection) return false;
+	selection.removeAllRanges();
+	selection.addRange(range);
+	historyFrozen = true;
+	return Boolean(outputSelection());
+}
 
 function closeHistory() {
+	closeOutputMenu();
 	clearOutputSelection();
 	historyPanel.hidden = true;
 	historyFrozen = false;
@@ -228,6 +293,7 @@ function selectAllOutput() {
 	const selection = document.getSelection();
 	selection.removeAllRanges();
 	selection.addRange(range);
+	updateOutputMenu();
 	return true;
 }
 async function copyOutputText(selectedText = null) {
@@ -252,9 +318,99 @@ async function copyOutputText(selectedText = null) {
 		copyStatus.textContent = copied ? "Copied output" : "Select text and use the browser Copy menu";
 	}
 }
-historyText.addEventListener("pointerdown", () => { historyFrozen = true; });
+async function pasteOutputText() {
+	closeOutputMenu();
+	const generation = connectionGeneration;
+	if (!navigator.clipboard?.readText) {
+		copyStatus.textContent = "Clipboard unavailable; use the keyboard Paste action";
+		return;
+	}
+	let text;
+	try {
+		text = await navigator.clipboard.readText();
+	} catch {
+		if (generation === connectionGeneration) copyStatus.textContent = "Clipboard permission denied";
+		return;
+	}
+	if (generation !== connectionGeneration || pendingSessionId) return;
+	if (!text) {
+		copyStatus.textContent = "Clipboard is empty";
+		return;
+	}
+	if (!authenticated || socket?.readyState !== WebSocket.OPEN) {
+		copyStatus.textContent = "Connect before pasting";
+		return;
+	}
+	closeHistory();
+	const start = command.selectionStart ?? command.value.length;
+	const end = command.selectionEnd ?? start;
+	if (terminal.buffer.active.type !== "alternate" && !remoteEditing) {
+		remoteEditing = false;
+		speechDraft = true; // Keep a multiline paste local until explicit Enter.
+		command.setRangeText(text, start, end, "end");
+		lastNativeValue = command.value;
+		focusCommand();
+		positionCommand();
+		copyStatus.textContent = "Pasted into draft; press Enter to send";
+		return;
+	}
+	const data = terminal.modes.bracketedPasteMode
+		? `\x1b[200~${text.replace(/\r?\n/g, "\r")}\x1b[201~`
+		: text;
+	if (send({ type: "input", data })) copyStatus.textContent = "Pasted";
+}
+function beginOutputLongPress(event) {
+	if (event.pointerType && event.pointerType !== "touch" && event.pointerType !== "pen") return;
+	historyFrozen = true;
+	clearTimeout(outputMenuTimer);
+	outputMenuPointer = { x: event.clientX ?? 0, y: event.clientY ?? 0 };
+	outputMenuTimer = setTimeout(() => {
+		if (!outputMenuPointer) return;
+		const { x, y } = outputMenuPointer;
+		outputMenuPointer = undefined;
+		selectOutputAtPoint(x, y);
+		showOutputMenu(x, y);
+	}, 500);
+}
+function cancelOutputLongPress(event) {
+	if (!outputMenuPointer) return;
+	if (event?.type === "pointermove") {
+		if (Math.hypot(event.clientX - outputMenuPointer.x, event.clientY - outputMenuPointer.y) > 10) closeOutputMenu();
+		return;
+	}
+	if (event && Math.hypot(event.clientX - outputMenuPointer.x, event.clientY - outputMenuPointer.y) > 10) closeOutputMenu();
+	else if (!outputMenuOpen) {
+		clearTimeout(outputMenuTimer);
+		outputMenuTimer = undefined;
+		outputMenuPointer = undefined;
+	}
+}
+historyText.addEventListener("pointerdown", beginOutputLongPress);
+historyText.addEventListener("pointermove", cancelOutputLongPress);
+historyText.addEventListener("pointerup", cancelOutputLongPress);
+historyText.addEventListener("pointercancel", closeOutputMenu);
+terminalContainer.addEventListener("pointerdown", (event) => {
+	if (historyPanel.hidden) beginOutputLongPress(event);
+});
+terminalContainer.addEventListener("pointermove", cancelOutputLongPress);
+terminalContainer.addEventListener("pointerup", cancelOutputLongPress);
+terminalContainer.addEventListener("pointercancel", closeOutputMenu);
+terminalContainer.addEventListener("contextmenu", (event) => {
+	if (!historyPanel.hidden) return;
+	event.preventDefault();
+	selectOutputAtPoint(event.clientX, event.clientY);
+	showOutputMenu(event.clientX, event.clientY);
+});
+historyText.addEventListener("contextmenu", (event) => {
+	event.preventDefault();
+	selectOutputAtPoint(event.clientX, event.clientY);
+	showOutputMenu(event.clientX, event.clientY);
+});
 document.addEventListener("selectionchange", () => {
-	if (!historyPanel.hidden && outputSelection()) historyFrozen = true;
+	if (outputMenuOpen) updateOutputMenu();
+	if (!historyPanel.hidden && outputSelection()) {
+		historyFrozen = true;
+	}
 });
 historyPanel.addEventListener("keydown", (event) => {
 	if (event.key.toLowerCase() === "a" && (event.metaKey || event.ctrlKey)) {
@@ -271,6 +427,25 @@ historyCopy.addEventListener("click", () => {
 	const selected = selectedForCopy || outputSelection();
 	selectedForCopy = null;
 	return copyOutputText(selected);
+});
+outputSelect.addEventListener("click", () => {
+	closeOutputMenu();
+});
+outputSelectAll.addEventListener("click", () => {
+	selectAllOutput();
+});
+outputMenu.addEventListener("pointerdown", (event) => { event.preventDefault(); });
+outputCopy.addEventListener("click", () => {
+	const selected = outputSelection();
+	closeOutputMenu();
+	return copyOutputText(selected);
+});
+outputPaste.addEventListener("click", pasteOutputText);
+document.addEventListener("pointerdown", (event) => {
+	if (outputMenuOpen && !outputMenu.contains(event.target)) closeOutputMenu();
+});
+document.addEventListener("keydown", (event) => {
+	if (event.key === "Escape") closeOutputMenu();
 });
 
 function updateModifiers() {
@@ -549,6 +724,7 @@ terminal.onBinary((data) => { if (!replayWrites) send({ type: "input", data }); 
 terminal.attachCustomKeyEventHandler((event) => {
 	if (!authenticated || pendingSessionId) return false;
 	if (event.type !== "keydown" || (!ctrl && !alt)) return true;
+	if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "c" && terminal.hasSelection()) return true;
 	if (event.metaKey || (event.ctrlKey && event.shiftKey && ["c", "v"].includes(event.key.toLowerCase()))) return true;
 	event.preventDefault();
 	terminalKey(event.key, event.shiftKey, event.ctrlKey, event.altKey);

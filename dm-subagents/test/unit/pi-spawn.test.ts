@@ -235,14 +235,14 @@ describe("getPiSpawnCommand", () => {
 		});
 	});
 
-	it("skips an unverified forwarded package-root env before resolving a verified DM package", () => {
+	it("rejects an unverified forwarded package-root env instead of resolving a different DM package", () => {
 		const tempDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "dm-spawn-unverified-env-root-"),
 		);
 		try {
 			const wrongRoot = path.join(tempDir, "not-dm");
 			const wrongCli = path.join(wrongRoot, "bin", "evil.js");
-			const piRoot = path.join(tempDir, "node_modules", "@earendil-works", "dm-coding-agent");
+			const piRoot = path.join(tempDir, "node_modules", "@duckmind", "dm-coding-agent");
 			const piEntry = path.join(piRoot, "dist", "index.js");
 			const piCli = path.join(piRoot, "dist", "cli.js");
 			fs.mkdirSync(path.dirname(wrongCli), { recursive: true });
@@ -253,18 +253,13 @@ describe("getPiSpawnCommand", () => {
 			fs.writeFileSync(piCli, "#!/usr/bin/env node\n");
 			fs.writeFileSync(path.join(piRoot, "package.json"), JSON.stringify({ name: "@duckmind/dm-coding-agent", bin: { dm: "dist/cli.js" } }));
 
-			const result = getPiSpawnCommand(["-p", "Task: hello"], {
+			assert.throws(() => getPiSpawnCommand(["-p", "Task: hello"], {
 				platform: "win32",
 				execPath: "C:\\Program Files\\nodejs\\node.exe",
 				argv1: "/opt/dm-web/dist/server.js",
 				env: { [DM_CODING_AGENT_PACKAGE_ROOT_ENV]: wrongRoot },
 				resolvePackageEntry: () => piEntry,
-			});
-
-			assert.deepEqual(result, {
-				command: "C:\\Program Files\\nodejs\\node.exe",
-				args: [piCli, "-p", "Task: hello"],
-			});
+			}), /expected "@duckmind\/dm-coding-agent"/);
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -285,9 +280,9 @@ describe("getPiSpawnCommand", () => {
 	});
 
 	it("ignores embedded host entry points and resolves the DM package bin on every platform", () => {
-		const tempDir = fs.mkdtempSync(
+		const tempDir = fs.realpathSync(fs.mkdtempSync(
 			path.join(os.tmpdir(), "dm-spawn-embedded-host-"),
-		);
+		));
 		try {
 			const hostRoot = path.join(tempDir, "dm-web");
 			const hostEntry = path.join(hostRoot, "dist", "server.js");
@@ -295,7 +290,7 @@ describe("getPiSpawnCommand", () => {
 			const piRoot = path.join(
 				tempDir,
 				"node_modules",
-				"@earendil-works",
+				"@duckmind",
 				"dm-coding-agent",
 			);
 			const piCli = path.join(piRoot, "dist", "cli.js");
@@ -349,13 +344,13 @@ describe("getPiSpawnCommand", () => {
 	});
 
 	it("validates argv1 ownership against its canonical target", () => {
-		const tempDir = fs.mkdtempSync(
+		const tempDir = fs.realpathSync(fs.mkdtempSync(
 			path.join(os.tmpdir(), "dm-spawn-canonical-entry-"),
-		);
+		));
 		try {
 			const hostRoot = path.join(tempDir, "embedded-host");
 			const hostEntry = path.join(hostRoot, "dist", "server.js");
-			const piRoot = path.join(tempDir, "node_modules", "@earendil-works", "dm-coding-agent");
+			const piRoot = path.join(tempDir, "node_modules", "@duckmind", "dm-coding-agent");
 			const disguisedEntry = path.join(piRoot, "dist", "cli.js");
 			const piCli = path.join(piRoot, "dist", "real-cli.js");
 			fs.mkdirSync(path.dirname(hostEntry), { recursive: true });
@@ -415,7 +410,7 @@ describe("getPiSpawnCommand", () => {
 			const packageRoot = path.join(
 				tempDir,
 				"node_modules",
-				"@earendil-works",
+				"@duckmind",
 				"dm-coding-agent",
 			);
 			const entry = path.join(packageRoot, "dist", "index.js");
@@ -469,6 +464,17 @@ describe("getPiSpawnCommand with piPackageRoot", () => {
 });
 
 describe("resolvePiCliScript", () => {
+	it("keeps extension-relative installed CLI discovery best-effort on POSIX", () => {
+		const args = ["--version"];
+		const deps = makeDeps({
+			platform: "linux",
+			argv1: "/missing/host.js",
+			packageJsonPath: "/opt/extension/node_modules/dm/package.json",
+			packageJsonContent: "{ malformed",
+		});
+		assert.deepEqual(getPiSpawnCommand(args, deps), { command: "dm", args });
+	});
+
 	it("supports package bin as string", () => {
 		const packageJsonPath = "/opt/dm/package.json";
 		const cliPath = path.resolve(

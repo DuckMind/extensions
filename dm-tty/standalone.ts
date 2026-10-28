@@ -46,8 +46,10 @@ export async function runStandalone(args: string[]): Promise<void> {
 		}
 		server = new DmTtyServer({ ...options, token });
 		const info = await server.start();
-		const host = ["0.0.0.0", "::"].includes(info.host) ? "127.0.0.1" : info.host;
+		const host = info.host;
 		console.log(`dm-tty: http://${host.includes(":") ? `[${host}]` : host}:${info.port}/`);
+		const localHost = host === "0.0.0.0" ? "127.0.0.1" : host === "::" ? "[::1]" : "";
+		if (localHost) console.log(`Local browser: http://${localHost}:${info.port}/`);
 		console.error(`Listening on ${info.host}:${info.port}. Full OS-user shell access; use SSH/HTTPS, never public HTTP.`);
 		if (options.tokenFile) console.error("Access token written to the requested private file; removed on shutdown.");
 		else console.error(`Token: ${token}`);

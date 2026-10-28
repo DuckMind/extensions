@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMcpAdapter } from "../index.ts";
-import { semanticSearch, type SemanticSearchEvaluator } from "../semantic-search.ts";
+import { semanticSearch, type SemanticSearchEvaluator } from "../jev-semantic-search.ts";
 import { getTestSecureKeyringReadCount, resetTestSecureKeyring } from "../secure-keyring.ts";
 import { isToolCallApprovalRequired } from "../tool-approval.ts";
 import type { McpExtensionState } from "../state.ts";

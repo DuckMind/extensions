@@ -5,8 +5,7 @@ import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/prom
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
-import { test as nodeTest } from "node:test";
-const test = nodeTest.skip; // Requires upstream publish scripts or DM 0.86.1 activation.
+import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const publishScript = fileURLToPath(new URL("../scripts/publish.js", import.meta.url));
@@ -43,13 +42,14 @@ async function createFixture(mode) {
 	const root = await mkdtemp(join(tmpdir(), "dm-web-access-publish-"));
 	const bin = join(root, "bin");
 	await mkdir(bin);
-	await writeFile(join(root, "package.json"), `${JSON.stringify({ type: "module", pi: { extensions: ["./index.ts"] } }, null, 2)}\n`);
+	await writeFile(join(root, "package.json"), `${JSON.stringify({ type: "module", dm: { extensions: ["./index.ts"] } }, null, 2)}\n`);
 
 	const fakeNpm = join(bin, "fake-npm.mjs");
 	await writeFile(fakeNpm, `#!/usr/bin/env node
-import { access, readFile, watch, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 const root = process.cwd();
 const signalFile = join(root, "terminated");
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -60,22 +60,20 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 const manifestPath = join(root, "package.json");
 const pkg = JSON.parse(await readFile(manifestPath, "utf8"));
-pkg.pi.extensions = ["./dist"];
+pkg.dm.extensions = ["./dist"];
 await writeFile(manifestPath, JSON.stringify(pkg, null, 2) + "\\n");
 await writeFile(join(root, "args"), JSON.stringify(process.argv.slice(2)));
 console.log(process.pid);
 const continuePath = join(root, "continue");
-const watcher = watch(root);
-try {
+// Poll rather than watch: fs.promises.watch only attaches on first iteration,
+// so a "continue" written right after the ready line could be missed.
+for (;;) {
   try {
     await access(continuePath);
+    break;
   } catch {
-	for await (const event of watcher) {
-	  if (event.filename === "continue") break;
-	}
+    await sleep(10);
   }
-} finally {
-  await watcher.return();
 }
 process.exit(Number(process.env.FAKE_NPM_EXIT));
 `);
@@ -97,7 +95,7 @@ async function runScenario({ exitCode, signal }) {
 	let fakePid;
 	try {
 		const before = JSON.parse(await readFile(join(fixture.root, "package.json"), "utf8"));
-		assert.deepEqual(before.pi.extensions, ["./index.ts"]);
+		assert.deepEqual(before.dm.extensions, ["./index.ts"]);
 
 		child = spawn(process.execPath, [publishScript, "--tag", "next"], {
 			cwd: fixture.root,
@@ -110,7 +108,7 @@ async function runScenario({ exitCode, signal }) {
 		lines.close();
 		fakePid = Number(ready);
 		const during = JSON.parse(await readFile(join(fixture.root, "package.json"), "utf8"));
-		assert.deepEqual(during.pi.extensions, ["./dist"]);
+		assert.deepEqual(during.dm.extensions, ["./dist"]);
 		assert.deepEqual(JSON.parse(await readFile(join(fixture.root, "args"), "utf8")), ["publish", "--tag", "next"]);
 
 		if (signal) child.kill(signal);
@@ -119,7 +117,7 @@ async function runScenario({ exitCode, signal }) {
 		const result = await waitForClose(child);
 		assert.equal(result.code, signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : exitCode);
 		const after = JSON.parse(await readFile(join(fixture.root, "package.json"), "utf8"));
-		assert.deepEqual(after.pi.extensions, ["./index.ts"]);
+		assert.deepEqual(after.dm.extensions, ["./index.ts"]);
 
 		if (signal) {
 			const terminated = JSON.parse(await readFile(join(fixture.root, "terminated"), "utf8"));
@@ -141,7 +139,7 @@ test("publish wrapper restores the manifest and exits 1 when npm cannot spawn", 
 	const root = await mkdtemp(join(tmpdir(), "dm-web-access-publish-spawn-"));
 	const bin = join(root, "bin");
 	await mkdir(bin);
-	await writeFile(join(root, "package.json"), `${JSON.stringify({ type: "module", pi: { extensions: ["./dist"] } }, null, 2)}\n`);
+	await writeFile(join(root, "package.json"), `${JSON.stringify({ type: "module", dm: { extensions: ["./dist"] } }, null, 2)}\n`);
 	let child;
 	try {
 		child = spawn(process.execPath, [publishScript], {
@@ -156,7 +154,7 @@ test("publish wrapper restores the manifest and exits 1 when npm cannot spawn", 
 		assert.equal(result.code, 1);
 		assert.match(stderr, /could not start npm publish/);
 		const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-		assert.deepEqual(manifest.pi.extensions, ["./index.ts"]);
+		assert.deepEqual(manifest.dm.extensions, ["./index.ts"]);
 	} finally {
 		if (child?.exitCode === null && child?.signalCode === null) child.kill("SIGKILL");
 		await rm(root, { recursive: true, force: true });

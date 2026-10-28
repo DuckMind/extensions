@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -14,10 +14,6 @@ test("ordinary prompt audit works without optional DM peers", async () => {
 	const opencodeSessionHeadersPath = join(isolatedRoot, "src/shared/opencode-session-headers.ts");
 
 	try {
-		// DM's compat stream is required at module load; only optional host peers stay absent.
-		const aiModule = join(isolatedRoot, "node_modules", "@duckmind", "dm-ai");
-		await mkdir(dirname(aiModule), { recursive: true });
-		await symlink(join(repositoryRoot, "node_modules", "@duckmind", "dm-ai"), aiModule, "dir");
 		await mkdir(dirname(promptAuditPath), { recursive: true });
 		await mkdir(dirname(streamOptionsPath), { recursive: true });
 		await mkdir(dirname(opencodeSessionHeadersPath), { recursive: true });

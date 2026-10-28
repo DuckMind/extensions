@@ -17,6 +17,17 @@ valid:
         def handler():
             return 42
         yield
+  - |
+    # #4840: the yield belongs to the lambda, not to make().
+    def make():
+        f = lambda: (yield)
+        return f
+  - |
+    # #1806 shape: the only yield is in a nested def; return 2 is not a generator return.
+    def outer():
+        def inner():
+            yield 1
+        return 2
 invalid:
   - |
     def gen():
@@ -32,3 +43,9 @@ invalid:
             yield 1
             return 99
         return inner_gen
+  - |
+    # #4840: a lambda elsewhere in a real generator does not hide its yield.
+    def gen():
+        key = lambda x: x
+        yield key(1)
+        return 2

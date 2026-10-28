@@ -108,7 +108,7 @@ for (const protocolVersion of ["legacy", "2026-07-28"] as const) {
         expect(streamMeta).toMatchObject({
           "io.modelcontextprotocol/protocolVersion": protocolVersion,
           "io.modelcontextprotocol/clientInfo": {
-            name: "pi-mcp-envelope-test",
+            name: "dm-mcp-envelope-test",
             version: "1.0.0",
           },
           "io.modelcontextprotocol/clientCapabilities": {

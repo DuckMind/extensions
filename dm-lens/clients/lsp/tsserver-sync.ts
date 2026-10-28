@@ -34,6 +34,7 @@
  */
 
 import type { LSPDiagnostic } from "./client.js";
+import type { LspLaunchVariant } from "./server-traits.js";
 import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey } from "../path-utils.js";
 
@@ -87,7 +88,7 @@ export interface TsserverProjectIdentityCommandChannel {
 
 export interface TsserverProjectIdentityProbeOptions {
 	serverId: string;
-	launchVariant?: "classic" | "native-ts7";
+	launchVariant?: LspLaunchVariant;
 	clientRoot: string;
 	file: string;
 	/**

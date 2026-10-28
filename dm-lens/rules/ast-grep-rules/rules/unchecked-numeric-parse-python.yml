@@ -10,9 +10,12 @@ note: |
   syntactically-certain `error`-level calls (open/json/os/shutil).
 
   Excluded as already-safe by construction: a numeric literal argument
-  (`int(3.7)`), and an argument that is itself a call to `int()`/
+  (`int(3.7)`), an argument that is itself a call to `int()`/
   `float()`/`Decimal()` (already-converted, or a `Decimal` — which raises
-  `decimal.InvalidOperation`, not `ValueError`, and is out of scope here).
+  `decimal.InvalidOperation`, not `ValueError`, and is out of scope here),
+  and a call to a builtin that returns a number or raises `TypeError`:
+  `round()`, `len()`, `abs()`, `sum()`, `ord()` (#4840). The match is by
+  name, so a local that shadows one of these names is exempt too.
 
   Residual, undecidable false positive: a call whose argument is a typed
   parameter already known to be numeric, e.g.
@@ -42,3 +45,11 @@ rule:
               - pattern: Decimal($$$)
               - pattern: int($$$)
               - pattern: float($$$)
+              # #4840: round() and len() always return a number; abs(), sum()
+              # and ord() too (#4841 review F4). min()/max() are not: they
+              # return their argument's type.
+              - pattern: round($$$)
+              - pattern: len($$$)
+              - pattern: abs($$$)
+              - pattern: sum($$$)
+              - pattern: ord($$$)

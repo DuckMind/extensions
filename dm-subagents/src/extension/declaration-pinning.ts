@@ -7,7 +7,8 @@ import type { TSchema } from "typebox";
 // re-declares any difference before the next request. A changed tool or prompt section makes
 // the provider re-read the whole conversation without its prompt cache, so a session keeps the
 // dm-subagents definitions and prompt text it already declared. Only a session that never
-// declared a tool gets its current definition.
+// declared a tool gets its current definition. Setting `pinToolDeclarations` to false turns this
+// off, so a resumed session gets the current definitions at the cost of one prompt-cache miss. (#2852)
 
 type PinnableTool = ToolDefinition<TSchema, unknown> & { constrainedSampling?: unknown };
 
@@ -24,15 +25,31 @@ interface Pins {
 	registered: Map<string, string>;
 	/** The prompt sections the session transcript recorded, read on session events only. */
 	sections: Record<string, string | null>;
+	/** False when the session should get the current definitions instead of the recorded ones. */
+	pinned: boolean;
 }
 
 const pinsByApi = new WeakMap<ExtensionAPI, Pins>();
 const GUIDELINES_PLACEHOLDER = "\u0000dm-subagents guidelines";
 
+/**
+ * A recorded description without the text a host appends to each declared tool, such as DM's
+ * codemode note on script-callable tools. The host decorates whatever is registered, so reusing a
+ * decorated description would add the note again on every session start (#2889). Drops a repeated
+ * trailing paragraph, then a trailing paragraph added after the current description.
+ */
+function undecorated(recorded: string, current: string): string {
+	const paragraphs = recorded.split("\n\n");
+	while (paragraphs.length > 1 && paragraphs.at(-1) === paragraphs.at(-2)) paragraphs.pop();
+	const stripped = paragraphs.join("\n\n");
+	return stripped.startsWith(`${current}\n\n`) ? current : stripped;
+}
+
 function pinnedDefinition(tool: PinnableTool, pin: DeclaredPin | undefined): PinnableTool {
 	const { constrainedSampling, promptSnippet, promptGuidelines, ...rest } = tool;
 	// An unchanged declaration keeps the registered schema object rather than its JSON copy.
-	const declaration = pin && !declarationsEqual(pin.declaration, tool) ? pin.declaration : undefined;
+	const recorded = pin ? { ...pin.declaration, description: undecorated(pin.declaration.description, rest.description) } : undefined;
+	const declaration = recorded && !declarationsEqual(recorded, tool) ? recorded : undefined;
 	const definition: PinnableTool = { ...rest, description: declaration?.description ?? rest.description, parameters: declaration?.parameters ?? rest.parameters };
 	const sampling = declaration ? (declaration as typeof declaration & { constrainedSampling?: unknown }).constrainedSampling : constrainedSampling;
 	if (sampling !== undefined) definition.constrainedSampling = sampling;
@@ -129,11 +146,11 @@ function declaredPins(dm: ExtensionAPI, pins: Pins, ctx: ExtensionContext | unde
 function pinsFor(dm: ExtensionAPI): Pins {
 	const existing = pinsByApi.get(dm);
 	if (existing) return existing;
-	const pins: Pins = { current: new Map(), declared: new Map(), registered: new Map(), sections: {} };
+	const pins: Pins = { current: new Map(), declared: new Map(), registered: new Map(), sections: {}, pinned: true };
 	pinsByApi.set(dm, pins);
 	// DM restores the transcript's active tools before both events, so handler order does not matter.
 	const refresh = (ctx: ExtensionContext | undefined) => {
-		const system = recordedSystemMessage(ctx);
+		const system = pins.pinned ? recordedSystemMessage(ctx) : undefined;
 		pins.sections = system?.sections ?? {};
 		pins.declared = declaredPins(dm, pins, ctx, system);
 		for (const name of pins.current.keys()) register(dm, pins, name);
@@ -162,4 +179,12 @@ export function registerPinnedTool<TParams extends TSchema, TDetails>(dm: Extens
 	pins.current.set(tool.name, tool as unknown as PinnableTool);
 	pins.registered.delete(tool.name);
 	register(dm, pins, tool.name);
+}
+
+/**
+ * Choose whether this session keeps the dm-subagents definitions and prompt text its transcript
+ * declared (the default) or gets the current ones. Call before registering any pinned tool.
+ */
+export function setDeclarationPinning(dm: ExtensionAPI, pinned: boolean): void {
+	pinsFor(dm).pinned = pinned;
 }

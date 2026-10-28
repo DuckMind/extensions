@@ -53,13 +53,20 @@ import { normalizeMapKey } from "./path-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
 import type { ProjectChangeSource } from "./project-changes.js";
 
-/** Which detector observed the change. */
-export type DiskChangeOrigin =
-	| "out-of-band"
-	| "bash-recovery"
-	| "head-move"
-	| "settled-sweep"
-	| "drift-heartbeat";
+/**
+ * Which detector observed the change. The list is the one source of the
+ * origin type, the subscriber declarations and the consumer census
+ * (`clients/disk-change-consumers.ts`): a detector added here is a cell every
+ * consumer row must answer.
+ */
+export const DISK_CHANGE_ORIGINS = [
+	"out-of-band",
+	"bash-recovery",
+	"head-move",
+	"settled-sweep",
+	"drift-heartbeat",
+] as const;
+export type DiskChangeOrigin = (typeof DISK_CHANGE_ORIGINS)[number];
 
 /**
  * The evidence the detector holds (`AGENTS.md` shape 10: a skip has a verdict
@@ -117,6 +124,14 @@ export interface DiskChangeSubscriber {
 	/** Stable consumer id; a second registration of one id replaces the first. */
 	id: string;
 	handler: (change: DiskChange) => unknown;
+	/**
+	 * The origins this consumer is delivered. The publisher skips every other
+	 * origin, so the declaration is what the consumer census reads and cannot
+	 * differ from what the consumer receives (#4535 slice 3: the diagnostics
+	 * cache dropped four origins inside its own handler, where no census could
+	 * see it). Absent on an entry registered by an older module copy: all.
+	 */
+	origins?: readonly DiskChangeOrigin[];
 }
 
 /**
@@ -204,23 +219,35 @@ function subscribers(): Map<string, DiskChangeSubscriber> {
 }
 
 /**
- * Register a consumer. Idempotent per id (a second module evaluation adopts
- * the first cell and replays the same registration instead of double-
- * delivering). Returns the unsubscriber.
+ * Register a consumer for `origins` (every origin when omitted). Idempotent per
+ * id (a second module evaluation adopts the first cell and replays the same
+ * registration instead of double-delivering). Returns the unsubscriber.
  */
 export function subscribeDiskChange(
 	id: string,
 	handler: (change: DiskChange) => unknown,
+	origins: readonly DiskChangeOrigin[] = DISK_CHANGE_ORIGINS,
 ): () => void {
-	subscribers().set(id, { id, handler });
+	subscribers().set(id, { id, handler, origins });
 	return () => {
 		if (subscribers().get(id)?.handler === handler) subscribers().delete(id);
 	};
 }
 
-/** The registered consumer ids, in registration order (census + tests). */
-export function diskChangeSubscriberIds(): string[] {
-	return [...subscribers().keys()];
+/**
+ * The registered consumers and the origins each is delivered, in registration
+ * order (the consumer census and tests).
+ */
+export function diskChangeSubscriberOrigins(): Map<
+	string,
+	readonly DiskChangeOrigin[]
+> {
+	return new Map(
+		[...subscribers().values()].map((subscriber) => [
+			subscriber.id,
+			subscriber.origins ?? DISK_CHANGE_ORIGINS,
+		]),
+	);
 }
 
 function publishFailure(cause: unknown): string {
@@ -318,7 +345,7 @@ export async function publishDiskChange(
  * so a caller that must await a chunk's own answer (the recovered set's drift
  * pass) keeps one chunk in flight at a time. It receives the chunk's position
  * in the chain, because the ordinal is the caller's evidence when a chunk
- * fails (`publishRecoveredDrift` records it and goes on).
+ * fails (`publishDriftPass` records it and goes on).
  */
 export async function publishDiskChangeChunked(
 	input: ChunkableDiskChangeInput,
@@ -442,6 +469,9 @@ async function fanOut(
 	// registers while this publish runs must not change who this one reaches.
 	const registered = Array.from(subscribers().values());
 	for (const subscriber of registered) {
+		// Delivery is the declaration (see {@link DiskChangeSubscriber.origins}).
+		if (subscriber.origins && !subscriber.origins.includes(change.origin))
+			continue;
 		try {
 			results.set(subscriber.id, await subscriber.handler(change));
 		} catch (cause) {

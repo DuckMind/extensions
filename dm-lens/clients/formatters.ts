@@ -20,6 +20,7 @@ import {
 	findNearestContaining,
 	normalizeMapKey,
 	realpathOrResolve,
+	walkUpDirs,
 } from "./path-utils.js";
 import { resolveToolCwd } from "./tool-cwd.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
@@ -257,9 +258,17 @@ async function findUp(
 	stopDir: string = path.parse(startDir).root,
 ): Promise<string[]> {
 	const found: string[] = [];
-	let currentDir = startDir;
-
-	while (currentDir !== stopDir) {
+	// #4689 item 6 (batch 7): the climb starts at the start directory's PATH
+	// IDENTITY, through the one shared upward walk. A link spelling's own
+	// parents are not the file's parents: the config that governs a file lives
+	// on the tree the kernel opens, so `repo/src/linked -> repo/shared` must
+	// read `repo/shared`'s configs and never `repo/src`'s. The `stopDir`
+	// parameter keeps its exact meaning on that axis (the walk stops AT it,
+	// excluding it and everything above), which is why it is a break here
+	// rather than a `walkUpDirs` option; no production caller passes one.
+	const stopIdentity = realpathOrResolve(stopDir);
+	for (const currentDir of walkUpDirs(startDir)) {
+		if (currentDir === stopIdentity) break;
 		// One `readdir` per directory instead of one `access` per target: the
 		// per-target probe made this loop's cost O(targets), so a long target
 		// list (e.g. `FORMATTER_CONFIG_FILES`) paid for every entry at every
@@ -299,9 +308,6 @@ async function findUp(
 			const candidate = path.join(currentDir, target);
 			if (await fileExists(candidate)) found.push(candidate);
 		}
-		const parent = path.dirname(currentDir);
-		if (parent === currentDir) break;
-		currentDir = parent;
 	}
 
 	return found;

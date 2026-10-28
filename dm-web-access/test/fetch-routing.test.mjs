@@ -12,7 +12,7 @@ function cleanProviderEnv(root) {
 	const childEnv = { ...process.env, DM_CODING_AGENT_DIR: root, HOME: root, USERPROFILE: root };
 	for (const key of [
 		"CRAWL4AI_BASE_URL", "CRAWL4AI_API_TOKEN", "FIRECRAWL_BASE_URL", "FIRECRAWL_API_KEY", "PARALLEL_API_KEY", "TINYFISH_API_KEY",
-		"SEARCH1API_KEY", "SEARCH1API_API_KEY", "QUERIT_API_KEY", "KAGI_API_KEY", "OLLAMA_API_KEY",
+		"SEARCH1API_KEY", "SEARCH1API_API_KEY", "QUERIT_API_KEY", "KAGI_API_KEY", "OLLAMA_API_KEY", "DEEPSEEK_API_KEY",
 		"BRIGHTDATA_API_KEY", "BRIGHTDATA_UNLOCKER_ZONE", "GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY", "GOOGLE_API_KEY",
 	]) delete childEnv[key];
 	return childEnv;
@@ -318,4 +318,43 @@ test("raw mode returns Cloudflare challenge bodies verbatim without fallback", a
 	assert.deepEqual(output.calls, ["https://example.com/challenge"]);
 	assert.equal(output.result.error, null);
 	assert.equal(output.result.content, cloudflareChallengePage);
+});
+
+async function runDeepSeekFetch(config) {
+	const root = await mkdtemp(join(tmpdir(), "pi-fetch-routing-deepseek-"));
+	await writeFile(join(root, "web-search.json"), JSON.stringify(config) + "\n", "utf8");
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+			const calls = [];
+			globalThis.fetch = async (url, init) => {
+				const text = String(url);
+				calls.push(text);
+				if (text === "https://example.com/routed") return new Response("blocked", { status: 403 });
+				if (text === "https://api.deepseek.com/v1/tools/fetch") {
+					return new Response(JSON.stringify({ title: "DeepSeek", content: "# DeepSeek\\n\\nFetched content." }), { status: 200 });
+				}
+				throw new Error("Unexpected fetch " + text);
+			};
+			const { extractContent } = await import(${JSON.stringify(extractUrl)});
+			const result = await extractContent("https://example.com/routed", undefined, { lookup: async () => [{ address: "93.184.216.34", family: 4 }] });
+			console.log(JSON.stringify({ calls, result }));
+		`,
+		encoding: "utf8",
+		env: cleanProviderEnv(root),
+		maxBuffer: 2 * 1024 * 1024,
+	});
+	assert.equal(child.status, 0, child.stderr);
+	return JSON.parse(child.stdout.trim());
+}
+
+test("DeepSeek Fetch is opt-in and honours the remote-hosted gate", async () => {
+	const gated = await runDeepSeekFetch({ deepseekApiKey: "ds-key", fetchRouting: { providers: ["http", "deepseek"] } });
+	assert.deepEqual(gated.calls, ["https://example.com/routed"]);
+	assert.match(gated.result.error, /HTTP 403/);
+
+	const routed = await runDeepSeekFetch({ deepseekApiKey: "ds-key", fetchRouting: { providers: ["http", "deepseek"], allowRemoteHostedProviders: true } });
+	assert.deepEqual(routed.calls, ["https://example.com/routed", "https://api.deepseek.com/v1/tools/fetch"]);
+	assert.equal(routed.result.error, null);
+	assert.equal(routed.result.title, "DeepSeek");
+	assert.match(routed.result.content, /Fetched content/);
 });

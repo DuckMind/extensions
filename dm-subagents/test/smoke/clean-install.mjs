@@ -1,14 +1,15 @@
-// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [0.86.1|1.0.0]
+// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [1.2.0]
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { registerHooks } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
-const version = process.argv[3] ?? "0.86.1";
-const supportedVersions = ["0.86.1", "1.0.0"];
+const version = process.argv[3] ?? "1.2.0";
+const supportedVersions = ["1.2.0"];
 assert.ok(supportedVersions.includes(version), `requires a supported smoke version: ${supportedVersions.join(", ")}`);
 const root = process.argv[2] ? path.resolve(process.argv[2]) : fs.mkdtempSync(path.join(os.tmpdir(), "clean-install-smoke-"));
 fs.mkdirSync(root, { recursive: true });
@@ -27,8 +28,8 @@ const env = {
 for (const key of Object.keys(env)) {
 	if (/API_KEY|TOKEN|SECRET|PASSWORD/.test(key) || ["NODE_OPTIONS", "NODE_PATH", "JITI_ALIAS"].includes(key)) delete env[key];
 }
-function run(name, command, args, workdir, extra = {}, success = true) {
-	const result = spawnSync(command, args, { cwd: workdir, env: { ...env, ...extra }, encoding: "utf8", timeout: 180000, maxBuffer: 10 * 1024 * 1024 });
+function run(name, command, args, workdir, extra = {}, success = true, timeout = 180000) {
+	const result = spawnSync(command, args, { cwd: workdir, env: { ...env, ...extra }, encoding: "utf8", timeout, maxBuffer: 10 * 1024 * 1024 });
 	fs.writeFileSync(path.join(root, `${name}.log`), `${result.stdout ?? ""}${result.stderr ?? ""}`);
 	assert.ifError(result.error);
 	if (success) assert.equal(result.status, 0, `${name}: ${result.stdout}\n${result.stderr}`);
@@ -36,13 +37,15 @@ function run(name, command, args, workdir, extra = {}, success = true) {
 	return result;
 }
 fs.writeFileSync(path.join(host, "package.json"), JSON.stringify({ private: true, dependencies: { "@duckmind/dm-coding-agent": version } }));
-run("host-install", "npm", ["install", "--no-audit", "--no-fund"], host);
+// Installing the DM host from the registry has taken over four minutes on slow days; the job timeout still bounds it.
+run("host-install", "npm", ["install", "--no-audit", "--no-fund"], host, {}, true, 420000);
 run("build-package", process.execPath, ["scripts/build-package.mjs"], source);
 const packed = JSON.parse(run("pack", "npm", ["pack", "--json", "--pack-destination", root, path.join(source, "dist-pkg")], source).stdout)[0];
 assert.ok(packed.files.some(file => file.path === "runner-peer-preload.mjs"), "peer preload must ship");
 assert.ok(packed.files.some(file => file.path === "runner-peer-loader.mjs"), "older-Node peer loader must ship");
 assert.equal(packed.files.some(file => file.path.endsWith(".ts") && !file.path.endsWith(".d.ts")), false, "package must not ship TypeScript sources");
 assert.ok(packed.files.some(file => file.path === "index.js"), "compiled extension entry must ship");
+assert.ok(packed.files.some(file => file.path === "bundle/index.js"), "bundled extension entry must ship");
 assert.ok(packed.files.some(file => file.path === "src/inspectors/inspector-runner.js"), "compiled inspector runner must ship");
 assert.ok(packed.files.some(file => file.path === "src/runs/background/subagent-runner-bootstrap.js"), "compiled background bootstrap must ship");
 assert.ok(packed.files.some(file => file.path === "src/runs/background/subagent-runner.js"), "compiled background execution module must ship");
@@ -69,8 +72,10 @@ assert.deepEqual(resolved.missing, []);
 const tui = findHostPeerPackageDir(dm, "@duckmind/dm-tui");
 assert.ok(tui.startsWith(host + path.sep), "TUI must come from the host install");
 assert.equal(resolved.aliases["@duckmind/dm-tui"], resolvePackageSubpath(tui, "."));
+// DM 1.2.0 dropped chord: alias it exactly when the real host install declares it.
+const hostDeclaresChord = Boolean(JSON.parse(fs.readFileSync(path.join(dm, "package.json"), "utf8")).dependencies?.["@earendil-works/chord"]);
 for (const specifier of ["@earendil-works/chord", "@earendil-works/chord/context"]) {
-	assert.ok(resolved.aliases[specifier]);
+	assert.equal(Boolean(resolved.aliases[specifier]), hostDeclaresChord, specifier);
 }
 assert.equal(resolved.aliases["@earendil-works/dm-client/unix"], undefined);
 fs.writeFileSync(path.join(root, "aliases.json"), JSON.stringify(resolved, null, 2));
@@ -82,9 +87,18 @@ const entryLoader = createJiti(import.meta.url, {
 	alias: { "@duckmind/dm-coding-agent": resolvePackageSubpath(dm, "."), ...resolved.aliases },
 });
 const entryStarted = performance.now();
-const entry = await entryLoader.import(path.join(installed, "index.js"));
-assert.equal(typeof entry.default, "function", "compiled extension entry must export its factory");
-console.log(`PASS compiled package entry loaded through Jiti in ${Math.round(performance.now() - entryStarted)} ms`);
+const [extensionEntry] = JSON.parse(fs.readFileSync(path.join(installed, "package.json"), "utf8")).dm.extensions;
+assert.equal(extensionEntry, "./bundle/index.js", "DM must load the bundled extension entry");
+// A bundle module that imported its compiled copy would load that module's state a second time.
+const loadedUrls = [];
+registerHooks({ load(url, context, next) { loadedUrls.push(url); return next(url, context); } });
+const entry = await entryLoader.import(path.join(installed, extensionEntry));
+assert.equal(typeof entry.default, "function", "bundled extension entry must export its factory");
+console.log(`PASS bundled package entry loaded through Jiti in ${Math.round(performance.now() - entryStarted)} ms`);
+for (const file of fs.readdirSync(path.join(installed, "bundle"))) await entryLoader.import(path.join(installed, "bundle", file));
+const compiledSource = pathToFileURL(path.join(fs.realpathSync(installed), "src")).href + "/";
+assert.deepEqual(loadedUrls.filter((url) => url.startsWith(compiledSource)), [], "bundled modules must not load compiled modules");
+console.log("PASS bundled entry, subpath exports and lazy chunks load no compiled module");
 for (const file of ["sdk-child.ts", "sdk-extension.ts"]) fs.copyFileSync(new URL(file, import.meta.url), path.join(cwd, file));
 const childEnv = {
 	SMOKE_EXTENSION: installed,

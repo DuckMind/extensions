@@ -143,7 +143,9 @@ describe("non-blocking wait subscriptions", () => {
 		registerWaitTool(dm, makeState(), true);
 		registerWaitTool(dm, makeState(), true, undefined, undefined, { nestedRootRunId: "root" });
 		assert.match(descriptions[0]!, /async subagent runs already wake this session natively/);
-		assert.match(descriptions[1]!, /bg_wait/);
+		assert.equal(descriptions[1], "Compatibility alias for `bg_wait`.");
+		assert.match(descriptions[2]!, /no native completion notifier: use blocking bg_wait to collect your owned descendants/);
+		assert.equal(descriptions[3], "Compatibility alias for `bg_wait`.");
 	});
 
 	it("ends a blocking bg_wait when the user sends a message while the agent is busy", async () => {
@@ -492,7 +494,7 @@ describe("non-blocking wait subscriptions", () => {
 			manager.arm({ targetKind: "async", runId: "run-timeout", requestedId: "run-timeout", timeoutMs: 100 });
 			now = 1_101;
 			manager.reconcile();
-			assert.match(sent.shift() ?? "", /timed out/);
+			assert.match(sent.shift() ?? "", /timed out[\s\S]*Parent action: Check the run status/, "a wait with no saved results points at the run status");
 			assert.equal(state.asyncJobs.size, 0);
 			assert.equal(state.waitSubscriptions?.size, 0);
 		} finally {

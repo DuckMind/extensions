@@ -306,4 +306,53 @@ describe("mission launch lifecycle", () => {
 			fs.rmSync(test.root, { recursive: true, force: true });
 		}
 	});
+
+	it("keeps requested foreground missions waiting for accepted evidence", () => {
+		const test = projectFixture();
+		try {
+			const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 };
+			const launch = (status: "review-required" | "verified") => {
+				const binding = prepareMissionLaunch({ params: { mission: { title: status }, task: "Do the work" }, projectRoot: test.projectRoot, config: test.missionConfig });
+				assert.ok(binding);
+				attachMissionToLaunchResult({ binding, result: {
+					content: [{ type: "text", text: "Done." }],
+					details: { mode: "single", runId: `run-${status}`, results: [{ index: 0, agent: "worker", task: "Do the work", exitCode: 0, usage, acceptance: { status } as never }] },
+				} });
+				return readMission(binding.location, binding.missionId).status;
+			};
+			assert.equal(launch("review-required"), "waiting");
+			assert.equal(launch("verified"), "completed");
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
+	it("retains acceptance for a terminal async run before its launch result attaches", () => {
+		const test = projectFixture();
+		try {
+			const asyncDir = path.join(test.root, "fast-run");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ state: "complete", steps: [{ acceptance: { status: "review-required" } }] }));
+			const binding = prepareMissionLaunch({ params: { mission: { title: "Fast run" }, task: "Do it" }, projectRoot: test.projectRoot, config: test.missionConfig });
+			assert.ok(binding);
+			attachMissionToLaunchResult({ binding, result: { content: [{ type: "text", text: "Started" }], details: { mode: "single", runId: "fast-1", asyncId: "fast-1", asyncDir, results: [] } } });
+			assert.equal(readMission(binding.location, binding.missionId).status, "waiting");
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
+	it("completes auto-created missions despite pending child acceptance", () => {
+		const test = projectFixture();
+		try {
+			const asyncDir = path.join(test.root, "default-run");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const binding = prepareMissionLaunch({ params: { task: "Edit the file" }, projectRoot: test.projectRoot, config: test.missionConfig });
+			assert.ok(binding);
+			attachMissionToLaunchResult({ binding, result: { content: [{ type: "text", text: "Started" }], details: { mode: "single", runId: "default-1", asyncId: "default-1", asyncDir, results: [] } } });
+			assert.equal(syncMissionFromAsyncCompletion({ runId: "default-1", asyncDir, mode: "single", state: "complete", success: true, results: [{ acceptance: { status: "review-required" } }] })?.status, "completed");
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
 });

@@ -1,3 +1,4 @@
+import { hashedSegment } from "../runs/background/index-segment.ts";
 import type { AgentProgress, AsyncStatus, WorkflowChildActivity, WorkflowChildSummary } from "../shared/types.ts";
 import type { WorkflowScriptChildResult, WorkflowScriptTraceEntry } from "./scripted-workflow.ts";
 
@@ -49,6 +50,12 @@ function requiredId(value: string, label: string): string {
 	return id;
 }
 
+/** Provider tool-call ids can be multi-kilobyte; the verbatim id stays in AsyncStatus.toolCallId, so an oversize id is recorded as its digest. */
+function parentToolCallId(value: string, label: string): string {
+	if (typeof value === "string" && value.trim() && Buffer.byteLength(value, "utf8") > MAX_REQUIRED_ID_BYTES) return hashedSegment(value);
+	return requiredId(value, label);
+}
+
 export function workflowChildSummary(input: {
 	parentToolCallId: string;
 	workflowRunId: string;
@@ -59,6 +66,8 @@ export function workflowChildSummary(input: {
 	steps?: NonNullable<AsyncStatus["steps"]>;
 	/** In-memory snapshots from synchronous child callbacks, keyed by workflow key. */
 	progress?: ReadonlyMap<string, WorkflowChildLiveProgress>;
+	/** Agent and run id each child launched with, keyed by workflow key; known before an async child settles. */
+	launches?: ReadonlyMap<string, { agent: string; runId?: string }>;
 }): WorkflowChildSummary {
 	const rows = new Map<string, WorkflowChildSummary["children"][number]>();
 	const runningAsyncKeys = new Set(input.children?.filter((child) => child.state === "running").map((child) => child.key));
@@ -120,6 +129,15 @@ export function workflowChildSummary(input: {
 			if (!TERMINAL_STATES.has(row.state) && !runningAsyncKeys.has(key)) rows.set(key, { ...row, state: input.workflowState === "stopped" ? "stopped" : "failed" });
 		}
 	}
+	for (const [key, launch] of input.launches ?? []) {
+		const row = rows.get(key);
+		if (!row || row.state !== "running") continue;
+		rows.set(key, {
+			...row,
+			...(!row.runId && bounded(launch.runId, 256) ? { runId: launch.runId } : {}),
+			...(!row.agent && bounded(launch.agent, 256) ? { agent: launch.agent } : {}),
+		});
+	}
 	for (const [key, progress] of input.progress ?? []) {
 		const row = rows.get(key);
 		if (!row || row.state !== "running") continue;
@@ -134,7 +152,7 @@ export function workflowChildSummary(input: {
 	}
 	return {
 		version: 1,
-		parentToolCallId: requiredId(input.parentToolCallId, "parentToolCallId"),
+		parentToolCallId: parentToolCallId(input.parentToolCallId, "parentToolCallId"),
 		workflowRunId: requiredId(input.workflowRunId, "workflowRunId"),
 		inventoryComplete: input.inventoryComplete,
 		workflowState: input.workflowState,
@@ -168,5 +186,5 @@ export function parseWorkflowChildSummary(value: unknown): WorkflowChildSummary 
 	if (new Set(children.map((child) => child.childId)).size !== children.length) throw new Error("workflowChildren has duplicate childId values.");
 	if (typeof input.parentToolCallId !== "string") throw new Error("workflowChildren.parentToolCallId is invalid.");
 	if (typeof input.workflowRunId !== "string") throw new Error("workflowChildren.workflowRunId is invalid.");
-	return { version: 1, parentToolCallId: requiredId(input.parentToolCallId, "workflowChildren.parentToolCallId"), workflowRunId: requiredId(input.workflowRunId, "workflowChildren.workflowRunId"), inventoryComplete: input.inventoryComplete, workflowState, children };
+	return { version: 1, parentToolCallId: parentToolCallId(input.parentToolCallId, "workflowChildren.parentToolCallId"), workflowRunId: requiredId(input.workflowRunId, "workflowChildren.workflowRunId"), inventoryComplete: input.inventoryComplete, workflowState, children };
 }

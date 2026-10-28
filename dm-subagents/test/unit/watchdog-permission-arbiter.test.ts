@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { StreamFn } from "@duckmind/dm-agent-core";
 import { createAssistantMessageEventStream, fauxAssistantMessage, fauxToolCall, type AssistantMessage, type Model, type TranscriptContext } from "@duckmind/dm-ai";
-import { getCurrentTools } from "../support/dm-transcript.ts";
+import { getCurrentTools } from "../../src/shared/dm-declarations.ts";
 import { createWatchdogPermissionArbiter } from "../../src/watchdog/permission-arbiter.ts";
 
 function model(): Model<any> {
@@ -96,7 +96,9 @@ describe("watchdog permission arbiter", () => {
 			rawWatchdogConfig: childConfig,
 		});
 
-		assert.equal(calls[0]?.systemPrompt, [
+		assert.deepEqual(calls[0]?.messages[0], {
+			role: "system",
+			content: [
 				"You are the dm-subagents watchdog permission arbiter.",
 				"Decide only whether this exact non-bash child tool call should proceed.",
 				"Call watchdog_permission_decision exactly once with approve or deny and a concise reason.",
@@ -105,8 +107,11 @@ describe("watchdog permission arbiter", () => {
 				"<cwd>",
 				"/tmp/watchdog-parent/../watchdog-permission",
 				"</cwd>",
-			].join("\n"));
-		assert.deepEqual(getCurrentTools(calls[0]!).map((tool) => tool.name), ["watchdog_permission_decision"]);
+			].join("\n"),
+			toolsAdded: getCurrentTools(calls[0]!.messages),
+			timestamp: calls[0]?.messages[0]?.timestamp,
+		});
+		assert.deepEqual(getCurrentTools(calls[0]!.messages).map((tool) => tool.name), ["watchdog_permission_decision"]);
 	});
 
 	it("fails closed before provider invocation when the helper cwd can escape its system section", async () => {

@@ -851,7 +851,7 @@ export function evaluateNoSurvivingLspProcesses(before, after) {
 		pass: surviving.length === 0,
 		detail:
 			surviving.length === 0
-				? "no new LSP-server processes survived pi's exit"
+				? "no new LSP-server processes survived DM's exit"
 				: `${surviving.length} surviving process(es): ${surviving.map((p) => `pid=${p.pid} ${p.command.slice(0, 80)}`).join("; ")}`,
 	};
 }

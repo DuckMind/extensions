@@ -24,10 +24,11 @@ function fakePi(override?: ToolDefinition, commandOverride?: ToolDefinition) {
 			constructor(options) { this.options = options; }
 			async reload() {
 				const extensions = [{ path: "/ambient.ts", tools: new Map([...(override ? [["bash", { definition: override }]] as const : []), ...(commandOverride ? [["subagent_command", { definition: commandOverride }]] as const : [])]) }];
-				for (const [index, hook] of this.options.extensionFactories.entries()) {
+				for (const hook of this.options.extensionFactories) {
 					const registered = new Map();
 					await hook({ registerTool(tool) { registered.set(tool.name, { definition: tool }); } });
-					extensions.push({ path: `<inline:${["dm-subagents:prompt-runtime", "dm-subagents:commands"][index] ?? index}>`, tools: registered });
+					const name = registered.has("subagent_command") ? "dm-subagents:commands" : "dm-subagents:prompt-runtime";
+					extensions.push({ path: `<inline:${name}>`, tools: registered });
 				}
 				this.result = this.options.extensionsOverride({ extensions, errors: [], runtime: {} });
 				order = this.result.extensions.map((extension) => extension.path);
@@ -131,7 +132,7 @@ describe("default child factory command integration", () => {
 			try {
 				await factory.create(input);
 				assert.equal(fake.tools.has("subagent_command"), false);
-				assert.equal(fake.order().includes("<inline:dm-subagents:commands>"), false);
+				assert.equal(fake.order().includes("<inline:2>"), false);
 				assert.equal("yieldTimeMs" in (fake.tools.get("bash")!.parameters as { properties: object }).properties, false);
 				const result = await fake.tools.get("bash")!.execute("plain", { command: "printf plain" }, undefined, undefined, ctxForTest());
 				assert.equal(result.content[0].text, "plain");
@@ -139,6 +140,21 @@ describe("default child factory command integration", () => {
 			} finally { await factory.dispose(); await fs.promises.rm(channel, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 		});
 	}
+
+	it("does not mistake a numbered codemode factory for disabled command controls", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-command-codemode-"));
+		const fake = fakePi();
+		(fake.dm as PiCodingAgentModule & { createCodemodeExtension?: () => (api: { registerTool(tool: ToolDefinition): void }) => void }).createCodemodeExtension =
+			() => (api) => api.registerTool({ name: "codemode" } as ToolDefinition);
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => fake.dm });
+		try {
+			const input = launch(dir, `codemode-${randomUUID()}`);
+			input.tools = ["bash", "codemode"];
+			await factory.create(input);
+			assert.deepEqual(fake.order(), ["<inline:dm-subagents:prompt-runtime>", "<inline:dm-subagents:prompt-runtime>", "/ambient.ts"]);
+			assert.equal(fake.tools.has("subagent_command"), false);
+		} finally { await factory.dispose(); await fs.promises.rm(dir, { recursive: true, force: true }); }
+	});
 
 	it("preserves a custom backend's explicitly required command tool", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-command-collision-"));

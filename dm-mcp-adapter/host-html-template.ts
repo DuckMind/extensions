@@ -212,7 +212,7 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
 
     const bridge = new AppBridge(
       null,
-      { name: "pi", version: "1.0.0" },
+      { name: "dm", version: "1.0.0" },
       {
         serverTools: {},
         openLinks: {},

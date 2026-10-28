@@ -52,6 +52,58 @@ it("settles a timed-out run whose session creation never returns, and contains l
 	assert.equal(prompted, false);
 });
 
+for (const control of ["stop", "timeout", "interrupt"] as const) {
+	it(`cancels background session startup on ${control} before a session is returned`, { timeout: 5_000 }, async () => {
+		let cancel!: () => void;
+		let observedAbort = false;
+		const factory: ChildSessionFactory = {
+			create(input) {
+				assert.ok(input.signal, "startup must receive a cancellation signal");
+				return new Promise((_resolve, reject) => {
+					input.signal!.addEventListener("abort", () => { observedAbort = true; reject(new Error("startup cancelled")); }, { once: true });
+				});
+			},
+			async dispose() {},
+		};
+		const run = runChildSession({
+			factory, launch, prompt: "must not reach the model", appendChildEvent() {}, writeOutputLine() {},
+			registerStop(handler) { if (control === "stop" && handler) cancel = handler; },
+			registerTimeout(handler) { if (control === "timeout" && handler) cancel = handler; },
+			registerInterrupt(handler) { if (control === "interrupt" && handler) cancel = handler; },
+		});
+		cancel();
+		const result = await run;
+		assert.equal(observedAbort, true);
+		assert.equal(result.toolCount, 0);
+		assert.equal(result[control === "stop" ? "stopped" : control === "timeout" ? "timedOut" : "interrupted"], true);
+	});
+}
+
+for (const control of ["stop", "timeout", "interrupt"] as const) {
+	it(`cancels foreground session startup on ${control} before a session is returned`, { timeout: 5_000 }, async () => {
+		const controller = new AbortController();
+		let observedAbort = false;
+		const factory: ChildSessionFactory = {
+			create(input) {
+				assert.ok(input.signal, "startup must receive a cancellation signal");
+				return new Promise((_resolve, reject) => {
+					input.signal!.addEventListener("abort", () => { observedAbort = true; reject(new Error("startup cancelled")); }, { once: true });
+					if (control !== "timeout") controller.abort();
+				});
+			},
+			async dispose() {},
+		};
+		const result = await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "must not reach the model", {
+			childSessionFactory: factory,
+			...(control === "stop" ? { signal: controller.signal } : control === "interrupt" ? { interruptSignal: controller.signal } : { timeoutMs: 100 }),
+		});
+		assert.equal(observedAbort, true);
+		assert.deepEqual(result.messages, []);
+		if (control === "timeout") assert.equal(result.timedOut, true);
+		if (control === "interrupt") assert.equal(result.interrupted, true);
+	});
+}
+
 it("reports the created child's context window before prompting", { timeout: 10_000 }, async () => {
 	const reported: number[] = [];
 	let timeout: (() => void) | undefined;
@@ -226,5 +278,28 @@ for (const mode of ["foreground", "background"] as const) {
 		assert.equal(result.outputPartial, undefined);
 		assert.doesNotMatch(result.finalOutput ?? "", /Partial output before child error/);
 		assert.match(result.finalOutput ?? "", /half a thought, finished/);
+	});
+}
+
+for (const mode of ["foreground", "background"] as const) {
+	it(`${mode}: reports a provider stop with its reply text`, { timeout: 10_000 }, async () => {
+		let listener: Parameters<ChildSession["subscribe"]>[0] = () => {};
+		const messages: ChildSession["messages"] = [];
+		const session: ChildSession = {
+			subscribe(handler) { listener = handler; return () => {}; },
+			async prompt() {
+				const message = { ...fauxAssistantMessage("Blocked by the provider's usage policy."), stopReason: "error", rawStopReason: "content_filter", errorMessage: "Provider finish_reason: content_filter" };
+				messages.push(message);
+				listener({ type: "message_end", message });
+			},
+			async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
+			messages, sessionId: "filtered-session", modelId: "mock/model",
+		};
+		const factory: ChildSessionFactory = { create: async () => session, async dispose() {} };
+		const result = mode === "foreground"
+			? await runSync(process.cwd(), makeAgentConfigs(["worker"]), "worker", "Study", { childSessionFactory: factory })
+			: await runChildSession({ factory, launch, prompt: "Study", appendChildEvent() {}, writeOutputLine() {} });
+		assert.equal(result.exitCode, 1);
+		assert.equal(result.error, "Provider finish_reason: content_filter\nReply text: Blocked by the provider's usage policy.");
 	});
 }

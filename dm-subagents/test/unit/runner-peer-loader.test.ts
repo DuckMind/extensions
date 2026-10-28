@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 
 const loaderUrl = new URL("../../runner-peer-loader.mjs", import.meta.url);
 const packageRootUrl = new URL("../../", import.meta.url).href;
-const hostModules = path.join(os.tmpdir(), "runner-peer-loader-host", "node_modules", "@earendil-works");
+const hostModules = path.join(os.tmpdir(), "runner-peer-loader-host", "node_modules", "@duckmind");
 const aliases = {
 	"@duckmind/dm-tui": path.join(hostModules, "dm-tui", "dist", "index.js"),
 	"@duckmind/dm-ai": path.join(hostModules, "dm-ai", "dist", "index.js"),
@@ -35,6 +35,7 @@ test("native preload leaves the SDK extension loader's require.resolve intact", 
 			timeout: 10_000,
 		});
 		assert.equal(child.status, 0, child.stderr);
+		// Node 24 returns the alias path verbatim and Node 25 the realpath; on macOS /var is a symlink to /private/var.
 		assert.equal(fs.realpathSync(child.stdout.trim()), fs.realpathSync(target));
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });

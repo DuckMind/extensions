@@ -45,13 +45,31 @@ export function isModelInScope(model: ModelLike, scopedModels: ReadonlyArray<{ m
 	return scopedModels.length === 0 || scopedModels.some(scoped => scoped.model.provider === model.provider && scoped.model.id === model.id);
 }
 
-export function splitThinkingSuffix(value: string): { value: string; thinkingLevel?: SummaryThinkingLevel } {
+function splitThinkingSuffix(value: string): { value: string; thinkingLevel?: SummaryThinkingLevel } {
 	const index = value.lastIndexOf(":");
 	if (index < 0) return { value };
 	const suffix = value.slice(index + 1);
 	return THINKING_LEVELS.has(suffix)
 		? { value: value.slice(0, index), thinkingLevel: suffix as SummaryThinkingLevel }
 		: { value };
+}
+
+/**
+ * Parse `current[:level]` or `provider/model-id[:level]`; `current` names the active DM session model and
+ * resolves to undefined when there is none. Throws for any other value.
+ */
+export function resolveHelperModelSelector(
+	value: string,
+	label: string,
+	currentModel?: ModelLike,
+): { provider: string; id: string; thinkingLevel?: SummaryThinkingLevel } | undefined {
+	const { value: selector, thinkingLevel } = splitThinkingSuffix(value.trim());
+	if (selector === "current") return currentModel ? { provider: currentModel.provider, id: currentModel.id, thinkingLevel } : undefined;
+	const slashIndex = selector.indexOf("/");
+	if (slashIndex <= 0 || slashIndex >= selector.length - 1) {
+		throw new Error(`Invalid ${label}: ${value}. Use provider/model-id or current.`);
+	}
+	return { provider: selector.slice(0, slashIndex), id: selector.slice(slashIndex + 1), thinkingLevel };
 }
 
 

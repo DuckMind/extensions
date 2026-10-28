@@ -16,10 +16,10 @@ import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-
 const sdkRoot = process.env.DM_SUBAGENTS_NATIVE_SDK;
 for (const host of ["foreground", "runner"] as const) {
 	for (const [systemPromptMode, structured] of [["append", false], ["replace", false], ["append", true], ["replace", true]] as const) {
-		it(`exact acceptance survives actual SDK split-turn compaction: ${host}/${systemPromptMode}/${structured ? "structured" : "fenced"}`, { skip: !sdkRoot && "Set DM_SUBAGENTS_NATIVE_SDK to the isolated 0.86.1 SDK root" }, async () => {
+		it(`exact acceptance survives actual SDK split-turn compaction: ${host}/${systemPromptMode}/${structured ? "structured" : "fenced"}`, { skip: !sdkRoot && "Set DM_SUBAGENTS_NATIVE_SDK to the isolated 1.2.0 SDK root" }, async () => {
 			const entry = execFileSync(process.execPath, ["--input-type=module", "-e", "console.log(import.meta.resolve('@duckmind/dm-coding-agent'))"], { cwd: sdkRoot, encoding: "utf8" }).trim();
 			const dm: PiCodingAgentModule = await import(entry);
-			assert.equal(dm.VERSION, "0.86.1");
+			assert.equal(dm.VERSION, "1.2.0");
 			const cwd = mkdtempSync(join(tmpdir(), "acceptance-compaction-"));
 			const agentDir = join(cwd, "agent"); mkdirSync(agentDir);
 			const oldDir = process.env.DM_CODING_AGENT_DIR;

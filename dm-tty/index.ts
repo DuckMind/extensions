@@ -45,7 +45,8 @@ export function parseCommand(args: string, cwd: string): TtyCommand {
 
 function describe(info: TtyServerInfo): string {
 	const host = info.host.includes(":") ? `[${info.host}]` : info.host;
-	return `dm-tty: http://${["0.0.0.0", "::"].includes(info.host) ? "127.0.0.1" : host}:${info.port}/\nToken: ${info.token}\nShell ${info.running ? `running (pid ${info.pid})` : "exited; use /tty stop then /tty start"}; cwd: ${info.cwd}\nThis opens a separate shell, not a mirror of this DM session. Run dm in the browser to start a new session.\nThe token grants full shell access as your OS user. Use an SSH tunnel or HTTPS for remote access; never expose this HTTP listener to the public Internet.${["0.0.0.0", "::"].includes(info.host) ? "\nListening on all interfaces; use this machine's reachable address in the browser. Use --host 127.0.0.1 to restrict access to this machine." : ""}`;
+	const localHost = info.host === "0.0.0.0" ? "127.0.0.1" : info.host === "::" ? "[::1]" : "";
+	return `dm-tty: http://${host}:${info.port}/${localHost ? `\nLocal browser: http://${localHost}:${info.port}/` : ""}\nToken: ${info.token}\nShell ${info.running ? `running (pid ${info.pid})` : "exited; use /tty stop then /tty start"}; cwd: ${info.cwd}\nThis opens a separate shell, not a mirror of this DM session. Run dm in the browser to start a new session.\nThe token grants full shell access as your OS user. Use an SSH tunnel or HTTPS for remote access; never expose this HTTP listener to the public Internet.${localHost ? "\nListening on all interfaces; use this machine's reachable address in the browser. Use --host 127.0.0.1 to restrict access to this machine." : ""}`;
 }
 
 export default function dmTty(dm: ExtensionAPI): void {

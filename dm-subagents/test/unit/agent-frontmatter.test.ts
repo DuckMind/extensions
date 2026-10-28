@@ -8,7 +8,7 @@ import { handleManagementAction } from "../../src/agents/agent-management.ts";
 import { serializeAgent } from "../../src/agents/agent-serializer.ts";
 import { parseChain, serializeChain } from "../../src/agents/chain-serializer.ts";
 import { discoverAgents, discoverAgentsAll, inspectAgentDefinitionDirectory, type AgentConfig } from "../../src/agents/agents.ts";
-import { parseFrontmatter } from "../../src/agents/frontmatter.ts";
+import { parseFrontmatter, parseFrontmatterList, parseUnquotedList } from "../../src/agents/frontmatter.ts";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 import { applyThinkingSuffix } from "../../src/runs/shared/child-tool-plan.ts";
 import { THINKING_LEVELS } from "../../src/shared/model-info.ts";
@@ -273,6 +273,67 @@ body`);
 
 		assert.equal(afterIndented.frontmatter.description, "normal\n  code\n\nnext");
 		assert.equal(beforeIndented.frontmatter.description, "normal\n\n  code\nnext");
+	});
+});
+
+describe("quoted names in tool and extension lists", () => {
+	it("reads each quoted item without its quote marks", () => {
+		const toolsOf = (value: string) => parseUnquotedList(parseFrontmatter(`---\ntools: ${value}\nname: worker\n---\nbody`).frontmatter.tools);
+		assert.deepEqual(toolsOf('"read", "bash"'), ["read", "bash"]);
+		assert.deepEqual(toolsOf("'read', 'bash'"), ["read", "bash"]);
+		assert.deepEqual(toolsOf('"read"'), ["read"]);
+		assert.deepEqual(parseUnquotedList(parseFrontmatter('---\ntools:\n  - "read"\n  - bash\nname: worker\n---\nbody').frontmatter.tools), ["read", "bash"]);
+		assert.deepEqual(toolsOf("false"), ["false"]);
+		assert.equal(parseUnquotedList(undefined), undefined);
+		const description = parseFrontmatter('---\ndescription: "Review \\"a\\", then continue"\nname: worker\n---\nbody');
+		assert.equal(description.frontmatter.description, 'Review \\"a\\", then continue');
+	});
+
+	it("loads quoted tools and extension paths as plain names", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "dm-quoted-project-"));
+		tempDirs.push(project);
+		const agentFile = path.join(project, ".dm", "agents", "reviewer.md");
+		writeAgent(agentFile, [
+			"---",
+			"name: reviewer",
+			"description: Reviews with quoted tools",
+			'tools: "read", "bash"',
+			`extensions: "./ext/a.ts", './ext/b.ts'`,
+			"---",
+			"Review.",
+			"",
+		].join("\n"));
+		const agent = discoverAgents(project, "project").agents.find((item) => item.name === "reviewer");
+		assert.deepEqual(agent?.tools, ["read", "bash"]);
+		const agentDir = path.dirname(agentFile);
+		assert.deepEqual(agent?.extensions, [path.resolve(agentDir, "ext/a.ts"), path.resolve(agentDir, "ext/b.ts")]);
+	}));
+});
+
+describe("frontmatter comments", () => {
+	const toolsOf = (frontmatter: string) => parseFrontmatterList(parseFrontmatter(`---\n${frontmatter}\nname: worker\n---\nbody`).frontmatter.tools);
+
+	it("ignores YAML comments in tool lists", () => {
+		assert.deepEqual(toolsOf("tools:\n  - read\n  # note\n  - bash"), ["read", "bash"]);
+		assert.deepEqual(toolsOf("tools:\n  - read\n# note\n  - bash"), ["read", "bash"]);
+		assert.deepEqual(toolsOf("tools:\n  - read # why\n  - bash"), ["read", "bash"]);
+		assert.deepEqual(toolsOf("tools:\n  - read\n  # note, more\n  - bash"), ["read", "bash"]);
+	});
+
+	it("keeps # inside quoted list items and block scalars", () => {
+		assert.deepEqual(toolsOf('tools:\n  - "a # b"\n  - bash'), ['"a # b"', "bash"]);
+		assert.deepEqual(parseFrontmatterList(parseFrontmatter('---\ndefaultReads: "notes #1.md"\n---\nbody').frontmatter.defaultReads), ["notes #1.md"]);
+		const parsed = parseFrontmatter(`---
+description: |
+  first
+  # kept
+notes: >
+  one
+  # two
+---
+body`);
+		assert.equal(parsed.frontmatter.description, "first\n# kept");
+		assert.equal(parsed.frontmatter.notes, "one # two");
 	});
 });
 

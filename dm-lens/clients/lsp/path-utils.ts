@@ -4,9 +4,11 @@
  */
 export {
 	isUnderDir,
+	kernelPathIdentityAsync,
 	normalizeEphemeralMapKey,
 	normalizeMapKey,
 	pathsEqual,
+	realpathOrResolveAsync,
 	uriToDiskPath,
 	uriToPath,
 } from "../path-utils.js";

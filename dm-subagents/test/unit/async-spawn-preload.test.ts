@@ -63,7 +63,7 @@ test("executeAsyncSingle preloads all peer aliases before the selected runner lo
 			});
 			assert.equal(result.isError, true);
 			if (scenario === "missing-pre-chord") {
-					assert.match(result.content[0]!.text, /@duckmind\/dm-agent-core\/node/);
+				assert.match(result.content[0]!.text, /@duckmind\/dm-agent-core\/node/);
 				assert.equal(spawn.mock.callCount(), 2);
 				continue;
 			}

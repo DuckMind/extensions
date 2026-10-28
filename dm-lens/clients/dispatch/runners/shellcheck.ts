@@ -22,7 +22,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { pathsEqual } from "../../path-utils.js";
+import { findLocalToolConfig, pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
@@ -147,19 +147,7 @@ export function resolveShellFileDialect(filePath: string): ShellFileDialect {
 }
 
 function findShellcheckConfig(cwd: string): string | undefined {
-	const local = path.join(cwd, ".shellcheckrc");
-	if (fs.existsSync(local)) return local;
-
-	let current = path.resolve(cwd);
-	while (true) {
-		const candidate = path.join(current, ".shellcheckrc");
-		if (fs.existsSync(candidate)) return candidate;
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-
-	return undefined;
+	return findLocalToolConfig(cwd, [".shellcheckrc"]);
 }
 
 /**

@@ -7,7 +7,7 @@
  */
 import type { Message } from "@duckmind/dm-ai";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
-import { extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
+import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, assistantMessageError, extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
 import { qualifyModelWithProvider } from "../../shared/model-info.ts";
 import type { EffectsProjection, RuntimeAcknowledgedChildExtensions, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
 import {
@@ -28,6 +28,8 @@ import { createReportedChildSessionInput, type InProcessChildLaunch } from "../s
 import { createPartialOutputTracker, formatPartialOutput, type PartialOutputCause } from "../shared/partial-output.ts";
 import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
+import { isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
+import { STRUCTURED_OUTPUT_FOLLOW_UP } from "../shared/structured-output.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
@@ -112,7 +114,7 @@ export interface RunChildSessionResult {
 	toolCount: number;
 	durationMs: number;
 	model?: string;
-	nativeMachine?: { provider: "herdr"; machineId: string; initialGit?: import("../../shared/types.ts").HerdrRemoteGitStatus; finalGit?: import("../../shared/types.ts").HerdrRemoteGitStatus };
+	nativeMachine?: import("../../shared/types.ts").SingleResult["nativeMachine"];
 	error?: string;
 	finalOutput: string;
 	outputState: SubagentOutputState;
@@ -200,14 +202,16 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let queuedDrainHold = false;
 		let compactionStartedReceived = false;
 		let afterCompactionSettlement = false;
+		let terminalAgentEndReceived = false;
+		let compactionAfterFinalOpen = false;
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardFinishTimer: NodeJS.Timeout | undefined;
 		let watchdogTailTimer: NodeJS.Timeout | undefined;
 		let abortSettleTimer: NodeJS.Timeout | undefined;
 		let childWatchdogState: ChildWatchdogStateSnapshot | undefined;
 		const childLifecycleState: ChildLifecycleState = { compactionRetryActive: false };
-		const timeoutMessage = () => input.timeoutMessage ?? "Subagent timed out.";
-		const stopMessage = () => input.stopMessage ?? "Subagent stopped.";
+		const timeoutMessage = () => input.timeoutMessage ?? SUBAGENT_TIMED_OUT_MESSAGE;
+		const stopMessage = () => input.stopMessage ?? SUBAGENT_STOPPED_MESSAGE;
 
 		type ActiveToolCall = { key: string; tool: string; args?: string; path?: string };
 		let activeToolSequence = 0;
@@ -251,10 +255,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			refreshCurrentTool();
 		};
 
+		const startup = new AbortController();
 		const abortChild = (): void => {
 			if (settled || promptSettled) return;
-			// A hung session creation has no session to abort yet; the settle timer below is the only
-			// thing that ends the run, and a session created afterwards is disposed by the launch block.
+			startup.abort();
+			// MCP startup can now stop before a session is returned. The timer still bounds
+			// other creation work that does not observe the startup signal.
 			void session?.abort().catch(() => {
 				// The run settles through its prompt promise; abort failures are not separately actionable.
 			});
@@ -335,7 +341,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (promptSettled || finalDrainTimer || settled) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled || promptSettled) return;
-				if (input.launch.capture.finalDrainHeld() || observeQueuedDrainHold()) {
+				if (input.launch.capture.finalDrainHeld() || observeQueuedDrainHold() || compactionAfterFinalOpen) {
 					finalDrainTimer = undefined;
 					armFinalDrainTimer();
 					return;
@@ -349,14 +355,22 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					if (settled || promptSettled) return;
 					settle(undefined, true);
 				}, HARD_FINISH_MS);
-				finalHardFinishTimer.unref?.();
 			}, FINAL_STOP_GRACE_MS);
-			finalDrainTimer.unref?.();
 		}
-		const applyChildLifecycle = (action: ChildLifecycleAction): void => {
+		const applyChildLifecycle = (action: ChildLifecycleAction, event?: { type?: string; willRetry?: unknown }): void => {
 			if (action === "cancel-drain") {
+				if (event?.type === "agent_end" && event.willRetry !== true && cleanTerminalAssistantStopReceived) {
+					agentSettledReceived = false;
+					terminalAgentEndReceived = true;
+					clearFinalDrainTimers();
+					clearWatchdogTailTimer();
+					startFinalDrain();
+					return;
+				}
 				cleanTerminalAssistantStopReceived = false;
 				agentSettledReceived = false;
+				terminalAgentEndReceived = false;
+				compactionAfterFinalOpen = false;
 				clearFinalDrainTimers();
 				clearWatchdogTailTimer();
 				return;
@@ -423,10 +437,16 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (event.type === "compaction_start") {
 				compactionStartedReceived = true;
 				if (agentSettledReceived) afterCompactionSettlement = true;
+				if (terminalAgentEndReceived) compactionAfterFinalOpen = true;
 			}
 			if (event.type === "compaction_end" && event.willRetry === true) {
 				compactionStartedReceived = false;
 				afterCompactionSettlement = false;
+			}
+			if (event.type === "compaction_end" && event.willRetry !== true && compactionAfterFinalOpen) {
+				compactionAfterFinalOpen = false;
+				clearFinalDrainTimers();
+				startFinalDrain();
 			}
 			if (event.type === "turn_start" || event.type === "agent_start" || event.type === "auto_retry_start") {
 				queuedDrainHold = false;
@@ -440,7 +460,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				agentSettledReceived = true;
 				afterCompactionSettlement = compactionStartedReceived;
 			}
-			applyChildLifecycle(lifecycleAction);
+			applyChildLifecycle(lifecycleAction, event);
 
 			if (isChildWatchdogStatusEvent(event)) {
 				if (!input.childWatchdog) return;
@@ -489,18 +509,11 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				return;
 			}
 
-			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-				if (event.type === "tool_result_end") {
-					clearActiveToolTimeout(event);
-					removeActiveToolCall({
-						toolCallId: (event.message as { toolCallId?: unknown }).toolCallId ?? event.toolCallId,
-						toolName: (event.message as { toolName?: unknown }).toolName ?? event.toolName,
-					});
-				}
+			if (event.type === "message_end" && event.message) {
 				messages.push(event.message);
 				const text = extractTextFromContent(event.message.content);
 				if (text) writeOutputText(text);
-				if (event.type === "message_end" && event.message.role === "user" && text) {
+				if (event.message.role === "user" && text) {
 					const matched = takeMatchingAcceptedSteer(acceptedSteers, text);
 					if (matched) {
 						input.onSteerOutcome?.(matched.request, {
@@ -511,11 +524,11 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					}
 				}
 
-				if (input.childWatchdog && event.type === "message_end") {
+				if (input.childWatchdog) {
 					const next = applyChildWatchdogMessage(childWatchdogState, event.message);
 					if (next) childWatchdogState = next;
 				}
-				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				if (event.message.role !== "assistant") return;
 				const hasToolCall = assistantStartsToolCall(event.message);
 				if (event.message.model) {
 					model = qualifyModelWithProvider(event.message.model, event.message.provider, input.modelVerificationRegistry) ?? event.message.model;
@@ -524,7 +537,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 						if (modelVerificationError && !error) error = modelVerificationError;
 					}
 				}
-				if (event.message.errorMessage) assistantError = event.message.errorMessage;
+				if (event.message.errorMessage) assistantError = assistantMessageError(event.message);
 				else if (hasToolCall && event.message.stopReason === "toolUse") {
 					// A recovered request can finish via a terminating tool, without a text stop.
 					assistantError = undefined;
@@ -632,7 +645,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					toolCount,
 					durationMs: Date.now() - startedAt,
 					model,
-					nativeMachine: session?.machineEvidence ? { provider: "herdr", machineId: session.machineEvidence.machineId, ...(session.machineEvidence.initial ? { initialGit: session.machineEvidence.initial } : {}), ...(session.machineEvidence.final ? { finalGit: session.machineEvidence.final } : {}) } : undefined,
+					nativeMachine: session?.machineEvidence ? { provider: session.machineEvidence.provider, machineId: session.machineEvidence.machineId, ...(session.machineEvidence.initial ? { initialGit: session.machineEvidence.initial } : {}), ...(session.machineEvidence.final ? { finalGit: session.machineEvidence.final } : {}) } : undefined,
 					error: stopped ? stopMessage() : timedOut ? (error ?? timeoutMessage()) : interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal && !commandError) ? undefined : finalError,
 					finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage() : error ?? timeoutMessage()) : finalOutput,
 					outputState: finalOutput.trim() ? "present" : "absent",
@@ -672,6 +685,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		void (async () => {
 			try {
 				const createInput = createReportedChildSessionInput(input.launch, input.transcriptWriter);
+				createInput.signal = startup.signal;
 				const created = await input.factory.create(createInput);
 				if (settled) {
 					await created.dispose().catch(() => undefined);
@@ -714,6 +728,22 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				if (interrupted || timedOut || stopped) abortChild();
 				messageBaseline = created.messages.length;
 				await created.prompt(input.prompt);
+				// A structured child that finished normally without calling structured_output gets one more turn (#2997).
+				if (input.launch.session.runtime.structuredOutput
+					&& !structuredOutputToolInvoked
+					&& !settled
+					&& !created.shutDown
+					&& !interrupted
+					&& !timedOut
+					&& !stopped
+					&& !forcedTermination
+					&& !error
+					&& !assistantError
+					&& !input.launch.capture.toolDiagnostic()
+					&& !(currentTool && isOrdinaryToolForMidToolExit(currentTool))) {
+					applyChildLifecycle("cancel-drain");
+					await created.prompt(STRUCTURED_OUTPUT_FOLLOW_UP);
+				}
 				promptSettled = true;
 				settle(undefined);
 			} catch (promptError) {

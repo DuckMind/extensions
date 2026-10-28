@@ -1081,6 +1081,8 @@ function resyncCommitGateForReadOnlyTurn(args: {
 	runtime: RuntimeCoordinator;
 	cwd: string;
 	lensGuardEnabled: boolean;
+	/** #4921: the turn's session; its pass judges only its own records. */
+	sessionId: string | undefined;
 }): void {
 	if (!args.lensGuardEnabled) return;
 	if (!args.runtime.gitGuardHasBlockers) return;
@@ -1088,7 +1090,9 @@ function resyncCommitGateForReadOnlyTurn(args: {
 	const inlinePolicyEntries: InlineBlockerPolicyTallyEntry[] = [];
 	const policySuppressedPaths: string[] = [];
 	const inlinePolicyStart = Date.now();
-	for (const entry of args.runtime.getInlineBlockersSnapshot()) {
+	for (const entry of args.runtime.getInlineBlockersSnapshot({
+		sessionId: args.sessionId,
+	})) {
 		const tally = {
 			displayPath: toRunnerDisplayPath(args.cwd, entry.filePath),
 			sources: entry.sources,
@@ -1109,6 +1113,7 @@ function resyncCommitGateForReadOnlyTurn(args: {
 	resyncGitGuardAfterInlinePolicy({
 		runtime: args.runtime,
 		suppressedFilePaths: policySuppressedPaths,
+		sessionId: args.sessionId,
 	});
 	// The SAME per-turn record the edit turn's pass writes, through the same
 	// summarizer and with the same guard fields: one phase literal carries one
@@ -1308,11 +1313,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			runtime,
 			cwd,
 			lensGuardEnabled: Boolean(getFlag("lens-guard")),
+			sessionId,
 		});
 		// A genuinely clean session must invalidate the persisted guard record.
 		// Blocker records are retained only while the runtime still reports one.
 		if (getFlag("lens-guard") && !runtime.gitGuardHasBlockers) {
-			retireSettledGitGuardRecord(runtime, cacheManager, cwd);
+			retireSettledGitGuardRecord(runtime, cacheManager, cwd, sessionId);
 		}
 		// #713: subagent sessions use a shorter idle reset (nominally 60s) — a
 		// short-lived task agent holding a warm fleet for 4 minutes after its
@@ -1662,7 +1668,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// authoritative channel this turn (see blocker-past-eof.ts's module doc
 	// for the full composition rule with #1631's gate).
 	const blockerPastEofStart = Date.now();
-	const blockerPastEof = sweepInlineBlockerPastEof(runtime, cwd);
+	// #4921: this turn session's records only; another session's are swept
+	// at its own turn end, against its own cwd.
+	const blockerPastEof = sweepInlineBlockerPastEof(runtime, cwd, {
+		sessionId,
+	});
 	logLatency({
 		type: "phase",
 		toolName: "turn_end",
@@ -1730,6 +1740,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		// #2982: the hook's own signal, so the self axis's filesystem work is
 		// bounded by the same abort everything else in this handler honours.
 		...(deps.signal === undefined ? {} : { signal: deps.signal }),
+		sessionId,
 		additionalEntries: getWidgetBlockingFilesForSweep().map((row) => ({
 			filePath: row.filePath,
 			recordedAtMs: row.recordedAtMs,
@@ -1757,7 +1768,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	// Re-surface inline blockers from this turn that the agent didn't fix.
 	// These were shown inline during write/edit but the agent moved on without resolving them.
-	const unresolvedBlockers = runtime.getInlineBlockersSnapshot();
+	// #4921: only this turn session's: a concurrent in-process session shares
+	// the coordinator's map, and its blockers are its own turn end's to say.
+	const unresolvedBlockers = runtime.getInlineBlockersSnapshot({ sessionId });
 	/** #3246: one bounded record per TURN for the policy pass, never per finding. */
 	const inlinePolicyEntries: InlineBlockerPolicyTallyEntry[] = [];
 	/**
@@ -1872,6 +1885,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	resyncGitGuardAfterInlinePolicy({
 		runtime,
 		suppressedFilePaths: policySuppressedPaths,
+		sessionId,
 	});
 	if (inlinePolicyEntries.length > 0) {
 		logLatency({
@@ -5916,20 +5930,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const {
 		files: resolvedBlockerFileList,
 		dropped: resolvedBlockerFilesDropped,
-	} = runtime.consumeResolvedBlockerFiles((entry) => {
-		if (unresolvedKeys.has(normalizeMapKey(path.resolve(entry.filePath))))
-			return true;
-		const cost = formatResolvedLine(entry).length + 1;
-		if (
-			resolvedCount > 0 &&
-			(resolvedCount >= resolvedLineBudget ||
-				resolvedChars + cost > resolvedCharBudget)
-		)
-			return true;
-		resolvedChars += cost;
-		resolvedCount += 1;
-		return false;
-	});
+	} = runtime.consumeResolvedBlockerFiles(
+		(entry) => {
+			if (unresolvedKeys.has(normalizeMapKey(path.resolve(entry.filePath))))
+				return true;
+			const cost = formatResolvedLine(entry).length + 1;
+			if (
+				resolvedCount > 0 &&
+				(resolvedCount >= resolvedLineBudget ||
+					resolvedChars + cost > resolvedCharBudget)
+			)
+				return true;
+			resolvedChars += cost;
+			resolvedCount += 1;
+			return false;
+		},
+		{ sessionId },
+	);
 	const resolvedLines = resolvedBlockerFileList.map(formatResolvedLine);
 	if (resolvedBlockerFilesDropped > 0) {
 		resolvedLines.push(formatResolvedTail(resolvedBlockerFilesDropped));
@@ -5965,6 +5982,51 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	];
 	const findingParts = composedParts.map((part) => part.text);
 	let heldSections = 0;
+	const logTurnEndRow = (deliverySuppressed?: "duplicate"): void => {
+		logLatency({
+			type: "tool_result",
+			toolName: "turn_end",
+			filePath: cwd,
+			durationMs: Date.now() - turnEndStart,
+			// #1622 review M2: a pending stale secret is NOT a clean turn. It gets its
+			// own result rather than being promoted to `blockers_found`, which would
+			// undo the demotion the freshness gate just made.
+			result:
+				blockerParts.length > 0
+					? "blockers_found"
+					: staleSecretParts.length > 0
+						? "stale_secrets_pending"
+						: "clean",
+			metadata: {
+				fileCount: files.length,
+				blockerSections: blockerParts.length,
+				staleSecretSections: staleSecretParts.length,
+				advisorySections: advisoryParts.length,
+				// #3218 criterion 2: how many files this turn LISTED as resolved
+				// (held-back entries are not counted), and how many retire events
+				// fell past the cap. The line itself is in the delivered content;
+				// these make the feature visible in latency.log even when the block
+				// is suppressed or the agent reads only telemetry.
+				resolvedBlockerFiles: resolvedBlockerFileList.length,
+				resolvedBlockerFilesDropped,
+				// #3813: one-shot parts the cap cut that stay pending for the next turn.
+				heldSections,
+				// #1944 AC3: an empty advisory section on its own cannot say whether
+				// the turn had nothing to report or dropped something. This counter
+				// answers that from latency.log even when the payload is empty, and
+				// the payload itself carries the retirement note when it is not.
+				demotedFindingsRetired,
+				// #2275: the widget-footer store's own dependency-drift retirements —
+				// a separate surface/counter from `demotedFindingsRetired` above,
+				// since a widget retirement never touches `advisoryParts` or the
+				// `turn-end-findings-last` suppression cache the block below clears.
+				widgetDemotedFindingsRetired,
+				// #4921: a turn whose content the agent already received is not
+				// re-sent; this row, the turn's only one, is where that is visible.
+				...(deliverySuppressed ? { deliverySuppressed } : {}),
+			},
+		});
+	};
 	if (findingParts.length > 0) {
 		dbg(
 			`turn_end: ${blockerParts.length} blocker section(s), ${advisoryParts.length} advisory section(s) found, persisting for next context`,
@@ -6012,17 +6074,36 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			}
 		};
 		const content = capTurnEndMessage(joined, holdPlan.heldCount);
-		const signature = `${files
-			.slice()
-			.sort((a, b) => compareOrdinal(a, b))
-			.join("|")}::${content}`;
+		// #4921: the delivered content names its blockers (file, rule, line,
+		// message), so the content IS the identity of what the agent was told. The
+		// turn's written-file set is not part of it: keying on it re-delivered an
+		// unchanged blocker on every turn that wrote a different file. It stays
+		// in the key only while a count-driven hold (#1950's drift cap) is in the
+		// message, because that hold advances only on a delivery: suppressing its
+		// repeats would stop the count short of the cap, and the record that the
+		// cap retires would stay forever. A hold the cap
+		// cut is not in the message (it stays pending, nothing advanced), so only
+		// a part in the delivered content counts: one that appears whole, or the
+		// leading part, which the hold plan counts delivered even when the cap kept
+		// only a prefix of it (`leadsOversized`, delivery-holds.ts).
+		const countDrivenFileSet = deliveryHolds.some(
+			(hold) =>
+				hold.skipOnSuppressed === true &&
+				(content.includes(hold.part) || composedParts[0]?.raw === hold.part),
+		)
+			? files
+					.slice()
+					.sort((a, b) => compareOrdinal(a, b))
+					.join("|")
+			: "";
+		const signature = `${countDrivenFileSet}::${content}`;
 		const last = cacheManager.readCache<{
 			signature: string;
 			sessionId: string;
 		}>("turn-end-findings-last", cwd);
 		if (
 			last?.data?.signature === signature &&
-			last?.data?.sessionId === runtime.telemetrySessionId &&
+			last?.data?.sessionId === deliverySessionId &&
 			// #3813: a retirement is an event, not a persisting finding. The
 			// coordinator already consumed these entries, so an identical
 			// second retirement on consecutive turns (same file, count and
@@ -6038,7 +6119,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					stored: existingGuard,
 					carried,
 					dropped,
-				} = readTurnEndGuardRecord(cacheManager, runtime, cwd);
+				} = readTurnEndGuardRecord(cacheManager, runtime, cwd, sessionId);
 				if (existingGuard) {
 					// #4733 r5 F21: this session's blocker sections lead the record, so
 					// it is this session's; another session's are carried (#4738).
@@ -6046,7 +6127,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						blockerParts.length > 0
 							? [
 									{
-										sessionId: runtime.telemetrySessionId,
+										sessionId: deliverySessionId,
 										blockerContent: capTurnEndMessage(
 											blockerParts.join("\n\n"),
 										),
@@ -6058,7 +6139,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					const blockers = blockerPartitionFields([...own, ...carried]);
 					writeGitGuardRecord(cacheManager, runtime, cwd, {
 						...(existingGuard as TurnEndFindingsCache),
-						sessionId: blockers.owner ?? runtime.telemetrySessionId,
+						sessionId: blockers.owner ?? deliverySessionId,
 						content,
 						blockerContent: blockers.blockerContent,
 						carriedBlockers: blockers.carriedBlockers,
@@ -6078,7 +6159,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								]),
 						),
 						fileContentHashes: {},
-						consumed: false,
+						// #4921: this turn's content was already delivered (the signature
+						// matched), so the rewrite keeps the record current for the gate
+						// without handing the same text to the model again.
+						consumed: true,
 					});
 					// #4750: the write, not the read, records what it left out.
 					logCarriedDrops(cwd, dropped);
@@ -6087,6 +6171,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			settleHolds(true);
 			clearOwnedTurnState();
 			runtime.fixedThisTurn.clear();
+			logTurnEndRow("duplicate");
 			resetFormatService();
 			return;
 		}
@@ -6105,7 +6190,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			stored: existingGuard,
 			carried,
 			dropped,
-		} = readTurnEndGuardRecord(cacheManager, runtime, cwd);
+		} = readTurnEndGuardRecord(cacheManager, runtime, cwd, sessionId);
 		if (getFlag("lens-guard") || carried.length > 0) {
 			// With `--lens-guard` off this session claims nothing, so a record that
 			// holds another session's blocker keeps theirs alone.
@@ -6125,7 +6210,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			const own: BlockerPartition[] = blockingContent
 				? [
 						{
-							sessionId: runtime.telemetrySessionId,
+							sessionId: deliverySessionId,
 							blockerContent: blockingContent,
 							blockingFiles: affectedFiles,
 							blockerWrittenAt: Date.now(),
@@ -6144,7 +6229,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				hasBlockers:
 					blockers.owner !== undefined || existingGuard?.testFailures === true,
 				affectedFiles,
-				sessionId: blockers.owner ?? runtime.telemetrySessionId,
+				sessionId: blockers.owner ?? deliverySessionId,
 				projectSeqStart: runtime.turnStartProjectSeq,
 				projectSeqEnd: runtime.projectSeq,
 				fileSeqByPath,
@@ -6198,7 +6283,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			"turn-end-findings-last",
 			{
 				signature,
-				sessionId: runtime.telemetrySessionId,
+				// #4921: the dedupe is per turn session (`last.sessionId` above).
+				sessionId: deliverySessionId,
 				projectSeqStart: runtime.turnStartProjectSeq,
 				projectSeqEnd: runtime.projectSeq,
 			},
@@ -6207,7 +6293,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		emitLensTurnFindings({
 			cwd,
 			filePaths: files.map((file) => resolveRunnerPath(cwd, file)),
-			sessionId: runtime.telemetrySessionId,
+			sessionId: deliverySessionId,
 			turnIndex: runtime.turnIndex,
 			blockerSections: blockerParts.length,
 			advisorySections: advisoryParts.length,
@@ -6229,7 +6315,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			resolvedParts.length === 0 &&
 			!runtime.gitGuardHasBlockers
 		) {
-			retireSettledGitGuardRecord(runtime, cacheManager, cwd);
+			retireSettledGitGuardRecord(runtime, cacheManager, cwd, sessionId);
 		}
 	}
 
@@ -6250,45 +6336,6 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		// record it describes.
 		cacheManager.clearCache("turn-end-findings-last", cwd);
 	}
-	logLatency({
-		type: "tool_result",
-		toolName: "turn_end",
-		filePath: cwd,
-		durationMs: Date.now() - turnEndStart,
-		// #1622 review M2: a pending stale secret is NOT a clean turn. It gets its
-		// own result rather than being promoted to `blockers_found`, which would
-		// undo the demotion the freshness gate just made.
-		result:
-			blockerParts.length > 0
-				? "blockers_found"
-				: staleSecretParts.length > 0
-					? "stale_secrets_pending"
-					: "clean",
-		metadata: {
-			fileCount: files.length,
-			blockerSections: blockerParts.length,
-			staleSecretSections: staleSecretParts.length,
-			advisorySections: advisoryParts.length,
-			// #3218 criterion 2: how many files this turn LISTED as resolved
-			// (held-back entries are not counted), and how many retire events
-			// fell past the cap. The line itself is in the delivered content;
-			// these make the feature visible in latency.log even when the block
-			// is suppressed or the agent reads only telemetry.
-			resolvedBlockerFiles: resolvedBlockerFileList.length,
-			resolvedBlockerFilesDropped,
-			// #3813: one-shot parts the cap cut that stay pending for the next turn.
-			heldSections,
-			// #1944 AC3: an empty advisory section on its own cannot say whether
-			// the turn had nothing to report or dropped something. This counter
-			// answers that from latency.log even when the payload is empty, and
-			// the payload itself carries the retirement note when it is not.
-			demotedFindingsRetired,
-			// #2275: the widget-footer store's own dependency-drift retirements —
-			// a separate surface/counter from `demotedFindingsRetired` above,
-			// since a widget retirement never touches `advisoryParts` or the
-			// `turn-end-findings-last` suppression cache the block below clears.
-			widgetDemotedFindingsRetired,
-		},
-	});
+	logTurnEndRow();
 	resetFormatService();
 }

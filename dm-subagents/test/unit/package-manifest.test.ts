@@ -107,7 +107,8 @@ function collectSourceFiles(dir: string): string[] {
 test("published extension APIs use supported package entrypoints", async () => {
 	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
 
-	assert.equal(packageJson.private, undefined, "the bundled package preserves upstream publish metadata");
+	assert.equal(packageJson.name, "dm-subagents");
+	assert.equal(packageJson.private, true, "the source checkout must not be publishable");
 	assert.deepEqual(packageJson.dm?.extensions, ["./index.ts"]);
 	assert.equal(packageJson.files?.includes("index.ts"), true);
 	assert.equal(packageJson.files?.includes("*.mjs"), true);
@@ -185,7 +186,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(typeof projectPanes.closeProjectPane, "function");
 });
 
-test("direct @earendil-works runtime imports are declared for CI installs", () => {
+test("direct @duckmind runtime imports are declared for CI installs", () => {
 	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
 	const declared = new Set([
 		...Object.keys(packageJson.dependencies ?? {}),
@@ -211,7 +212,12 @@ test("direct dependency declarations are exact version pins", () => {
 
 	for (const section of ["dependencies", "devDependencies"] as const) {
 		for (const [name, version] of Object.entries<string>(packageJson[section] ?? {})) {
-			assert.match(version, section === "devDependencies" && name.startsWith("@duckmind/") ? /^file:\.\.\/\.\.\/dm-mono\/packages\// : exactVersionPattern, `${section}.${name} should use a pinned or local version`);
+			if (name.startsWith("@duckmind/") && section === "devDependencies") {
+				assert.equal(version, expectedHostDevVersions[name as keyof typeof expectedHostDevVersions]);
+				assert.equal(fs.existsSync(path.resolve(projectRoot, version.slice("file:".length), "package.json")), true, `${name} must resolve to a real DM host source`);
+			} else {
+				assert.match(version, exactVersionPattern, `${section}.${name} should use an exact version`);
+			}
 		}
 	}
 });

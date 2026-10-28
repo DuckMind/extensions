@@ -584,8 +584,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 				structuredOutputCapture: { ok: true },
 				jsonl: [
 					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 					{ type: "tool_execution_end", toolName: "structured_output" },
+					{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 					terminalMessage,
 				],
 			});
@@ -621,8 +621,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 			mockPi.onCall(capture === "invalid" ? {
 				jsonl: [
 					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: "invalid" } } },
-					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 					{ type: "tool_execution_end", toolName: "structured_output", isError: true },
+					{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 					events.assistantMessage("done"),
 				],
 			} : { output: "done" });
@@ -1213,8 +1213,10 @@ setTimeout(() => process.exit(90), 15000).unref();
 		const result = await readAsyncPayload(id);
 		assert.equal(result.success, true);
 		const rows = fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-		const attention = rows.filter((row) => row.type === "subagent.control" && row.event?.reason === "tool_open_threshold").map((row) => row.event.toolCallId);
-		assert.deepEqual(attention, ["bash-first", "bash-second"]);
+		const attention = rows.filter((row) => row.type === "subagent.control" && row.event?.reason === "tool_open_threshold");
+		assert.deepEqual(attention.map((row) => row.event.toolCallId), ["bash-first", "bash-second"]);
+		// The mock child has no native command controller, so the notice must not offer command controls.
+		for (const row of attention) assert.doesNotMatch(row.noticeText, /"action":"command\.(status|yield|cancel)"/);
 	});
 
 	it("background runs emit active-long-running control events from child turns", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1626,6 +1628,113 @@ setTimeout(() => process.exit(90), 15000).unref();
 		}
 	});
 
+	it("background runs record a parallel batch's mutating failure against the failed call's path", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		// DM's parallel tool execution: every start and end comes before the result messages.
+		const result = (toolCallId: string, isError: boolean, text: string) => ({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "edit", isError, content: [{ type: "text", text }] } });
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [
+					{ type: "tool_execution_start", toolCallId: "edit-a", toolName: "edit", args: { path: "src/a.ts" } },
+					{ type: "tool_execution_start", toolCallId: "edit-b", toolName: "edit", args: { path: "src/b.ts" } },
+					{ type: "tool_execution_end", toolCallId: "edit-a", toolName: "edit", isError: true },
+					{ type: "tool_execution_end", toolCallId: "edit-b", toolName: "edit", isError: false },
+					result("edit-a", true, "No exact match found for a.ts"),
+					result("edit-b", false, "Edited src/b.ts"),
+				] },
+				{ jsonl: [events.assistantMessage("Edit A failed.")] },
+			],
+		});
+
+		const id = `async-parallel-failure-${Date.now().toString(36)}`;
+		const eventsPath = path.join(ASYNC_DIR, id, "events.jsonl");
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Edit both files",
+			agentConfig: makeAgent("worker"),
+			ctx: { dm: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: {
+				enabled: true,
+				needsAttentionAfterMs: 999_999,
+				activeNoticeAfterTurns: 999_999,
+				activeNoticeAfterMs: 999_999,
+				activeNoticeAfterTokens: 999_999,
+				failedToolAttemptsBeforeAttention: 1,
+				notifyOn: ["active_long_running", "needs_attention"],
+				notifyChannels: ["event", "async", "intercom"],
+			},
+		});
+
+		const deadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		const failureEvent = fs.readFileSync(eventsPath, "utf-8").split("\n").filter(Boolean)
+			.map((line) => (JSON.parse(line) as { event?: { reason?: string; currentPath?: string; recentFailureSummary?: string } }).event)
+			.find((event) => event?.reason === "tool_failures");
+		assert.equal(failureEvent?.currentPath, "src/a.ts");
+		assert.equal(failureEvent?.recentFailureSummary, "edit(src/a.ts): No exact match found for a.ts");
+	});
+
+	it("background status shows a tool-budget block from DM's tool result message while the run is active", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const blockedMessage = "Tool budget hard limit reached after 2 tool calls (hard 1). The 'bash' tool is blocked so you can finalize from the context you already have.";
+		const blockedResult = { role: "toolResult", toolCallId: "bash-2", toolName: "bash", isError: true, content: [{ type: "text", text: blockedMessage }] };
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash", { command: "echo 1" }), events.toolEnd("bash"), events.toolResult("bash", "1")] },
+				// DM's sequence for a call blocked by a tool_call handler: start, end with isError, then the toolResult message.
+				{ jsonl: [
+					{ type: "tool_execution_start", toolCallId: "bash-2", toolName: "bash", args: { command: "echo 2" } },
+					{ type: "tool_execution_end", toolCallId: "bash-2", toolName: "bash", isError: true },
+					{ type: "message_start", message: blockedResult },
+					{ type: "message_end", message: blockedResult },
+				] },
+				{ delay: 2_000, jsonl: [events.assistantMessage("Finalizing from what I have.")] },
+			],
+		});
+
+		const id = `async-tool-budget-blocked-${Date.now().toString(36)}`;
+		const statusPath = path.join(ASYNC_DIR, id, "status.json");
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Run echo three times",
+			agentConfig: makeAgent("worker"),
+			ctx: { dm: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			toolBudget: { hard: 1, block: "*" },
+		});
+
+		const deadline = Date.now() + 10_000;
+		let blockedStep: AsyncStatusPayload["steps"][number] | undefined;
+		while (Date.now() < deadline && !fs.existsSync(resultPath)) {
+			if (fs.existsSync(statusPath)) {
+				const step = (JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload).steps?.[0];
+				if (step?.status === "running" && step.toolBudgetBlocked) {
+					blockedStep = step;
+					break;
+				}
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(blockedStep, "expected status.json to show the tool-budget block while the run is still active");
+		assert.equal(blockedStep.toolBudget?.blockedTool, "bash");
+
+		const doneDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > doneDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
 	it("background event logs drop noisy message updates and cap child diagnostics", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const previousMaxBytes = process.env.DM_SUBAGENT_ASYNC_EVENTS_MAX_BYTES;
 		process.env.DM_SUBAGENT_ASYNC_EVENTS_MAX_BYTES = "1100";
@@ -1787,6 +1896,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 			const asyncDir = path.join(ASYNC_DIR, id);
 			const asking = await waitForAsyncState(id, (status) => status.currentTool === "contact_supervisor");
 			assert.deepEqual((asking as AsyncStatusPayload & { launcher?: unknown }).launcher, { name: "wrap", argv: runnerLaunchers.wrap });
+			// A launcher may run the runner under another kernel, so its pid never carries DM's boot id.
+			assert.equal((asking as AsyncStatusPayload & { bootId?: unknown }).bootId, undefined);
 			const wrapperArgv = fs.readFileSync(argvLog, "utf-8").trimEnd().split("\n");
 			assert.equal(wrapperArgv[0], "tag arg");
 			assert.ok(path.isAbsolute(wrapperArgv[1]!), "the wrapper received the resolved runner executable");

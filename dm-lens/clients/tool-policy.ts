@@ -940,7 +940,7 @@ export interface AutofixPolicy {
 	gate: ToolGate;
 	safe: boolean;
 	/** Execution/deduplication boundary for mutating tools. */
-	scope?: "file" | "cargo-project" | "dart-project";
+	scope?: "file" | "dart-project";
 }
 
 export interface AutofixCapability {
@@ -1741,7 +1741,6 @@ export function getAutofixPolicyForFile(
 			defaultWhenUnconfigured: true,
 			gate: "smart-default",
 			safe: true,
-			scope: "cargo-project",
 		};
 	}
 

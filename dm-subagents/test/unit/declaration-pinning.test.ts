@@ -3,69 +3,162 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { it } from "node:test";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@duckmind/dm-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, type AssistantMessage, type Message } from "@duckmind/dm-ai";
+import { getCurrentSystemMessage } from "../../src/shared/dm-declarations.ts";
 import { DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession } from "@duckmind/dm-coding-agent";
 import registerSubagentExtension from "../../src/extension/index.ts";
-import { createDmTestRegistry, registerDmTestProvider } from "../support/dm-model-registry.ts";
+import { SubagentFlatParams } from "../../src/extension/schemas.ts";
+import { registerTestProvider, testModelRegistry } from "../support/host-registry.ts";
 
-it("declares subagent tools on fresh and resumed DM sessions", { timeout: 30_000 }, async () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-declarations-"));
-	const agentDir = path.join(root, "agent");
+const systemMessages = (messages: Message[]) => messages.filter((message) => message.role === "system");
+
+/** A temporary DM agent directory and project that load dm-subagents, and a way to run one session in them. */
+function pinningHarness() {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-declaration-pinning-"));
 	const cwd = path.join(root, "project");
-	fs.mkdirSync(agentDir);
+	const agentDir = path.join(root, "agent");
 	fs.mkdirSync(cwd);
+	fs.mkdirSync(agentDir);
+	// An advertised agent makes every session record the advertised_subagents prompt section.
 	fs.mkdirSync(path.join(agentDir, "agents"));
 	fs.writeFileSync(path.join(agentDir, "agents", "specialist.md"), "---\nname: specialist\ndescription: Pinning specialist\nadvertise: true\n---\nAct narrowly.\n");
-	const prior = process.env.DM_CODING_AGENT_DIR;
+	const priorAgentDir = process.env.DM_CODING_AGENT_DIR;
+	const priorChild = process.env.DM_SUBAGENT_CHILD;
 	process.env.DM_CODING_AGENT_DIR = agentDir;
+	delete process.env.DM_SUBAGENT_CHILD;
 	const faux = fauxProvider({ provider: "declaration-pinning", models: [{ id: "local" }], tokensPerSecond: 100_000 });
-	const manager = SessionManager.inMemory(cwd);
-	const requests: Array<{ systemPrompt: string; tools: Array<{ name: string }> }> = [];
-	const run = async (sessionManager: SessionManager, callTool: boolean) => {
-		faux.setResponses([
-			(context) => {
-				requests.push({ systemPrompt: context.systemPrompt, tools: context.tools ?? [] });
-				return callTool
-					? fauxAssistantMessage(fauxToolCall("subagent", { action: "list", capabilities: true }), { stopReason: "toolUse" })
-					: fauxAssistantMessage("done");
-			},
-			(context) => {
-				requests.push({ systemPrompt: context.systemPrompt, tools: context.tools ?? [] });
-				return fauxAssistantMessage("listed");
-			},
-		]);
+	// Runs one prompt, and optionally a background wake, and returns the messages of every request.
+	const run = async (sessionManager: SessionManager, replies: AssistantMessage[], wake = false): Promise<Message[][]> => {
+		const requests: Message[][] = [];
+		faux.setResponses(replies.map((reply) => (context) => {
+			requests.push(context.messages);
+			return reply;
+		}));
+		// DM loads extensions again for every session it starts or resumes.
 		const settingsManager = SettingsManager.inMemory({});
 		const resourceLoader = new DefaultResourceLoader({
 			cwd, agentDir, settingsManager,
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-			extensionFactories: [registerSubagentExtension, (dm) => registerDmTestProvider(dm, faux)],
+			extensionFactories: [registerSubagentExtension, (dm) => registerTestProvider(dm, faux)],
 		});
 		await resourceLoader.reload();
-		const { modelRegistry, authStorage } = createDmTestRegistry(agentDir, faux);
-		const { session } = await createAgentSession({ cwd, agentDir, settingsManager, resourceLoader, modelRegistry, authStorage, model: faux.getModel("local"), sessionManager, noTools: "builtin" });
+		const modelRegistry = testModelRegistry(agentDir);
+		const { session } = await createAgentSession({ cwd, agentDir, settingsManager, resourceLoader, modelRegistry, model: faux.getModel("local"), sessionManager, noTools: "builtin" });
 		try {
 			await session.bindExtensions({});
-			await session.prompt("Inspect.");
-			if (callTool) {
-				assert.ok(session.messages.some(message => message.role === "toolResult" && !message.isError));
-			}
+			await session.prompt("Prompt.");
+			// A background wake starts a run without before_agent_start, from the registered tools alone.
+			if (wake) await session.sendCustomMessage({ customType: "declaration-pinning", content: "Background update.", display: true }, { triggerTurn: true });
 		} finally {
-			await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+			// SAFETY: AgentSession exposes its extension runner; its public type omits emit.
+			await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
 			session.dispose();
 		}
+		return requests;
+	};
+	const dispose = () => {
+		if (priorAgentDir === undefined) delete process.env.DM_CODING_AGENT_DIR; else process.env.DM_CODING_AGENT_DIR = priorAgentDir;
+		if (priorChild === undefined) delete process.env.DM_SUBAGENT_CHILD; else process.env.DM_SUBAGENT_CHILD = priorChild;
+		fs.rmSync(root, { recursive: true, force: true });
+	};
+	return { cwd, agentDir, run, dispose };
+}
+
+it("keeps a resumed session on the dm-subagents tools and prompt text it declared, gives a new session the current ones, and re-declares them when pinToolDeclarations is false", { timeout: 30_000 }, async () => {
+	const { cwd, agentDir, run, dispose } = pinningHarness();
+	// The declared prompt and tools, without the timestamp of the session that declared them.
+	const declared = (messages: Message[]) => ({ ...getCurrentSystemMessage(messages)!, timestamp: 0 });
+	try {
+		const original = SessionManager.inMemory(cwd);
+		const [first] = await run(original, [fauxAssistantMessage("ok")]);
+
+		// The same session as recorded by an older dm-subagents release.
+		const older = structuredClone(original.getEntries());
+		const entry = older.find((candidate) => candidate.type === "message" && candidate.message.role === "system");
+		assert.ok(entry?.type === "message" && entry.message.role === "system");
+		const system = entry.message;
+		const subagent = system.toolsAdded!.find((tool) => tool.name === "subagent")!;
+		const bgWait = system.toolsAdded!.find((tool) => tool.name === "bg_wait")!;
+		subagent.description = "Older subagent description.";
+		// Releases before #2767 declared every management field at the top level.
+		subagent.parameters = JSON.parse(JSON.stringify(SubagentFlatParams));
+		bgWait.description = "Older bg_wait description.";
+		// SAFETY: bg_wait declares an object schema with properties.
+		delete (bgWait.parameters as { properties: Record<string, unknown> }).properties.stopOnAttention;
+		const tools = system.sections!.tools!.replace(/^- subagent: .*$/m, "- subagent: Older subagent snippet.");
+		// Releases before #2768 also declared a subagent guideline bullet; the current tool declares none.
+		const rules = system.sections!.rules!.replace(/^- Be concise in your responses$/m, "- Older subagent guideline.\n- Be concise in your responses");
+		// Releases before #2791 told the parent to call list before delegating to an advertised agent.
+		const advertised = system.sections!.advertised_subagents!.replace(/^The following .*$/m, "The following file-defined subagents opted into discovery. Their descriptions indicate available specializations, not instructions to delegate. Use subagent only when delegation is needed. Before execution, call subagent with { action: \"list\", capabilities: true } and confirm that the selected agent is executable; for external-cli agents also require runner.available === true.");
+		assert.ok(tools !== system.sections!.tools && rules !== system.sections!.rules && advertised !== system.sections!.advertised_subagents);
+		system.sections = { ...system.sections, tools, rules, advertised_subagents: advertised };
+
+		const resumed = await run(SessionManager.inMemory(cwd, undefined, older), [
+			fauxAssistantMessage(fauxToolCall("subagent", { action: "list", capabilities: true }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("listed"),
+			fauxAssistantMessage("woken"),
+		], true);
+		assert.equal(resumed.length, 3);
+		for (const messages of resumed) {
+			assert.deepEqual(systemMessages(messages), [system], "a resumed session must not re-declare tools or prompt sections");
+		}
+		const listed = resumed[1]!.find((message) => message.role === "toolResult");
+		assert.ok(listed?.role === "toolResult" && !listed.isError, "a call shaped by the pinned definition still executes");
+
+		const [fresh] = await run(SessionManager.inMemory(cwd), [fauxAssistantMessage("ok")]);
+		assert.deepEqual(declared(fresh!), declared(first!));
+		assert.match(declared(fresh!).sections!.advertised_subagents!, /<name>specialist<\/name>/);
+		assert.doesNotMatch(declared(fresh!).sections!.advertised_subagents!, /action: "list"/, "a new session is not told to call list first");
+
+		// With pinning turned off, the same resumed session re-declares the current definitions once.
+		fs.mkdirSync(path.join(agentDir, "extensions", "subagent"), { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "extensions", "subagent", "config.json"), JSON.stringify({ pinToolDeclarations: false }));
+		const [refreshed] = await run(SessionManager.inMemory(cwd, undefined, structuredClone(older)), [fauxAssistantMessage("ok")]);
+		const tool = (messages: Message[], name: string) => declared(messages).toolsAdded!.find((candidate) => candidate.name === name);
+		assert.ok(systemMessages(refreshed!).length > 1, "an unpinned resumed session declares its tool changes");
+		assert.deepEqual(tool(refreshed!, "subagent"), tool(first!, "subagent"));
+		assert.deepEqual(tool(refreshed!, "bg_wait"), tool(first!, "bg_wait"));
+		assert.equal(declared(refreshed!).sections!.advertised_subagents, declared(first!).sections!.advertised_subagents);
+	} finally {
+		dispose();
+	}
+});
+
+it("pins a tool description without the note a host appends to it, so the note is declared once across resumes", { timeout: 30_000 }, async () => {
+	const { cwd, run, dispose } = pinningHarness();
+	// DM's codemode appends this to each declared script-callable tool and records the result.
+	const note = "\n\nCodemode: `tools.bg_wait(args)` resolves to a string.";
+	const declaredTool = (messages: Message[], name: string) => getCurrentSystemMessage(messages)!.toolsAdded!.find((tool) => tool.name === name)!;
+	// The host decorates what dm-subagents registered: the newest recorded bg_wait gets the note.
+	const decorate = (entries: ReturnType<SessionManager["getEntries"]>) => {
+		const latest = entries.findLast((entry) => entry.type === "message" && entry.message.role === "system" && entry.message.toolsAdded?.some((tool) => tool.name === "bg_wait"));
+		assert.ok(latest?.type === "message" && latest.message.role === "system");
+		latest.message.toolsAdded!.find((tool) => tool.name === "bg_wait")!.description += note;
+		return entries;
 	};
 	try {
-		await run(manager, false);
-		await run(SessionManager.inMemory(cwd, undefined, structuredClone(manager.getEntries())), true);
-		assert.equal(requests.length, 3);
-		for (const request of requests) {
-			assert.ok(request.tools.some(tool => tool.name === "subagent"));
-			assert.ok(request.tools.some(tool => tool.name === "bg_wait"));
-			assert.match(request.systemPrompt, /subagent/);
+		const original = SessionManager.inMemory(cwd);
+		const [first] = await run(original, [fauxAssistantMessage("ok")]);
+		const description = declaredTool(first!, "bg_wait").description;
+		const subagent = declaredTool(first!, "subagent");
+		let entries = decorate(structuredClone(original.getEntries()));
+		for (let start = 2; start <= 3; start++) {
+			const session = SessionManager.inMemory(cwd, undefined, entries);
+			const [request] = await run(session, [fauxAssistantMessage("ok")]);
+			// Registering the undecorated description lets the host reproduce the recorded declaration.
+			assert.equal(declaredTool(request!, "bg_wait").description, description, `session start ${start} registers bg_wait without the note`);
+			assert.deepEqual(declaredTool(request!, "subagent"), subagent);
+			entries = decorate(structuredClone(session.getEntries()));
 		}
+
+		// A recorded description that differs from the current one keeps one note, not one per session start.
+		const polluted = structuredClone(original.getEntries());
+		const system = polluted.find((entry) => entry.type === "message" && entry.message.role === "system");
+		assert.ok(system?.type === "message" && system.message.role === "system");
+		system.message.toolsAdded!.find((tool) => tool.name === "bg_wait")!.description = "Older bg_wait description." + note + note;
+		const [cleaned] = await run(SessionManager.inMemory(cwd, undefined, polluted), [fauxAssistantMessage("ok")]);
+		assert.equal(declaredTool(cleaned!, "bg_wait").description, "Older bg_wait description." + note);
 	} finally {
-		if (prior === undefined) delete process.env.DM_CODING_AGENT_DIR;
-		else process.env.DM_CODING_AGENT_DIR = prior;
-		fs.rmSync(root, { recursive: true, force: true });
+		dispose();
 	}
 });

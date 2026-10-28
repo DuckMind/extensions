@@ -1,6 +1,7 @@
-import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve as resolvePath } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/parallel-utils.ts";
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
@@ -240,8 +241,16 @@ function trackPromiseCombinator(items, createPromise) {
   return trackObservationTracker({ observations: [], consumed: false, dependencies }, promise, true);
 }
 
-const workflowPromise = new Proxy(Promise, {
-  construct(target, [executor]) {
+// Hosts that freeze built-ins make Promise.all and friends non-writable and non-configurable, and a
+// Proxy over Promise itself may not return wrappers for those. Proxy a plain constructor instead.
+const workflowPromiseTarget = function Promise() {};
+workflowPromiseTarget.prototype = Promise.prototype;
+const workflowPromise = new Proxy(workflowPromiseTarget, {
+  apply() {
+    throw new TypeError("Promise constructor cannot be invoked without 'new'");
+  },
+  construct(_proxyTarget, [executor]) {
+    const target = Promise;
     if (typeof executor !== "function") return new target(executor);
     const tracker = { observations: [], consumed: false };
     const promise = new target((resolve, reject) => {
@@ -264,7 +273,8 @@ const workflowPromise = new Proxy(Promise, {
     });
     return trackObservationTracker(tracker, promise, true);
   },
-  get(target, prop) {
+  get(_proxyTarget, prop) {
+    const target = Promise;
     if (prop === "all") return (items) => trackPromiseCombinator(items, (values) => target.all(values));
     if (prop === "allSettled") return (items) => trackPromiseCombinator(items, (values) => target.allSettled(values));
     if (prop === "race") return (items) => trackPromiseCombinator(items, (values) => target.race(values));
@@ -1134,7 +1144,7 @@ export interface WorkflowScriptChildResult {
 	continuation?: { runIds: string[] };
 	artifactPaths: string[];
 	results?: SingleResult[];
-	/** Came from a runtime-replaced run of the same script and args (its saved result, or its still-running child re-attached); this run launched nothing. */
+	/** Came from a runtime-replaced or owner-exited run of the same script (and args, unless named by options.reuseFrom): its saved result, or its still-running child re-attached; this run launched nothing. */
 	reused?: boolean;
 }
 
@@ -2141,9 +2151,24 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		throw new WorkflowScriptError("Workflow parser dependency 'acorn' is unavailable from dm-subagents. Reinstall dm-subagents dependencies before launching workflowScript.", emptyPartial(), "runtime", { cause: error });
 	}
 	let worker: Worker;
+	let workerDirectory: string | undefined;
 	try {
-		worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { acornPath } });
+		// Bun can garbage-collect eval workers before their message is handled. A file-backed
+		// worker stays alive under Bun; the private file exists only until the worker exits.
+		if (process.versions.bun) {
+			workerDirectory = mkdtempSync(join(tmpdir(), "dm-workflow-worker-"));
+			const workerFile = join(workerDirectory, "worker.cjs");
+			writeFileSync(workerFile, WORKER_SOURCE, { mode: 0o600 });
+			worker = new Worker(workerFile, { workerData: { acornPath } });
+			worker.once("exit", () => {
+				try { rmSync(workerDirectory!, { recursive: true, force: true }); }
+				catch (error) { console.error("Workflow worker cleanup failed:", error); }
+			});
+		} else {
+			worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { acornPath } });
+		}
 	} catch (error) {
+		if (workerDirectory) rmSync(workerDirectory, { recursive: true, force: true });
 		throw new WorkflowScriptError(`Workflow worker could not start: ${error instanceof Error ? error.message : String(error)}`, emptyPartial(), "runtime", { cause: error });
 	}
 	const emits: unknown[] = [];

@@ -26,7 +26,7 @@ const INITIALIZE_REQUEST = {
   params: {
     protocolVersion: LEGACY_PROTOCOL_VERSION,
     capabilities: {},
-    clientInfo: { name: "pi-mcp-probe", version: "2.1.2" },
+    clientInfo: { name: "dm-mcp-probe", version: "2.1.2" },
   },
 };
 

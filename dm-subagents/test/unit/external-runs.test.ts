@@ -213,7 +213,7 @@ test("external snapshots throw on malformed cached records by default", () => {
 		};
 		assert.throws(
 			() => snapshotExternalRuns("session-a"),
-			/Malformed cached external run 'session-a\0bad': External run startedAt must be a non-negative safe timestamp/,
+			/Malformed cached external run 'bad': External run startedAt must be a non-negative safe timestamp/,
 		);
 	} finally {
 		clearRegistry();
@@ -232,7 +232,7 @@ test("external snapshots can remove malformed cached records for display-only ca
 			]),
 		};
 		assert.deepEqual(snapshotExternalRuns("session-a", { ignoreMalformed: true, onMalformedRecord: (message) => diagnostics.push(message) }).map((run) => run.id), ["good"]);
-		assert.deepEqual(diagnostics, ["Malformed cached external run 'session-a\0bad': External run startedAt must be a non-negative safe timestamp."]);
+		assert.deepEqual(diagnostics, ["Malformed cached external run 'bad': External run startedAt must be a non-negative safe timestamp."]);
 		assert.deepEqual(snapshotExternalRuns("session-a").map((run) => run.id), ["good"]);
 	} finally {
 		clearRegistry();
@@ -257,5 +257,17 @@ test("external snapshots apply count and serialized byte caps without provider c
 	assert.ok(snapshot.length <= EXTERNAL_RUN_LIMITS.maxSnapshotRuns);
 	assert.ok(Buffer.byteLength(JSON.stringify(snapshot), "utf8") <= EXTERNAL_RUN_LIMITS.maxSerializedBytes);
 	assert.equal(snapshot[0]?.id, "run-0", "active jobs sort ahead of terminal jobs");
+	clearRegistry();
+});
+
+test("external run identities accept session-file paths with Unicode spaces and reject terminal controls", () => {
+	clearRegistry();
+	const nbsp = String.fromCodePoint(0xa0);
+	const sessionFile = `/tmp/pCloud${nbsp}Drive/My  Project/session.jsonl`;
+	registerExternalRun({ id: "nbsp-run", sessionId: sessionFile, source: "interactive-shell", label: "Run", state: "running", startedAt: 1 });
+	assert.deepEqual(snapshotExternalRuns(sessionFile).map((run) => run.id), ["nbsp-run"]);
+	for (const unsafe of [`session${String.fromCodePoint(0x1b)}[31m`, "session\nnext", `session${String.fromCodePoint(0x202e)}x`, `session${String.fromCodePoint(0x2028)}x`]) {
+		assert.throws(() => snapshotExternalRuns(unsafe), /display-safe text/);
+	}
 	clearRegistry();
 });

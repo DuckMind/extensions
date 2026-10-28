@@ -20,6 +20,10 @@ input:focus, textarea:focus, select:focus, button:focus-visible, summary:focus-v
 #history-lines { width: 72px; padding: 3px 5px; font-size: 16px; }
 #history-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; font: 14px/1.4 "courier-new", courier, monospace; }
 ::selection { color: #fff; background: #5b21b6; }
+.output-menu { position: absolute; z-index: 6; display: grid; min-width: 148px; gap: 2px; padding: 4px; border: 1px solid #64748b; border-radius: 7px; background: #1e293b; box-shadow: 0 8px 24px #0009; }
+.output-menu[hidden] { display: none; }
+.output-menu button { min-height: 38px; padding: 7px 10px; border: 0; border-radius: 4px; background: transparent; text-align: left; }
+.output-menu button:hover, .output-menu button:focus-visible { background: #334155; }
 summary { cursor: pointer; }
 #session-menu { flex: none; }
 #session-menu > summary { list-style: none; width: 40px; height: 34px; text-align: center; font-size: 24px; line-height: 30px; }

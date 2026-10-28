@@ -4,8 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFactory } from "@duckmind/dm-ai";
-import { getSystemMessageText } from "../support/dm-transcript.ts";
+import { ModelRuntime } from "@duckmind/dm-coding-agent";
 import type { ExtensionAPI } from "@duckmind/dm-coding-agent";
+import { registerTestProvider } from "../support/host-registry.ts";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 import { createDefaultChildSessionFactory } from "../../src/runs/shared/child-session.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
@@ -57,26 +58,29 @@ describe("child provider system prompt", () => {
 		const faux = fauxProvider({ provider: "probe", models: [{ id: "local" }], tokensPerSecond: 100_000 });
 		const requests: string[] = [];
 		const reply = (message: ReturnType<typeof fauxAssistantMessage>): FauxResponseFactory => (context) => {
-			requests.push(getSystemMessageText({ content: context.systemPrompt }));
+			requests.push(context.systemPrompt ?? "");
 			return message;
 		};
 		faux.setResponses((run.prompts ?? ["Task"]).flatMap(() => run.toolTurn
 			? [reply(fauxAssistantMessage(fauxToolCall("read", { path: "notes.txt" }), { stopReason: "toolUse" })), reply(fauxAssistantMessage("done"))]
 			: [reply(fauxAssistantMessage("done"))]));
+		const parentProviders = await ModelRuntime.create({
+			authPath: path.join(agentDir, "auth.json"),
+			modelsPath: path.join(agentDir, "models.json"),
+			allowModelNetwork: false,
+		});
+		parentProviders.registerNativeProvider(faux.provider);
 		const { session, config } = buildInProcessChildLaunch({
 			host: "parent", cwd: repo, childAgentName: "worker", childIndex: 0, sessionEnabled: false, waitToolEnabled: false,
 			model: "probe/local", systemPrompt: "Role instructions.", systemPromptMode: "append", ...run.flags,
 			...(run.fanout ? { allowNestedSubagents: true } : {}),
-			...(run.structured ? { structuredOutput: createStructuredOutputRuntime({ type: "object" }, repo) } : {}),
+			...(run.structured ? { structuredOutput: createStructuredOutputRuntime({ type: "object" }, agentDir) } : {}),
 		});
 		// Unset flags make the prompt runtime leave the prompt alone, so the same launch yields DM's original render.
 		if (run.unsetFlags) Object.assign(config, { inheritProjectContext: undefined, inheritGlobalContext: undefined, inheritSkills: undefined });
-		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => ({ ...await import("@duckmind/dm-coding-agent"), initTheme() {} }) as never });
-		const hooks = [(dm: ExtensionAPI) => dm.registerProvider("probe", {
-			api: faux.api, baseUrl: "http://localhost:0", apiKey: "test",
-			models: [faux.getModel("local")], streamSimple: faux.provider.streamSimple,
-		} as never), ...run.hooks ?? []];
-		const child = await factory.create({ ...session, hooks: [...session.hooks, ...hooks.map((factory, index) => ({ name: `probe-${index}`, factory }))] });
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: () => import("@duckmind/dm-coding-agent") });
+		const hooks = run.hooks ?? [];
+		const child = await factory.create({ ...session, parentProviderRegistry: parentProviders, hooks: [...session.hooks, ...hooks.map((factory, index) => ({ name: `probe-${index}`, factory }))] });
 		try {
 			for (const prompt of run.prompts ?? ["Task"]) await child.prompt(prompt);
 		} finally {
@@ -94,7 +98,7 @@ describe("child provider system prompt", () => {
 			toolTurn: true,
 			hooks: [
 				(dm) => dm.on("before_agent_start", (event) => { captured.push(event.systemPrompt); }),
-				(dm) => dm.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n<probe>\nPROBE-SECTION-MARKER\n</probe>` })),
+				(dm) => dm.on("before_agent_start", (event) => { event.systemPromptOptions.sections.probe = "PROBE-SECTION-MARKER"; }),
 			],
 		});
 
@@ -107,7 +111,8 @@ describe("child provider system prompt", () => {
 			assert.doesNotMatch(capture, /GLOBAL-CONTEXT-MARKER/);
 			assert.doesNotMatch(request, /GLOBAL-CONTEXT-MARKER/);
 			assert.match(request, /REPO-CONTEXT-MARKER/);
-			assert.ok(request.endsWith(`\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`));
+			assert.ok(request.includes(`\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`));
+			assert.ok(request.indexOf("<probe>") > request.indexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), "hook-set sections follow the child boundary");
 			assert.equal(count(request, CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 1);
 		}
 	});
@@ -134,14 +139,11 @@ describe("child provider system prompt", () => {
 			// The launch without the removed resources leaves rewriteSubagentPrompt nothing to strip, so it only appends the boundary.
 			const [render] = await providerPrompts({ ...run, fixture: { ...run.fixture, ...absent }, unsetFlags: true });
 			const [actual] = await providerPrompts(run);
-			if (run.structured) {
-				// DM's environment listing includes the just-created structured-output temp dir.
-				assert.match(actual!, /strict structured output contract/);
-				assert.ok(actual!.includes(`${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}\n\nThis subagent step has a strict structured output contract.`));
-				assert.doesNotMatch(actual!, /GLOBAL-CONTEXT-MARKER|<name>dm-subagents<\/name>/);
-			} else {
-				assert.equal(actual, rewriteSubagentPrompt(render!, { ...run.flags, structuredOutput: run.structured }));
-			}
+			const expected = rewriteSubagentPrompt(render!, { ...run.flags, structuredOutput: run.structured });
+			// The structured-output scratch dir is created between these two live
+			// requests; only its dynamic entry in DM's ls_la snapshot may vary.
+			const stable = (prompt: string) => prompt.replace(/^[ \t]*d[ \t]+\d+[ \t]+dm-subagent-structured-[^\r\n]+(?:\r?\n)?/gm, "");
+			assert.equal(stable(actual!), stable(expected));
 		});
 	}
 

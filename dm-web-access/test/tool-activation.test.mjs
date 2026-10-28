@@ -3,8 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test as nodeTest } from "node:test";
-const test = nodeTest.skip; // Requires upstream publish scripts or DM 0.86.1 activation.
+import { test } from "node:test";
 
 const indexUrl = new URL("../index.ts", import.meta.url).href;
 // A model DM can hand added tools without a transcript checkpoint; `model: null` means no model.

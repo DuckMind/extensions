@@ -5,7 +5,6 @@ import {
 } from "./config-warn.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { errorClassName } from "./error-class.js";
-import * as path from "node:path";
 import {
 	assignFlagConfigSection,
 	flagConfigSectionKeys,
@@ -47,6 +46,7 @@ import {
 	findNestedProjectMutationValue,
 	type DmLensProjectConfig,
 } from "./project-lens-config.js";
+import { pathsEqual } from "./path-utils.js";
 import { readToolConfig } from "./tool-config.js";
 
 /**
@@ -614,10 +614,9 @@ export function resolveDmLensFlagWithSource(
 		if (nested) {
 			return {
 				value: flagValueFromConfig(spec, nested.value),
-				source:
-					path.resolve(nested.dir) === path.resolve(projectRoot as string)
-						? "project"
-						: (`nested-project:${nested.dir}` as const),
+				source: pathsEqual(nested.dir, projectRoot as string)
+					? "project"
+					: (`nested-project:${nested.dir}` as const),
 			};
 		}
 		const projectValue = readFlagConfigValue(projectConfig, spec.configKey);

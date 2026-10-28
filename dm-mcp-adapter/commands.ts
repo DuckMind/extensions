@@ -18,16 +18,17 @@ import {
   previewSharedServerEntry,
   previewStarterSharedConfig,
   writeDirectToolsConfig,
-  writeJevSemanticSearchConfig,
   writeProjectServerDisabledOverride,
+  writeSemanticSearchConfig,
+  writeJevSemanticSearchConfig,
   writeSharedServerEntry,
   writeSharedConfigText,
   writeStarterSharedConfig,
 } from "./config.ts";
 import { markKeepAliveAfterConnect, notifyToolMetadataUpdated, updateMetadataCache, updateStatusBar, getFailureAgeSeconds, getFailureMessage, clearFailure, recordFailure } from "./init.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
-import { loadMetadataCache, reconstructPromptMetadata } from "./metadata-cache.ts";
-import { buildToolMetadata } from "./tool-metadata.ts";
+import { loadMetadataCache, reconstructPromptMetadata, withSessionMetadata } from "./metadata-cache.ts";
+import { buildToolMetadata, cacheReader, executorAppToolsLine, executorAppToolsStatus, executorCatalogNotes, ownTools } from "./tool-metadata.ts";
 import { supportsOAuth, authenticate, removeAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { getAuthStorageOptions, inspectAuthForUrl } from "./mcp-auth.ts";
 import { inspectBearerTokenForUrl, removeBearerToken } from "./mcp-bearer-store.ts";
@@ -35,8 +36,63 @@ import { loadOnboardingState, markSetupCompleted as persistSetupCompleted, markS
 import { findPiSignInImports, importPiSignIn } from "./pi-signin-import.ts";
 import { formatTerminalError, openPath, providerSignInMessage, resolveServerUrl, sanitizeTerminalText } from "./utils.ts";
 import { isAbortError } from "./runtime-owner.ts";
+import { classifierRegistryOf, resolveSemanticClassifier, SEMANTIC_SEARCH_UNAVAILABLE } from "./semantic-search.ts";
 import { resolveJevCredential } from "./jev-key-store.ts";
-import { describeProjectServerBlock } from "./project-server-trust.ts";
+
+/** Explicit consent to share only named servers' tool metadata with the original Jev endpoint. */
+export async function setupJevSemanticSearch(
+  state: McpExtensionState, ctx: ExtensionContext, configOverridePath?: string,
+): Promise<boolean> {
+  if (!ctx.hasUI) return false;
+  const credential = resolveJevCredential();
+  if (credential.status !== "present") {
+    const detail = credential.status === "unavailable" ? ` ${credential.message}` : "";
+    ctx.ui.notify(`Jev needs a System One API key.${detail}\nRun \`dm-mcp-adapter key set systemone\` in a terminal, then run \`/mcp-adapter jev setup\` again.`, "error");
+    return false;
+  }
+  const servers = Object.keys(state.config.mcpServers)
+    .filter((name) => !isServerDisabled(state.config.mcpServers[name]))
+    .sort((a, b) => a.localeCompare(b));
+  if (servers.length === 0) {
+    ctx.ui.notify("Enable or add an MCP server before setting up Jev semantic search.", "error");
+    return false;
+  }
+  const configured = state.config.settings?.jev;
+  const disclosure = configured && configured.scriptEvaluation
+    ? " Allowed servers can also be sources for script evaluations, which may send state and MCP results."
+    : " Semantic search does not send tool results.";
+  const choice = await ctx.ui.select("Configure Jev semantic search", [
+    `Use all ${servers.length} enabled servers (default)`, "Restrict to selected servers", "Cancel",
+  ]);
+  if (!choice || choice === "Cancel") return false;
+  let allowedServers: string[];
+  if (choice.startsWith("Use all ")) {
+    if (!await ctx.ui.confirm("Share MCP tool metadata with Jev?",
+      `Semantic searches send the query text, server names, tool paths, tool names, and descriptions from ${servers.length} servers to the configured Jev endpoint.${disclosure}`)) return false;
+    allowedServers = servers;
+  } else {
+    allowedServers = [];
+    for (const server of servers) {
+      if (await ctx.ui.confirm(`Allow ${server}?`,
+        `Semantic searches send the query text, server name, tool paths, tool names, and descriptions to the configured Jev endpoint.${disclosure}`)) allowedServers.push(server);
+    }
+    if (allowedServers.length === 0) {
+      ctx.ui.notify("Jev setup cancelled because no servers were allowed.", "info");
+      return false;
+    }
+  }
+  try {
+    const result = writeJevSemanticSearchConfig(configOverridePath, ctx.cwd, allowedServers, state.config.settings?.jev);
+    ctx.ui.notify(result.changed
+      ? `Jev semantic search configured for ${allowedServers.length} server${allowedServers.length === 1 ? "" : "s"}. Reloading DM…`
+      : "Jev semantic search is already configured for those servers.", "info");
+    return result.changed;
+  } catch (error) {
+    ctx.ui.notify(`Jev setup failed: ${formatTerminalError(error)}`, "error");
+    return false;
+  }
+}
+import { describeProjectServerBlock, keepProjectServerApprovals } from "./project-server-trust.ts";
 
 function terminalHyperlink(label: string, url: string): string {
   return `\u001B]8;;${sanitizeTerminalText(url)}\u001B\\${sanitizeTerminalText(label)}\u001B]8;;\u001B\\`;
@@ -70,46 +126,45 @@ export async function editSharedConfig(ctx: ExtensionContext, target: SharedConf
   return true;
 }
 
-export async function setupJevSemanticSearch(
+export async function setupSemanticSearch(
   state: McpExtensionState,
   ctx: ExtensionContext,
   configOverridePath?: string,
 ): Promise<boolean> {
   if (!ctx.hasUI) return false;
-  const credential = resolveJevCredential();
-  if (credential.status !== "present") {
-    const detail = credential.status === "unavailable" ? ` ${credential.message}` : "";
-    ctx.ui.notify(
-      `Jev needs a System One API key.${detail}\nRun \`dm-mcp-adapter key set systemone\` in a terminal, then run \`/mcp-adapter jev setup\` again.`,
-      "error",
-    );
+  const registry = classifierRegistryOf(ctx.modelRegistry);
+  if (!registry) {
+    ctx.ui.notify(SEMANTIC_SEARCH_UNAVAILABLE, "error");
     return false;
   }
+  const choice = resolveSemanticClassifier(registry, state.config.settings?.semanticSearch ? state.config.settings.semanticSearch.model : undefined);
+  if (!choice.ok) {
+    ctx.ui.notify(choice.error.message, "error");
+    return false;
+  }
+  const { model } = choice;
 
   const servers = Object.keys(state.config.mcpServers)
     .filter((name) => !isServerDisabled(state.config.mcpServers[name]))
     .sort((a, b) => a.localeCompare(b));
   if (servers.length === 0) {
-    ctx.ui.notify("Enable or add an MCP server before setting up Jev semantic search.", "error");
+    ctx.ui.notify("Enable or add an MCP server before setting up semantic search.", "error");
     return false;
   }
-  const configuredJev = state.config.settings?.jev;
-  const payloadDisclosure = configuredJev && configuredJev.scriptEvaluation
-    ? " Allowed servers can also be sources for script evaluations, which may send state and MCP results."
-    : " Semantic search does not send tool results.";
+  const payloadDisclosure = " Semantic search does not send tool results.";
 
-  const choice = await ctx.ui.select("Configure Jev semantic search", [
+  const scope = await ctx.ui.select("Configure semantic search", [
     `Use all ${servers.length} enabled servers (default)`,
     "Restrict to selected servers",
     "Cancel",
   ]);
-  if (!choice || choice === "Cancel") return false;
+  if (!scope || scope === "Cancel") return false;
 
   let allowedServers: string[];
-  if (choice.startsWith("Use all ")) {
+  if (scope.startsWith("Use all ")) {
     const confirmed = await ctx.ui.confirm(
-      "Share MCP tool metadata with Jev?",
-      `Semantic searches send the query text, server names, tool paths, tool names, and descriptions from ${servers.length} servers to the configured Jev endpoint.${payloadDisclosure}`,
+      `Share MCP tool metadata with ${model}?`,
+      `Semantic searches send the query text, server names, tool paths, tool names, and descriptions from ${servers.length} servers to ${model} through DM.${payloadDisclosure}`,
     );
     if (!confirmed) return false;
     allowedServers = servers;
@@ -118,26 +173,26 @@ export async function setupJevSemanticSearch(
     for (const server of servers) {
       if (await ctx.ui.confirm(
         `Allow ${server}?`,
-        `Semantic searches send the query text, server name, tool paths, tool names, and descriptions to the configured Jev endpoint.${payloadDisclosure}`,
+        `Semantic searches send the query text, server name, tool paths, tool names, and descriptions to ${model} through DM.${payloadDisclosure}`,
       )) allowedServers.push(server);
     }
     if (allowedServers.length === 0) {
-      ctx.ui.notify("Jev setup cancelled because no servers were allowed.", "info");
+      ctx.ui.notify("Semantic search setup cancelled because no servers were allowed.", "info");
       return false;
     }
   }
 
   try {
-    const result = writeJevSemanticSearchConfig(configOverridePath, ctx.cwd, allowedServers, state.config.settings?.jev);
+    const result = writeSemanticSearchConfig(configOverridePath, ctx.cwd, allowedServers, state.config.settings?.semanticSearch);
     ctx.ui.notify(
       result.changed
-        ? `Jev semantic search configured for ${allowedServers.length} server${allowedServers.length === 1 ? "" : "s"}. Reloading DM…`
-        : "Jev semantic search is already configured for those servers.",
+        ? `Semantic search configured for ${allowedServers.length} server${allowedServers.length === 1 ? "" : "s"}. Reloading DM…`
+        : "Semantic search is already configured for those servers.",
       "info",
     );
     return result.changed;
   } catch (error) {
-    ctx.ui.notify(`Jev setup failed: ${formatTerminalError(error)}`, "error");
+    ctx.ui.notify(`Semantic search setup failed: ${formatTerminalError(error)}`, "error");
     return false;
   }
 }
@@ -148,6 +203,14 @@ export async function showStatus(state: McpExtensionState, ctx: ExtensionContext
   const lines: string[] = ["MCP Server Status:", ""];
   if (state.migrationNotices?.length) {
     lines.push(...state.migrationNotices.map((notice) => `⚠ ${notice}`), "");
+  }
+  if (state.scriptToolIssues?.length) {
+    lines.push(...state.scriptToolIssues.map((issue) => `⚠ ${issue}`), "");
+  }
+  const readCache = cacheReader();
+  const catalogNotes = executorCatalogNotes(state, readCache);
+  if (catalogNotes.length > 0) {
+    lines.push(...catalogNotes.map((note) => `⚠ ${sanitizeTerminalText(note)}`), "");
   }
   if (!state.programmaticConfig) {
     lines.push(
@@ -170,7 +233,7 @@ export async function showStatus(state: McpExtensionState, ctx: ExtensionContext
     }
     const connection = state.manager.getConnection(name);
     const metadata = state.toolMetadata.get(name);
-    const toolCount = metadata?.length ?? 0;
+    const toolCount = ownTools(metadata).length;
     const failedAgo = getFailureAgeSeconds(state, name);
     let status = "not listening (disconnected)";
     let statusIcon = "○";
@@ -203,6 +266,8 @@ export async function showStatus(state: McpExtensionState, ctx: ExtensionContext
 
     const toolSuffix = failed ? "" : ` (${toolCount} tools${status.startsWith("cached") ? ", cached" : ""})`;
     lines.push(`${statusIcon} ${name}: ${status}${toolSuffix}`);
+    const appTools = executorAppToolsStatus(state, name, readCache);
+    if (appTools) lines.push(`  ${appTools}`);
   }
 
   if (state.config.settings?.freezeDirectTools === true) {
@@ -257,12 +322,18 @@ export async function showPrompts(state: McpExtensionState, ctx: ExtensionContex
 export async function showTools(state: McpExtensionState, ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
 
-  const allTools = [...state.toolMetadata.entries()]
+  const servers = [...state.toolMetadata.entries()]
     .filter(([serverName]) => !isServerDisabled(state.config.mcpServers[serverName]))
-    .filter(([serverName]) => !isServerInActiveFailureBackoff(state, serverName))
-    .flatMap(([, metadata]) => metadata.map(m => m.name));
+    .filter(([serverName]) => !isServerInActiveFailureBackoff(state, serverName));
+  // Executor's app tools are counted in one line per server, not listed: there can be a thousand.
+  const allTools = servers.flatMap(([, metadata]) => ownTools(metadata).map(m => m.name));
+  const readCache = cacheReader();
+  const appToolLines = servers.flatMap(([serverName]) => {
+    const line = executorAppToolsLine(state, serverName, readCache);
+    return line ? [`  ${serverName}: ${line}`] : [];
+  });
 
-  if (allTools.length === 0) {
+  if (allTools.length === 0 && appToolLines.length === 0) {
     ctx.ui.notify("No MCP tools available", "info");
     return;
   }
@@ -271,11 +342,54 @@ export async function showTools(state: McpExtensionState, ctx: ExtensionContext)
     "MCP Tools:",
     "",
     ...allTools.map(t => `  ${t}`),
+    ...appToolLines,
     "",
     `Total: ${allTools.length} tools`,
   ];
 
   ctx.ui.notify(lines.join("\n"), "info");
+}
+
+export function showBackgroundTasks(state: McpExtensionState, ctx: ExtensionContext): void {
+  if (!ctx.hasUI) return;
+  if (state.backgroundTasks === undefined) {
+    ctx.ui.notify("Background MCP tasks run only in the interactive terminal.", "info");
+    return;
+  }
+  const tasks = state.backgroundTasks.list();
+  if (tasks.length === 0) {
+    ctx.ui.notify("No background MCP tasks are running.", "info");
+    return;
+  }
+  const lines = [
+    "Background MCP tasks:",
+    "",
+    ...tasks.map(task => {
+      const statusMessage = task.statusMessage ? sanitizeTerminalText(task.statusMessage) : "";
+      return `  ${sanitizeTerminalText(task.key)} (${sanitizeTerminalText(task.tool)}): ${task.status}${statusMessage ? ` — ${statusMessage}` : ""}`;
+    }),
+    "",
+    "Stop one with /mcp-adapter tasks stop <server>/<taskId>",
+  ];
+  ctx.ui.notify(lines.join("\n"), "info");
+}
+
+export async function stopBackgroundTask(state: McpExtensionState, ctx: ExtensionContext, key: string): Promise<void> {
+  if (!ctx.hasUI) return;
+  if (state.backgroundTasks === undefined) {
+    ctx.ui.notify("Background MCP tasks run only in the interactive terminal.", "info");
+    return;
+  }
+  try {
+    if (!await state.backgroundTasks.stop(key, "you")) {
+      ctx.ui.notify(`No running MCP task "${key}". Run /mcp-adapter tasks to list them.`, "error");
+      return;
+    }
+  } catch (error) {
+    ctx.ui.notify(`Could not stop MCP task "${key}": ${error instanceof Error ? error.message : String(error)}`, "error");
+    return;
+  }
+  ctx.ui.notify(`Stopped MCP task "${key}".`, "info");
 }
 
 export async function reconnectServer(
@@ -326,6 +440,7 @@ export async function reconnectServer(
     } else {
       state.serverInstructions.delete(name);
     }
+    // Also puts this session's Executor app tools back into the metadata buildToolMetadata just replaced.
     updateMetadataCache(state, name);
     const restored = clearFailure(state, name, "command-reconnect");
     if (!restored) notifyToolMetadataUpdated(state, name, "command-reconnect");
@@ -689,7 +804,7 @@ export async function openMcpSetup(
   return new Promise<PanelFlowResult>((resolve) => {
     ctx.ui.custom(
       (tui, theme, keybindings, done) => {
-        return createMcpSetupPanel(discovery, callbacks, { mode, onboardingState, keybindings, theme }, tui, () => {
+        return createMcpSetupPanel(discovery, callbacks, { mode, onboardingState, keybindings: keybindings as unknown as import("./panel-keys.ts").PanelKeybindings, theme }, tui, () => {
           done(undefined);
           resolve({ configChanged });
         });
@@ -792,7 +907,7 @@ export async function openMcpPanel(
   }
 
   const config = state.config;
-  const cache = loadMetadataCache();
+  const cache = withSessionMetadata(loadMetadataCache(), config, state.sessionMetadata);
   const configPath = pi.getFlag("mcp-config") as string | undefined ?? configOverridePath;
   const provenanceMap = getServerProvenance(configPath, ctx.cwd);
   const { lines: noticeLines, fingerprint } = buildSharedConfigNoticeLines(configPath, ctx.cwd);
@@ -838,9 +953,11 @@ export async function openMcpPanel(
               }
             }
             if (!result.cancelled && result.changes.size > 0) {
+              const before = loadMcpConfig(configPath, ctx.cwd);
               writeDirectToolsConfig(result.changes, provenanceMap, config, () => {
                 directToolsFileWritten = true;
               });
+              keepProjectServerApprovals(ctx, before, loadMcpConfig(configPath, ctx.cwd), result.changes.keys());
               directToolsSaved = true;
               await onDirectToolsConfigChanged?.(result.changes);
               ctx.ui.notify("Direct tools updated for this session.", "info");
@@ -861,7 +978,7 @@ export async function openMcpPanel(
             done(undefined);
             resolve();
           });
-        }, { noticeLines, keybindings, theme });
+        }, { noticeLines, keybindings: keybindings as unknown as import("./panel-keys.ts").PanelKeybindings, theme });
       },
       {
         overlay: true,
@@ -918,7 +1035,7 @@ export async function openMcpAuthPanel(
           resolve();
         }, {
           authOnly: true,
-          keybindings,
+          keybindings: keybindings as unknown as import("./panel-keys.ts").PanelKeybindings,
           theme,
           noticeLines: ["Select an OAuth MCP server and press Enter or ctrl+a to authenticate."],
         });

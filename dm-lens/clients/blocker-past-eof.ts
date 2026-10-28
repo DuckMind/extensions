@@ -94,6 +94,11 @@ export interface BlockerPastEofOptions {
 	lineCountCache?: LineCountCache;
 	/** Test seam: defaults to the real LSP resync trigger. */
 	resync?: (filePath: string) => void;
+	/**
+	 * #4921: the turn session whose records this sweep covers (omitted: the
+	 * coordinator's). Another session's are swept at its own turn end.
+	 */
+	sessionId?: string | undefined;
 }
 
 /**
@@ -121,7 +126,9 @@ export function sweepInlineBlockerPastEof(
 
 	let entries: ReturnType<RuntimeCoordinator["getInlineBlockersSnapshot"]>;
 	try {
-		entries = runtime.getInlineBlockersSnapshot();
+		entries = runtime.getInlineBlockersSnapshot({
+			sessionId: options?.sessionId,
+		});
 	} catch {
 		return counts;
 	}

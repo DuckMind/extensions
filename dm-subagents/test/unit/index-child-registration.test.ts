@@ -520,6 +520,42 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
+	it("registers no slash commands or shortcut when enableSlashCommands is false, and keeps the subagent tool", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const registered = { tools: [], commands: [], shortcuts: [] };
+			const fakePi = new Proxy({
+				events: { on() { return () => {}; }, emit() {} },
+				registerTool(tool) { registered.tools.push(tool.name); },
+				registerCommand(name) { registered.commands.push(name); },
+				registerShortcut(key) { registered.shortcuts.push(key); },
+				registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(fakePi);
+			process.stdout.write(JSON.stringify(registered));
+		`;
+		const register = (config: object) => {
+			const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-slash-commands-config-"));
+			try {
+				const configDir = path.join(agentDir, "extensions", "subagent");
+				fs.mkdirSync(configDir, { recursive: true });
+				fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ foregroundDetachShortcut: "ctrl+alt+d", ...config }), "utf-8");
+				const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), encoding: "utf-8" });
+				return JSON.parse(output) as { tools: string[]; commands: string[]; shortcuts: string[] };
+			} finally {
+				fs.rmSync(agentDir, { recursive: true, force: true });
+			}
+		};
+		const defaults = register({});
+		assert.ok(defaults.commands.includes("run") && defaults.commands.includes("subagents-watchdog") && defaults.commands.includes("prompt-workflow"));
+		assert.deepEqual(defaults.shortcuts, ["ctrl+alt+d"]);
+		const disabled = register({ enableSlashCommands: false });
+		assert.deepEqual(disabled.commands, []);
+		assert.deepEqual(disabled.shortcuts, []);
+		assert.deepEqual(disabled.tools, defaults.tools);
+		assert.ok(disabled.tools.includes("subagent"));
+	});
+
 	it("yields registered root bg_wait for an owned nested supervisor request", () => {
 		const script = String.raw`
 			import assert from "node:assert/strict";
@@ -1248,7 +1284,7 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
-	it("claims the explicit predecessor session during session replacement", () => {
+	it("delivers a replaced session's async results to the session started in its place", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-session-transition-"));
 		const configDir = path.join(agentDir, "extensions", "subagent");
 		fs.mkdirSync(configDir, { recursive: true });
@@ -1258,43 +1294,225 @@ describe("subagent extension child mode", () => {
 			import path from "node:path";
 			import registerSubagentExtension from "./index.ts";
 			import { currentCompletionOwnerId } from "./src/shared/completion-owner.ts";
-			const handlers = new Map();
-			const listeners = new Map();
-			const events = {
-				on(channel, handler) { let set = listeners.get(channel); if (!set) listeners.set(channel, set = new Set()); set.add(handler); return () => set.delete(handler); },
-				emit(channel, payload) { for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload); },
+			import { writeAsyncResultFile } from "./src/runs/background/result-files.ts";
+			import { DIRS } from "./src/shared/types.ts";
+			// DM tears the old session's extension instance down and starts a new one on every session switch.
+			const makePi = () => {
+				const handlers = new Map();
+				const listeners = new Map();
+				const events = {
+					on(channel, handler) { let set = listeners.get(channel); if (!set) listeners.set(channel, set = new Set()); set.add(handler); return () => set.delete(handler); },
+					emit(channel, payload) { for (const handler of [...(listeners.get(channel) ?? [])]) handler(payload); },
+				};
+				const sent = [];
+				const dm = new Proxy({
+					events,
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
+					registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+					sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				registerSubagentExtension(dm);
+				return { handlers, events, sent };
 			};
-			const sent = [];
-			const dm = new Proxy({
-				events,
-				on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
-				registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
-				sendMessage(message) { sent.push(message); }, getSessionName() { return undefined; },
-			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			const emit = async (instance, name, event, ctx) => { for (const handler of instance.handlers.get(name) ?? []) await handler(event, ctx); };
 			const sessions = path.join(process.env.DM_CODING_AGENT_DIR, "sessions");
 			fs.mkdirSync(sessions, { recursive: true });
 			const oldSession = path.join(sessions, "old.jsonl");
 			const newSession = path.join(sessions, "new.jsonl");
+			const foreignSession = path.join(sessions, "foreign.jsonl");
 			fs.writeFileSync(oldSession, "");
 			fs.writeFileSync(newSession, "");
-			let currentSession = oldSession;
-			const sessionManager = { getSessionId() { return path.basename(currentSession); }, getSessionFile() { return currentSession; }, getEntries() { return []; } };
-			const ctx = { cwd: process.cwd(), isIdle() { return false; }, hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager, modelRegistry: { getAvailable() { return []; } } };
-			registerSubagentExtension(dm);
-			for (const handler of handlers.get("session_start")) await handler({ reason: "startup" }, ctx);
-			currentSession = newSession;
-			for (const handler of handlers.get("session_start")) await handler({ reason: "new", previousSessionFile: oldSession }, ctx);
+			const ctxFor = (file) => ({ cwd: process.cwd(), isIdle() { return false; }, hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager: { getSessionId() { return path.basename(file); }, getSessionFile() { return file; }, getEntries() { return []; } }, modelRegistry: { getAvailable() { return []; } } });
 			const owner = currentCompletionOwnerId();
-			events.emit("subagent:async-complete", { id: "old-owned", agent: "worker", success: true, summary: "old", timestamp: 1, sessionId: oldSession, completionOwnerId: owner });
-			events.emit("subagent:async-complete", { id: "foreign", agent: "worker", success: true, summary: "foreign", timestamp: 2, sessionId: path.join(sessions, "foreign.jsonl"), completionOwnerId: owner });
-			if (sent.length !== 1) throw new Error("expected only the claimed predecessor completion, got " + sent.length);
-			for (const handler of handlers.get("session_shutdown")) await handler({ reason: "quit" });
+			const stamp = Date.now();
+			const writeResult = (name, sessionId) => {
+				const id = "transition-" + name + "-" + stamp;
+				writeAsyncResultFile(path.join(DIRS.results, id + ".json"), { id, agent: "worker", success: true, summary: name, timestamp: stamp, sessionId, completionOwnerId: owner });
+				return id;
+			};
+			const delivered = (instance, id) => instance.sent.filter((message) => JSON.stringify(message).includes(id)).length;
+			const waitFor = async (predicate) => { for (let i = 0; i < 100 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 20)); };
+			const first = makePi();
+			await emit(first, "session_start", { reason: "startup" }, ctxFor(oldSession));
+			await emit(first, "session_shutdown", { reason: "new" });
+			// Finished while the old session was shutting down and nobody owned delivery.
+			const before = writeResult("before", oldSession);
+			const foreign = writeResult("foreign", foreignSession);
+			const second = makePi();
+			await emit(second, "session_start", { reason: "new", previousSessionFile: oldSession }, ctxFor(newSession));
+			await waitFor(() => delivered(second, before) > 0);
+			second.events.emit("subagent:async-complete", { id: "transition-after-" + stamp, agent: "worker", success: true, summary: "after", timestamp: stamp + 1, sessionId: oldSession, completionOwnerId: owner });
+			second.events.emit("subagent:async-complete", { id: "transition-live-foreign-" + stamp, agent: "worker", success: true, summary: "foreign", timestamp: stamp + 2, sessionId: foreignSession, completionOwnerId: owner });
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			const counts = { before: delivered(second, before), after: delivered(second, "transition-after-" + stamp), foreign: delivered(second, foreign), liveForeign: delivered(second, "transition-live-foreign-" + stamp), old: first.sent.length };
+			await emit(second, "session_shutdown", { reason: "quit" });
+			fs.rmSync(path.join(DIRS.results, foreign + ".json"), { force: true });
+			if (JSON.stringify(counts) !== JSON.stringify({ before: 1, after: 1, foreign: 0, liveForeign: 0, old: 0 })) throw new Error("unexpected deliveries " + JSON.stringify(counts));
 		`;
 
 		try {
 			const env = parentToolEnv();
 			env.DM_CODING_AGENT_DIR = agentDir;
 			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env, stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("gives a session started in place of another control of that session's async runs", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-inherit-"));
+		const script = String.raw`
+			import fs from "node:fs";
+			import path from "node:path";
+			import { spawn } from "node:child_process";
+			import registerSubagentExtension from "./index.ts";
+			import { DIRS } from "./src/shared/types.ts";
+			const fail = (message) => { throw new Error(message); };
+			const makePi = () => {
+				const handlers = new Map();
+				const tools = new Map();
+				const dm = new Proxy({
+					events: { on() { return () => {}; }, emit() {} },
+					on(channel, handler) { handlers.set(channel, [...(handlers.get(channel) ?? []), handler]); },
+					registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+					sendMessage() {}, getSessionName() { return undefined; },
+				}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+				registerSubagentExtension(dm);
+				return { handlers, tools };
+			};
+			const emit = async (instance, name, event, ctx) => { for (const handler of instance.handlers.get(name) ?? []) await handler(event, ctx); };
+			const sessions = path.join(process.env.DM_CODING_AGENT_DIR, "sessions");
+			fs.mkdirSync(sessions, { recursive: true });
+			const sessionFile = (name) => { const file = path.join(sessions, name + ".jsonl"); fs.writeFileSync(file, ""); return file; };
+			const [a, b, foreign, fresh, childSession] = ["a", "b", "foreign", "fresh", "child"].map(sessionFile);
+			const ctxFor = (file) => ({ cwd: process.cwd(), isIdle() { return false; }, hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager: { getSessionId() { return path.basename(file); }, getSessionFile() { return file; }, getEntries() { return []; } }, modelRegistry: { getAvailable() { return []; } } });
+			const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+			const stamp = Date.now();
+			const runs = [];
+			const writeRun = (name, status) => {
+				const runId = "inherit-" + name + "-" + stamp;
+				fs.mkdirSync(path.join(DIRS.async, runId), { recursive: true });
+				fs.writeFileSync(path.join(DIRS.async, runId, "status.json"), JSON.stringify({ runId, mode: "single", startedAt: stamp, lastUpdate: Date.now(), ...status }));
+				runs.push(runId);
+				return runId;
+			};
+			const live = writeRun("live", { sessionId: a, state: "running", pid: sleeper.pid, steps: [{ agent: "worker", status: "running" }] });
+			const done = writeRun("done", { sessionId: a, state: "complete", steps: [{ agent: "worker", status: "complete", sessionFile: childSession }] });
+			const otherLive = writeRun("foreign-live", { sessionId: foreign, state: "running", pid: sleeper.pid, steps: [{ agent: "worker", status: "running" }] });
+			const otherDone = writeRun("foreign-done", { sessionId: foreign, state: "complete", steps: [{ agent: "worker", status: "complete", sessionFile: childSession }] });
+			// Registered tools throw on error results; both outcomes are compared as text.
+			const call = async (tool, params, ctx) => {
+				try {
+					return (await tool.execute("inherit-test", params, new AbortController().signal, undefined, ctx)).content.map((part) => part.text ?? "").join("\n");
+				} catch (error) {
+					return error.message;
+				}
+			};
+			const expect = (text, pattern, label) => { if (!pattern.test(text)) fail(label + ": " + text); };
+			const notOwned = /only the session that launched this run can resume it/;
+			try {
+				const first = makePi();
+				await emit(first, "session_start", { reason: "startup" }, ctxFor(a));
+				await emit(first, "session_shutdown", { reason: "new" });
+				const second = makePi();
+				const ctxB = ctxFor(b);
+				await emit(second, "session_start", { reason: "new", previousSessionFile: a }, ctxB);
+				const subagent = (params) => call(second.tools.get("subagent"), params, ctxB);
+				if (/No active run matched/.test(await call(second.tools.get("bg_wait"), { id: live, timeoutMs: 200 }, ctxB))) fail("bg_wait did not find the replaced session's run");
+				expect(await subagent({ action: "steer", id: live, message: "check", index: 5 }), /Index 5 is out of range/, "steer");
+				const inherited = await subagent({ action: "status", id: done });
+				expect(inherited, /Owner: inherited from session '.*a\.jsonl' \(replaced in this process\)\./, "owner line");
+				expect(inherited, new RegExp('Revive: subagent\\(\\{ action: "resume", id: "' + done), "revive hint");
+				expect(await subagent({ action: "status", id: otherDone }), notOwned, "other session status");
+				expect(await subagent({ action: "stop", id: otherLive }), /was not found in the active session/, "other session stop");
+				expect(await subagent({ action: "stop", id: live }), /Stop requested for async run/, "stop");
+				await emit(second, "session_shutdown", { reason: "quit" });
+				const third = makePi();
+				const ctxFresh = ctxFor(fresh);
+				await emit(third, "session_start", { reason: "startup" }, ctxFresh);
+				expect(await call(third.tools.get("subagent"), { action: "status", id: done }, ctxFresh), notOwned, "startup inherits nothing");
+				await emit(third, "session_shutdown", { reason: "quit" });
+			} finally {
+				sleeper.kill();
+				for (const runId of runs) fs.rmSync(path.join(DIRS.async, runId), { recursive: true, force: true });
+			}
+		`;
+		try {
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), stdio: "pipe" });
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("excludes view-only slash reports from model requests and marks other dm-subagents messages as automated", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "slash-context-agent-"));
+		const script = String.raw`
+			import assert from "node:assert/strict";
+			import registerSubagentExtension from "./index.ts";
+			const handlers = new Map();
+			const commands = new Map();
+			const renderers = new Map();
+			const transcript = [];
+			const fakePi = new Proxy({
+				events: { on() { return () => {}; }, emit() {} },
+				on(name, handler) {
+					const registered = handlers.get(name) ?? [];
+					registered.push(handler);
+					handlers.set(name, registered);
+				},
+				registerCommand(name, spec) { commands.set(name, spec); },
+				registerMessageRenderer(type, renderer) { renderers.set(type, renderer); },
+				sendMessage(message) { transcript.push({ role: "custom", timestamp: 1, ...message }); },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(fakePi);
+			const ctx = {
+				cwd: process.cwd(), hasUI: false,
+				sessionManager: { getBranch() { return []; } },
+			};
+			await commands.get("subagent-cost").handler("", ctx);
+			assert.equal(transcript.length, 1);
+			const report = transcript[0];
+			assert.equal(report.customType, "subagent-slash-text-result");
+			assert.equal(report.display, true, "TUI and RPC retain the displayed message");
+			const theme = { fg(_token, text) { return text; }, bg(_token, text) { return text; }, bold(text) { return text; } };
+			assert.match(renderers.get(report.customType)(report, { expanded: true }, theme).render(120).join("\n"), /cost/i);
+			const user = { role: "user", content: "Continue", timestamp: 2 };
+			const workResult = { role: "custom", customType: "subagent-slash-result", content: "Worker finished", timestamp: 3 };
+			const unrelated = { role: "custom", customType: "other-extension", content: "Keep this", timestamp: 4 };
+			const assistant = { role: "assistant", content: [{ type: "text", text: "subagent-slash-text-result" }], timestamp: 5 };
+			const historical = { role: "custom", customType: "subagent-slash-text-result", content: "Report stored before the update", display: true, timestamp: 0 };
+			const notify = { role: "custom", customType: "subagent-notify", content: "Background task completed: **worker**\n\nParent action: review", display: true, details: { runs: [] }, timestamp: 6 };
+			const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+			const partsNotice = { role: "custom", customType: "subagent-wait-subscription", content: [{ type: "text", text: "Run finished" }, image], display: true, timestamp: 7 };
+			const messages = [historical, report, user, workResult, unrelated, assistant, { ...report, content: "Second report" }, notify, partsNotice];
+			const stored = structuredClone(messages);
+			async function modelContext(input) {
+				let current = input;
+				for (const handler of handlers.get("context") ?? []) {
+					const result = await handler({ type: "context", messages: current }, ctx);
+					if (result?.messages) current = result.messages;
+				}
+				return current;
+			}
+			const open = (type) => '<pi_subagents_notice type="' + type + '" origin="automated message from the dm-subagents extension, not typed by the user">';
+			const close = "</pi_subagents_notice>";
+			const expected = [
+				{ ...historical, content: open("subagent-slash-text-result") + "\nReport stored before the update\n" + close },
+				user,
+				{ ...workResult, content: open("subagent-slash-result") + "\nWorker finished\n" + close },
+				unrelated,
+				assistant,
+				{ ...notify, content: open("subagent-notify") + "\nBackground task completed: **worker**\n\nParent action: review\n" + close },
+				{ ...partsNotice, content: [{ type: "text", text: open("subagent-wait-subscription") + "\n" }, { type: "text", text: "Run finished" }, image, { type: "text", text: "\n" + close }] },
+			];
+			assert.deepEqual(await modelContext(messages), expected);
+			assert.equal(JSON.stringify(await modelContext(messages)), JSON.stringify(expected), "every request renders the same history bytes");
+			assert.deepEqual(messages, stored, "the stored transcript is not mutated");
+			assert.deepEqual(await modelContext([]), []);
+			assert.deepEqual(await modelContext([user, unrelated, assistant]), [user, unrelated, assistant]);
+		`;
+		try {
+			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), stdio: "pipe" });
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
@@ -1384,6 +1602,7 @@ describe("subagent extension child mode", () => {
 		).trim().split("\n").at(-1)!) as { messageTypes: string[]; entryTypes: string[]; blocks: { messages: Array<[string, string[]]>; entries: Array<[string, string[]]> } };
 
 		assert.deepEqual(output.messageTypes, [
+			"subagent-auto-resume",
 			"subagent-completion-unanswered",
 			"subagent-completion-unhandled",
 			"subagent-incremental-child-notify",
@@ -1403,7 +1622,7 @@ describe("subagent extension child mode", () => {
 		assert.deepEqual(output.entryTypes, ["subagent_supervisor_reply", "subagent_watchdog_warning"]);
 		for (const [type, lines] of [...output.blocks.messages, ...output.blocks.entries]) {
 			assert.equal(lines.length, 1, type);
-			assert.match(lines[0]!, /^ \[subagent\] .+ \(ctrl\+o to expand\)$/, type);
+			assert.match(lines[0]!, /^ \[subagent\] .+ \((?:click|ctrl\+o) to expand\)$/, type);
 		}
 	});
 

@@ -567,7 +567,7 @@ logExtension({
 	subsystem: "project-trust",
 	level: "debug",
 	message:
-		"mcp: workspace trust belongs to the MCP client; pi trust not consulted",
+		"mcp: workspace trust belongs to the MCP client; DM trust not consulted",
 });
 
 const cacheManager = new CacheManager();
@@ -1803,12 +1803,20 @@ async function callTool(
 			name === "dmlens_ast_grep_search"
 				? astGrepSearchTool
 				: astGrepReplaceTool;
+		// #4682 shape 84 (F3): the search tool's no-match hint recommends sibling
+		// tools, so the route tells it which host renders the answer. The replace
+		// tool consumes no host yet: its own NOT APPLIED line is a residual.
+		const ctx = {
+			cwd,
+			resultMaxItems: Number.POSITIVE_INFINITY,
+			...(name === "dmlens_ast_grep_search" ? { host: "mcp" as const } : {}),
+		};
 		const out = (await tool.execute(
 			"mcp",
 			args,
 			new AbortController().signal,
 			undefined,
-			{ cwd, resultMaxItems: Number.POSITIVE_INFINITY },
+			ctx,
 		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
 		return out;
 	}

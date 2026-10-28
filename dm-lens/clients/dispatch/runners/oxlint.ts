@@ -24,6 +24,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { faultResult } from "../types.js";
 import {
 	resolveToolCommand,
 	resolveToolCommandWithInstallFallback,
@@ -213,24 +214,17 @@ const oxlintRunner: RunnerDefinition = {
 				noFilesDecision.kind === "unconfirmed-no-files"
 					? noFilesDecision.reason
 					: "status-zero";
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: `oxlint:no-files-unconfirmed:${reason}`,
-						message: `oxlint no-files report was not canonical (${reason})`,
-						filePath: ctx.filePath,
-						line: 1,
-						column: 1,
-						severity: "warning",
-						semantic: "warning",
-						tool: "oxlint",
-					},
-				],
-				semantic: "warning",
-				failureKind: "unconfirmed_output",
-				failureMessage: `no-files-${reason}`,
-			};
+			return faultResult(
+				{ kind: "unconfirmed_output", failureMessage: `no-files-${reason}` },
+				{
+					id: `oxlint:no-files-unconfirmed:${reason}`,
+					message: `oxlint no-files report was not canonical (${reason})`,
+					filePath: ctx.filePath,
+					line: 1,
+					column: 1,
+					tool: "oxlint",
+				},
+			);
 		}
 		const diagnostics = parsedRun.diagnostics.filter(
 			(diagnostic): diagnostic is Diagnostic =>

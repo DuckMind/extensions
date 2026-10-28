@@ -124,7 +124,7 @@ function claimNextResponse(dir: string, haystack: string): FakeChildResponse {
 }
 
 /** Synthetic argv in the shape existing call assertions read; a child session receives no argv. */
-export function fakeChildArgs(launch: ChildSessionLaunch, task: string): string[] {
+function fakeChildArgs(launch: ChildSessionLaunch, task: string): string[] {
 	const args: string[] = ["--mode", "json", "-p"];
 	if (launch.storage.kind === "file") args.push("--session", launch.storage.sessionFile);
 	else if (launch.storage.kind === "dir") args.push("--session-dir", launch.storage.sessionDir);
@@ -302,15 +302,16 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 			};
 			const emit = (event: unknown): void => {
 				const typed = event as ChildSessionEvent & { message?: AgentMessage };
-				if ((typed.type === "message_end" || typed.type === "tool_result_end") && typed.message) messages.push(typed.message);
+				if (typed.type === "message_end" && typed.message) messages.push(typed.message);
 				for (const listener of [...listeners]) listener(typed);
 			};
 			let sawProviderError = false;
 			const emitEntries = async (entries: unknown[], task: string, injectAcceptance = true): Promise<void> => {
 				for (const entry of entries) {
 					if (record.aborted) return;
-					const typed = entry as { type?: string; message?: { content?: Array<{ type?: string; text?: string }>; errorMessage?: string; stopReason?: string } };
-					if (typed?.type === "message_end" && injectAcceptance) {
+					const typed = entry as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }>; errorMessage?: string; stopReason?: string } };
+					// Only the child's own replies carry its acceptance report; tool results are returned verbatim.
+					if (typed?.type === "message_end" && typed.message?.role !== "toolResult" && injectAcceptance) {
 						const textPart = typed.message?.content?.find?.((part) => part?.type === "text");
 						const providerError = Boolean(typed.message?.errorMessage || typed.message?.stopReason === "error");
 						if (providerError) sawProviderError = true;
@@ -325,7 +326,9 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 			};
 			const waitForReleasePath = async (releasePath: string | undefined): Promise<void> => {
 				if (typeof releasePath !== "string") return;
-				const deadline = Date.now() + 30_000;
+				// Release is a test-controlled event and abort short-circuits below; this bound only prevents an endless wait,
+				// so it must stay clear of pre-release phases that spawn several cold `node --experimental-strip-types` children.
+				const deadline = Date.now() + 120_000;
 				while (!fs.existsSync(releasePath)) {
 					if (record.aborted) return;
 					if (Date.now() >= deadline) throw new Error(`Timed out waiting for mock release path: ${releasePath}`);
@@ -398,8 +401,8 @@ export function createFakeChildSessions(queueDir: () => string): FakeChildSessio
 				if (Object.prototype.hasOwnProperty.call(response, "structuredOutput")) {
 					launch.runtime.structuredOutput?.capture(response.structuredOutput, undefined);
 					emit({ type: "tool_execution_start", toolName: "structured_output", args: { value: response.structuredOutput } });
-					emit({ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } });
 					emit({ type: "tool_execution_end", toolName: "structured_output" });
+					emit({ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } });
 				}
 				if (record.aborted) return;
 				if (!response.omitImplicitFinalEvents) {

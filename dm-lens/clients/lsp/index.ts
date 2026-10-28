@@ -11,10 +11,24 @@
 import { CASCADE_DIAGNOSTICS_TTL_MS } from "../cascade-types.js";
 import * as nodeFs from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL, URL } from "node:url";
 import { BoundedFifoMap } from "../bounded-cache.js";
-import { workspaceFileCreatedAtFor } from "./workspace-diagnostics-session.js";
+import {
+	CONTENT_HASH_MAX_BYTES,
+	type ContentStamp,
+	stampContentBytes,
+} from "../content-stamp.js";
+import {
+	FILE_CHANGED,
+	FILE_CREATED,
+	watchedTypeForOpen,
+} from "./watch-queue.js";
+import {
+	noteWorkspaceFilesChangedOnDisk,
+	workspaceFileCreatedAtFor,
+} from "./workspace-diagnostics-session.js";
 import {
 	emitCreatedImportScanRollupAtSessionEnd,
 	goPackageFilesToAnnounce,
@@ -44,8 +58,10 @@ import {
 	DocumentDriftTracker,
 	fingerprintDocumentContent,
 	type DriftDisposition,
+	type DriftSweepOptions,
 	type DriftSweepResult,
 } from "./document-drift.js";
+import { exceedsLspSyncLimits } from "./content-limits.js";
 import {
 	captureAuxPublicationBacklog,
 	markPendingAuxiliaryCoverage,
@@ -54,6 +70,7 @@ import {
 import {
 	isAtOrAboveHomeDir,
 	normalizeMapKey,
+	realpathOrResolve,
 	uriToPath,
 } from "../path-utils.js";
 import type {
@@ -80,6 +97,7 @@ import {
 	type TouchFileResult,
 } from "./diagnostic-binding.js";
 import { getServersForFileWithConfig } from "./config.js";
+import { serverIdsForConfigFile } from "./server-config-files.js";
 // #2052: deliberately NOT taken from `config.js`. This module's import surface
 // from `config.js` is mirrored by explicit `vi.mock` factories in ~58 test
 // files, so every new symbol taken from there breaks all of them.
@@ -124,7 +142,11 @@ import {
 	resetClassicTsRepairGuard,
 	resetLspLaunchAvailabilityGeneration,
 } from "./server.js";
-import { isAuxiliary, serverTraits } from "./server-traits.js";
+import {
+	isAuxiliary,
+	type LspLaunchVariant,
+	serverTraits,
+} from "./server-traits.js";
 import {
 	auxWaitBudgetMs,
 	readEnvAuxGraceMs,
@@ -1144,8 +1166,14 @@ async function collectWorkspaceDiagnosticFiles(
 	// nothing is the honest result; the caller (runWorkspaceDiagnostics →
 	// tools/lens-diagnostics.ts) renders "unsafe root" so an empty sweep never
 	// reads as a clean project. Same ceiling as fresh-fetch.ts / the cheap-tier
-	// scanner.
-	if (isAtOrAboveHomeDir(root, homeDir)) return files;
+	// scanner. By real path on both sides (#4911).
+	if (
+		isAtOrAboveHomeDir(
+			realpathOrResolve(root),
+			realpathOrResolve(homeDir ?? os.homedir()),
+		)
+	)
+		return files;
 	const ignoreMatcher = getProjectIgnoreMatcher(root);
 	// #703: prime the tracked-files set once before the walk so a tracked file
 	// matching a `.gitignore`/global pattern still gets its workspace
@@ -1191,7 +1219,18 @@ async function collectWorkspaceDiagnosticFiles(
 
 export class LSPService {
 	private static readonly MAX_SIBLING_ANNOUNCEMENTS = 1024;
+	private static readonly MAX_UNHELD_STAMPS = 4096;
 	private state: LSPState;
+	/**
+	 * #4532 gap 13: per path no live client holds open, the content stamp it
+	 * had when this service last brought its live servers' view up to date.
+	 * Two writers, one meaning: the check (`unheldBytesMoved`) and every
+	 * watched-files event this service sends (`noteUnheldSent`). Dropped with
+	 * the service; an evicted path is read as one seen for the first time.
+	 */
+	private readonly unheldStamps = new BoundedFifoMap<string, ContentStamp>(
+		LSPService.MAX_UNHELD_STAMPS,
+	);
 	/** Content hashes already announced to a sibling root in this service. */
 	private readonly siblingAnnouncementHashes = new BoundedFifoMap<
 		string,
@@ -3555,11 +3594,46 @@ export class LSPService {
 		changes: ReadonlyArray<{ filePath: string; type: number }>,
 	): void {
 		if (this.checkDestroyed() || changes.length === 0) return;
-		for (const { filePath, type } of changes)
-			for (const server of getServersForFileWithConfig(filePath))
-				this.notifyLiveClientsForServer(server.id, filePath, type, "", true);
+		for (const { filePath, type } of changes) {
+			// #4532 gap 12: a config file a server reads once is routed by name
+			// (its extension names a JSON or TOML server, never pyright), and still
+			// reaches the servers its extension names (format clients, auxiliaries).
+			const serverIds = new Set([
+				...(serverIdsForConfigFile(filePath) ?? []),
+				...getServersForFileWithConfig(filePath).map((server) => server.id),
+			]);
+			for (const serverId of serverIds)
+				this.notifyLiveClientsForServer(serverId, filePath, type, "", true);
+			this.noteUnheldSent(filePath);
+		}
 		for (const client of this.state.clients.values())
 			if (client.isAlive()) client.notify.flushWatched?.();
+	}
+
+	/**
+	 * #4532 gap 13: an event sent for `filePath` brought its live servers' view
+	 * up to date, so its {@link unheldStamps} record moves to the stat now (the
+	 * bytes hash is kept when the stat is the one already recorded), or goes
+	 * with the file (a Deleted event, or a path that cannot be statted). Without this, a sender that announces after it notifies
+	 * (#4742's head-move phase) had each path sent twice.
+	 */
+	private noteUnheldSent(filePath: string): void {
+		const key = normalizeMapKey(filePath);
+		let stat: nodeFs.Stats | undefined;
+		try {
+			stat = nodeFs.statSync(filePath, { throwIfNoEntry: false });
+		} catch {
+			// none: an unstattable path drops its record, and its next sighting
+			// takes the first-sighting rule, which errs toward sending.
+			stat = undefined;
+		}
+		if (stat === undefined) {
+			this.unheldStamps.delete(key);
+			return;
+		}
+		const seen = this.unheldStamps.get(key);
+		if (seen?.size === stat.size && seen.mtimeMs === stat.mtimeMs) return;
+		this.unheldStamps.set(key, { size: stat.size, mtimeMs: stat.mtimeMs });
 	}
 
 	/**
@@ -3593,14 +3667,25 @@ export class LSPService {
 	 * workspace sweep (which looks every file up before it touches any), is
 	 * answered from cache, or by a server that has not heard of the module yet.
 	 * Each client decides which entries are new to it (`watchedTypeForExisting`).
+	 *
+	 * #4532 gap 13: `importTargets`, the files the caller's targets import
+	 * directly (`importTargetsToAnnounce`), are announced too, and first each
+	 * one whose bytes moved since its servers last saw them goes out as Changed
+	 * (`sendUnheldChanges`), so a module changed outside DM is re-read before
+	 * the importer's answer. Only import targets are checked: a sweep's own
+	 * file list (up to 5000) would churn the check's record (#4926 review F2).
 	 */
-	announceCreatedFiles(filePaths: readonly string[]): void {
+	announceCreatedFiles(
+		filePaths: readonly string[],
+		importTargets: readonly string[] = [],
+	): void {
 		if (this.checkDestroyed() || this.state.clients.size === 0) return;
+		this.sendUnheldChanges(importTargets);
 		const byServer = new Map<
 			string,
 			Array<{ filePath: string; stat: nodeFs.Stats }>
 		>();
-		for (const filePath of filePaths) {
+		for (const filePath of [...filePaths, ...importTargets]) {
 			let stat: nodeFs.Stats;
 			try {
 				stat = nodeFs.statSync(filePath);
@@ -3624,6 +3709,132 @@ export class LSPService {
 	}
 
 	/**
+	 * #4532 gap 13: send Changed, now, for each of `filePaths` that no live
+	 * client holds open and whose bytes moved since its live servers last saw
+	 * them ({@link unheldBytesMoved}), before the caller's read. Each such path
+	 * is also noted as changed on disk under the root of every live client of
+	 * its servers, the record #4476 writes for a change seen on disk: a cached
+	 * answer whose dependency scope holds the path is refused, and a touch
+	 * debounced before the change pushes again.
+	 */
+	private sendUnheldChanges(filePaths: readonly string[]): void {
+		const changed: Array<{ filePath: string; type: number }> = [];
+		const at = Date.now();
+		for (const filePath of filePaths) {
+			let stat: nodeFs.Stats;
+			try {
+				stat = nodeFs.statSync(filePath);
+			} catch {
+				// none: an absent path has no bytes to compare, and a module
+				// deleted outside DM is an accepted residual of #4532 gap 13.
+				continue;
+			}
+			const servers = getServersForFileWithConfig(filePath);
+			if (!this.unheldBytesMoved(filePath, stat, servers)) continue;
+			changed.push({ filePath, type: FILE_CHANGED });
+			for (const client of this.liveClientsOf(servers, filePath))
+				noteWorkspaceFilesChangedOnDisk(
+					client.root,
+					[normalizeMapKey(filePath)],
+					at,
+				);
+		}
+		if (changed.length === 0) return;
+		this.notifyOutOfBandFileChanges(changed);
+		logLatency({
+			type: "phase",
+			phase: "lsp_unheld_dependency_changed",
+			filePath: changed[0]?.filePath ?? "",
+			durationMs: Date.now() - at,
+			result: `changed:${changed.length}`,
+			metadata: {
+				changed: changed.length,
+				paths: changed.slice(0, 5).map((change) => change.filePath),
+			},
+		});
+	}
+
+	/**
+	 * #4532 gap 13: whether `filePath`, which no live client holds open, has
+	 * bytes a live server of its may not have read. A server keeps the bytes of
+	 * a closed module it read for an importer and re-reads them only when a
+	 * watched-files event names the file (pyright 1.1.414, measured), so a
+	 * module changed outside DM left its importer's answer stale for the
+	 * server's life, on the first call and every call after it.
+	 *
+	 * The record ({@link unheldStamps}) is the content stamp the path had when
+	 * this service last brought its live servers' view up to date. An equal
+	 * stat is unchanged; a moved stat is read and compared by its bytes, so a
+	 * rewrite of the same bytes sends nothing. A path seen for the first time
+	 * has no record to compare, so its bytes take the client-start rule a
+	 * birth takes ({@link watchedTypeForOpen}, #4320): bytes written at or
+	 * after a live server of the path started (less the margin) may be newer
+	 * than the bytes that server read, and older ones are what it read. A path every
+	 * live client holds is skipped: the open-document sync keeps those views
+	 * current. One that some client reads closed is compared and sent, and a
+	 * holder's copy of the event is redundant, since its open document wins.
+	 */
+	private unheldBytesMoved(
+		filePath: string,
+		stat: nodeFs.Stats,
+		servers: ReadonlyArray<{ id: string }>,
+	): boolean {
+		// #4926 review F3: held-ness is per client. Skip only when every live
+		// client of the path holds it (or none is live: nothing to tell); one
+		// that reads it closed needs the event.
+		const live = this.liveClientsOf(servers, filePath);
+		if (live.every((client) => client.holds)) return false;
+		const key = normalizeMapKey(filePath);
+		const seen = this.unheldStamps.get(key);
+		if (seen?.size === stat.size && seen.mtimeMs === stat.mtimeMs) return false;
+		let stamp: ContentStamp = { size: stat.size, mtimeMs: stat.mtimeMs };
+		if (stat.size <= CONTENT_HASH_MAX_BYTES) {
+			try {
+				stamp = stampContentBytes(nodeFs.readFileSync(filePath), stat.mtimeMs);
+			} catch (cause) {
+				// The stat alone is compared: a read that failed is no proof the
+				// bytes are unchanged, so a moved stat sends the event.
+				recordDegradationOnce({
+					kind: "lsp-unheld-dependency-unreadable",
+					subject: key,
+					reason: `could not read a closed module to compare its bytes; a change of its stat is sent as a change: ${cause instanceof Error ? cause.message : String(cause)}`,
+				});
+			}
+		}
+		this.unheldStamps.set(key, stamp);
+		// A first sighting has nothing to compare: the client-start rule (#4320).
+		if (seen === undefined)
+			return live.some(
+				(client) =>
+					watchedTypeForOpen(stat.mtimeMs, client.launchedAt) === FILE_CREATED,
+			);
+		return seen.sha256 === undefined || seen.sha256 !== stamp.sha256;
+	}
+
+	/**
+	 * The live clients of `servers`, each with its root, the launch epoch from
+	 * which that server could read a project file, and whether it holds
+	 * `filePath` open.
+	 */
+	private liveClientsOf(
+		servers: ReadonlyArray<{ id: string }>,
+		filePath: string,
+	): Array<{ root: string; launchedAt: number; holds: boolean }> {
+		const live: Array<{ root: string; launchedAt: number; holds: boolean }> =
+			[];
+		for (const [key, client] of this.state.clients) {
+			if (!client.isAlive()) continue;
+			if (!servers.some((server) => key.startsWith(`${server.id}:`))) continue;
+			live.push({
+				root: client.root,
+				launchedAt: this.clientRegistry.clientLaunchStartedAt.get(key) ?? 0,
+				holds: documentIsOpenOn(client, filePath),
+			});
+		}
+		return live;
+	}
+
+	/**
 	 * #4493 r2: push the disk bytes of `filePaths` to the PRIMARY servers that
 	 * already hold them, and to no auxiliary. A HEAD move's resync runs this
 	 * first: the primary's view is the one the next read or edit's dispatch
@@ -3644,6 +3855,21 @@ export class LSPService {
 	 * (for a server whose replies are `threaded` it proves only liveness).
 	 * `drained` requires measured single-task ordering and a successful probe;
 	 * threaded/unmeasured servers and timeouts are undrained.
+	 *
+	 * #4782: a server may check a document as soon as it reads its change, so a
+	 * dependent sent before its rewritten dependency is checked against the
+	 * dependency's old bytes, and its re-check after the dependency arrives is
+	 * the server's own timer, which can answer after the drain reply. No answer
+	 * carries the dependency's version, so no read can tell. A client whose
+	 * server `rechecks` unchanged bytes is therefore sent each document again,
+	 * after the last one it was sent, before the drain: the server's latest check
+	 * of each follows every change of this pass, and the re-send's version bump
+	 * lets a versioned server's older answer be dropped as superseded. The
+	 * re-send clears the path's stored answer, so the dispatch read waits for
+	 * the answer to it; the drain below runs only for `single-task-ordered`
+	 * clients, and no row declared `rechecks` is one. Both sends carry the stamp
+	 * taken before the read (#3481): a parallel tool's newer read of the same
+	 * path, sent in between, makes the queue drop this pass's older bytes.
 	 */
 	async resyncHeldPrimaries(
 		filePaths: readonly string[],
@@ -3652,7 +3878,16 @@ export class LSPService {
 		let sent = 0;
 		const sentTo = new Map<
 			string,
-			{ client: LSPClientInfo; ordered: boolean }
+			{
+				client: LSPClientInfo;
+				ordered: boolean;
+				rechecks: boolean;
+				documents: Array<{
+					filePath: string;
+					content: string;
+					readStamp: number;
+				}>;
+			}
 		>();
 		for (const filePath of filePaths) {
 			if (this.checkDestroyed()) break;
@@ -3661,6 +3896,7 @@ export class LSPService {
 			for (const server of servers)
 				if (isAuxiliary(server)) exclude.add(server.id);
 			if (servers.every((server) => exclude.has(server.id))) continue;
+			const readStamp = performance.now();
 			let content: string;
 			try {
 				content = await fs.readFile(filePath, "utf8");
@@ -3673,6 +3909,7 @@ export class LSPService {
 				source: "head_move_primary",
 				clientScope: "all",
 				excludeServerIds: exclude,
+				readStamp,
 			});
 			sent += 1;
 			for (const server of servers) {
@@ -3683,15 +3920,37 @@ export class LSPService {
 				);
 				const key = root ? `${server.id}:${normalizeMapKey(root)}` : undefined;
 				const client = key ? this.state.clients.get(key) : undefined;
-				if (key && client)
+				if (key && client) {
+					const traits = serverTraits(server);
+					const documents = sentTo.get(key)?.documents ?? [];
+					documents.push({ filePath, content, readStamp });
 					sentTo.set(key, {
 						client,
-						ordered:
-							serverTraits(server).replyOrdering === "single-task-ordered",
+						ordered: traits.replyOrdering === "single-task-ordered",
+						rechecks: traits.resendRecheck === "rechecks",
+						documents,
 					});
+				}
 			}
 		}
 		if (sentTo.size === 0) return { sent, drained: true };
+		await Promise.all(
+			[...sentTo.values()].flatMap(({ client, rechecks, documents }) =>
+				(rechecks ? documents : [])
+					.slice(0, -1)
+					.map(({ filePath, content, readStamp }) =>
+						client.notify.open(
+							filePath,
+							content,
+							getLanguageId(filePath) ?? "plaintext",
+							undefined,
+							undefined,
+							undefined,
+							readStamp,
+						),
+					),
+			),
+		);
 		const answers = await Promise.all(
 			[...sentTo.values()].map(async ({ client, ordered }) => {
 				// #4528 r2: a threaded or unmeasured reply proves only liveness.
@@ -3825,12 +4084,16 @@ export class LSPService {
 	 * no stale view to correct, so its record is dropped instead of resynced.
 	 */
 	async sweepDocumentDrift(
-		options: { force?: boolean } = {},
+		options: DriftSweepOptions = {},
 	): Promise<DriftSweepResult | undefined> {
 		if (this.checkDestroyed()) return undefined;
 		return this.documentDrift.sweep(
 			{
 				resync: async (filePath, content, _driftAgeMs, readStamp, saved) => {
+					// A file past the sync bound is never framed to a server (every other
+					// writer skips it). Returning false keeps the old record, so the pass
+					// reports a failed resync and retries once the file is small again.
+					if (exceedsLspSyncLimits(content).tooLarge) return false;
 					// Reuse the normal touch path so the resync inherits the existing
 					// per-server notify-write budget, the #743 backpressure demotion and
 					// the client-lease machinery. diagnostics:"none" keeps it a pure
@@ -7037,7 +7300,7 @@ export class LSPService {
 		// with a PerServerEntry; raceToCompletion collects them as they finish.
 		type PerServerEntry = {
 			serverId: string;
-			launchVariant?: "classic" | "native-ts7";
+			launchVariant?: LspLaunchVariant;
 			waitMs: number;
 			diagnosticCount: number;
 			diagnostics: import("./client.js").LSPDiagnostic[];
@@ -8791,10 +9054,9 @@ export class LSPService {
 		// a file's imports name (created outside dm-lens), for every file a
 		// fresh clean entry will not answer (#4368 r1 F1), and a Go file's
 		// package files; each resolved file's imports go to the cache.
-		this.announceCreatedFiles([
-			...files,
-			...goPackageFilesToAnnounce(files),
-			...(await importTargetsToAnnounce(
+		this.announceCreatedFiles(
+			[...files, ...goPackageFilesToAnnounce(files)],
+			await importTargetsToAnnounce(
 				root,
 				files.filter(
 					(filePath) =>
@@ -8805,8 +9067,8 @@ export class LSPService {
 				),
 				(filePath, scope) =>
 					workspaceDiagnosticsCacheCtx.noteImportScope(filePath, scope),
-			)),
-		]);
+			),
+		);
 		const cachedResults: LSPWorkspaceDiagnosticResult[] = [];
 		const filesToTouch: string[] = [];
 		const writeIndexByPath = new Map<string, number | undefined>();

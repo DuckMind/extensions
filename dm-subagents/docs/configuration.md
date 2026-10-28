@@ -74,15 +74,15 @@ For a native DM `model_verification_failed` where your proxy accepts `claude-hai
 }
 ```
 
-Replace `YOUR_PROVIDER` with the resolved DM provider ID. Keep the outgoing model alias unchanged. This native remedy already exists in v0.65.1; it does not infer equivalence from provider prefixes or dates. The built-in external `claude-code` adapter does not invoke this verifier or use this setting. If an external run shows this diagnostic, identify the installed version, resolved runner kind/adapter, and error location before applying a native remedy. Thanks to [sixtus](https://github.com/sixtus) for the concrete request-ID/response-ID example in [#1922](https://github.com/nicobailon/pi-subagents/issues/1922).
+Replace `YOUR_PROVIDER` with the resolved DM provider ID. Keep the outgoing model alias unchanged. This native remedy already exists in v0.65.1; it does not infer equivalence from provider prefixes or dates. The built-in external `claude-code` adapter does not invoke this verifier or use this setting. If an external run shows this diagnostic, identify the installed version, resolved runner kind/adapter, and error location before applying a native remedy. Thanks to [sixtus](https://github.com/sixtus) for the concrete request-ID/response-ID example in #1922.
 
 A local DM child whose selected model is a virtual model (`dm.registerVirtualModel()`, such as a router) needs no alias. Its assistant messages name whichever physical model the router picked, so verification compares the child's selected virtual `provider/id` with the launch model instead, exactly. A different virtual selection fails, and `modelResponseAliases` does not override it.
 
 ## Tool activation lifecycle
 
-On DM 0.86.1 or newer, when the model can take a new tool mid-conversation (see [`toolActivation`](#toolactivation)), a fresh unrestricted parent starts with `subagents_enable`, `bg_wait`, and `subagent_supervisor` active while `subagent` stays registered but inactive. Calling `subagents_enable({})` preserves unrelated active tools and exposes `subagent` on the next model request. It does not launch a child or infer authority from prompt keywords. With other models, a fresh parent starts with `subagent`, `bg_wait`, and `subagent_supervisor` active and no `subagents_enable`.
+When the model can take a new tool mid-conversation (see [`toolActivation`](#toolactivation)), a fresh unrestricted parent starts with only `subagents_enable` active while `subagent`, `bg_wait`, and `subagent_supervisor` stay registered but inactive. Calling `subagents_enable({})` preserves unrelated active tools and exposes all three on the next model request. It does not launch a child or infer authority from prompt keywords. `bg_wait` is also declared without `subagent` once another extension registers a [background-work provider](extension-api.md#background-work-provider-api), because only `bg_wait` waits for that work. `subagent_supervisor`, which answers this session's children, is also declared when a child request reaches a session that does not have it, such as one from a scheduled run. With other models, a fresh parent starts with `subagent`, `bg_wait`, and `subagent_supervisor` active and no `subagents_enable`. `contact_supervisor` is active whenever `subagent` is, with the definition children use, so a forked child declares the same tools as its parent and can reuse its prompt cache; called in a session that is not a subagent, it returns an error.
 
-The recorded native `subagent` selection is restored on resume, reload, and tree navigation, so an activated session stays activated and a cold session stays cold. With the default `toolActivation`, the recorded `subagents_enable` selection is restored too, so a session that started without the loader never gets it later. Older history without tool-selection records keeps eager `subagent` availability. If DM's allowlist or exclusions remove the loader, the extension does not hide `subagent`; if they remove `subagent`, the loader reports it unavailable. Hosts whose extension API lacks `getAllTools`, `getActiveTools`, or `setActiveTools` keep eager behavior and log one compatibility warning. The host version is not read from disk, so in-process hosts such as dm-web activate the same way as the DM CLI.
+The recorded native `subagent` selection is restored on resume, reload, and tree navigation, so an activated session stays activated and a cold session stays cold. The recorded `bg_wait` and `subagent_supervisor` selections are restored the same way, so a session that declared them, for example on an earlier version, keeps them. With the default `toolActivation`, the recorded `subagents_enable` selection is restored too, so a session that started without the loader never gets it later. Older history without tool-selection records keeps eager `subagent`, `bg_wait`, and `subagent_supervisor` availability. If DM's allowlist or exclusions remove the loader, the extension does not hide `subagent` or `bg_wait`; if they remove `subagent`, the loader reports it unavailable. The host version is not read from disk, so in-process hosts such as dm-web activate the same way as the DM CLI.
 
 Some providers fix the tool list for a whole prompt, for example bridges that hand DM's tools to another agent SDK. There `subagent` appears only on the next user prompt, not the next model request. Start DM with `--exclude-tools subagents_enable` to keep `subagent` active from the start.
 
@@ -98,7 +98,7 @@ Controls how a new parent session offers the `subagent` tool. The default is `"a
 - `"dynamic"`: every new session starts with the loader, whatever the model. This was the behavior before `toolActivation` existed.
 - `"eager"`: the loader is not registered, so `subagent` is active from the first request, as with `--exclude-tools subagents_enable`. A resumed session that recorded the loader changes its tool list once on the next request.
 
-The choice is made at session start or tree navigation, and only for a session with no messages. Resumed sessions keep the tools they recorded, and switching models mid-session does not change them. `"auto"` avoids only the loader's cache miss; other tool-list or provider changes can still miss the cache. An active `subagent` sends its full schema on every request. An invalid value is a config error, not a fallback to the default. Restart DM after changing it.
+The choice is made at session start or tree navigation, and only for a session with no messages. If a compaction that kept no tool checkpoint dropped the record of this choice, the session is decided again as a new session would be; tool selections recorded after that compaction (for `bg_wait` or another extension's tools) are not evidence that the choice survived. Resumed sessions keep the tools they recorded, and switching models mid-session does not change them. `"auto"` avoids only the loader's cache miss; other tool-list or provider changes can still miss the cache. An active `subagent` sends its full schema on every request. An invalid value is a config error, not a fallback to the default. Restart DM after changing it.
 
 ## `toolDescriptionMode`
 
@@ -108,7 +108,15 @@ The choice is made at session start or tree navigation, and only for a session w
 
 Controls the parent-facing `subagent` tool description registered at startup. The default registers the short execution/safety description, which states the delegation authorization rule, plus a one-line `promptSnippet`. Explicit `"compact"` uses the same description without the snippet; `"full"` adds workflow and management detail, also without the snippet. All modes retain the same flat parameter schema. Extended examples and recipes are available on demand through `action:"guide"` and the bundled dm-subagents skill; full mode is not an exhaustive manual. Count the default snippet as well as the tool definition when comparing prompt footprints.
 
-`custom` reads `subagent-tool-description.md` from the project config directory, then from `~/.dm/agent/subagent-tool-description.md`. Missing, empty, unreadable, or oversized custom files fall back to the full description. Custom templates may use `{{fullDescription}}`, `{{compactDescription}}`, `{{safetyGuidance}}`, `{{agentDir}}`, and `{{projectConfigDir}}`; the safety guidance is always present so custom prose cannot remove the runtime guardrails. Restart DM after changing the mode or custom file. The change applies to new sessions; a resumed session keeps the tool definition and prompt text it already declared, so its prompt cache stays valid.
+`custom` reads `subagent-tool-description.md` from the project config directory, then from `~/.dm/agent/subagent-tool-description.md`. Missing, empty, unreadable, or oversized custom files fall back to the full description. Custom templates may use `{{fullDescription}}`, `{{compactDescription}}`, `{{safetyGuidance}}`, `{{agentDir}}`, and `{{projectConfigDir}}`; the safety guidance is always present so custom prose cannot remove the runtime guardrails. Restart DM after changing the mode or custom file. The change applies to new sessions; a resumed session keeps the tool definition and prompt text it already declared, so its prompt cache stays valid. To apply it to resumed sessions too, set [`pinToolDeclarations`](#pintooldeclarations) to `false`.
+
+## `pinToolDeclarations`
+
+```json
+{ "pinToolDeclarations": false }
+```
+
+DM records each tool definition and prompt section a session declares, and declares any difference again before the next request; a changed definition makes the provider read the whole conversation again without its prompt cache. So by default (`true`) a resumed or reloaded session keeps the `subagent`, `bg_wait`, and `subagents_enable` definitions and the dm-subagents prompt text it already declared, and only a session that never declared a tool gets its current definition. With `false`, every parent session gets the current definitions (subagent children stay pinned): a long-lived session picks up an upgrade, a changed `toolDescriptionMode`, `disabledFeatures`, or an edited custom description on the next restart, and pays one cache miss on its next request. Restart DM after changing it.
 
 ## `disabledFeatures`
 
@@ -142,8 +150,8 @@ Disabling a per-call option removes only the per-call override. Configured defau
 
 `workflow-scripts` removes workflow scripts and named workflow resources from every entry point. The model can no longer write a script, and a script that still arrives from RPC `spawn` (`script` or `workflow`), `/prompt-workflow`, a saved schedule, or a delegated launch fails with an error that names the setting. Schedule inspection, pause, and delete still work, but `schedule.create` cannot succeed because it needs a script. `/run` still works: it launches its one child directly. The built-in tool description and prompt snippet drop the script guidance and describe two small inputs instead:
 
-- `tasks: [{ agent, task }, ...]` runs the children in parallel and returns their results in order.
-- `chain: [step, ...]` runs steps in order. A step is `{ agent, task?, as? }` or a parallel group `{ parallel: [{ agent, task }, ...] }`. A group waits for all of its children.
+- `tasks: [{ agent, task, cwd?, model? }, ...]` runs the children in parallel and returns their results in order.
+- `chain: [step, ...]` runs steps in order. A step is `{ agent, task?, as?, cwd?, model? }` or a parallel group `{ parallel: [{ agent, task, cwd?, model? }, ...] }`. A group waits for all of its children. `cwd` and `model` are optional and apply to that one child.
 
 A top-level `task` is the original request. Tasks can use three placeholders:
 
@@ -186,6 +194,16 @@ With `"summary"`, a tool result looks like this:
 ✓ reviewer · completed
 ```
 
+## `enableSlashCommands`
+
+```json
+{ "enableSlashCommands": false }
+```
+
+Set to `false` to register none of the dm-subagents slash commands (`/run`, `/subagents`, `/subagents-fleet`, `/subagents-watchdog`, `/prompt-workflow`, and the rest) and no [`foregroundDetachShortcut`](#foregrounddetachshortcut). The `subagent` tool, RPC, the async widget, and the extension's other features are unchanged. Prompt templates whose frontmatter has `chain:` launch through `/prompt-workflow`, so they stop working too. Defaults to `true`. Restart DM or run `/reload` after changing it.
+
+The package's prompt shortcuts, such as `/parallel-review` and `/review-loop`, are DM prompt templates, not commands, so this setting leaves them alone. DM's package filter removes them: `{ "packages": [{ "source": "npm:dm-subagents", "prompts": [] }] }` in DM's `settings.json`, or `dm config`.
+
 ## `foregroundDetachShortcut`
 
 ```json
@@ -225,6 +243,14 @@ Set `enabled` to `false` (or remove the block) as a kill switch. In that state, 
 ```
 
 Workflow script calls use background execution when the request omits `async`. Set `asyncByDefault` to `false` to restore foreground-by-default behavior for tool launches that still use the internal single-run primitive. Callers can still force foreground with `async: false` unless `forceTopLevelAsync` is enabled.
+
+## `autoResume`
+
+```json
+{ "autoResume": false }
+```
+
+Default `true`. When a session is reopened (`dm -c`, `dm --session`, `/resume`) or reloaded (`/reload`), its own async workflows that a DM exit or a reload interrupted in the last 24 hours are resumed once, without delaying session start; set `autoResume` to `false` to resume them only by hand. A one-shot `dm -p` run does not auto-resume, so it does not wait on the workflow. See [Workflows](workflows.md).
 
 ## `runnerLaunchers`
 
@@ -270,7 +296,7 @@ Controls how resolved fork launches prepare the inherited session. The default `
 
 Child-visible spilled items contain only the model summary and a stable `{ batchId, itemId }` recovery ref. Raw bodies and their digests, source entry ids, labels, sizes, and tool metadata go to a private `0600` sidecar next to the child session. This release does not add a recovery command or expose that payload to the child model.
 
-Pruned forks keep the normal `parentSession` link, child cwd alignment, and fork thinking-block sanitization (signed Anthropic thinking blocks are stripped; the child keeps its requested thinking level). Missing model or auth, invalid or incomplete summary JSON, budget overflow, recovery validation failure, and raw overflow leakage all stop the launch before child spawn. The extension never falls back to a full fork or refs-only context after a prune failure.
+Pruned forks keep the normal `parentSession` link, child cwd alignment, and fork thinking-block sanitization (a pruned fork rewrites inherited content, so its signed and redacted Anthropic thinking blocks are stripped; the child keeps its requested thinking level). Missing model or auth, invalid or incomplete summary JSON, budget overflow, recovery validation failure, and raw overflow leakage all stop the launch before child spawn. The extension never falls back to a full fork or refs-only context after a prune failure.
 
 ## `fleetView`
 
@@ -351,7 +377,15 @@ Reports are sent only from an interactive TUI session whose standard output is a
 | failed, partial, or rejected | `error` |
 | stopped or paused | `idle` |
 
-Each record's `title` is the agent names or workflow key, and its `msg` is the current tool while working, or the outcome. Neither includes the task text. Finished runs keep their `done`, `error`, or `idle` record after they leave the async widget, for as long as they are in Fleet's recent history (the last 20 finished runs). Records of runs this session no longer tracks, for example after switching sessions, are cleared. At most 64 records are shown: running and waiting runs first, then finished ones, most recently updated first; older finished records are cleared to make room. When the extension is reloaded or the session is replaced, it clears every record it sent and the new session reports the runs it still tracks. DM 1.1 and later reports its own state on the root record and clears every record, these included, when it quits, suspends with Ctrl+Z, or opens an external editor. After a suspend, this extension sends its records again; after an external editor, each record comes back the next time it changes. Foreground runs are not reported, and tmux drops these sequences unless you configure passthrough.
+Each record's `title` is the agent names or workflow key, and its `msg` is the current tool while working, or the outcome. Neither includes the task text. Finished runs keep their `done`, `error`, or `idle` record after they leave the async widget, for as long as they are in Fleet's recent history (the last 20 finished runs). Records of runs this session no longer tracks, for example after switching sessions, are cleared. At most 64 records are shown: running and waiting runs first, then finished ones, most recently updated first; older finished records are cleared to make room. When the extension is reloaded or the session is replaced, it clears every record it sent and the new session reports the runs it still tracks. DM reports its own state on the root record and clears every record, these included, when it quits, suspends with Ctrl+Z, or opens an external editor. After a suspend, this extension sends its records again; after an external editor, each record comes back the next time it changes. Foreground runs are not reported, and tmux drops these sequences unless you configure passthrough.
+
+## `activeRunsPrompt`
+
+```json
+{ "activeRunsPrompt": true }
+```
+
+Adds a short `active_subagents` section to the parent's system prompt while this session has queued or running background runs, so the model remembers work it launched earlier instead of starting it again. Off by default. Each run gets one line, for example `- <run id> researcher (chain, step 2/3)`, built from in-memory run state with no file reads; at most 10 runs are listed, then a `+N more` line. The line holds only the run id, agents, mode, and chain step (task text is redacted at launch), so the section changes only when a run starts, finishes, or moves to another chain step. DM sends such a change as a mid-conversation system update where the provider supports it; on other providers it rebuilds the system prompt, so the prompt cache starts over on those turns. Nothing is added when no run is active.
 
 ## `waitTool`
 
@@ -361,8 +395,8 @@ Each record's `title` is the agent names or workflow key, and its `msg` is the c
 
 `defaultTimeoutMs` sets the blocking window used when a `bg_wait` call omits `timeoutMs`; explicit call values win, followed by this setting, then the 30-minute fallback. `bg_wait` is the only registered wait tool. When the window elapses, the tool returns a non-error `window_elapsed` result with the still-active work identities, and that work keeps running. Set `enabled` to `false` to make direct calls return immediately instead of blocking. The default is enabled. You can also set `"waitTool": false`; set `DM_SUBAGENT_WAIT_TOOL_ENABLED=false` (or `0`, `off`, `disabled`) to override config for one process. The effective enabled and default-timeout values are passed explicitly to child runtimes. Headless `agent_end` auto-drain retains its own strict deadline and fails if required work remains unresolved. Invalid config or environment values fail instead of being coerced.
 
-Blocking `bg_wait({ id: "..." })` keeps the current tool call open until that run changes. By default it returns when a run needs attention. Use `bg_wait({ stopOnAttention: false })` only for run-to-completion flows that should wait through idle or long-thinking attention; supervisor/contact requests still stop the wait. A steer or follow-up the operator sends while a blocking wait is open also ends it, with a non-error `user_input` result listing the still-active work, so the message reaches the model without waiting out the window. In a long-lived interactive parent session, `bg_wait({ id: "...", nonBlocking: true })` instead resolves the prefix once, persists the exact run identity, returns a subscription token immediately, and wakes that session on completion, failure, attention, reconciliation failure, or timeout. Use it for provider, detached, or other background work without a native completion notification; ordinary async subagent runs notify the parent natively and do not need a wait subscription. Armed subscriptions appear in ordinary `subagent({ action: "status" })` output and are not counted as active child work. Native completion notifications wake the session through the DM process that launched the run, while that process is still running; a session reopened in a new process does not get that wake and should read the result with `subagent({ action: "status" })`. `nonBlocking` subscriptions need a host with a UI context, such as interactive or RPC mode; plain SDK embedding without a UI context rejects them.
 
+Blocking `bg_wait({ id: "..." })` keeps the current tool call open until that run changes. By default it returns when a run needs attention, even when the run is still working normally, for example a `bash` command open longer than `activeNoticeAfterMs`; the result then says the run is still running. Use `bg_wait({ stopOnAttention: false })` for run-to-completion flows: it waits through idle time, a tool held open, or repeated tool failures, and still ends for a supervisor/contact request, a finished run, the timeout, user input, or abort. A steer or follow-up the operator sends while a blocking wait is open also ends it, with a non-error `user_input` result listing the still-active work, so the message reaches the model without waiting out the window. In a long-lived interactive parent session, `bg_wait({ id: "...", nonBlocking: true })` instead resolves the prefix once, persists the exact run identity, returns a subscription token immediately, and wakes that session on completion, failure, attention, reconciliation failure, or timeout. Use it for provider, detached, or other background work without a native completion notification; ordinary async subagent runs notify the parent natively and do not need a wait subscription. Armed subscriptions appear in ordinary `subagent({ action: "status" })` output and are not counted as active child work. A native completion notification goes to the DM process that launched the run while that process is running; once it has exited, the session gets the result the next time it is open in any DM. `nonBlocking` subscriptions need a host with a UI context, such as interactive or RPC mode; plain SDK embedding without a UI context rejects them.
 This is different from `waitTool.enabled=false`, which returns immediately without registering any future wake. Provider items remain available only to blocking fleet-wide waits; non-blocking subscriptions require one async or remembered detached foreground run id.
 
 ## `resultScanLogging`
@@ -459,7 +493,7 @@ The budget counts single launches, expanded `tasks`/`count`, static chain steps 
 
 Optionally caps concurrently active top-level async runs owned by one parent session. Unset or `0` keeps the existing unlimited behavior. A positive integer reserves one slot before an async single, parallel, chain, or workflow creates run artifacts or starts children. Foreground runs and nested/workflow children do not reserve another slot.
 
-Queued, running, paused, and needs-attention runs retain capacity. Runner-backed slots release only after terminal logical state and matching observed process-terminal proof from #1030. Missing, malformed, or unknown cleanup proof retains the slot. A terminal async workflow releases after its controller is gone and every launched child is accounted for: awaited foreground children are covered by workflow settlement, while actual background children still require observed process-terminal proof. Two cases release without that proof: a run whose runner failed before child startup, recorded as `not-started` with an error, and the abandoned-slot policy below. Resume transfers the source slot without a second charge. Dismissal and history cleanup do not release capacity.
+Queued, running, paused, and needs-attention runs retain capacity. Runner-backed slots release only after terminal logical state and matching observed process-terminal proof from #1030. Missing, malformed, or unknown cleanup proof retains the slot. A terminal async workflow releases after its controller is gone and every launched child is accounted for: awaited foreground children are covered by workflow settlement, while actual background children still require observed process-terminal proof. Three cases release without that proof: a run whose runner failed before child startup, recorded as `not-started` with an error; an async workflow child whose launch failed before any runner existed, recorded as a failed roster step with an error and no status or runner files in its run directory; and the abandoned-slot policy below. Resume transfers the source slot without a second charge. Dismissal and history cleanup do not release capacity.
 
 When the runner is gone but process cleanup proof remains unknown, configure a bounded policy reclaim under `capacity.abandonedSlotReleaseAfterMs`:
 
@@ -467,9 +501,9 @@ When the runner is gone but process cleanup proof remains unknown, configure a b
 { "maxActiveAsyncRunsPerSession": 4, "capacity": { "abandonedSlotReleaseAfterMs": 1200000 } }
 ```
 
-The default is `1200000` milliseconds (20 minutes). The policy releases only a failed terminal run whose runner PID is dead and whose last activity is older than the threshold. A live or unknown PID, a non-failed terminal state, a recent run, or missing activity timestamp retains the slot. Set the value to `false` to keep strict retention. Valid configured durations range from 5 minutes through 24 hours. Policy release is reported as `abandoned-timeout` with `processProof: unknown`; it is not observed process-terminal proof and may reclaim capacity while an orphan child still exists.
+The default is `1200000` milliseconds (20 minutes). For a top-level run, the policy releases only a failed terminal run whose runner PID is dead and whose last activity is older than the threshold (workflow children follow the rule below). A live or unknown PID, a top-level run in a non-failed terminal state, a recent run, or missing activity timestamp retains the slot. Set the value to `false` to keep strict retention. Valid configured durations range from 5 minutes through 24 hours. Policy release is reported as `abandoned-timeout` with `processProof: unknown`; it is not observed process-terminal proof and may reclaim capacity while an orphan child still exists.
 
-A terminal workflow whose controller is gone uses the same policy when async children lack proof: the workflow must have ended longer ago than the threshold, and every async child without proof must itself be a failed run with a dead runner PID and old activity. Any other child without proof keeps the slot. The release event lists those children under `abandonedChildren`.
+A terminal workflow whose controller is gone uses the same policy when async children lack proof: the workflow must have ended longer ago than the threshold, and every async child without proof must be a terminal run (failed, stopped, complete, partial or rejected, but not paused) with a dead runner PID in this PID namespace and old activity. A stopped or completed child counts too, because a child whose launching DM process is gone never gets observed proof however it ended. Any other child without proof keeps the slot. The release event lists those children and their states under `abandonedChildren`.
 
 This limit bounds current top-level async load. It is separate from cumulative `maxSubagentSpawnsPerSession`, `maxSubagentSpawnsPerRun`, and `globalConcurrencyLimit`.
 
@@ -554,7 +588,7 @@ export DM_SUBAGENTS_DM_CODING_AGENT_PACKAGE_ROOT=/path/to/dm-coding-agent-packag
 
 Overrides host-package discovery for spawned children. Foreground CLI resolution uses this root to locate the `dm` CLI script, and the detached background runner uses it for jiti host resolution and peer-package aliases, so both child kinds agree on one host. The value must be the root of a canonical `@duckmind/dm-coding-agent` installation (the directory containing its `package.json`, with that package name); both child kinds still validate the package name and its peer packages from that install tree, so a package whose manifest carries a different name is rejected even with the override set. Empty or whitespace-only values are ignored.
 
-The default in-process child session loader consults the same discovery. Before falling back to a bare `@duckmind/dm-coding-agent` import, it resolves the host package root (the running dm process's location, then this override, then dm-subagents' own install tree as a last fallback) and imports the host's entry file directly, so children share the host's single SDK instance instead of a second copy. Roots whose `package.json` name is not `@duckmind/dm-coding-agent` are rejected. When this override is selected, an unimportable root is reported instead of falling back to a bare import from a different tree.
+The default in-process child session loader consults the same discovery. Before falling back to a bare `@duckmind/dm-coding-agent` import, it resolves the host package root (a verified DM-owned JavaScript entry, then this override, then any other DM-owned entry such as an extensionless `.bin/dm` symlink, then the embedding host's dependency, then dm-subagents' own install tree as a last fallback) and imports the host's entry file directly, so children share the host's single SDK instance instead of a second copy. For an embedding host, discovery walks ancestor `node_modules` directories from the host entry's canonical location to find its DM dependency before using the extension's install tree. Roots whose `package.json` name is not `@duckmind/dm-coding-agent` are rejected. When this override is selected, an unimportable root is reported instead of falling back to a bare import from a different tree, and foreground CLI resolution fails instead of falling back to another install or `dm` on `PATH`.
 
 ## `intercomBridge`
 

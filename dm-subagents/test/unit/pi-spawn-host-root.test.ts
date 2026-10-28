@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { findPiPackageRootFromEntry, resolvePiPackageRoot } from "../../src/runs/shared/dm-spawn.ts";
 
-const PACKAGE_DIR = path.join("@earendil-works", "dm-coding-agent");
+const PACKAGE_DIR = path.join("@duckmind", "dm-coding-agent");
 
 function writePackageRoot(root: string, name = "@duckmind/dm-coding-agent"): void {
 	fs.mkdirSync(root, { recursive: true });

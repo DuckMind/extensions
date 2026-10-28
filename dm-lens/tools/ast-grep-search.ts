@@ -18,7 +18,15 @@ import {
 	synthesizeRule,
 } from "../clients/ast-grep-yaml-synth.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
-import { isAtOrAboveHomeDir } from "../clients/path-utils.js";
+import * as os from "node:os";
+import {
+	isAtOrAboveHomeDir,
+	realpathOrResolve,
+} from "../clients/path-utils.js";
+import {
+	type LensToolHost,
+	translateGuidanceToolNames,
+} from "../clients/tool-config.js";
 import { compactRenderResult } from "./render-compact.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
 import { readAstGrepLang, resolveAstGrepPaths } from "./shared.js";
@@ -29,9 +37,14 @@ import { readAstGrepLang, resolveAstGrepPaths } from "./shared.js";
  * the hint map (their message already carries guidance), so this never doubles
  * up — it only adds value for the raw-stderr categories (#ast-grep tool errors).
  */
-function errorTextWithHint(raw: string): string {
+function errorTextWithHint(raw: string, host: LensToolHost): string {
 	const hint = astGrepRemediationHint(classifyAstGrepError(raw));
-	return hint ? `Error: ${raw}\n\n${hint}` : `Error: ${raw}`;
+	// The hint names this tool family (“use ast_grep_search with dump=true”), so it
+	// goes through the host translation; the raw stderr stays byte-identical
+	// because it can quote the caller's own pattern (#4809 F3).
+	return hint
+		? `Error: ${raw}\n\n${translateGuidanceToolNames(hint, host)}`
+		: `Error: ${raw}`;
 }
 
 export function _telemetryErrorForTest(
@@ -430,10 +443,11 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 			params: Record<string, unknown>,
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
-			ctx: { cwd?: string; signal?: AbortSignal },
+			ctx: { cwd?: string; signal?: AbortSignal; host?: LensToolHost },
 		) {
 			// Escape aborts the turn via ctx.signal; the positional signal is the
 			// tool-call one. Honor both so a broad search cancels on Escape.
+			const host: LensToolHost = ctx.host ?? "pi";
 			const abortSignal = combineAbortSignals(_signal, ctx.signal);
 			const startedAt = Date.now();
 			const deadlineAt = startedAt + AST_GREP_SEARCH_TIMEOUT_MS;
@@ -683,8 +697,15 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				// what the user asked to search — never second-guessed. But when no
 				// paths are given we fall back to `ctx.cwd`, and if that resolves at or
 				// above $HOME a full structural scan of the entire home tree would be
-				// spawned. Refuse and tell the caller how to scope it.
-				if (!paths?.length && isAtOrAboveHomeDir(ctx.cwd || ".")) {
+				// spawned. Refuse and tell the caller how to scope it. By real path
+				// on both sides (#4911), so a link on either side is refused too.
+				if (
+					!paths?.length &&
+					isAtOrAboveHomeDir(
+						realpathOrResolve(ctx.cwd || "."),
+						realpathOrResolve(os.homedir()),
+					)
+				) {
 					logOutcome("error", {
 						errorRaw: "defaulted cwd resolves at or above home directory",
 					});
@@ -825,7 +846,7 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 							content: [
 								{
 									type: "text" as const,
-									text: errorTextWithHint(ruleResult.error),
+									text: errorTextWithHint(ruleResult.error, host),
 								},
 							],
 							isError: true,
@@ -882,7 +903,10 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 					logOutcome("error", { errorRaw: result.error });
 					return {
 						content: [
-							{ type: "text" as const, text: errorTextWithHint(result.error) },
+							{
+								type: "text" as const,
+								text: errorTextWithHint(result.error, host),
+							},
 						],
 						isError: true,
 						details: {},
@@ -897,10 +921,16 @@ export function createAstGrepSearchTool(astGrepClient: AstGrepClient) {
 				const output = groupByFile
 					? formatGroupedByFile(page)
 					: astGrepClient.formatMatches(page, false, false, PAGE_SIZE);
-				const hint =
+				// #4682 shape 84 (F3): the no-match hint recommends sibling tools, so it
+				// follows the delivery host. Only the hint is translated, never the match
+				// text: a match can quote source that spells a tool name.
+				const rawHint =
 					page.length === 0 && !result.error
 						? getPatternHint(pattern, lang, selector)
 						: undefined;
+				const hint = rawHint
+					? translateGuidanceToolNames(rawHint, host)
+					: undefined;
 				const paginationNote =
 					hasMore && page.length > 0
 						? `\n\n(Showing ${page.length} of ${result.matches.length - skipOffset} remaining matches. Use skip=${skipOffset + PAGE_SIZE} for the next page.)`

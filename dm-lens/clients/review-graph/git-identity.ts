@@ -76,7 +76,10 @@ function readCommonDir(gitDir: string): string {
  * keeps looking, so the walk does too (#4508).
  */
 function resolveGitDir(cwd: string): ResolvedGitDir | null {
-	for (const dir of walkUpDirs(cwd)) {
+	// Spelled by design: `worktreeRoot` becomes `GitCheckout.spelledRoot`,
+	// which callers compare with paths spelled like `cwd` (#3872 r3); `root`
+	// and `commonDir` carry the identity.
+	for (const dir of walkUpDirs(cwd, { spelling: true })) {
 		const gitPath = path.join(dir, ".git");
 		let stat: fs.Stats;
 		try {

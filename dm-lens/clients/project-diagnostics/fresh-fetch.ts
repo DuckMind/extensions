@@ -351,7 +351,7 @@ export async function fetchFreshProjectDiagnostics(
 						"explicit analysis root must be strictly contained by the canonical home directory",
 				}
 			: { state: "safe", root: analysisRoot };
-	} else if (isAtOrAboveHomeDir(analysisRoot, options.homeDir)) {
+	} else if (isAtOrAboveHomeDir(analysisRoot, homeRoot)) {
 		analysisRootValidation = {
 			state: "unsafe",
 			root: analysisRoot,

@@ -9,7 +9,10 @@ import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import { isOutsideProjectRoot, toProjectRelativePath } from "./path-utils.js";
 import { decodeShellWords, type DecodedShellWord } from "./bash-file-access.js";
-import { incrementDegradationCount } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { absorbSettledRunnerBlockers } from "./deferred-runner-blockers.js";
 import { logLatency } from "./latency-logger.js";
 import { resolveLensToolName, type LensToolHost } from "./tool-config.js";
@@ -1319,11 +1322,15 @@ function pastFreshnessWindow(
  * it through the freshness window, so a day-old record was invisible to it and
  * its write replaced the record whole), the partitions to carry, and what the
  * write leaves out, for `logCarriedDrops` once it has written.
+ *
+ * #4921: `sessionId` is the composing turn's session, the one whose own
+ * partition the write replaces; omitted, the coordinator's.
  */
 export function readTurnEndGuardRecord(
 	cacheManager: CacheManager,
 	runtime: RuntimeCoordinator,
 	cwd: string,
+	sessionId?: string,
 ): {
 	stored: Partial<TurnEndFindingsCache> | undefined;
 	carried: BlockerPartition[];
@@ -1332,19 +1339,23 @@ export function readTurnEndGuardRecord(
 	const stored = storedRecord(cacheManager, cwd)?.fields;
 	// The composer writes on every path that reads, so a stamp this read gave
 	// a released partition reaches the record with that write.
-	const { carried, dropped } = carriedTurnEndBlockers(stored, runtime, cwd);
+	const { carried, dropped } = carriedTurnEndBlockers(
+		stored,
+		cwd,
+		sessionId ?? runtime.telemetrySessionId,
+	);
 	return { stored, carried, dropped };
 }
 
 function carriedTurnEndBlockers(
 	stored: StoredRecord | undefined,
-	runtime: RuntimeCoordinator,
 	cwd: string,
+	/** The session whose own partition is not carried. */
+	me: string,
 ): { carried: BlockerPartition[]; dropped: CarriedDrops; stamped: boolean } {
 	const dropped: CarriedDrops = { gone: false, noFile: false };
 	if (!isTurnEndFindingsCache(stored))
 		return { carried: [], dropped, stamped: false };
-	const me = runtime.telemetrySessionId;
 	const now = Date.now();
 	const carried: BlockerPartition[] = [];
 	// A released partition carried whole gets its first stamp here.
@@ -1460,17 +1471,22 @@ function logRecordRetired(
  * re-checks the files it names). The latch that described the record goes
  * with it; a dispatch latch stays (`RecordLatchReason`).
  *
+ * #4921: `sessionId` is the settling turn's session, whose own partition
+ * leaves; omitted, the coordinator's.
+ *
  * @returns true when the record was retired.
  */
 export function retireSettledGitGuardRecord(
 	runtime: RuntimeCoordinator,
 	cacheManager: CacheManager,
 	cwd: string,
+	sessionId?: string,
 ): boolean {
 	const stored = storedRecord(cacheManager, cwd)?.fields;
 	if (!stored) return false;
+	const me = sessionId ?? runtime.telemetrySessionId;
 	const own =
-		stored.sessionId === runtime.telemetrySessionId &&
+		stored.sessionId === me &&
 		stored.testFailures !== true &&
 		stored.carriedBlockers === undefined;
 	const basis = own
@@ -1486,7 +1502,7 @@ export function retireSettledGitGuardRecord(
 		logRecordRetired(cwd, "turn_end", basis);
 		return true;
 	}
-	return retireOwnPartition(runtime, cacheManager, cwd, stored);
+	return retireOwnPartition(runtime, cacheManager, cwd, stored, me);
 }
 
 /**
@@ -1503,9 +1519,9 @@ function retireOwnPartition(
 	cacheManager: CacheManager,
 	cwd: string,
 	stored: StoredRecord,
+	me: string,
 ): boolean {
 	if (!isTurnEndFindingsCache(stored)) return false;
-	const me = runtime.telemetrySessionId;
 	// A record this session owns whole: the rule above decided it.
 	if (stored.sessionId === me && stored.carriedBlockers === undefined)
 		return false;
@@ -1516,7 +1532,7 @@ function retireOwnPartition(
 		carried: kept,
 		dropped,
 		stamped,
-	} = carriedTurnEndBlockers(stored, runtime, cwd);
+	} = carriedTurnEndBlockers(stored, cwd, me);
 	if (!ownDropped && !dropped.gone && !dropped.noFile) {
 		// #4762 r3: nothing dropped, so the partitions kept are the stored ones
 		// in their order. A released one just got its first stamp, and only a
@@ -1714,7 +1730,8 @@ function shownLatchFile(filePath: string, cwd: string): string {
 function unconfirmedRecordRemedy(
 	stored: StoredValue | undefined,
 	inspection: CacheInspection,
-	runtime: RuntimeCoordinator,
+	/** #4921: the session attempting the commit. */
+	me: string,
 	cwd: string,
 ): string | undefined {
 	if (stored === undefined) return undefined;
@@ -1727,7 +1744,7 @@ function unconfirmedRecordRemedy(
 	if (
 		record &&
 		inspection === "fresh" &&
-		record.sessionId === runtime.telemetrySessionId &&
+		record.sessionId === me &&
 		record.carriedBlockers === undefined
 	) {
 		// #4733 r1 F5: a write re-checks this session's own files, and clears no
@@ -1842,6 +1859,9 @@ export function retireInlineBlockerAndResyncGuard(args: {
 	coveredSources: readonly string[];
 	lensGuardEnabled: boolean;
 }): boolean {
+	// #4921: the retired record's section sits in its owner's partition, so
+	// the resync speaks as that owner, whichever session ran the check.
+	const owner = args.runtime.inlineBlockerOwner(args.filePath);
 	const retired = args.runtime.retireInlineBlockerOnConfirmedClean(
 		args.filePath,
 		args.writeIndex,
@@ -1855,6 +1875,9 @@ export function retireInlineBlockerAndResyncGuard(args: {
 			args.cacheManager,
 			args.cwd,
 			args.filePath,
+			undefined,
+			undefined,
+			owner,
 		);
 	}
 	return true;
@@ -1892,9 +1915,15 @@ export function resyncGitGuardAfterInlinePolicy(args: {
 	runtime: RuntimeCoordinator;
 	/** Files whose EVERY inline blocker the turn-end policy suppressed. */
 	suppressedFilePaths: readonly string[];
+	/**
+	 * #4921: the turn session whose policy pass this is: only its records were
+	 * judged, so only theirs take a verdict.
+	 */
+	sessionId: string | undefined;
 }): void {
 	const changed = args.runtime.applyInlineBlockerPolicyVerdicts(
 		args.suppressedFilePaths,
+		{ sessionId: args.sessionId },
 	);
 	// Nothing left the gate's view of the map and nothing rejoined it. This is
 	// what keeps the recompute off every ordinary turn end: `updateGitGuardStatus`
@@ -1915,6 +1944,11 @@ export function resyncGitGuardAfterInlinePolicy(args: {
  * no verdict (failed, unanswered, in flight, edit-scoped) observes nothing
  * (AGENTS.md shape 10), and this session's map, which carries its own blockers
  * through such runs, holds nothing of another session's.
+ *
+ * #4921: `sessionId` is the writing turn's session (omitted: the
+ * coordinator's). Its partition is built from its own inline-blocker records
+ * only and carries its id; a concurrent in-process session's records are its
+ * own partition's, written by its own writes.
  */
 export function syncGitGuardRecord(
 	runtime: RuntimeCoordinator,
@@ -1923,15 +1957,16 @@ export function syncGitGuardRecord(
 	editedFilePath?: string,
 	analysisRootMode: AnalysisRootMode = "session",
 	editedCleanVerdict = false,
+	sessionId?: string,
 ): void {
 	if (!canWriteAnalysisRoot(analysisRootMode)) return;
 	// #3248: a record the turn-end policy fully suppressed is not a blocker the
 	// commit gate may persist — the agent was shown nothing for it. The entry
 	// stays in the map so the next turn re-derives the verdict from current
 	// bytes; it just stops speaking for the gate.
-	const entries = (runtime.getInlineBlockersSnapshot?.() ?? []).filter(
-		(entry) => !entry.policySuppressed,
-	);
+	const entries = (
+		runtime.getInlineBlockersSnapshot?.({ sessionId }) ?? []
+	).filter((entry) => !entry.policySuppressed);
 	// #4725: the record is read whatever its age (`storedRecord`). Read through
 	// the freshness window, a stale record latched `cache_stale` here on every
 	// write, and no later session could clear it.
@@ -1949,7 +1984,7 @@ export function syncGitGuardRecord(
 	const editedKey = editedFilePath
 		? guardPathKey(editedFilePath, cwd)
 		: undefined;
-	const me = runtime.telemetrySessionId;
+	const me = sessionId ?? runtime.telemetrySessionId;
 	const blockerSections = existing?.blockerContent
 		? blockingProvenance(
 				existing.blockerContent,
@@ -1994,6 +2029,19 @@ export function syncGitGuardRecord(
 		droppedForeign === 0 &&
 		droppedOwn === 0
 	) {
+		// #4921 r2 F1: the latch is process-wide, so it speaks for the record's
+		// owner. Only the coordinator's own write may say "another session's
+		// record"; a concurrent session's write leaves the record and the
+		// latch to the session that owns them.
+		if (sessionId !== undefined && !runtime.isCoordinatorSession(sessionId)) {
+			recordDegradationOnce({
+				kind: "git-guard-non-owner-write",
+				subject: sessionId,
+				reason:
+					"a concurrent session's write left another session's commit-gate record and latch untouched",
+			});
+			return;
+		}
 		markCacheUnknown(runtime, "session_mismatch");
 		return;
 	}
@@ -2271,7 +2319,13 @@ export function evaluateGitGuard(
 	cacheManager: CacheManager,
 	cwd: string,
 	host: LensToolHost = "pi",
+	/**
+	 * #4921: the session attempting the commit (`ToolCallDeps.sessionId`);
+	 * omitted, the coordinator's. A record only it owns is its own to judge.
+	 */
+	sessionId?: string,
 ): GuardDecision {
+	const me = sessionId ?? runtime.telemetrySessionId;
 	// #2535 F3: a known tool with no mapping on this host resolves to
 	// undefined — rephrase rather than naming a dead tool. `lens_diagnostics`
 	// is pinned available on both hosts, so the fallback is defensive only.
@@ -2331,7 +2385,7 @@ export function evaluateGitGuard(
 	const stored =
 		inspection === "missing" ? undefined : storedRecord(cacheManager, cwd);
 	const recordRemedy = () =>
-		unconfirmedRecordRemedy(stored, inspection, runtime, cwd) ?? RECHECK_REMEDY;
+		unconfirmedRecordRemedy(stored, inspection, me, cwd) ?? RECHECK_REMEDY;
 	const latched = runtime.gitGuardCacheUnknownReason;
 	if (latched) return unknown(cwd, latched, {}, recordRemedy());
 	// #4733 r2 F12: a dispatch that never answered refuses until that file's own
@@ -2382,10 +2436,7 @@ export function evaluateGitGuard(
 	}
 	// #4738: the record speaks for every session that owns a section of it, so
 	// this session judges it alone only when it is the only owner.
-	if (
-		record.sessionId !== runtime.telemetrySessionId ||
-		record.carriedBlockers !== undefined
-	) {
+	if (record.sessionId !== me || record.carriedBlockers !== undefined) {
 		return unknown(cwd, "session_mismatch", {}, recordRemedy());
 	}
 	if (record.projectSeqEnd !== runtime.projectSeq) {

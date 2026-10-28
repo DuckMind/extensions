@@ -39,13 +39,21 @@ export interface Symbol {
 	 * graph keeps the full symbol set regardless, so its edges are unaffected.
 	 */
 	local?: boolean;
-	doc?: string; // JSDoc comment if available
+	/**
+	 * First-sentence summary of the symbol's documentation: an attached doc
+	 * comment (JSDoc, `///`, `#`), or for a Python def/class its docstring
+	 * (#4948). A docstring lives inside the body, so it sets `doc` WITHOUT
+	 * `docStartLine`.
+	 */
+	doc?: string;
 	/**
 	 * 1-based start line of the attached doc-comment block that `doc` was
 	 * summarized from (same attachment computation — position-based, blank-line-
-	 * gap aware). Undefined when no doc comment is attached. Lets a body reader
-	 * (readSymbol) extend its returned range to include the comment (#523) without
-	 * re-deriving attachment.
+	 * gap aware). Undefined when no doc comment is attached, and ALSO undefined
+	 * when `doc` came from a Python docstring: a start line inside the body would
+	 * cut the signature off a body read, so a reader must use
+	 * `docStartLine ?? line`. Lets a body reader (readSymbol) extend its returned
+	 * range to include the comment (#523) without re-deriving attachment.
 	 */
 	docStartLine?: number;
 	/**

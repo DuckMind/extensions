@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
-import { checkPidLiveness, reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
+import { checkPidLiveness, checkRecordedPidLiveness, reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 import { summarizeAsyncStatus } from "../../src/runs/background/async-status.ts";
 
 function tempRoot(prefix: string): string {
@@ -32,6 +32,102 @@ describe("async stale-run reconciliation", () => {
 		assert.equal(checkPidLiveness(123, () => { throw errno("ESRCH"); }), "dead");
 		assert.equal(checkPidLiveness(123, () => { throw errno("EPERM"); }), "unknown");
 		assert.equal(checkPidLiveness(123, () => { throw new Error("boom"); }), "unknown");
+	});
+
+	it("treats a pid saved under another boot as dead without probing, only when the pid namespaces are comparable", () => {
+		const noProbe = () => { throw new Error("the pid must not be probed"); };
+		const alive = () => true;
+		const cases = [
+			{ name: "other boot, same scope", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-b" }, kill: noProbe, expected: "dead" },
+			{ name: "other boot, neither has a scope", recorded: { bootId: "boot-a" }, observed: { observedScope: undefined, observedBootId: "boot-b" }, kill: noProbe, expected: "dead" },
+			{ name: "other boot, record scope differs", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[2]", observedBootId: "boot-b" }, kill: () => { throw errno("ESRCH"); }, expected: "unknown" },
+			{ name: "other boot, only the observer has a scope", recorded: { bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-b" }, kill: alive, expected: "alive" },
+			{ name: "same boot, live pid", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-a" }, kill: alive, expected: "alive" },
+			{ name: "record has no boot id", recorded: { pidNamespaceScope: "pid:[1]" }, observed: { observedScope: "pid:[1]", observedBootId: "boot-b" }, kill: alive, expected: "alive" },
+			{ name: "observer has no boot id", recorded: { pidNamespaceScope: "pid:[1]", bootId: "boot-a" }, observed: { observedScope: "pid:[1]", observedBootId: undefined }, kill: alive, expected: "alive" },
+		];
+		for (const testCase of cases) {
+			assert.equal(checkRecordedPidLiveness({ pid: 4242, ...testCase.recorded }, { ...testCase.observed, kill: testCase.kill }), testCase.expected, testCase.name);
+		}
+	});
+
+	it("marks a workflow whose DM process is dead owner-exited, and no other repair", () => {
+		const root = tempRoot("dm-stale-run-owner-exited-");
+		try {
+			const resultsDir = path.join(root, "results");
+			const workflowStatus = (runId: string, extra: Record<string, unknown> = {}) => ({
+				runId,
+				sessionId: "session-owner",
+				mode: "workflow",
+				state: "running",
+				pid: 4242,
+				pidNamespaceScope: "pid:[same]",
+				bootId: "boot-now",
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [{ agent: "echo", status: "running", startedAt: 1000, workflowKey: "stage2" }],
+				workflow: { trace: [], emits: [], console: [], scriptDigest: "digest" },
+				...extra,
+			});
+			const reconcile = (runId: string, status: Record<string, unknown>, options: Parameters<typeof reconcileAsyncRun>[1]) => {
+				const asyncDir = path.join(root, runId);
+				writeStatus(asyncDir, status);
+				const result = reconcileAsyncRun(asyncDir, { resultsDir, pidNamespaceScope: () => "pid:[same]", bootId: () => "boot-now", now: () => 2000, ...options });
+				return { result, status: JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) };
+			};
+			const ownerExitedMessage = (runId: string) => `The DM process (PID 4242) that ran workflow ${runId} exited before the workflow finished. Marked run failed by stale-run reconciliation. Its finished children are kept.`;
+
+			const dead = reconcile("wf-dead", workflowStatus("wf-dead"), { kill: () => { throw errno("ESRCH"); } });
+			assert.equal(dead.result.repaired, true);
+			assert.equal(dead.status.state, "failed");
+			assert.equal(dead.status.workflow.stopCause, "owner-exited");
+			assert.equal(dead.status.workflow.scriptDigest, "digest");
+			// When the dead owner last updated it, not the repair time, and the stop cause in the result.
+			assert.equal(dead.status.workflow.ownerExitedAt, 1000);
+			assert.equal(dead.status.endedAt, 2000);
+			assert.deepEqual(JSON.parse(fs.readFileSync(path.join(resultsDir, "wf-dead.json"), "utf-8")).workflow, { stopCause: "owner-exited" });
+			const neverUpdated = reconcile("wf-never-updated", workflowStatus("wf-never-updated", { lastUpdate: undefined, startedAt: 900 }), { kill: () => { throw errno("ESRCH"); } });
+			assert.equal(neverUpdated.status.workflow.ownerExitedAt, 900);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(resultsDir, "wf-dead.json"), "utf-8")).summary, ownerExitedMessage("wf-dead"));
+
+			const rebooted = reconcile("wf-rebooted", workflowStatus("wf-rebooted", { bootId: "boot-before" }), { kill: () => { throw new Error("the pid must not be probed"); } });
+			assert.equal(rebooted.status.workflow.stopCause, "owner-exited");
+
+			const alive = reconcile("wf-alive", workflowStatus("wf-alive"), { kill: () => true });
+			assert.equal(alive.result.repaired, false);
+			assert.equal(alive.status.workflow.stopCause, undefined);
+
+			const staleAlive = reconcile("wf-stale-alive", workflowStatus("wf-stale-alive"), { kill: () => true, staleAlivePidMs: 500 });
+			assert.equal(staleAlive.status.state, "failed");
+			assert.equal(staleAlive.status.workflow.stopCause, undefined);
+			assert.match(staleAlive.result.message ?? "", /^Async runner PID 4242 is still live; status has not updated/);
+
+			const staleUnknown = reconcile("wf-stale-unknown", workflowStatus("wf-stale-unknown", { pidNamespaceScope: "pid:[container]" }), { kill: () => { throw errno("ESRCH"); }, staleAlivePidMs: 500 });
+			assert.equal(staleUnknown.status.state, "failed");
+			assert.equal(staleUnknown.status.workflow.stopCause, undefined);
+			assert.match(staleUnknown.result.message ?? "", /cannot be probed from this process/);
+
+			const { workflow: _workflow, ...singleStatus } = workflowStatus("single-dead", { mode: "single" });
+			const single = reconcile("single-dead", singleStatus, { kill: () => { throw errno("ESRCH"); } });
+			assert.equal(single.status.workflow, undefined);
+			assert.equal(single.result.message, "Async runner process 4242 exited or disappeared before writing a result. Marked run failed by stale-run reconciliation.");
+
+			// An owning session's repair adopts its completion owner, so it can deliver the notice; only an owner-exited workflow does.
+			const deadPid = () => { throw errno("ESRCH"); };
+			const resultOwner = (runId: string) => JSON.parse(fs.readFileSync(path.join(resultsDir, `${runId}.json`), "utf-8")).completionOwnerId;
+			const adopted = reconcile("wf-adopted", workflowStatus("wf-adopted", { completionOwnerId: "dead-process" }), { kill: deadPid, adoptCompletionOwnerId: "this-process" });
+			assert.equal(adopted.status.completionOwnerId, "this-process");
+			assert.equal(resultOwner("wf-adopted"), "this-process");
+			// A repair where no owning session adopts it leaves its notice to whichever session owns the run.
+			const elsewhere = reconcile("wf-elsewhere", workflowStatus("wf-elsewhere", { completionOwnerId: "dead-process" }), { kill: deadPid });
+			assert.equal(elsewhere.status.completionOwnerId, "owning-session");
+			assert.equal(resultOwner("wf-elsewhere"), "owning-session");
+			const singleKept = reconcile("single-kept", { ...singleStatus, runId: "single-kept", completionOwnerId: "dead-process" }, { kill: deadPid, adoptCompletionOwnerId: "this-process" });
+			assert.equal(singleKept.status.completionOwnerId, "dead-process");
+			assert.equal(resultOwner("single-kept"), "dead-process");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("repairs a recent Linux zombie only with a verified PID namespace", { skip: process.platform !== "linux", timeout: 10_000 }, async () => {
@@ -182,6 +278,7 @@ describe("async stale-run reconciliation", () => {
 				runId: "run-dead",
 				sessionId: "session-current",
 				completionOwnerId: "owner-current",
+				completionOwnerProcess: { pid: 4321, bootId: "boot-a" },
 				mode: "single",
 				state: "running",
 				pid: 12345,
@@ -213,6 +310,7 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(resultJson.success, false);
 			assert.equal(resultJson.sessionId, "session-current");
 			assert.equal(resultJson.completionOwnerId, "owner-current");
+			assert.deepEqual(resultJson.completionOwnerProcess, { pid: 4321, bootId: "boot-a" });
 			assert.equal(resultJson.state, "failed");
 			assert.equal(resultJson.exitCode, 1);
 			assert.equal(resultJson.results[0].contextOverflow, true);
@@ -227,6 +325,35 @@ describe("async stale-run reconciliation", () => {
 			});
 			assert.equal(second.repaired, false);
 			assert.equal(fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8"), resultText);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a dead workflow child's workflow identity in its repaired result", () => {
+		const root = tempRoot("dm-stale-run-");
+		try {
+			const asyncDir = path.join(root, "run-child");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-child",
+				sessionId: "session-current",
+				parentWorkflowRunId: "workflow-1",
+				workflowKey: "memory",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [{ agent: "worker", status: "running", startedAt: 1000 }],
+			});
+
+			reconcileAsyncRun(asyncDir, { resultsDir, kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+
+			const resultJson = JSON.parse(fs.readFileSync(path.join(resultsDir, "run-child.json"), "utf-8"));
+			assert.equal(resultJson.state, "failed");
+			assert.equal(resultJson.parentWorkflowRunId, "workflow-1");
+			assert.equal(resultJson.workflowKey, "memory");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -413,6 +540,78 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(result.status?.steps?.[1]?.contextOverflow, true);
 			assert.equal(result.status?.steps?.[1]?.sessionFile, workerSession);
 			assert.equal(result.status?.error, "boom");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the outcome of workflow children that settled before their owner died", () => {
+		const root = tempRoot("dm-stale-workflow-children-");
+		try {
+			const asyncDir = path.join(root, "wf");
+			const step = (key: string, runId: string) => ({ agent: "worker", status: "running", startedAt: 1000, workflowKey: key, parentWorkflowRunId: "wf", runId, async: true });
+			writeStatus(asyncDir, {
+				runId: "wf",
+				mode: "workflow",
+				state: "running",
+				pid: 12345,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				steps: [
+					{ ...step("done", "child-done"), error: "stale host progress error" },
+					step("bad", "child-bad"),
+					step("live", "child-live"),
+					step("gone", "child-gone"),
+					step("corrupt", "child-corrupt"),
+					step("halted", "child-halted"),
+					step("cut", "child-cut"),
+					step("foreign", "child-foreign"),
+				],
+			});
+			const child = (runId: string, key: string, state: string, endedAt: number | undefined, childStep: Record<string, unknown>, parentWorkflowRunId = "wf") =>
+				writeStatus(path.join(root, runId), { runId, mode: "single", state, startedAt: 1000, ...(endedAt !== undefined ? { endedAt } : {}), parentWorkflowRunId, workflowKey: key, steps: [{ agent: "worker", ...childStep }] });
+			child("child-done", "done", "complete", 1500, { status: "complete", exitCode: 0 });
+			child("child-bad", "bad", "failed", 1600, { status: "failed", exitCode: 1, error: "child boom" });
+			child("child-halted", "halted", "stopped", undefined, { status: "stopped", exitCode: 1, error: "stopped by bg_stop" });
+			child("child-cut", "cut", "partial", 1700, { status: "partial", exitCode: 1, error: "turn budget exhausted" });
+			// Owned by another workflow: its outcome must not be borrowed.
+			child("child-foreign", "foreign", "complete", 1500, { status: "complete", exitCode: 0 }, "other-wf");
+			fs.mkdirSync(path.join(root, "child-corrupt"), { recursive: true });
+			fs.writeFileSync(path.join(root, "child-corrupt", "status.json"), "{not json", "utf-8");
+			writeStatus(path.join(root, "child-live"), { runId: "child-live", mode: "single", state: "running", startedAt: 1000, steps: [{ agent: "worker", status: "running" }] });
+
+			const result = reconcileAsyncRun(asyncDir, {
+				resultsDir: path.join(root, "results"),
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 2000,
+			});
+
+			assert.equal(result.status?.state, "failed");
+			const steps = result.status?.steps ?? [];
+			assert.equal(steps[0]?.status, "complete");
+			assert.equal(steps[0]?.exitCode, 0);
+			assert.equal(steps[0]?.endedAt, 1500);
+			assert.equal(steps[0]?.error, undefined);
+			assert.equal(steps[1]?.status, "failed");
+			assert.equal(steps[1]?.error, "child boom");
+			// Unsettled or unreadable children still inherit the owner failure.
+			assert.equal(steps[2]?.status, "failed");
+			assert.match(steps[2]?.error ?? "", /stale-run reconciliation/);
+			assert.equal(steps[3]?.status, "failed");
+			// A corrupt child status keeps the owner repair going and stays visible in the error.
+			assert.equal(result.repaired, true);
+			assert.equal(steps[4]?.status, "failed");
+			assert.match(steps[4]?.error ?? "", /child status unreadable/);
+			// Every terminal child state is kept, not only complete and failed.
+			assert.equal(steps[5]?.status, "stopped");
+			assert.equal(steps[5]?.stopped, true);
+			assert.equal(steps[5]?.error, "stopped by bg_stop");
+			assert.equal(steps[5]?.endedAt, 2000);
+			assert.equal(steps[6]?.status, "partial");
+			assert.equal(steps[6]?.error, "turn budget exhausted");
+			assert.equal(steps[6]?.endedAt, 1700);
+			assert.equal(steps[7]?.status, "failed");
+			assert.match(steps[7]?.error ?? "", /stale-run reconciliation/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

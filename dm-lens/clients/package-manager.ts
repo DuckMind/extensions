@@ -33,7 +33,12 @@ import {
 	createGenerationSource,
 	type GenerationHandle,
 } from "./generation-guard.js";
-import { isAtOrAboveHomeDir, isUnderDir, walkUpDirs } from "./path-utils.js";
+import {
+	isAtOrAboveHomeDir,
+	isUnderDir,
+	realpathOrResolve,
+	walkUpDirs,
+} from "./path-utils.js";
 import { getProjectTrustState } from "./project-trust.js";
 import {
 	NODE_MODULES_BIN_DIRS,
@@ -421,7 +426,7 @@ async function probeGlobalBinDirs(
 				? ["bin", "-g"]
 				: ["global", "bin"]; // yarn
 	// #4530: the managers read project configuration (`.npmrc`, `.yarnrc`)
-	// from their cwd, so under untrusted pi trust the query runs from HOME and
+	// from their cwd, so under untrusted DM trust the query runs from HOME and
 	// a project cannot redirect where global binaries are looked up.
 	const res = await safeSpawnAsync(pmBinary(pm), query, {
 		timeout: 5000,
@@ -543,14 +548,14 @@ function refuseLocalBin(tool: string, root: string): LocalBinTrustRefusal {
 		recordDegradationOnce({
 			kind: "trust-refusal",
 			subject,
-			reason: `project-local binary refused: pi project trust is ${trust}`,
+			reason: `project-local binary refused: DM project trust is ${trust}`,
 		})
 	) {
 		logExtension({
 			subsystem: "project-trust",
 			level: "warn",
 			message:
-				"project-local binary refused: mark the project trusted in pi or upgrade pi",
+				"project-local binary refused: mark the project trusted in DM or upgrade DM",
 			metadata: { tool, root: resolvedRoot, trust },
 		});
 	}
@@ -709,7 +714,16 @@ function* localBinMatches(
 		ceiling = true,
 	} = options;
 	const names = expandCandidateNames(tools, windowsExt, isWindows);
-	for (const dir of walkUpDirs(startDir)) {
+	// The ceiling compares real paths (#4911): a HOME or an ancestor spelled
+	// through a link is still the home folder. A start whose spelling is its
+	// real path has no link in it, so neither has any ancestor the walk yields:
+	// each step is then compared as spelled, one realpath for the whole walk
+	// instead of one per step (measured 4x at depth 12 on Linux).
+	const home = ceiling ? realpathOrResolve(homeDir) : homeDir;
+	let startIsReal: boolean | undefined;
+	// Spelled by design (#4689 item 6): the resolver climbs the axis its trust
+	// classifier (`projectLocalBinDirs`) climbs; see there.
+	for (const dir of walkUpDirs(startDir, { spelling: true })) {
 		// Tool-resolution walker, not a config lookup (#2514/#2517 policy):
 		// escaping the project upward past HOME means STOP, not keep reading. A
 		// config-file lookup (`findLocalToolConfig`) keeps climbing past HOME
@@ -721,7 +735,13 @@ function* localBinMatches(
 		// because there is no legitimate case for this resolver to hand back a
 		// bin from outside the project tree. `ceiling: false` (own-install
 		// walk only, #2544 round 4 F1) skips this check entirely.
-		if (ceiling && isAtOrAboveHomeDir(dir, homeDir)) return;
+		// The first step is the start itself.
+		startIsReal ??= ceiling && realpathOrResolve(dir) === dir;
+		if (
+			ceiling &&
+			isAtOrAboveHomeDir(startIsReal ? dir : realpathOrResolve(dir), home)
+		)
+			return;
 		yield* matchesInDir(dir, names, binDirs);
 	}
 }

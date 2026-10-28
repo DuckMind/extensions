@@ -11,7 +11,11 @@ type ToolSetMutationReason =
 	| "fresh_session_lazy_deactivation"
 	| "session_rebuild_restore"
 	| "model_switch"
-	| "lazy_activation";
+	| "lazy_activation"
+	// A registered tool the policy disabled (config or command line, such as
+	// `--no-tool`, #4913) dropped from the active set: its own reason, so a
+	// monitor does not read it as lazy posture.
+	| "policy_disabled_tool";
 
 export interface ToolSetMutation {
 	addedCount: number;
@@ -175,6 +179,12 @@ export interface ToolSetPlan {
 	desired: string[];
 	addedCount: number;
 	removedCount: number;
+	/**
+	 * How many of `removedCount` are active tools named in `disabled` (off by
+	 * config or command line), removed for that reason whatever the lazy
+	 * posture would have done.
+	 */
+	policyDisabledCount: number;
 	/** False when `desired` already equals the host's active set. */
 	changed: boolean;
 }
@@ -189,11 +199,16 @@ export interface ToolSetPlan {
  * and this restores the parent's posture character-for-character — which both
  * preserves the model's activations and keeps the advertised tool list equal
  * to the one the prompt cache prefix was built from.
+ *
+ * `disabled` names the registered tools the policy turns off, by config or
+ * command line (`--no-tool`, whose value pi applies after the factory ran,
+ * #4913). They are in neither the kept set nor the restored one.
  */
 export function planToolSet(
 	active: readonly string[],
 	lazyNames: ReadonlySet<string>,
 	remembered: ReadonlySet<string>,
+	disabled: ReadonlySet<string> = new Set(),
 ): ToolSetPlan {
 	const desired = active.filter(
 		// Lazy tools are dropped here and re-appended below in REMEMBERED
@@ -201,13 +216,13 @@ export function planToolSet(
 		// position would restore the right SET in the wrong ARRAY order, and
 		// the active-tools array is what serializes into the request's tool
 		// block — a transposition is a changed prefix, i.e. a cache miss.
-		(name) => !lazyNames.has(name),
+		(name) => !lazyNames.has(name) && !disabled.has(name),
 	);
 	// A remembered tool the host did not list as active still belongs in the
 	// set (defensive: the host controls what `getActiveTools` returns).
 	const desiredSet = new Set(desired);
 	for (const name of remembered) {
-		if (!desiredSet.has(name)) {
+		if (!desiredSet.has(name) && !disabled.has(name)) {
 			desired.push(name);
 			desiredSet.add(name);
 		}
@@ -215,10 +230,13 @@ export function planToolSet(
 	const activeSet = new Set(active);
 	const removedCount = active.filter((name) => !desiredSet.has(name)).length;
 	const addedCount = desired.filter((name) => !activeSet.has(name)).length;
+	let policyDisabledCount = 0;
+	for (const name of active) if (disabled.has(name)) policyDisabledCount++;
 	return {
 		desired,
 		addedCount,
 		removedCount,
+		policyDisabledCount,
 		changed: addedCount > 0 || removedCount > 0,
 	};
 }

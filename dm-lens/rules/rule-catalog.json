@@ -417,10 +417,34 @@
       "canonical_concept": "sql-in-code-literal",
       "severity_default": "warning",
       "confidence": "medium",
-      "status": "active"
+      "status": "active",
+      "allow_overlap": true
     },
     {
       "rule_id": "no-sql-in-code-js",
+      "engine": "ast-grep",
+      "language": "javascript",
+      "family": "security",
+      "scope": "file",
+      "canonical_concept": "sql-in-code-literal",
+      "severity_default": "warning",
+      "confidence": "medium",
+      "status": "active",
+      "allow_overlap": true
+    },
+    {
+      "rule_id": "no-sql-in-code-execute",
+      "engine": "ast-grep",
+      "language": "typescript",
+      "family": "security",
+      "scope": "file",
+      "canonical_concept": "sql-in-code-literal",
+      "severity_default": "warning",
+      "confidence": "medium",
+      "status": "active"
+    },
+    {
+      "rule_id": "no-sql-in-code-execute-js",
       "engine": "ast-grep",
       "language": "javascript",
       "family": "security",

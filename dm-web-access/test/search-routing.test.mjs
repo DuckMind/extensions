@@ -7,6 +7,7 @@ import { test } from "node:test";
 
 const searchModuleUrl = new URL("../gemini-search.ts", import.meta.url).href;
 const indexModuleUrl = new URL("../index.ts", import.meta.url).href;
+const coreModuleUrl = new URL("../web-tool-core.ts", import.meta.url).href;
 
 async function createConfig(config) {
 	const home = await mkdtemp(join(tmpdir(), "dm-web-access-search-routing-"));
@@ -691,4 +692,75 @@ test("Curator auto default follows the same current-model Hosted Search eligibil
 
 	assert.equal(child.status, 0, child.stderr);
 	assert.deepEqual(JSON.parse(child.stdout.trim()), { official: "openai", proxy: "tavily" });
+});
+
+test("a default provider array falls back to searchRouting only when every array provider fails", async () => {
+	const home = await createConfig({
+		provider: ["brave", "perplexity"],
+		searchRouting: { providers: ["brave", "tavily"], fallbackOn: ["transient"] },
+	});
+	const child = runChild(`
+		const calls = [];
+		globalThis.fetch = async (input, init) => {
+			const url = String(input instanceof Request ? input.url : input);
+			const query = url.startsWith("https://api.search.brave.com/") ? new URL(url).searchParams.get("q") : JSON.parse(init.body).query;
+			calls.push(new URL(url).host + " " + query);
+			if (url.startsWith("https://api.search.brave.com/")) return new Response("unavailable", { status: 500 });
+			if (url === "https://api.perplexity.ai/search") {
+				if (query === "mixed") return new Response("bad key", { status: 401 });
+				if (query !== "one succeeds") return new Response("unavailable", { status: 503 });
+				return Response.json({ id: "search-id", results: [{ title: "Perplexity", url: "https://example.com/perplexity", snippet: "Perplexity result" }] });
+			}
+			if (url === "https://api.tavily.com/search") {
+				return Response.json({ answer: "Tavily route answer", results: [{ title: "Tavily", url: "https://example.com/tavily", content: "Tavily result" }] });
+			}
+			throw new Error("Unexpected fetch " + url);
+		};
+		const { createStandaloneWebToolCore } = await import(${JSON.stringify(coreModuleUrl)});
+		const core = createStandaloneWebToolCore();
+		const summarize = (result) => ({ isError: result.isError ?? false, providers: result.details.queryProviders?.[0]?.providers, text: result.content[0].text });
+		const out = {
+			fallback: summarize(await core.webSearch({ query: "both fail" })),
+			partial: summarize(await core.webSearch({ query: "one succeeds" })),
+			mixed: summarize(await core.webSearch({ query: "mixed" })),
+			explicit: summarize(await core.webSearch({ query: "explicit array", provider: ["brave", "perplexity"] })),
+			explicitList: summarize(await core.webSearch({ query: "explicit list", provider: "brave,perplexity" })),
+		};
+		console.log(JSON.stringify({ out, calls }));
+	`, {
+		DM_CODING_AGENT_DIR: home,
+		BRAVE_API_KEY: "brave-test-key",
+		PERPLEXITY_API_KEY: "perplexity-test-key",
+		TAVILY_API_KEY: "tavily-test-key",
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const { out, calls } = JSON.parse(child.stdout.trim().split("\n").at(-1));
+	// Both array providers failed with transient errors: the untried routing provider answers.
+	assert.equal(out.fallback.isError, false);
+	assert.deepEqual(out.fallback.providers, ["tavily"]);
+	// One array provider succeeded: merged array result, no routing.
+	assert.equal(out.partial.isError, false);
+	assert.deepEqual(out.partial.providers, ["perplexity"]);
+	// One failure (401) is not a fallbackOn type: the array error stands, no routing.
+	assert.equal(out.mixed.isError, true);
+	assert.match(out.mixed.text, /Selected-provider search failed/);
+	// A per-call array or comma-separated list stays strict.
+	for (const explicit of [out.explicit, out.explicitList]) {
+		assert.equal(explicit.isError, true);
+		assert.match(explicit.text, /Selected-provider search failed/);
+	}
+	assert.deepEqual(calls.sort(), [
+		"api.perplexity.ai both fail",
+		"api.perplexity.ai explicit array",
+		"api.perplexity.ai explicit list",
+		"api.perplexity.ai mixed",
+		"api.perplexity.ai one succeeds",
+		"api.search.brave.com both fail",
+		"api.search.brave.com explicit array",
+		"api.search.brave.com explicit list",
+		"api.search.brave.com mixed",
+		"api.search.brave.com one succeeds",
+		"api.tavily.com both fail",
+	]);
 });

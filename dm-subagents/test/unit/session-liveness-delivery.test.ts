@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { fauxAssistantMessage, fauxProvider } from "@duckmind/dm-ai";
 import { DefaultResourceLoader, SessionManager, SettingsManager, createAgentSession } from "@duckmind/dm-coding-agent";
-import { createDmTestRegistry, registerDmTestProvider } from "../support/dm-model-registry.ts";
+import { registerTestProvider, testModelRegistry } from "../support/host-registry.ts";
 import registerSubagentExtension from "../../src/extension/index.ts";
 import { PI_WEB_SESSION_LIVENESS_REGISTRY_KEY } from "../../src/integrations/dm-web-session-liveness.ts";
 import { currentCompletionOwnerId } from "../../src/shared/completion-owner.ts";
@@ -181,7 +181,7 @@ describe("session liveness through result delivery", () => {
 		}
 	});
 
-	it("stays live while DM queues a completion wake during a turn and at agent_end", { timeout: 30_000 }, async () => {
+	it("stays live while DM queues a completion wake during a turn and past agent_settled", { timeout: 30_000 }, async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-session-liveness-sdk-"));
 		const agentDir = path.join(root, "agent");
 		fs.mkdirSync(agentDir);
@@ -210,7 +210,7 @@ describe("session liveness through result delivery", () => {
 			cwd: root, agentDir, settingsManager,
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 			extensionFactories: [
-				(api) => { registerDmTestProvider(api, faux); },
+				(api) => { registerTestProvider(api, faux); },
 				registerSubagentExtension,
 				(api) => {
 					api.on("agent_start", () => {
@@ -218,7 +218,7 @@ describe("session liveness through result delivery", () => {
 						complete(api, "during-turn");
 						activeAt.duringTurn = provider?.isActive();
 					});
-					api.on("agent_end", () => {
+					api.on("agent_settled", () => {
 						if ("atSettle" in activeAt) {
 							activeAt.finalSettle = provider?.isActive();
 							return;
@@ -232,8 +232,8 @@ describe("session liveness through result delivery", () => {
 		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 		try {
 			await resourceLoader.reload();
-			const { modelRegistry, authStorage } = createDmTestRegistry(agentDir, faux);
-			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRegistry, authStorage, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
+			const modelRegistry = testModelRegistry(agentDir);
+			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRegistry, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
 			await session.bindExtensions({});
 			await session.prompt("Start the original turn.");
 			assert.deepEqual(activeAt, { duringTurn: true, atSettle: true, finalSettle: false });
@@ -284,8 +284,8 @@ describe("session liveness through result delivery", () => {
 			cwd: root, agentDir, settingsManager,
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 			extensionFactories: [registerSubagentExtension, (api) => {
-				registerDmTestProvider(api, faux);
-				api.on("agent_end", async () => {
+				registerTestProvider(api, faux);
+				api.on("agent_settled", async () => {
 					if (reloaded) return;
 					reloaded = true;
 					api.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
@@ -307,8 +307,8 @@ describe("session liveness through result delivery", () => {
 		});
 		try {
 			await resourceLoader.reload();
-			const { modelRegistry, authStorage } = createDmTestRegistry(agentDir, faux);
-			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRegistry, authStorage, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
+			const modelRegistry = testModelRegistry(agentDir);
+			({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRegistry, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
 			// With no bindings, SDK reload skips session_start. Bind an error listener
 			// to exercise the real reload lifecycle.
 			await session.bindExtensions({ onError: (error) => { errors.push(error); } });
@@ -318,9 +318,9 @@ describe("session liveness through result delivery", () => {
 			assert.deepEqual(observed, {
 				activeBeforeReload: true,
 				registrations: 2, // reload actually bound the replacement producer
-				isIdle: false, // agent_end fires before DM completes the active run
+				isIdle: true,
 				pendingMessageCount: 0, // DM's deferred settled action is not counted as a pending message
-				noticeAppended: false, // queued until agent_end finishes
+				noticeAppended: false, // the notice begins the deferred run after agent_settled
 				activeAfterReload: true, // the retained wake prompt owns liveness until its deferred run starts
 			});
 			assert.equal(provider?.isActive(), false, "the woken run releases the retained wake");

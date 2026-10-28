@@ -14,6 +14,7 @@ import { createSubsystemLogger } from "./extension-log.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import * as fs from "node:fs";
 import { mkdtempSync } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getExcludedDirGlobs,
@@ -21,7 +22,12 @@ import {
 	getProjectIgnoreMatcher,
 } from "./file-utils.js";
 import { findNodeToolBinary } from "./package-manager.js";
-import { isAtOrAboveHomeDir, isFullyQualified, toPosix } from "./path-utils.js";
+import {
+	isAtOrAboveHomeDir,
+	isFullyQualified,
+	realpathOrResolve,
+	toPosix,
+} from "./path-utils.js";
 import { getJscpdMaxEntriesDerived } from "./project-scale.js";
 import {
 	createAvailabilityChecker,
@@ -327,8 +333,14 @@ export class JscpdClient {
 		const targetDir = path.resolve(cwd);
 
 		// #747/#250: never walk from a cwd at/above $HOME — from there jscpd's
-		// tokenizer would run across every unrelated repo under home.
-		if (isAtOrAboveHomeDir(targetDir, options.homeDir)) {
+		// tokenizer would run across every unrelated repo under home. By real path
+		// on both sides (#4911), so a link on either side cannot slip past.
+		if (
+			isAtOrAboveHomeDir(
+				realpathOrResolve(targetDir),
+				realpathOrResolve(options.homeDir ?? os.homedir()),
+			)
+		) {
 			this.log(`Refusing scan of unsafe root at/above home: ${targetDir}`);
 			return { ...EMPTY_RESULT };
 		}

@@ -274,6 +274,12 @@ interface WidgetSweepBlockerEntry {
 export interface BlockerFreshnessOptions {
 	/** Wall-clock baseline override; defaults to `Date.now()`. Test seam only. */
 	now?: number;
+	/**
+	 * #4921: the turn session whose inline records this sweep covers (omitted:
+	 * the coordinator's). Another session's are swept at its own turn end,
+	 * against its own cwd.
+	 */
+	sessionId?: string | undefined;
 	/** Forward-import resolution override; defaults to tree-sitter extraction. */
 	resolveForwardImports?: ForwardImportResolver;
 	/**
@@ -1172,7 +1178,9 @@ export async function sweepInlineBlockerFreshness(
 		recordedHash?: string;
 	}>;
 	try {
-		inlineEntries = runtime.getInlineBlockersSnapshot();
+		inlineEntries = runtime.getInlineBlockersSnapshot({
+			sessionId: options?.sessionId,
+		});
 	} catch {
 		return counts;
 	}

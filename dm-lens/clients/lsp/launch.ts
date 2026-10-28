@@ -521,7 +521,7 @@ function recordUntrustedLspExecution(
 		logExtension({
 			subsystem: "lsp-registry",
 			level: "warn",
-			message: `${label} refused: mark the project trusted in pi or upgrade pi`,
+			message: `${label} refused: mark the project trusted in DM or upgrade DM`,
 			metadata: { field: request.kind },
 		});
 	}

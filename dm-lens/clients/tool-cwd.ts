@@ -9,6 +9,7 @@ import {
 	isWindowsPath,
 	nameMatchesMarkerGlob,
 	normalizeEphemeralMapKey,
+	realpathOrResolve,
 } from "./path-utils.js";
 import {
 	getDegradationLedgerGeneration,
@@ -136,6 +137,12 @@ function syncGeneration(): void {
 	}
 }
 
+/**
+ * `startDir` is a path identity: `resolveToolCwd` resolves the file once and
+ * hands its directory here, so the climb names the parents the kernel opens
+ * and `homeDir` is on the same axis (the caller resolves it too). A caller
+ * that passes a spelling climbs the link's parents instead (#4689 item 6).
+ */
 function walkMarkerRoot(
 	startDir: string,
 	markers: readonly string[],
@@ -244,11 +251,6 @@ export function resolveToolCwd(
 	file: string,
 	ctx: ToolCwdContext,
 ): ToolCwdResolution {
-	const dispatchRoot = path.resolve(ctx.cwd ?? process.cwd());
-	const absoluteFile = path.resolve(file);
-	const fileDir = path.dirname(absoluteFile);
-	const homeDir = ctx.homeDir ?? os.homedir();
-	const insideDispatch = isUnderDir(absoluteFile, dispatchRoot);
 	if (ctx.serverRoot) {
 		const rootPath = isWindowsPath(ctx.serverRoot) ? path.win32 : path;
 		const serverRoot = rootPath.resolve(ctx.serverRoot);
@@ -256,12 +258,23 @@ export function resolveToolCwd(
 			emitResolution(kind, tool, serverRoot, "server-root");
 		return { cwd: serverRoot };
 	}
+	const dispatchRoot = path.resolve(ctx.cwd ?? process.cwd());
+	// #4689 item 6: the child's project is the one the file LIVES in. A link
+	// spelling (`pkg-a/src/blink.ts` -> `pkg-b/b.ts`) climbs `pkg-a`'s parents
+	// and ran the other package's tool config; the identity's parents are the
+	// ones the kernel opens. One resolution per call, and the home ceiling the
+	// walks compare against is resolved with it so both sit on one axis.
+	const absoluteFile = realpathOrResolve(file);
+	const fileDir = path.dirname(absoluteFile);
+	const homeDir = ctx.homeDir ?? os.homedir();
+	const homeCeiling = realpathOrResolve(homeDir);
+	const insideDispatch = isUnderDir(absoluteFile, dispatchRoot);
 	const markers = markersFor(kind, tool, absoluteFile, ctx);
 	const markerResult = markers.length
 		? findMarkerRoot(
 				fileDir,
 				markers,
-				ctx.allowHomeMarker ? path.parse(homeDir).root : homeDir,
+				ctx.allowHomeMarker ? path.parse(homeCeiling).root : homeCeiling,
 			)
 		: { root: null };
 	const markerRoot = markerResult.root;
@@ -281,7 +294,7 @@ export function resolveToolCwd(
 	}
 	const memo = ctx.toolCwdMemo;
 	if (memo && memo.gitRoot === undefined) {
-		const gitResult = findMarkerRoot(fileDir, [".git"], homeDir);
+		const gitResult = findMarkerRoot(fileDir, [".git"], homeCeiling);
 		memo.gitRoot =
 			gitResult.root && isRealGitMarker(path.join(gitResult.root, ".git"))
 				? gitResult.root
@@ -291,7 +304,7 @@ export function resolveToolCwd(
 		memo && memo.gitRoot !== undefined
 			? memo.gitRoot
 			: (() => {
-					const gitResult = findMarkerRoot(fileDir, [".git"], homeDir);
+					const gitResult = findMarkerRoot(fileDir, [".git"], homeCeiling);
 					return gitResult.root &&
 						isRealGitMarker(path.join(gitResult.root, ".git"))
 						? gitResult.root

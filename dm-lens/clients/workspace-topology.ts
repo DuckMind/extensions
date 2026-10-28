@@ -46,11 +46,7 @@ import {
 import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
 import { MTIME_DRIFT_TOLERANCE_MS, freshnessFromMtime } from "./freshness.js";
 import { logLatency } from "./latency-logger.js";
-import {
-	isAtOrAboveHomeDir,
-	nameMatchesMarkerGlob,
-	walkUpDirs,
-} from "./path-utils.js";
+import { nameMatchesMarkerGlob, walkUpDirs } from "./path-utils.js";
 
 /** Depth cap on any upward marker walk — mirrors `findNearestMarkerRoot`'s bound. */
 const MAX_WALK_DEPTH = 64;
@@ -433,8 +429,8 @@ function walkToNearestMatch(
 	const dirMtimes: Array<{ dir: string; mtimeMs: number }> = [];
 	let found: string | undefined;
 	let depth = 0;
-	for (const dir of walkUpDirs(startDir)) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) break;
+	// #4689 item 6: the home ceiling sits on the walk's identity axis.
+	for (const dir of walkUpDirs(startDir, { homeDir })) {
 		if (depth >= MAX_WALK_DEPTH) {
 			logLatency({
 				type: "phase",

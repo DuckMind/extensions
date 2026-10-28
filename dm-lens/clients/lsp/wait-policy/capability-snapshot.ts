@@ -2,6 +2,7 @@ import type {
 	LSPOperationSupport,
 	LSPWorkspaceDiagnosticsSupport,
 } from "../client.js";
+import type { LspLaunchVariant } from "../server-traits.js";
 
 /**
  * Capability inventory consumed by incumbent wait policy for attached
@@ -32,5 +33,5 @@ export interface LSPCapabilitySnapshot {
 	 *  both under server id "typescript"). Undefined = single-variant server or
 	 *  an older client that predates this marker; consumers (the #458 cascade
 	 *  tier classifier) must treat that as classic/default behavior. */
-	launchVariant?: "classic" | "native-ts7";
+	launchVariant?: LspLaunchVariant;
 }

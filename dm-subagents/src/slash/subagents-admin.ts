@@ -15,8 +15,9 @@ import { mergeRuntimeAgents, type RuntimeAgentOwner } from "../agents/runtime-ag
 import { editableAgentConfig, preservedAgentFrontmatterFields } from "../agents/agent-management.ts";
 import { findModelInfo, getSupportedThinkingLevels, toModelInfo } from "../shared/model-info.ts";
 import { SelectorComponent, type SelectorItem, type SelectorResult } from "./selector.ts";
+import { canRenderComponents } from "../shared/extension-context.ts";
 
-const ADMIN_MESSAGE_TYPE = "subagents-admin";
+export const ADMIN_MESSAGE_TYPE = "subagents-admin";
 const INHERIT_MODEL_CHOICE = "Default / inherit session model";
 const INHERIT_THINKING_CHOICE = "Default / inherit session thinking";
 
@@ -223,8 +224,8 @@ function metadataFor(agent: AgentConfig): string {
 }
 
 async function selectFromList(ctx: ExtensionContext, title: string, subtitle: string | undefined, items: SelectorItem[]): Promise<string | undefined> {
-	// RPC mode defines ui.custom as a no-op that resolves undefined, so only TUI can show the component.
-	if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
+	// Hosts that expose only the RPC no-op stub cannot show the component; they use `ui.select` below.
+	if (canRenderComponents(ctx)) {
 		const result = await ctx.ui.custom<SelectorResult>(
 			(tui, theme, kb, done) => new SelectorComponent(tui, theme, kb, { title, subtitle, items, done }),
 			{ overlay: false },

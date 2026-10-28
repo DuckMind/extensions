@@ -30,6 +30,7 @@ export function onDmBeforeSettle(
   };
   const unsubscribe = host.on("agent_before_settle", (event) => active ? handler(event) : undefined);
   dm.on("agent_end", (event, ctx: ExtensionContext) => {
+    if ((dm as ExtensionAPI).supportsAgentBeforeSettle) return;
     if (!active || !ctx || ctx.signal?.aborted || (typeof ctx.hasPendingMessages === "function" && ctx.hasPendingMessages())) return;
     const final = [...event.messages].reverse().find(message => message.role === "assistant");
     if (!final || final.stopReason !== "stop") return;

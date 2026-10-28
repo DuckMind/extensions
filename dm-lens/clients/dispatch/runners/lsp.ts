@@ -37,7 +37,11 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult, spanOverlapsModifiedRanges } from "../types.js";
+import {
+	faultResult,
+	findingsResult,
+	spanOverlapsModifiedRanges,
+} from "../types.js";
 import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
 import { demoteLanguageServerRows } from "../../lsp/inferred-project.js";
 import type { TsserverProjectIdentity } from "../../lsp/tsserver-sync.js";
@@ -352,24 +356,17 @@ const lspRunner: RunnerDefinition = {
 		}
 
 		if (serverFailed) {
-			return {
-				status: "failed",
-				failureKind: "server_error",
-				failureMessage: failureReason.slice(0, 200),
-				diagnostics: [
-					{
-						id: `lsp:server-error:0`,
-						message: `LSP server failed: ${failureReason}`,
-						filePath: diagnosticPath,
-						line: 1,
-						column: 1,
-						severity: "error",
-						semantic: "warning", // Don't block - fallback to other runners
-						tool: "lsp",
-					},
-				],
-				semantic: "warning",
-			};
+			return faultResult(
+				{ kind: "server_error", failureMessage: failureReason },
+				{
+					id: `lsp:server-error:0`,
+					message: `LSP server failed: ${failureReason}`,
+					filePath: diagnosticPath,
+					line: 1,
+					column: 1,
+					tool: "lsp",
+				},
+			);
 		}
 
 		if (!lspClientReady) {

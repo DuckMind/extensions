@@ -15,6 +15,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	createDeadline,
@@ -25,7 +26,11 @@ import { incrementDegradationCount } from "./degradation-ledger.js";
 import { KIND_EXTENSIONS, type FileKind } from "./file-kinds.js";
 import { isTestFileName } from "./file-role.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
-import { isAtOrAboveHomeDir, normalizeEphemeralMapKey } from "./path-utils.js";
+import {
+	isAtOrAboveHomeDir,
+	normalizeEphemeralMapKey,
+	realpathOrResolve,
+} from "./path-utils.js";
 import { createSingleFlight, type SingleFlight } from "./single-flight.js";
 import {
 	createDebounceScheduler,
@@ -2645,8 +2650,14 @@ export function triggerBackgroundWordIndexBuild(
 	// and via MCP where cwd can be a raw tool argument) — the session-start and
 	// quick-mode-warmup builds sit behind `canWarmCaches`, which already refuses
 	// a home-rooted cwd. Apply the same `isAtOrAboveHomeDir` ceiling here so a
-	// cold query from $HOME never starts a whole-home walk-and-read.
-	if (isAtOrAboveHomeDir(key, options.homeDir)) {
+	// cold query from $HOME never starts a whole-home walk-and-read. By real
+	// path on both sides (#4911), so a link on either side is refused too.
+	if (
+		isAtOrAboveHomeDir(
+			realpathOrResolve(key),
+			realpathOrResolve(options.homeDir ?? os.homedir()),
+		)
+	) {
 		const reason = `root at/above home directory (${key})`;
 		dbg?.(`word-index cold-build: skipped — ${reason}`);
 		logWordIndex({

@@ -46,3 +46,11 @@ export function createPartialOutputTracker(): PartialOutputTracker {
 export function formatPartialOutput(text: string, cause: PartialOutputCause): string {
 	return `Partial output before ${cause}:\n${text}`;
 }
+
+/**
+ * Summary of a timed-out background run. The timeout message comes first; when a child kept text streamed before
+ * the kill, the per-child summary follows, so the completion notice and status show it (capped, with its file path).
+ */
+export function timedOutRunSummary(message: string, summary: string, results: ReadonlyArray<{ outputPartial?: boolean }>): string {
+	return results.some((result) => result.outputPartial === true) ? `${message}\n\n${summary}` : message;
+}

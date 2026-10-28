@@ -1333,10 +1333,15 @@ function getSpawnEnvironment(
 	overrides: NodeJS.ProcessEnv | undefined,
 	stripNpmConfig: boolean | undefined,
 ): NodeJS.ProcessEnv {
+	// #4930: `git status` writes a refreshed index back under `index.lock`, and a
+	// read killed mid-write orphans the lock. The seam, not each caller, opts out
+	// of that optional write. Ambient does not win (the guarantee is that dm-lens
+	// never takes the lock); a caller override does.
+	const ambient = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
 	const merged =
 		process.platform === "win32"
-			? mergeWindowsEnvironment(process.env, overrides)
-			: { ...process.env, ...overrides };
+			? mergeWindowsEnvironment(ambient, overrides)
+			: { ...ambient, ...overrides };
 	if (!stripNpmConfig) return merged;
 	// A copy loop rather than `Object.fromEntries(…filter(…))`: `filter` is a
 	// retired glossary identifier and a new use would move the census. This runs
@@ -1426,14 +1431,14 @@ export function trustScopedSearchPath(
 			recordDegradationOnce({
 				kind: "trust-refusal",
 				subject: `project-path-entry:${real}`,
-				reason: `search-path entry inside the project ignored: pi project trust is ${trust}`,
+				reason: `search-path entry inside the project ignored: DM project trust is ${trust}`,
 			})
 		) {
 			logExtension({
 				subsystem: "project-trust",
 				level: "warn",
 				message:
-					"search-path entry inside the project ignored: mark the project trusted in pi or upgrade pi",
+					"search-path entry inside the project ignored: mark the project trusted in DM or upgrade DM",
 				metadata: { entry, dir: real, trust },
 			});
 		}
@@ -1537,7 +1542,7 @@ function admitSpawn(
 function trustRefusalResult(command: string, executable: string): SpawnResult {
 	const message =
 		`Refusing to run "${command}": ${executable} is inside the project, ` +
-		`which pi has not trusted (${getProjectTrustState()})`;
+		`which DM has not trusted (${getProjectTrustState()})`;
 	const cause = Object.assign(new Error(message), { code: "EACCES" });
 	return {
 		stdout: "",

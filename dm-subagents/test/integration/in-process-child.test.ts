@@ -7,6 +7,7 @@
 
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
@@ -16,7 +17,7 @@ import { buildRunnerChildLaunch } from "../../src/runs/background/runner-child-l
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
-import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
+import type { ForegroundChildSessionControls, PlacementMachineReference, SingleResult } from "../../src/shared/types.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -102,9 +103,26 @@ describe("in-process foreground child", () => {
 	});
 
 	it("projects authoritative native-machine Git evidence into the public foreground result", async () => {
-		mockPi.onCall({ output: "done" }); const base = childSessionFactory(); const wrapped: ChildSessionFactory = { async create(input) { const child = await base.create(input); Object.defineProperty(child, "machineEvidence", { value: { machineId: "remote-machine", initial: { head: "aaa", dirty: false }, final: { head: "bbb", dirty: true } } }); return child; }, dispose: () => base.dispose() };
+		mockPi.onCall({ output: "done" }); const base = childSessionFactory(); const wrapped: ChildSessionFactory = { async create(input) { const child = await base.create(input); Object.defineProperty(child, "machineEvidence", { value: { provider: "herdr", machineId: "remote-machine", initial: { head: "aaa", dirty: false }, final: { head: "bbb", dirty: true } } }); return child; }, dispose: () => base.dispose() };
 		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "native-git-evidence", waitToolEnabled: false, childSessionFactory: wrapped });
 		assert.deepEqual(result.nativeMachine, { provider: "herdr", machineId: "remote-machine", initialGit: { head: "aaa", dirty: false }, finalGit: { head: "bbb", dirty: true } });
+	});
+
+	it("counts this disk's Git changes only for a machine 'local' child", async () => {
+		const repo = path.join(tempDir, "repo"), file = path.join(repo, "input.md"); fs.mkdirSync(repo);
+		const git = (...args: string[]) => assert.equal(spawnSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { cwd: repo }).status, 0);
+		fs.writeFileSync(file, "input\n"); git("init", "-q"); git("add", "."); git("commit", "-qm", "init");
+		// The remote paths match the local repo, as when both Macs keep code at the same home path; only 'local' may count its changes.
+		const machines: Record<string, PlacementMachineReference> = { local: { provider: "rex", id: "local", session: "session:s", cwd: repo }, rexSsh: { provider: "rex", id: "workmac", target: "100.82.67.118", cwd: repo }, herdr: { provider: "herdr", id: "h1", target: "100.82.67.118", cwd: repo } };
+		const changed: Record<string, string[] | undefined> = {};
+		for (const [name, machine] of Object.entries(machines)) {
+			fs.writeFileSync(file, "input\n");
+			mockPi.onCall({ writeFiles: [{ path: file, content: "changed\n" }], hangUntilAbort: true });
+			const base = childSessionFactory(); const wrapped: ChildSessionFactory = { async create(input) { const child = await base.create({ ...input, machine: undefined }); Object.defineProperty(child, "machineEvidence", { value: { provider: machine.provider, machineId: machine.id, initial: { head: "aaa", dirty: false }, final: { head: "aaa", dirty: false } } }); return child; }, dispose: () => base.dispose() };
+			const result = await runSync(repo, makeAgentConfigs(["echo"]), "echo", "Task", { runId: `git-evidence-${name}`, timeoutMs: 500, machine, waitToolEnabled: false, childSessionFactory: wrapped });
+			changed[name] = result.timeoutRecovery?.changedFiles;
+		}
+		assert.deepEqual(changed, { local: ["input.md"], rexSsh: [], herdr: [] });
 	});
 
 	it("adds the fanout hook and nested route only for fanout-authorized children", async () => {
@@ -257,8 +275,8 @@ describe("in-process foreground child", () => {
 			structuredOutputAcceptanceReport: acceptanceReport,
 			jsonl: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true }, acceptanceReport } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "message_end", message: { role: "assistant", content: [], model: "mock/test-model", stopReason: "error", errorMessage: "later provider failure", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 			],
 		});
@@ -280,8 +298,8 @@ describe("in-process foreground child", () => {
 			structuredOutputCapture: { ok: true },
 			jsonl: [
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 			],
 			hangUntilAbort: true,
 		});
@@ -301,8 +319,8 @@ describe("in-process foreground child", () => {
 		const structured = createStructuredOutputRuntime({ type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, tempDir);
 		mockPi.onCall({ jsonl: [
 			{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: "invalid" } } },
-			{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 			{ type: "tool_execution_end", toolName: "structured_output", isError: true },
+			{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 		] });
 
 		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "structured-invalid", acceptance: false, structuredOutput: structured });
@@ -412,14 +430,9 @@ describe("default child session factory", () => {
 			constructor(options: ConstructorParameters<PiCodingAgentModule["DefaultResourceLoader"]>[0]) { this.options = options; }
 			async reload() {
 				const factories = this.options.extensionFactories ?? [];
-				const names: string[] = [];
-				for (const factory of factories) {
-					await factory({ registerTool: (tool: { name: string }) => {
-						names.push(tool.name);
-						registrations.push(tool.name);
-					} } as never);
-				}
-				loaded.push({ names, ambient: !this.options.noExtensions, paths: this.options.additionalExtensionPaths ?? [] });
+				const codemode = factories.find((entry) => typeof entry === "function" ? entry !== hooks[0]!.factory : entry.name === "codemode");
+				loaded.push({ names: factories.map((entry) => typeof entry === "function" ? entry === hooks[0]!.factory ? "existing-child-hook" : "codemode" : entry.name), ambient: !this.options.noExtensions, paths: this.options.additionalExtensionPaths ?? [] });
+				if (codemode) await (typeof codemode === "function" ? codemode : codemode.factory)({ registerTool: (tool: { name: string }) => registrations.push(tool.name) } as never);
 			}
 		} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => dm });
@@ -431,9 +444,9 @@ describe("default child session factory", () => {
 		await factory.create({ ...stubLaunch, excludeTools: ["codemode"] });
 		assert.deepEqual(registrations, ["codemode"]);
 		assert.deepEqual(loaded, [
-			{ names: ["codemode"], ambient: true, paths: ["/provided.ts"] },
-			{ names: [], ambient: true, paths: ["/provided.ts"] },
-			{ names: [], ambient: true, paths: ["/provided.ts"] },
+			{ names: ["existing-child-hook", "codemode"], ambient: true, paths: ["/provided.ts"] },
+			{ names: ["existing-child-hook"], ambient: true, paths: ["/provided.ts"] },
+			{ names: ["existing-child-hook"], ambient: true, paths: ["/provided.ts"] },
 			{ names: [], ambient: false, paths: [] },
 		]);
 		// The supported older SDK has no codemode export. Do not require it for ordinary children.
@@ -572,7 +585,7 @@ describe("default child session factory", () => {
 				loader!.extendResources({ skillPaths: [{ path: skillDir, metadata: { source: "ext", scope: "temporary", origin: "top-level" } }] });
 				const names = loader!.getSkills().skills.map((skill) => skill.name);
 				if (noSkills) assert.deepEqual(names, []);
-				else assert.equal(names.filter((name) => name === "ext-skill").length, 1);
+				else assert.ok(names.includes("ext-skill"), "the contributed skill remains visible");
 			}
 		} finally {
 			removeTempDir(skillDir);
@@ -702,32 +715,56 @@ describe("default child session factory", () => {
 	});
 });
 
-/** DM 0.99's built-in MCP seam: MCP registers `mcp__srv__*` as `codemode` after the session starts, `builtin:` entries load only when their path is requested, and `tools` declares allowlisted direct tools. */
-function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add", "srv/add"]]) {
+/** MCP connects after session_start. Its tool_call hook waits for the connection, not a separate registration timer. */
+function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add", "srv/add"]], connect?: Promise<void>) {
+	type Tool = { name: string; label?: string; exposure: string; reachesTools?: () => string[] };
+	type Handler = (event: { toolName?: string }, ctx: { signal?: AbortSignal }) => unknown;
 	const registry = new Map<string, string>();
+	const definitions = new Map<string, Tool>();
+	const handlers = new Map<string, Handler[]>();
 	const loaded: Array<{ name: string; replaceable?: boolean }> = [];
 	const lifecycle: string[] = [];
 	let allowlist: string[] = [];
-	// DM's getAllTools() exposes tool metadata, not the MCP registration exposure.
-	const dm = stubPi({ extensionRunner: { hasHandlers: () => true, emit: async () => { lifecycle.push("session_shutdown"); } }, dispose: () => { lifecycle.push("dispose"); }, getAllTools: () => [...registry].map(([name]) => ({ name })).filter(({ name }) => allowlist.includes(name)), getActiveToolNames: () => [...registry].filter(([name, exposure]) => exposure === "direct" && allowlist.includes(name)).map(([name]) => name) });
-	Object.assign(dm, { createMcpExtension: () => (api: { registerTool(tool: { name: string; label: string; exposure: string }): void }) => {
-		setTimeout(() => { for (const [name, label] of tools) api.registerTool({ name: name!, label: label!, exposure: "codemode" }); }, 20);
-	} });
+	const getAllTools = () => [...definitions.values()].filter(({ name }) => allowlist.includes(name));
+	const dm = stubPi({ bindExtensions: async () => { for (const handler of handlers.get("session_start") ?? []) await handler({}, {}); }, extensionRunner: { hasHandlers: () => true, emit: async () => { lifecycle.push("session_shutdown"); } }, dispose: () => { lifecycle.push("dispose"); }, getAllTools, getActiveToolNames: () => getAllTools().filter(({ exposure }) => exposure === "direct").map(({ name }) => name) });
+	Object.assign(dm, {
+		createCodemodeExtension: () => (api: { registerTool(tool: Tool): void }) => api.registerTool({ name: "codemode", exposure: "codemode", reachesTools: () => ["mcp__srv"] }),
+		createMcpExtension: () => (api: { registerTool(tool: Tool): void; on(type: string, handler: Handler): void; getAllTools(): Tool[] }) => {
+			let ready: Promise<void>;
+			api.on("session_start", () => {
+				ready = (async () => {
+					await (connect ?? new Promise((resolve) => setTimeout(resolve, 20)));
+					for (const [name, label, exposure = "codemode"] of tools) api.registerTool({ name: name!, label: label!, exposure });
+				})();
+			});
+			api.on("tool_call", async (event, ctx) => {
+				assert.ok(api.getAllTools().find(({ name }) => name === event.toolName)?.reachesTools, "MCP must see the host-owned readiness metadata despite the child allowlist");
+				if (ctx.signal?.aborted) return;
+				let onAbort: () => void;
+				try {
+					await Promise.race([ready, new Promise<void>((resolve) => { onAbort = resolve; ctx.signal?.addEventListener("abort", onAbort, { once: true }); })]);
+				} finally { ctx.signal?.removeEventListener("abort", onAbort!); }
+			});
+		},
+	});
 	dm.DefaultResourceLoader = class {
-		private readonly options: { additionalExtensionPaths: string[]; extensionFactories: Array<(api: unknown) => unknown> };
+		private readonly options: { additionalExtensionPaths: string[]; extensionFactories: Entry[] };
 		constructor(options: typeof this.options) { this.options = options; }
 		async reload() {
-			if (this.options.additionalExtensionPaths.includes("builtin:mcp")) {
-				loaded.push({ name: "mcp", replaceable: true });
-				for (const factory of this.options.extensionFactories) {
-					await factory({ registerTool: (tool: { name: string; exposure: string }) => { registry.set(tool.name, tool.exposure); } });
-				}
+			for (const [index, factory] of this.options.extensionFactories.entries()) {
+				const builtin = this.options.additionalExtensionPaths.includes("builtin:mcp") && index === this.options.extensionFactories.length - 1;
+				if (builtin) loaded.push({ name: "mcp", replaceable: true });
+				await factory({
+					registerTool: (tool: Tool) => { definitions.set(tool.name, tool); if (tool.name.startsWith("mcp__")) registry.set(tool.name, tool.exposure); },
+					getAllTools,
+					on: (type: string, handler: Handler) => { const list = handlers.get(type) ?? []; list.push(handler); handlers.set(type, list); },
+				});
 			}
 		}
 	} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
 	const createSession = dm.createAgentSession;
 	dm.createAgentSession = ((options: { tools?: string[] }) => { allowlist = options.tools ?? []; return createSession(options); }) as PiCodingAgentModule["createAgentSession"];
-	return { dm, registry, loaded, lifecycle };
+	return { dm, registry, definitions, loaded, lifecycle };
 }
 
 describe("selected built-in MCP tools in a child session", () => {
@@ -738,45 +775,48 @@ describe("selected built-in MCP tools in a child session", () => {
 		await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm }).create(mcpLaunch);
 		assert.deepEqual(mcp.loaded, [{ name: "mcp", replaceable: true }]);
 		assert.deepEqual([...mcp.registry], [["mcp__srv__echo", "direct"], ["mcp__srv__add", "hidden"]]);
+		assert.equal(mcp.definitions.get("codemode")?.exposure, "hidden", "the readiness metadata must not grant codemode");
 	});
 
 	it("grants a server's tools for its configured name and for its `-`→`_` form", async () => {
 		const name = "mcp__codebase_memory__list_projects";
 		for (const selector of ["codebase-memory", "codebase_memory", "codebase_memory/list_projects"]) {
 			const mcp = builtinMcpPi([[name, "codebase-memory/list_projects"]]);
-			await createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 200, loadPiCodingAgent: async () => mcp.dm }).create({ ...stubLaunch, tools: [name], builtinMcpTools: [{ name, selector }] });
+			await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm }).create({ ...stubLaunch, tools: [name], builtinMcpTools: [{ name, selector }] });
 			assert.deepEqual([...mcp.registry], [[name, "direct"]], selector);
 		}
 	});
 
 	it("fails the launch and shuts the session down when a selected tool never registers", async () => {
 		const mcp = builtinMcpPi();
-		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 30, loadPiCodingAgent: async () => mcp.dm });
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm });
 		await assert.rejects(factory.create({ ...mcpLaunch, tools: [...mcpLaunch.tools!, "mcp__gone__x"], builtinMcpTools: [...mcpLaunch.builtinMcpTools!, { name: "mcp__gone__x", selector: "gone" }] }), /did not register in the child session: mcp__gone__x\. The MCP server may have failed to connect/);
 		assert.deepEqual(mcp.lifecycle, ["session_shutdown", "dispose"]);
 	});
 
 	it("does not expose a tool whose name DM gave to a different raw tool than the selector names", async () => {
 		const mcp = builtinMcpPi([["mcp__srv__a_b", "srv/a_b"]]);
-		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 50, loadPiCodingAgent: async () => mcp.dm });
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm });
 		await assert.rejects(factory.create({ ...stubLaunch, tools: ["mcp__srv__a_b"], builtinMcpTools: [{ name: "mcp__srv__a_b", selector: "srv/a.b" }] }), /did not register in the child session: mcp__srv__a_b\./);
 		assert.deepEqual([...mcp.registry], [["mcp__srv__a_b", "hidden"]]);
 	});
 
 	it("does not hold other child launches while it waits for MCP tools", async () => {
-		const mcp = builtinMcpPi();
+		let connected!: () => void;
+		const mcp = builtinMcpPi(undefined, new Promise<void>((resolve) => { connected = resolve; }));
 		let waitEnded = false;
-		const waiting = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 500, loadPiCodingAgent: async () => mcp.dm })
+		const waiting = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm })
 			.create({ ...mcpLaunch, builtinMcpTools: [{ name: "mcp__gone__x", selector: "gone" }] }).finally(() => { waitEnded = true; });
 		while (mcp.loaded.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
 		await createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() }).create(stubLaunch);
 		assert.equal(waitEnded, false);
+		connected();
 		await assert.rejects(waiting, /mcp__gone__x/);
 	});
 
 	it("shuts down a child still waiting for MCP tools when the factory is disposed", async () => {
-		const mcp = builtinMcpPi();
-		const factory = createDefaultChildSessionFactory({ builtinMcpToolWaitMs: 5_000, loadPiCodingAgent: async () => mcp.dm });
+		const mcp = builtinMcpPi(undefined, new Promise<void>(() => {}));
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm });
 		const creating = factory.create({ ...mcpLaunch, builtinMcpTools: [{ name: "mcp__gone__x", selector: "gone" }] });
 		while (mcp.loaded.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
 		await new Promise((resolve) => setTimeout(resolve, 20));
@@ -793,5 +833,15 @@ describe("selected built-in MCP tools in a child session", () => {
 
 	it("rejects selected tools when the host DM has no built-in MCP", async () => {
 		await assert.rejects(createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() }).create(mcpLaunch), /mcp__srv__echo\) need a DM version with built-in MCP/);
+	});
+
+	it("names the DM 0.99.2 floor when built-in MCP has no connection readiness hook", async () => {
+		const mcp = builtinMcpPi();
+		type Api = { on(type: string, handler: unknown): void };
+		const create = (mcp.dm as unknown as { createMcpExtension: () => (api: Api) => unknown }).createMcpExtension;
+		// DM 0.99.0 and 0.99.1 register no tool_call handler.
+		Object.assign(mcp.dm, { createMcpExtension: () => (api: Api) => create()({ ...api, on: (type: string, handler: unknown) => { if (type !== "tool_call") api.on(type, handler); } }) });
+		await assert.rejects(createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.dm }).create(mcpLaunch), /mcp__srv__echo\) need DM 0\.99\.2 or later/);
+		assert.deepEqual(mcp.lifecycle, ["session_shutdown", "dispose"]);
 	});
 });

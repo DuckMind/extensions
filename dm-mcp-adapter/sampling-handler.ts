@@ -1,4 +1,4 @@
-import { completeSimple, type Api, type AssistantMessage, type Message, type Model, type TextContent } from "@duckmind/dm-ai/compat";
+import { completeSimple, type Api, type AssistantMessage, type Message, type Model, type ModelThinkingLevel, type TextContent } from "@duckmind/dm-ai/compat";
 import { truncateAtWord } from "./utils.ts";
 import { throwIfAborted } from "./abort.ts";
 import type { ExtensionUIContext, ModelRegistry } from "@duckmind/dm-coding-agent";
@@ -20,6 +20,7 @@ export interface SamplingHandlerOptions {
   ui?: SamplingUIContext;
   modelRegistry: SamplingModelRegistry;
   getCurrentModel: () => Model<Api> | undefined;
+  getThinkingLevel: () => ModelThinkingLevel;
   getSignal: () => AbortSignal | undefined;
 }
 
@@ -68,22 +69,24 @@ export async function handleSamplingRequest(
   const auth = await options.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) throw new Error(auth.error);
   throwIfAborted(signal);
-  const result = await completeSimple(
-    model,
-    {
-      ...(params.systemPrompt !== undefined ? { systemPrompt: params.systemPrompt } : {}),
-      messages,
-    },
-    {
-      maxTokens: params.maxTokens,
-      ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
-      ...(params.metadata !== undefined ? { metadata: params.metadata as Record<string, unknown> } : {}),
-      ...(signal ? { signal } : {}),
-      ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
-      ...(auth.headers ? { headers: auth.headers } : {}),
-      ...(auth.env ? { env: auth.env } : {}),
-    },
-  );
+  const context = {
+    ...(params.systemPrompt !== undefined ? { systemPrompt: params.systemPrompt } : {}),
+    messages,
+  };
+  const requestOptions = {
+    maxTokens: params.maxTokens,
+    ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
+    ...(params.metadata !== undefined ? { metadata: params.metadata as Record<string, unknown> } : {}),
+    ...(signal ? { signal } : {}),
+    ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+    ...(auth.headers ? { headers: auth.headers } : {}),
+    ...(auth.env ? { env: auth.env } : {}),
+  };
+  const thinkingLevel = options.getThinkingLevel();
+  const result = await completeSimple(model, context, {
+    ...requestOptions,
+    ...(thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
+  });
 
   const converted = convertAssistantResult(result);
   throwIfAborted(signal);

@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { createAsyncJobTracker } from "../../src/runs/background/async-job-tracker.ts";
+import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
+import { writeAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
 import { SUBAGENT_ASYNC_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
 import registerSubagentNotify from "../../src/runs/background/notify.ts";
 import { makeAgent } from "../support/helpers.ts";
@@ -16,9 +21,14 @@ function fileBarrier(file: string): Promise<void> {
 	return new Promise((resolve, reject) => {
 		// libuv on Windows compares long event paths against this watch path; expand TEMP's 8.3 aliases.
 		const watcher = fs.watch(fs.realpathSync.native(path.dirname(file)), check);
-		const deadline = setTimeout(() => { watcher.close(); reject(new Error(`Missing barrier: ${file}`)); }, 15_000);
+		// macOS can miss a directory event for a newly created file through a
+		// symlink alias; the file itself remains the authoritative barrier.
+		const poll = setInterval(check, 25);
+		poll.unref();
+		const deadline = setTimeout(() => { clearInterval(poll); watcher.close(); reject(new Error(`Missing barrier: ${file}`)); }, 15_000);
 		function check() {
 			if (!fs.existsSync(file)) return;
+			clearInterval(poll);
 			clearTimeout(deadline);
 			watcher.close();
 			resolve();
@@ -128,6 +138,7 @@ describe("native runner result publication", { skip: !available ? "dm packages u
 			const publishedPath = fs.existsSync(publicPath) ? publicPath : path.join(RESULTS_DIR, "result-pending", sessionId, `${id}.json`);
 			const published = JSON.parse(fs.readFileSync(publishedPath, "utf8"));
 			assert.equal(published.completionOwnerId, owner);
+			assert.equal(published.completionOwnerProcess.pid, process.pid, "records the launching DM beside its owner id");
 			assert.equal(published.success, false);
 			assert.equal(mockPi.callCount(), 1, "dynamic failure occurs before reviewer children start");
 			trackerTick(); // Final failed-to-failed refresh through the actual tracker.
@@ -234,6 +245,57 @@ describe("native runner result publication", { skip: !available ? "dm packages u
 			assert.equal(state.poller, null);
 			assert.equal(state.asyncJobs.size, 0);
 			assert.equal(state.cleanupTimers.size, 0);
+		});
+	}
+	for (const inherited of [false, true]) {
+		it(`keeps a restored run whose launching DM exited until its late result is published${inherited ? ", after another session takes over" : ""}`, (t) => {
+			const id = inherited ? "restored-dead-owner-inherited" : "restored-dead-owner";
+			const sessionId = `session-${id}`;
+			const asyncDir = path.join(ASYNC_DIR, id);
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const state = publicationState(sessionId, "owner-reopened");
+			const exitedPid = spawnSync(process.execPath, ["-e", ""]).pid;
+			const status = {
+				runId: id, sessionId, completionOwnerId: "owner-exited", completionOwnerProcess: { pid: exitedPid },
+				mode: "single", startedAt: Date.now(), steps: [{ agent: "worker", status: "running" }],
+			};
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ ...status, state: "running" }));
+			updateActiveRunIndex(asyncDir, "running");
+			let tick!: () => void;
+			let refreshes = 0;
+			const tracker = createAsyncJobTracker({ events: { emit() {} } }, state, ASYNC_DIR, {
+				platform: "darwin", widgetEnabled: false, resultsDir: RESULTS_DIR, pollIntervalMs: 0,
+				deliveryOwnerId: createResultDeliveryOwnership(state).deliveryOwnerId,
+				onJobTerminal: () => { refreshes++; },
+			});
+			const interval = t.mock.method(globalThis, "setInterval", ((handler: () => void) => {
+				tick = handler;
+				return { unref() {} } as ReturnType<typeof setInterval>;
+			}) as typeof setInterval);
+			try {
+				tracker.restoreActiveJobs();
+				interval.mock.restore();
+				assert.equal(state.asyncJobs.get(id)?.status, "running");
+				if (inherited) {
+					recordSessionReplacement(`${sessionId}-next`, sessionId);
+					state.currentSessionId = `${sessionId}-next`;
+				}
+				fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+					...status, state: "failed", steps: [{ agent: "worker", status: "failed" }],
+					processTerminal: { version: 1, state: "pending", runId: id, runnerProcessInstanceId: "instance" },
+				}));
+				tick();
+				assert.equal(state.asyncJobs.get(id)?.status, "failed");
+				assert.equal(state.cleanupTimers.has(id), false, "kept while its result is not published yet");
+				assert.equal(refreshes, 1);
+				writeAsyncResultFile(path.join(RESULTS_DIR, `${id}.json`), { id, sessionId, completionOwnerId: "owner-exited", success: false, state: "failed", summary: "late" });
+				tick();
+				assert.equal(refreshes, 2, "publication triggers a delivery scan");
+				assert.equal(state.cleanupTimers.has(id), true);
+			} finally {
+				tracker.resetJobs();
+				fs.rmSync(path.join(RESULTS_DIR, `${id}.json`), { force: true });
+			}
 		});
 	}
 	it("watches the canonical barrier directory through a path alias", async (t) => {

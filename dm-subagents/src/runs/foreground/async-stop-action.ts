@@ -8,8 +8,9 @@ import { deliverStopRequest, stopInboxClosedPath } from "../background/control-c
 import { readProcessTerminal } from "../background/process-terminal.ts";
 import { resultFilePath, resultPayloadFileForSessionRun, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
-import { readStatus } from "../../shared/utils.ts";
+import { SUBAGENT_STOPPED_MESSAGE, readStatus } from "../../shared/utils.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
+import { ownsRun } from "../shared/run-ownership.ts";
 
 function getAsyncStopTarget(
 	state: SubagentState,
@@ -26,8 +27,6 @@ function getAsyncStopTarget(
 	const direct = state.asyncJobs.get(runId);
 	return direct ? { asyncId: direct.asyncId, asyncDir: direct.asyncDir } : undefined;
 }
-
-const STOP_MESSAGE = "Subagent stopped.";
 
 function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string): string | undefined {
 	const runnerProcessInstanceId = status.processTerminal?.runnerProcessInstanceId;
@@ -49,6 +48,8 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string
 			sessionId: status.sessionId,
 			asyncDir,
 			...(status.completionOwnerId ? { completionOwnerId: status.completionOwnerId } : {}),
+			...(status.completionOwnerProcess ? { completionOwnerProcess: status.completionOwnerProcess } : {}),
+			...(status.parentWorkflowRunId ? { parentWorkflowRunId: status.parentWorkflowRunId } : {}),
 			...(status.toolCallId ? { toolCallId: status.toolCallId } : {}),
 			results: (status.steps ?? []).map((step) => ({
 				agent: step.agent,
@@ -78,7 +79,7 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string
 		return {
 			...rest,
 			status: "stopped" as const,
-			error: STOP_MESSAGE,
+			error: SUBAGENT_STOPPED_MESSAGE,
 			exitCode: 1,
 			stopped: true,
 			endedAt: now,
@@ -91,15 +92,15 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string
 			const stepState = status.steps?.[index]?.status;
 			if ((stepState !== "pending" && stepState !== "running" && stepState !== "paused") || !entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
 			const { interrupted: _interrupted, ...result } = entry as Record<string, unknown>;
-			return { ...result, output: STOP_MESSAGE, error: STOP_MESSAGE, success: false, exitCode: 1, stopped: true };
+			return { ...result, output: SUBAGENT_STOPPED_MESSAGE, error: SUBAGENT_STOPPED_MESSAGE, success: false, exitCode: 1, stopped: true };
 		})
 		: existingResult.results;
 	const stoppedResult = {
 		...existingResult,
 		success: false,
 		state: "stopped",
-		summary: STOP_MESSAGE,
-		error: STOP_MESSAGE,
+		summary: SUBAGENT_STOPPED_MESSAGE,
+		error: SUBAGENT_STOPPED_MESSAGE,
 		stopped: true,
 		exitCode: 1,
 		timestamp: now,
@@ -109,7 +110,7 @@ function sealPausedRun(asyncDir: string, status: AsyncStatus, resultsDir: string
 		...status,
 		state: "stopped",
 		stopped: true,
-		error: STOP_MESSAGE,
+		error: SUBAGENT_STOPPED_MESSAGE,
 		endedAt: now,
 		lastUpdate: now,
 		steps,
@@ -135,7 +136,7 @@ export function stopAsyncRun(
 	state: SubagentState,
 	runId: string | undefined,
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean,
-	location?: { asyncDir: string | null; resolvedId?: string },
+	location?: { asyncDir: string | null; resolvedId?: string; reattachedRunId?: string },
 	childId?: string,
 ): AgentToolResult<Details> | null {
 	const target = getAsyncStopTarget(state, runId, location);
@@ -153,7 +154,8 @@ export function stopAsyncRun(
 	}
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
-	if (state.currentSessionId && status?.sessionId !== state.currentSessionId) {
+	// A relaunched workflow stops the exact child run it re-attached from its relaunch chain, whichever session launched it.
+	if (state.currentSessionId && !ownsRun(state.currentSessionId, status?.sessionId) && location?.reattachedRunId !== target.asyncId) {
 		return {
 			content: [{ type: "text", text: `Async run '${target.asyncId}' was not found in the active session.` }],
 			isError: true,

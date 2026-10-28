@@ -116,9 +116,17 @@ export function cleanupMaterializedBinaryResources(scope?: object): void {
   drainPendingCleanupDirectories();
 }
 
+const rewrittenBinaryResources = new WeakSet<object>();
+
+/** True for a resource whose blob the adapter replaced with its own note, so its text is not the server's. */
+export function isRewrittenBinaryResource(resource: object): boolean {
+  return rewrittenBinaryResources.has(resource);
+}
+
 function replaceBlob(resource: BinaryResource, text: string): string {
   delete (resource as Partial<BinaryResource>).blob;
   resource.text = text;
+  rewrittenBinaryResources.add(resource);
   return text;
 }
 
@@ -231,11 +239,17 @@ export function transformMcpContent(content: McpContent[], scope?: object): Cont
 
 /**
  * Resolve a tool result's content blocks, appending structuredContent when it
- * coexists with ordinary content and falling back to it when content is empty.
+ * coexists with ordinary content (unless the server opts out) and falling back
+ * to it when content is empty.
  */
-export function resolveMcpResultContent(result: Record<string, unknown>, scope?: object): ContentBlock[] {
+export function resolveMcpResultContent(
+  result: Record<string, unknown>,
+  scope?: object,
+  appendStructuredContent = true,
+): ContentBlock[] {
   const blocks = transformMcpContent((Array.isArray(result.content) ? result.content : []) as McpContent[], scope);
   if (result.structuredContent !== undefined && result.structuredContent !== null) {
+    if (blocks.length > 0 && !appendStructuredContent) return blocks;
     const structured = stringifyStructuredContent(result.structuredContent);
     if (blocks.length > 0) {
       return [...blocks, { type: "text" as const, text: `structuredContent:\n${structured}` }];

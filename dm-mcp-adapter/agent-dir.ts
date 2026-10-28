@@ -12,7 +12,7 @@ export function getAgentDir(): string {
   const name = piConfig?.name;
   const appName = typeof name === "string" && name.trim() ? name.trim() : "dm";
   const configured = process.env[`${appName.toUpperCase()}_CODING_AGENT_DIR`]?.trim()
-    ?? (appName === "dm" ? process.env.PI_CODING_AGENT_DIR?.trim() : undefined);
+    || (appName === "dm" ? process.env.PI_CODING_AGENT_DIR?.trim() : undefined);
   if (!configured) {
     return join(homedir(), getConfigDirName(), "agent");
   }
@@ -38,7 +38,7 @@ export function getAgentPath(...segments: string[]): string {
  * upstream product package is required.
  */
 function readDmConfig(): { name?: unknown; configDir?: unknown; clientUri?: unknown } | undefined {
-  const dir = process.env.DM_PACKAGE_DIR?.trim() ?? process.env.PI_PACKAGE_DIR?.trim()
+  const dir = process.env.DM_PACKAGE_DIR?.trim() || process.env.PI_PACKAGE_DIR?.trim()
   if (!dir) return undefined
   try {
     const manifest = JSON.parse(readFileSync(join(resolve(dir), "package.json"), "utf8")) as {

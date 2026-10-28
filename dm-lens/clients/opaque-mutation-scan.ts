@@ -35,6 +35,7 @@
  *   recognizes them.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import type { ToolCallEvent } from "@duckmind/dm-coding-agent";
@@ -52,7 +53,11 @@ import {
 	incrementDegradationCount,
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
-import { normalizeMapKey } from "./path-utils.js";
+import {
+	isAtOrAboveHomeDir,
+	normalizeMapKey,
+	realpathOrResolve,
+} from "./path-utils.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { createSingleFlight } from "./single-flight.js";
@@ -96,6 +101,11 @@ type OpaqueUnknownReason =
 	| "walk-failed"
 	| "file-cap-exceeded"
 	| "entry-budget-exceeded"
+	/**
+	 * #4905: the root is the home folder or above it (`isAtOrAboveHomeDir`), so
+	 * its stat-diff walk is refused outright: it always passes the file cap.
+	 */
+	| "home-root"
 	| "no-git"
 	| "git-failed"
 	| "git-status-parse-failed"
@@ -201,6 +211,12 @@ export interface CaptureOptions {
 	 * simply carry no hash (comparison degrades to mtime+size for them).
 	 */
 	withHashes?: boolean;
+	/**
+	 * Internal test seam (#4905): the walk's entry budget, so the
+	 * `entry-budget-exceeded` verdict is reachable without planting 200,000
+	 * directory entries. Absent in production, which takes the walker's default.
+	 */
+	maxScanEntries?: number;
 }
 
 /** What a bounded capture returns: the snapshot, and whether it was cut. */
@@ -296,22 +312,43 @@ export async function captureFileStats(
 	if (options.forcedUnknownReason !== undefined) {
 		return { unknownReason: options.forcedUnknownReason, scannedCount: 0 };
 	}
+	// #4905: the home folder (or a folder above it) holds more than the file cap
+	// of files on any real machine, so the walk below would spend its time and
+	// end at `file-cap-exceeded`. Same rule as `analysis-root`, `jscpd-client`
+	// and `lsp/index` (#4760): refuse, and let the caller read it as UNKNOWN.
+	// By real path on both sides, as `analysis-root` does (#4689): a root or a
+	// HOME spelled through a link names the same folder.
+	if (
+		isAtOrAboveHomeDir(realpathOrResolve(root), realpathOrResolve(os.homedir()))
+	)
+		return { unknownReason: "home-root", scannedCount: 0 };
+	const rootKey = normalizeMapKey(root);
+	// #4905: `budgetMs` below paces the walk's event-loop yields (the walker
+	// resets that deadline after every directory read); it does not bound the
+	// walk's wall time. A root already found over the file cap would pay the
+	// whole walk again on every call, so the verdict is kept until the session
+	// ends.
+	if (overCapRootMemo.has(rootKey))
+		return { unknownReason: "file-cap-exceeded", scannedCount: 0 };
 	const budgetMs = options.budgetMs ?? 50;
 	try {
 		const walk = await collectSourceFilesWithBudgetAsync(root, {
 			maxFiles: OPAQUE_SCAN_MAX_FILES + 1,
 			budgetMs,
+			...(options.maxScanEntries === undefined
+				? {}
+				: { maxScanEntries: options.maxScanEntries }),
 		});
 		const files = walk.files;
 		if (walk.entryBudgetExceeded || files.length > OPAQUE_SCAN_MAX_FILES) {
 			// A PARTIAL universe must never read as a confident diff (invariant
 			// 3): writes in the unvisited tail would silently vanish.
-			return {
-				unknownReason: walk.entryBudgetExceeded
-					? "entry-budget-exceeded"
-					: "file-cap-exceeded",
-				scannedCount: files.length,
-			};
+			const unknownReason = walk.entryBudgetExceeded
+				? "entry-budget-exceeded"
+				: "file-cap-exceeded";
+			if (unknownReason === "file-cap-exceeded")
+				overCapRootMemo.set(rootKey, true);
+			return { unknownReason, scannedCount: files.length };
 		}
 		const { snapshot } = await captureFileStatsForPaths(files, options);
 		return { snapshot, scannedCount: snapshot.size };
@@ -675,6 +712,14 @@ export function getOpaqueBaselineStore(): OpaqueBaselineStore {
 const gitRepoMemo = new Map<string, boolean>();
 
 /**
+ * #4905: roots whose stat walk answered `file-cap-exceeded`, so the next call
+ * in the session answers the same without walking. Bounded (a session names
+ * few roots), and cleared with the rest of this module at the session
+ * boundary, so a tree that shrank is walked again by the next session.
+ */
+const overCapRootMemo = new BoundedFifoMap<string, true>(16);
+
+/**
  * Session-boundary clear (#1635): unconsumed pending baselines are keyed by
  * cwd:generation, so entries from a finished session are unreachable; and a
  * directory that was not a worktree last session may be one now. Without this
@@ -683,6 +728,7 @@ const gitRepoMemo = new Map<string, boolean>();
 export function resetOpaqueMutationState(): void {
 	getOpaqueBaselineStore().takeAllForTest();
 	gitRepoMemo.clear();
+	overCapRootMemo.clear();
 	gitToplevelMemo.clear();
 	headRecords.clear();
 	headLooks.clear();

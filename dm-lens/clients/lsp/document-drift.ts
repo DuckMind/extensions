@@ -137,6 +137,17 @@ export type DriftDisposition =
 	/** Drifted, but this pass's resync budget was already spent. */
 	| "deferred";
 
+export interface DriftSweepOptions {
+	/** Skip the interval and the empty-queue rate limit. */
+	force?: boolean;
+	/**
+	 * #4532 gap 13: check every tracked document and re-push every change, for a
+	 * caller that is about to answer from the server's view. The turn-settle
+	 * backstop leaves it off and keeps its per-pass caps.
+	 */
+	full?: boolean;
+}
+
 export interface DriftSweepResult {
 	/** Documents stat'd in this pass. */
 	readonly checked: number;
@@ -179,7 +190,7 @@ const SKIPPED: DriftSweepResult = {
 };
 
 /** Documents stat'd per pass. Bounds the per-pass cost on a large workspace. */
-const DRIFT_CHECK_BATCH = 64;
+export const DRIFT_CHECK_BATCH = 64;
 /** Resyncs issued per pass. Paces the heal so a bulk edit cannot burst. */
 export const DRIFT_RESYNC_BATCH = 4;
 /**
@@ -458,7 +469,7 @@ export class DocumentDriftTracker {
 	 */
 	async sweep(
 		deps: DriftSweepDeps,
-		options: { force?: boolean } = {},
+		options: DriftSweepOptions = {},
 	): Promise<DriftSweepResult> {
 		const now = deps.now ?? Date.now;
 		// The rate limit and the empty check only decide whether to START a pass.
@@ -478,12 +489,20 @@ export class DocumentDriftTracker {
 				return SKIPPED;
 			}
 		}
-		return this.flight.run(SWEEP_KEY, () => this.runSweep(deps, now));
+		const full = options.full === true;
+		// #4532 gap 13: a full pass must not join a capped pass already in flight,
+		// which started before the caller's change and checks 64 documents. Let
+		// that pass settle, then run this one. A rejection of that pass reaches
+		// this caller as it would have when joining it.
+		if (full && this.flight.has(SWEEP_KEY))
+			await this.flight.run(SWEEP_KEY, () => this.runSweep(deps, now));
+		return this.flight.run(SWEEP_KEY, () => this.runSweep(deps, now, full));
 	}
 
 	private async runSweep(
 		deps: DriftSweepDeps,
 		now: () => number,
+		full = false,
 	): Promise<DriftSweepResult> {
 		this.lastSweepAt = now();
 		const stat = deps.stat ?? defaultStat;
@@ -496,8 +515,13 @@ export class DocumentDriftTracker {
 		const keys = [...this.synced.keys()];
 		const tracked = keys.length;
 		if (this.cursor >= tracked) this.cursor = 0;
+		// A full pass checks every tracked document and re-pushes every change it
+		// finds, so the per-pass caps do not apply (its window is every tracked
+		// key, so the cursor lands where it started).
+		const checkBatch = full ? tracked : DRIFT_CHECK_BATCH;
+		const resyncBatch = full ? Number.POSITIVE_INFINITY : DRIFT_RESYNC_BATCH;
 		const window: string[] = [];
-		for (let i = 0; i < Math.min(DRIFT_CHECK_BATCH, tracked); i++) {
+		for (let i = 0; i < Math.min(checkBatch, tracked); i++) {
 			window.push(keys[(this.cursor + i) % tracked] as string);
 		}
 		this.cursor = tracked === 0 ? 0 : (this.cursor + window.length) % tracked;
@@ -600,7 +624,7 @@ export class DocumentDriftTracker {
 		const resyncedKeys = new Set<string>();
 		for (const key of queued) {
 			if (!this.pendingResync.has(key)) continue;
-			if (resynced >= DRIFT_RESYNC_BATCH) {
+			if (resynced >= resyncBatch) {
 				deferred += 1;
 				queuedDispositions.set(key, "deferred");
 				deps.onDrift?.({
@@ -664,7 +688,7 @@ export class DocumentDriftTracker {
 			// folding Git recovery onto this scheduler double-counts the same write.
 			if (resyncedKeys.has(key)) continue;
 			const driftAgeMs = Math.max(0, now() - record.syncedAt);
-			if (resynced >= DRIFT_RESYNC_BATCH) {
+			if (resynced >= resyncBatch) {
 				// Paced, not dropped: the cursor already advanced past this file, but
 				// a later pass wraps around to it. Recorded so a backlog is visible.
 				deferred += 1;

@@ -20,11 +20,13 @@ import {
 } from "./completion-batcher.ts";
 import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type ChildWatchdogProgress, type ChildWatchdogWarningSummary, type ParallelHandoffReference, type ScheduleOrigin, type SubagentState } from "../../shared/types.ts";
 import { safeTerminalText } from "../../shared/display-text.ts";
-import type { ParentWake } from "../../shared/parent-wake.ts";
+import { COMPLETION_ACTION, type ParentWake } from "../../shared/parent-wake.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { isUnexplainedProcessSignal } from "../shared/process-signal.ts";
 import { capSummaryOutputs } from "../shared/single-output.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
+import { describeWorkflowResume } from "../../workflows/workflow-resume-claim.ts";
+import { isReusableWorkflowStopCause } from "../../workflows/workflow-stop-cause.ts";
 
 export interface SubagentNotifyChildOutput {
 	workflowKey?: string;
@@ -58,6 +60,8 @@ export interface SubagentNotifyDetails {
 	/** The finished run's id; for a workflow it equals workflowRunId. */
 	runId?: string;
 	workflowRunId?: string;
+	/** What happens next to a workflow that DM's exit or a runtime replacement stopped; decided once at delivery. */
+	resumeNotice?: string;
 	childRuns?: Array<{ runId: string; workflowKey?: string; agent?: string; status?: string }>;
 	childOutputs?: SubagentNotifyChildOutput[];
 	reconciledFromDetachedChild?: string;
@@ -163,8 +167,8 @@ export interface CompletionNotifier {
 	/** Releases a completion wake once DM starts it (native message_start). */
 	messageStarted(message: AgentMessage): void;
 	/** Adopts wakes a reloaded notifier left queued for the same session manager and session UUID. */
-	bindSession(sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId">): void;
-	/** Drops queued wakes unless the session is only reloading extensions. */
+	bindSession(sessionManager: Pick<ExtensionContext["sessionManager"], "getSessionId"> & Partial<Pick<ExtensionContext["sessionManager"], "getBranch">>): void;
+	/** Unless the session is only reloading extensions, records the notices of wakes DM never started in the session (resent on its next start) and drops the wakes. */
 	sessionShutdown(reason: string | undefined): void;
 	/** Send every batched completion now instead of waiting for its batch timer. */
 	flush(): void;
@@ -343,11 +347,14 @@ function formatCorrelationLines(details: SubagentNotifyDetails): string[] {
 	return [
 		details.asyncDir ? `Retention-managed async directory: ${boundedSafeText(details.asyncDir)}` : undefined,
 		details.workflowRunId ? `Workflow run: ${details.workflowRunId}` : undefined,
+		details.resumeNotice,
 		details.childRuns?.length ? `Child runs: ${details.childRuns.map(formatChildRun).join(", ")}` : undefined,
 		details.reconciledFromDetachedChild ? `Reconciled detached child: ${details.reconciledFromDetachedChild}` : undefined,
 	].filter((line): line is string => line !== undefined);
 }
 
+// The forms of describeWorkflowResume, so a re-render keeps the line out of the result preview.
+const RESUME_NOTICE_PREFIXES = ["Auto-resumed as ", "Resumed as ", "Relaunched as ", "Not auto-resumed: ", "Resume by hand: ", "Relaunch it by hand with "];
 const WATCHDOG_BLOCKERS_HEADING = "Watchdog blockers:";
 
 function formatWatchdogBlockerLines(details: SubagentNotifyDetails): string[] {
@@ -458,6 +465,9 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 	const workflowRunIndex = body.findIndex((line) => line.startsWith("Workflow run: "));
 	const childRunsIndex = body.findIndex((line) => line.startsWith("Child runs: "));
 	const reconciledIndex = body.findIndex((line) => line.startsWith("Reconciled detached child: "));
+	// Only the slot right after `Workflow run:` carries the resume line; the same text elsewhere is output.
+	const resumeNoticeLine = workflowRunIndex >= 0 ? body[workflowRunIndex + 1] : undefined;
+	const resumeNotice = resumeNoticeLine && RESUME_NOTICE_PREFIXES.some((prefix) => resumeNoticeLine.startsWith(prefix)) ? resumeNoticeLine : undefined;
 	const watchdogIndex = body.findIndex((line) => line === WATCHDOG_BLOCKERS_HEADING);
 	const watchdogBlockers = watchdogIndex >= 0 ? parseWatchdogBlockerLines(body.slice(watchdogIndex + 1)) : [];
 	const metadataIndexes = [sessionIndex, handoffIndex, workflowRunIndex, childRunsIndex, reconciledIndex, watchdogIndex].filter((index) => index >= 0);
@@ -495,6 +505,7 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 		resultPreview,
 		...(handoffPath ? { handoffPath } : {}),
 		...(workflowRunId ? { workflowRunId } : {}),
+		...(resumeNotice ? { resumeNotice } : {}),
 		...(childRuns?.length ? { childRuns } : {}),
 		...(reconciledFromDetachedChild ? { reconciledFromDetachedChild } : {}),
 		...(watchdogBlockers.length ? { watchdogBlockers } : {}),
@@ -525,7 +536,8 @@ const notificationDebug = debuglog("dm-subagents-notify");
 type TraceIdentity = Pick<CompletionNotification, "id" | "runId" | "source">;
 type NotificationReason = "disposed" | "missing_session" | "foreground_session_mismatch" | "not_owned"
 	| "intercom_delivered" | "deduped_ttl" | "deduped_pending" | "batch_deferred"
-	| "emit_foreground_session_mismatch" | "emit_not_owned" | "send_joined" | "send_accepted" | "send_failed" | "dispose_pending";
+	| "emit_foreground_session_mismatch" | "emit_not_owned" | "send_joined" | "send_accepted" | "send_failed" | "dispose_pending"
+	| "shutdown_persisted" | "shutdown_persist_failed" | "replayed";
 
 // Slice before sanitizing: diagnostic work and each identity are bounded even for
 // malformed result metadata. Never include task/output, paths, or error bodies.
@@ -622,7 +634,8 @@ const processCompletionSendRegistry = processGlobal[completionSendRegistrySymbol
 
 // Reload replaces extension instances, not DM's session manager or queued wakes.
 // A manager can change sessions; retain wakes only while its UUID is unchanged.
-type QueuedWakes = { sessionId: string; wakes: string[]; unansweredCompletions: Map<string, { reminded: boolean }> };
+type QueuedWakes = { sessionId: string; wakes: string[]; unansweredCompletions: Map<string, { reminded: boolean }>; notices?: Map<string, SubagentNotifyMessage> };
+type SubagentNotifyMessage = { customType: "subagent-notify"; content: string; display: boolean; details: { runs: NotifyRunDetails[] } };
 const queuedWakesSymbol = Symbol.for("dm-subagents.queued-completion-wakes.v2");
 const wakeGlobal = globalThis as typeof globalThis & { [queuedWakesSymbol]?: WeakMap<object, QueuedWakes> };
 const queuedWakes = wakeGlobal[queuedWakesSymbol] ?? (wakeGlobal[queuedWakesSymbol] = new WeakMap<object, QueuedWakes>());
@@ -638,9 +651,27 @@ function notifyRunDetails({ resultPreview: _preview, childOutputs, ...run }: Sub
 	};
 }
 
-const COMPLETION_ACTION = "Read the saved results above and resume the already-authorized parent task, or report completion. If approval is required, explicitly ask the user. Do not silently yield, rerun completed work, or infer new authorization.";
+/** Session entry holding a notice whose wake DM never started before the session ended. */
+export const PENDING_NOTICE_ENTRY = "subagent-notify-pending";
+type PendingNoticeEntry = { message: SubagentNotifyMessage };
+type NotifyEntry = { type: string; customType?: string; content?: unknown; data?: unknown };
+
+/** Pending notices recorded at shutdown that no later subagent-notify message in the session carries. */
+export function unreplayedPendingNotices(entries: readonly NotifyEntry[]): SubagentNotifyMessage[] {
+	const pending = new Map<string, SubagentNotifyMessage>();
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === PENDING_NOTICE_ENTRY) {
+			const message = (entry.data as Partial<PendingNoticeEntry> | undefined)?.message;
+			if (message?.customType === "subagent-notify" && typeof message.content === "string") pending.set(message.content, message);
+		} else if (entry.type === "custom_message" && entry.customType === "subagent-notify" && typeof entry.content === "string") {
+			pending.delete(entry.content);
+		}
+	}
+	return [...pending.values()];
+}
+
 const HELD_COMPLETION_ACTION = "The user stopped the parent turn. Report these results at the user's next prompt and do not resume the stopped task unless asked.";
-function sendCompletion(dm: Pick<ParentWake, "sendMessage" | "isHeld">, items: PendingCompletion[], unstartedWakes: string[], unansweredCompletions: Map<string, { reminded: boolean }>, updateSettleSubscription: () => void): boolean {
+function sendCompletion(dm: Pick<ParentWake, "sendMessage" | "isHeld">, items: PendingCompletion[], unstartedWakes: string[], unansweredCompletions: Map<string, { reminded: boolean }>, updateSettleSubscription: () => void, queuedNotices: Map<string, SubagentNotifyMessage>): boolean {
 	if (items.length === 0) return true;
 	const details = items.map((item) => item.details);
 	const triggerTurn = items.some((item) => item.triggerTurn);
@@ -650,30 +681,31 @@ function sendCompletion(dm: Pick<ParentWake, "sendMessage" | "isHeld">, items: P
 	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
 	// A held notice starts no wake, so the silent-wake reminder must not later tell the model to resume the stopped task.
 	const tracked = triggerTurn && !held;
+	const message: SubagentNotifyMessage = {
+		customType: "subagent-notify",
+		content,
+		display,
+		// DM does not send details to the model. Hosts match runs by id; the text previews stay in content only.
+		details: { runs: details.map(notifyRunDetails) },
+	};
 	// DM can queue an accepted wake behind the current turn or past agent_settled.
 	// Recorded before sending in case DM starts the message synchronously.
 	if (tracked) {
 		unstartedWakes.push(content);
+		queuedNotices.set(content, message);
 		unansweredCompletions.set(content, { reminded: false });
 		updateSettleSubscription();
 	}
 	try {
-		const appended = dm.sendMessage(
-			{
-				customType: "subagent-notify",
-				content,
-				display,
-				// DM does not send details to the model. Hosts match runs by id; the text previews stay in content only.
-				details: { runs: details.map(notifyRunDetails) },
-			},
-			{ triggerTurn },
-		);
-		// An idle parent's appended notice gets no message_start; its wake prompt holds liveness instead.
+		const appended = dm.sendMessage(message, { triggerTurn });
+		// A notice only appended (held, or joining another extension's starting wake) gets no message_start.
 		if (appended && tracked) unstartedWakes.splice(unstartedWakes.lastIndexOf(content), 1);
+		if (tracked && !unstartedWakes.includes(content)) queuedNotices.delete(content);
 		return true;
 	} catch {
 		if (tracked) {
 			unstartedWakes.splice(unstartedWakes.lastIndexOf(content), 1);
+			if (!unstartedWakes.includes(content)) queuedNotices.delete(content);
 			unansweredCompletions.delete(content);
 			updateSettleSubscription();
 		}
@@ -794,6 +826,9 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		: undefined;
 	const reconciledFromDetachedChild = typeof result.reconciledFromDetachedChild === "string" ? result.reconciledFromDetachedChild : undefined;
 	const asyncDir = nonemptyPath(result.asyncDir);
+	// Read here, once per delivery; a re-render parses the line back instead of reading the run again.
+	const stopCause = (result.workflow as { stopCause?: unknown } | null | undefined)?.stopCause;
+	const resumeNotice = workflowRunId && asyncDir && isReusableWorkflowStopCause(stopCause) ? describeWorkflowResume(asyncDir, workflowRunId) : undefined;
 	const watchdogBlockers: SubagentNotifyWatchdogBlocker[] = [];
 	const watchdogConcerns: string[] = [];
 	const collectWatchdogFindings = (owner: string, progress: ChildWatchdogProgress | undefined) => {
@@ -830,6 +865,7 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		...(handoffPath ? { handoffPath } : {}),
 		...(rawRunId ? { runId: rawRunId } : {}),
 		...(workflowRunId ? { workflowRunId } : {}),
+		...(resumeNotice ? { resumeNotice } : {}),
 		...(childRuns.length ? { childRuns } : {}),
 		...(childOutputs?.length ? { childOutputs } : {}),
 		...(reconciledFromDetachedChild ? { reconciledFromDetachedChild } : {}),
@@ -839,7 +875,7 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 }
 
 export default function registerSubagentNotify(
-	dm: Pick<ExtensionAPI, "events"> & Partial<Pick<ExtensionAPI, "on">> & Pick<ParentWake, "sendMessage" | "isHeld">,
+	dm: Pick<ExtensionAPI, "events"> & Partial<Pick<ExtensionAPI, "on" | "appendEntry">> & Pick<ParentWake, "sendMessage" | "isHeld">,
 	state: Pick<SubagentState, "currentSessionId" | "completionOwnerId">,
 	options: RegisterSubagentNotifyOptions = {},
 ): CompletionNotifier {
@@ -851,8 +887,11 @@ export default function registerSubagentNotify(
 	const batchConfig = resolveCompletionBatchConfig(options.batchConfig);
 	const batchers = new Map<string, CompletionBatcher<PendingCompletion>>();
 	let unstartedWakes: string[] = [];
+	// The notice behind each unstarted wake, so shutdown can still put it in the session.
+	let queuedNotices = new Map<string, SubagentNotifyMessage>();
 	let unansweredCompletions = new Map<string, { reminded: boolean }>();
 	let bound = false;
+	let boundSessionId: string | undefined;
 	let disposed = false;
 	let unsubscribeSettle: (() => void) | undefined;
 	const ownsResult = options.ownership?.owns
@@ -890,7 +929,7 @@ export default function registerSubagentNotify(
 			void claim.outcome.then((outcome) => settle([item], outcome, outcome ? undefined : "send_failed"));
 		}
 		const claimedItems = claimed.map(({ item }) => item);
-		const sent = sendCompletion(dm, claimedItems, unstartedWakes, unansweredCompletions, updateSettleSubscription);
+		const sent = sendCompletion(dm, claimedItems, unstartedWakes, unansweredCompletions, updateSettleSubscription, queuedNotices);
 		for (const { claim } of claimed) claim.settle?.(sent);
 		settle(claimedItems, sent, sent ? "send_accepted" : "send_failed");
 	};
@@ -967,6 +1006,35 @@ export default function registerSubagentNotify(
 		return completion;
 	};
 
+	// Resend notices a previous process recorded at shutdown; the wake is tracked like any other.
+	const replayNotices = (sessionId: string, messages: SubagentNotifyMessage[]) => {
+		if (disposed || boundSessionId !== sessionId) return;
+		for (const message of messages) {
+			if (unstartedWakes.includes(message.content)) continue;
+			const tracked = !dm.isHeld();
+			if (tracked) {
+				unstartedWakes.push(message.content);
+				unansweredCompletions.set(message.content, { reminded: false });
+				queuedNotices.set(message.content, message);
+				updateSettleSubscription();
+			}
+			traceNotification("replayed");
+			const release = () => {
+				unstartedWakes.splice(unstartedWakes.lastIndexOf(message.content), 1);
+				if (!unstartedWakes.includes(message.content)) queuedNotices.delete(message.content);
+			};
+			try {
+				if (dm.sendMessage(message, { triggerTurn: true }) && tracked) release();
+			} catch (error) {
+				console.error("Failed to resend a subagent completion notice recorded at the last shutdown; the next start retries it:", error);
+				if (tracked) {
+					release();
+					unansweredCompletions.delete(message.content);
+					updateSettleSubscription();
+				}
+			}
+		}
+	};
 	const handleBeforeSettle = (event: AgentBeforeSettleEvent): AgentBeforeSettleEventResult | undefined => {
 		if (disposed || event.outcome !== "completed" || event.continue || event.context.pendingMessages.length)
 			return;
@@ -1037,6 +1105,7 @@ export default function registerSubagentNotify(
 			if (message.role !== "custom" || message.customType !== "subagent-notify") return;
 			const index = unstartedWakes.indexOf(message.content as string);
 			if (index !== -1) unstartedWakes.splice(index, 1);
+			if (!unstartedWakes.includes(message.content as string)) queuedNotices.delete(message.content as string);
 		},
 		bindSession(sessionManager) {
 			if (disposed) return;
@@ -1046,19 +1115,46 @@ export default function registerSubagentNotify(
 			const unanswered = retained?.sessionId === sessionId && retained.unansweredCompletions instanceof Map
 				? retained.unansweredCompletions
 				: new Map<string, { reminded: boolean }>(wakes.map(content => [content, { reminded: false }]));
+			const notices = retained?.sessionId === sessionId && retained.notices instanceof Map
+				? retained.notices
+				: new Map<string, SubagentNotifyMessage>();
 			// Before the first bind, local wakes belong to this session; after it, to the previous one.
 			if (!bound) {
 				wakes.push(...unstartedWakes);
 				for (const [content, notice] of unansweredCompletions) unanswered.set(content, notice);
+				for (const [content, notice] of queuedNotices) notices.set(content, notice);
 			}
 			bound = true;
+			boundSessionId = sessionId;
 			unstartedWakes = wakes;
 			unansweredCompletions = unanswered;
-			queuedWakes.set(sessionManager, { sessionId, wakes, unansweredCompletions });
+			queuedNotices = notices;
+			const firstBind = retained?.sessionId !== sessionId;
+			queuedWakes.set(sessionManager, { sessionId, wakes, unansweredCompletions, notices });
 			updateSettleSubscription();
+			// A new process on this session: resend notices the previous one recorded at shutdown.
+			// Deferred past session_start so the resend starts its run after DM has finished binding the session.
+			// Only the active branch: a resend recorded on an abandoned branch never reached this one.
+			if (firstBind && typeof sessionManager.getBranch === "function") {
+				const pendingNotices = unreplayedPendingNotices(sessionManager.getBranch() as NotifyEntry[]);
+				if (pendingNotices.length) (options.timers?.setTimeout ?? setTimeout)(() => replayNotices(sessionId, pendingNotices), 0);
+			}
 		},
 		sessionShutdown(reason) {
 			if (reason !== "reload") {
+				// The result file is already gone and DM drops its queued steers with the session, so a wake
+				// that never started would lose its notice. Record it in the session; the next start resends it.
+				for (const content of new Set(unstartedWakes)) {
+					const message = queuedNotices.get(content) ?? { customType: "subagent-notify", content, display: true, details: { runs: [] } };
+					try {
+						dm.appendEntry?.(PENDING_NOTICE_ENTRY, { message } satisfies PendingNoticeEntry);
+						traceNotification(dm.appendEntry ? "shutdown_persisted" : "shutdown_persist_failed");
+					} catch (error) {
+						traceNotification("shutdown_persist_failed");
+						console.error("Failed to record an undelivered subagent completion notice in the session; it is lost:", error);
+					}
+				}
+				queuedNotices.clear();
 				unstartedWakes.length = 0;
 				unansweredCompletions.clear();
 			}

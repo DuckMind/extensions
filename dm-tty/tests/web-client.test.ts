@@ -6,7 +6,7 @@ import { runInNewContext } from "node:vm";
 function browser(storage = new Map<string, string>()) {
 	let layoutReads = 0;
 	const elements = new Map<string, any>();
-	for (const id of ["#token", "#save-token", "#clear-token", "#token-status", "#connect", "#disconnect", "#state", "#session-menu", "#tabs", "#tab-order", "#session-create", "#session-name", "#session-backend", "#session-refresh", "#session-add", "#terminal", "#command", "#command-form", "#command-preview", "#command-before", "#command-selection", "#command-after", "#command-caret", "#accessory", "#ctrl", "#alt", "#more", "#primary-key-strip", "#primary-key-row", "#function-keys", "#extra-key-row", "#history", "#history-panel", "#history-text", "#history-lines", "#history-copy", "#copy-status"]) {
+	for (const id of ["#token", "#save-token", "#clear-token", "#token-status", "#connect", "#disconnect", "#state", "#session-menu", "#tabs", "#tab-order", "#session-create", "#session-name", "#session-backend", "#session-refresh", "#session-add", "#terminal", "#command", "#command-form", "#command-preview", "#command-before", "#command-selection", "#command-after", "#command-caret", "#accessory", "#ctrl", "#alt", "#more", "#primary-key-strip", "#primary-key-row", "#function-keys", "#extra-key-row", "#history", "#history-panel", "#history-text", "#history-lines", "#history-copy", "#copy-status", "#output-menu", "#output-paste", "#output-select", "#output-select-all", "#output-copy"]) {
 		elements.set(id, {
 			value: "", disabled: false, dataset: {}, style: {}, hidden: false, scrollHeight: 20, listeners: new Map(),
 			addEventListener(name: string, callback: (event: any) => void) { this.listeners.set(name, callback); },
@@ -17,7 +17,7 @@ function browser(storage = new Map<string, string>()) {
 			},
 			setAttribute(name: string, value: string) { this[name] = value; },
 			setSelectionRange(start: number, end: number) { this.selectionStart = start; this.selectionEnd = end; },
-			contains(node: unknown) { return node === this; },
+			contains(node: unknown) { return node === this || (node as any)?.parentElement === this; },
 			querySelectorAll() { return []; },
 			getBoundingClientRect() { layoutReads++; return { left: 0, top: 0, width: 824, height: 494, right: 824, bottom: 494 }; },
 		});
@@ -65,7 +65,7 @@ function browser(storage = new Map<string, string>()) {
 	class FakeTerminal {
 		cols = 80; rows = 24;
 		element = { querySelector: () => ({ getBoundingClientRect: () => { layoutReads++; return { left: 12, top: 4, width: 800, height: 480, right: 812, bottom: 484 }; } }) };
-		buffer = { active: { cursorX: 3, cursorY: 23 } };
+		buffer = { active: { cursorX: 3, cursorY: 23, type: "normal" } };
 		modes = { bracketedPasteMode: false };
 		textarea = { addEventListener: (_name: string, callback: () => void) => { this.focusChange = callback; } };
 		loadAddon() {}
@@ -92,19 +92,34 @@ function browser(storage = new Map<string, string>()) {
 		toString() { return this.text; },
 		removeAllRanges() { this.anchorNode = this.focusNode = null; this.text = ""; },
 		addRange(range: any) {
-			this.anchorNode = this.focusNode = range.node;
-			this.text = range.node.textContent;
+			this.anchorNode = this.focusNode = range.node ?? range.startContainer;
+			this.text = range.text ?? range.node?.textContent ?? "";
 		},
 	};
+	const historyText = elements.get("#history-text");
+	const historyNode = { nodeType: 3, parentElement: historyText, get textContent() { return historyText.textContent; } };
+	const pointRange = { offset: 0 };
 	const clipboard = {
 		writes: [] as string[], fallback: [] as string[], fallbackWorks: true,
-		api: undefined as undefined | { writeText(text: string): Promise<void> },
+		api: undefined as undefined | { writeText(text: string): Promise<void>; readText?: () => Promise<string> },
 	};
 	runInNewContext(readFileSync(new URL("../web/client.js", import.meta.url), "utf8"), {
 		document: {
 			body: { style: {} }, querySelector: (id: string) => elements.get(id), addEventListener() {},
 			getSelection: () => selection,
-			createRange: () => ({ node: null as any, selectNodeContents(node: any) { this.node = node; } }),
+			caretRangeFromPoint: () => ({
+				startContainer: historyNode, startOffset: pointRange.offset,
+				setStart() {}, setEnd() {},
+			}),
+			createRange: () => ({
+				node: null as any, text: "", startContainer: null as any, startOffset: 0, endOffset: 0,
+				selectNodeContents(node: any) { this.node = node; this.text = node.textContent; },
+				setStart(node: any, offset: number) { this.startContainer = node; this.startOffset = offset; },
+				setEnd(node: any, offset: number) {
+					this.endOffset = offset;
+					this.text = node.textContent.slice(this.startOffset, offset);
+				},
+			}),
 			execCommand: (name: string) => {
 				assert.equal(name, "copy");
 				clipboard.fallback.push(selection.toString());
@@ -146,7 +161,7 @@ function browser(storage = new Map<string, string>()) {
 		command.listeners.get("keydown")({ key, preventDefault() { prevented = true; }, ...options });
 		return prevented;
 	};
-	return { elements, command, form, sent, term, ready, submit, key, frame, advance, windowListeners, selection, clipboard,
+	return { elements, command, form, sent, term, ready, submit, key, frame, advance, windowListeners, selection, clipboard, pointRange,
 		layoutReads: () => layoutReads,
 		flush: () => { const pending = [...timers.values()]; timers.clear(); pending.forEach(({ fn }) => fn()); frame(); },
 		socket: () => socket };
@@ -1036,6 +1051,87 @@ test("History Copy supports async clipboard, denied permission fallback, and hon
 	}
 });
 
+test("mobile long-press opens output actions and selects the pressed word without PTY input", async () => {
+	const { elements, ready, socket, selection, pointRange, sent, advance } = browser();
+	ready();
+	socket().onmessage({ data: JSON.stringify({ type: "output", data: "alpha beta\ngamma" }) });
+	elements.get("#history").listeners.get("click")({});
+	pointRange.offset = 2;
+	elements.get("#history-text").listeners.get("pointerdown")({
+		pointerType: "touch", clientX: 20, clientY: 30,
+	});
+	advance(500);
+	assert.equal(elements.get("#output-menu").hidden, false);
+	assert.equal(selection.toString(), "alpha");
+	assert.equal(elements.get("#output-copy").hidden, false);
+	const before = sent.length;
+	await elements.get("#output-copy").listeners.get("click")({});
+	assert.equal(sent.length, before);
+});
+
+test("menu Paste inserts a safe shell draft and brackets multiline alternate-buffer paste", async () => {
+	const { elements, ready, term, command, socket, clipboard, sent } = browser();
+	ready();
+	clipboard.api = { writeText: async () => {}, readText: async () => "echo one\necho two" };
+	elements.get("#history").listeners.get("click")({});
+	await elements.get("#output-paste").listeners.get("click")({});
+	assert.equal(command.value, "echo one\necho two");
+	assert.deepEqual(sent.filter((message) => message.type === "input"), []);
+
+	term.buffer.active.type = "alternate";
+	term.modes.bracketedPasteMode = true;
+	elements.get("#history").listeners.get("click")({});
+	await elements.get("#output-paste").listeners.get("click")({});
+	assert.equal(sent.at(-1).data, "\x1b[200~echo one\recho two\x1b[201~");
+});
+
+test("Paste in an active remote editor sends clipboard text without local draft echo", async () => {
+	const { elements, ready, term, command, clipboard, sent } = browser();
+	ready();
+	clipboard.api = { writeText: async () => {}, readText: async () => "inserted text" };
+	term.buffer.active.type = "normal";
+	command.listeners.get("keydown")({ key: "Tab", preventDefault() {} });
+	await elements.get("#output-paste").listeners.get("click")({});
+	assert.equal(command.value, "");
+	assert.equal(sent.at(-1).data, "inserted text");
+});
+
+test("live long-press opens actions, tolerates jitter and cancels on scrolling", () => {
+	const { elements, ready, socket, advance, sent } = browser();
+	ready();
+	socket().onmessage({ data: JSON.stringify({ type: "output", data: "live output" }) });
+	const live = elements.get("#terminal");
+	live.listeners.get("pointerdown")({ pointerType: "touch", clientX: 20, clientY: 30 });
+	live.listeners.get("pointermove")({ type: "pointermove", clientX: 21, clientY: 31 });
+	advance(500);
+	assert.equal(elements.get("#output-menu").hidden, false);
+	assert.equal(elements.get("#history-panel").hidden, false);
+	assert.deepEqual(sent.filter((message) => message.type === "input"), []);
+	elements.get("#history").listeners.get("click")({});
+	live.listeners.get("pointerdown")({ pointerType: "touch", clientX: 20, clientY: 30 });
+	live.listeners.get("pointermove")({ type: "pointermove", clientX: 20, clientY: 80 });
+	advance(500);
+	assert.equal(elements.get("#output-menu").hidden, true);
+});
+
+test("delayed Paste cannot cross a controller change and denied clipboard stays inert", async () => {
+	const { elements, ready, socket, clipboard, command, sent } = browser();
+	ready();
+	let resolve!: (text: string) => void;
+	clipboard.api = { writeText: async () => {}, readText: () => new Promise((done) => { resolve = done; }) };
+	const pending = elements.get("#output-paste").listeners.get("click")({});
+	socket().onclose({ code: 1000 });
+	resolve("private clipboard\ncommand");
+	await pending;
+	assert.equal(command.value, "");
+	assert.deepEqual(sent.filter((message) => message.type === "input"), []);
+	ready();
+	clipboard.api.readText = async () => { throw new Error("NotAllowedError"); };
+	await elements.get("#output-paste").listeners.get("click")({});
+	assert.match(elements.get("#copy-status").textContent, /permission denied/);
+	assert.deepEqual(sent.filter((message) => message.type === "input"), []);
+});
+
 test("output select-all keyboard shortcuts are scoped; live Ctrl+A/C remain terminal keys", async () => {
 	const { elements, ready, socket, key, sent, selection, clipboard } = browser();
 	ready();
@@ -1056,6 +1152,14 @@ test("output select-all keyboard shortcuts are scoped; live Ctrl+A/C remain term
 		assert.equal(clipboard.fallback.at(-1), "terminal output");
 	}
 	assert.equal(sent.length, before);
+});
+
+test("live terminal selection keeps Ctrl+C for native xterm copy", () => {
+	const { ready, term, sent } = browser();
+	ready();
+	term.selected = true;
+	assert.equal(term.customKey?.({ type: "keydown", key: "c", ctrlKey: true, metaKey: false }), true);
+	assert.deepEqual(sent.filter((message) => message.type === "input"), []);
 });
 
 test("copy state clears on auth/session changes and ignores stale async completion", async () => {

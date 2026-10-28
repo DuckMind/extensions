@@ -34,6 +34,13 @@ export type ActiveToolsHost = {
 
 export interface ActivateToolsOptions {
 	onRejected?: (name: string) => void;
+	/**
+	 * Whether a catalog tool is still enabled NOW. The catalog is fixed when the
+	 * factory runs, but `--no-tool` reaches the extension after it (#4913), so a
+	 * tool the flag names is in the catalog and must still be refused here.
+	 * Absent: every catalog tool is enabled.
+	 */
+	isEnabled?: (name: string) => boolean;
 	deferredToolSupport?: (ctx: unknown) => boolean;
 	/**
 	 * Called with every lazy tool name the model asked for, so the extension
@@ -87,14 +94,16 @@ export function createActivateToolsTool(
 			_onUpdate: unknown,
 			ctx?: unknown,
 		) {
+			const available = (name: string): boolean =>
+				lazyNameSet.has(name) && (options.isEnabled?.(name) ?? true);
 			const requested = Array.isArray(params.tools)
 				? (params.tools as unknown[]).filter(
-						(t): t is string => typeof t === "string" && lazyNameSet.has(t),
+						(t): t is string => typeof t === "string" && available(t),
 					)
 				: [];
 			if (Array.isArray(params.tools)) {
 				for (const name of params.tools) {
-					if (typeof name === "string" && !lazyNameSet.has(name))
+					if (typeof name === "string" && !available(name))
 						options.onRejected?.(name);
 				}
 			}

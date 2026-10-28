@@ -24,7 +24,7 @@ import { createRunFanoutBudget, getRunFanoutBudgetSnapshot, writeRunFanoutBudget
 import { writeRetainedRequiredChildExtensions } from "../../src/shared/required-child-extensions.ts";
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { deriveForkPromptCacheKey } from "../../src/runs/shared/child-tool-plan.ts";
-import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
+import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, STRUCTURED_OUTPUT_FOLLOW_UP, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
 import {
@@ -807,8 +807,8 @@ export default function() {
 			jsonl: [
 				{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "structured-rejected", name: "structured_output", arguments: { value: {} } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 				{ type: "tool_execution_start", toolCallId: "structured-rejected", toolName: "structured_output", args: { value: {} } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: diagnostic }] } },
 				{ type: "tool_execution_end", toolCallId: "structured-rejected", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-rejected", toolName: "structured_output", isError: true, content: [{ type: "text", text: diagnostic }] } },
 			],
 		});
 		const id = `async-single-schema-rejected-${Date.now().toString(36)}`;
@@ -835,6 +835,39 @@ export default function() {
 		assert.match(status.steps?.[0]?.error ?? "", /Structured output validation failed: ok: is required/);
 	});
 
+	it("background execution gives a structured child one follow-up turn to call structured_output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const prompts = () => fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.map((name) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { args: string[] }).args.at(-1));
+		const runStructured = async (id: string) => {
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Return structured data", agentConfig: makeAgent("worker"),
+				ctx: { dm: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+				acceptance: false, structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			});
+			return JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		};
+		mockPi.onCall({ output: "prose without the tool call" });
+		mockPi.onCall({ matchArgIncludes: STRUCTURED_OUTPUT_FOLLOW_UP, structuredOutput: { ok: true } });
+
+		const recovered = await runStructured(`async-single-schema-follow-up-${Date.now().toString(36)}`);
+
+		assert.equal(recovered.success, true, recovered.results[0]?.error);
+		assert.deepEqual(recovered.results[0]?.structuredOutput, { ok: true });
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+
+		mockPi.reset();
+		mockPi.onCall({ output: "prose without the tool call" });
+		const missing = await runStructured(`async-single-schema-follow-up-missing-${Date.now().toString(36)}`);
+
+		assert.equal(missing.success, false);
+		assert.match(missing.results[0]?.error ?? "", /Missing structured_output call/);
+		assert.equal(missing.results[0]?.usage?.turns, 2);
+		assert.equal(prompts().filter((prompt) => prompt === STRUCTURED_OUTPUT_FOLLOW_UP).length, 1);
+		assert.equal(prompts().length, 2);
+	});
+
 	it("does not persist malformed outputSchema compiler text in background evidence", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const sentinel = "BACKGROUND_PRIVATE_SCHEMA_SENTINEL";
 		const structuredOutputSchema = { type: "string", pattern: `${sentinel}_[invalid` };
@@ -845,8 +878,8 @@ export default function() {
 		mockPi.onCall({
 			jsonl: [
 				{ type: "tool_execution_start", toolCallId: "structured-malformed-schema", toolName: "structured_output", args: { value: "value" } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 				{ type: "tool_execution_end", toolCallId: "structured-malformed-schema", toolName: "structured_output" },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: "structured-malformed-schema", toolName: "structured_output", isError: true, content: [{ type: "text", text: `Structured output validation failed: ${validation.message}` }] } },
 			],
 		});
 		const id = `async-single-malformed-schema-${Date.now().toString(36)}`;
@@ -916,7 +949,8 @@ export default function() {
 		assert.equal(children.find(({ key }) => key === "inherited")?.ok, false);
 		assert.match(children.find(({ key }) => key === "inherited")?.error ?? "", /Missing structured_output call/);
 		assert.deepEqual(children.find(({ key }) => key === "disabled"), { key: "disabled", ok: true, output: "false opted out" });
-		assert.equal(mockPi.callCount(), 3);
+		// Each inherited-schema child that skips structured_output also gets one follow-up prompt.
+		assert.equal(mockPi.callCount(), 5);
 	});
 
 	it("background outputSchema runs fail closed when required acceptanceReport is missing", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1703,7 +1737,7 @@ syncBuiltinESMExports();
 		assert.equal(payload.results[0]?.model, "gateway/parent-model");
 	});
 
-	it("background forked runs receive the derived fork cache key", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+	it("background forks do not claim cache affinity without the host projection hook", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		mockPi.onCall({ output: "cache affinity inspected" });
 		const parentSessionFile = path.join(tempDir, "parent-cache.jsonl");
 		const forkedSessionFile = path.join(tempDir, "forked-cache.jsonl");
@@ -1732,7 +1766,7 @@ syncBuiltinESMExports();
 
 		const payload = await readAsyncPayload(launch.details.asyncId);
 		assert.equal(payload.success, true);
-		assert.equal((await waitForMockPiRuntime(mockPi, 0)).forkCacheKey, deriveForkPromptCacheKey("session-cache-parent"));
+		assert.equal((await waitForMockPiRuntime(mockPi, 0)).forkCacheKey, undefined);
 	});
 
 	it("follows up an async run whose recovery descriptor includes fast", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
@@ -1770,6 +1804,67 @@ syncBuiltinESMExports();
 		assert.ok(!result.isError, result.content[0]?.text);
 		assert.ok(result.details.asyncId);
 		assert.equal((await readAsyncPayload(result.details.asyncId)).success, true);
+	});
+
+	it("writes an output-less resume next to the original run's saved output instead of over it", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		mockPi.onCall({ output: "Stage 1 report" });
+		const sourceId = `async-revive-output-${Date.now().toString(36)}`;
+		const sessionFile = path.join(tempDir, "sessions", "output.jsonl");
+		const report = path.join(tempDir, "reports", "lane-writer-report.md");
+		fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+		fs.writeFileSync(sessionFile, "", "utf-8");
+		executeAsyncSingle(sourceId, {
+			agent: "worker",
+			task: "Initial work",
+			agentConfig: makeAgent("worker"),
+			ctx: { dm: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-123" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			sessionFile,
+			output: report,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+		await readAsyncPayload(sourceId);
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/);
+
+		mockPi.onCall({ output: "Stage 2 report" });
+		const result = await makeAsyncExecutor([makeAgent("worker")]).execute(
+			"revive-output",
+			{ action: "resume", id: sourceId, message: "Continue", acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		) as AsyncExecutionResult;
+		assert.ok(!result.isError, result.content[0]?.text);
+		assert.ok(result.details.asyncId);
+		const revived = await readAsyncPayload(result.details.asyncId);
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/, "the original run's report must survive the resume");
+		const revivedReport = path.join(tempDir, "reports", `lane-writer-report.${result.details.asyncId.slice(0, 8)}.md`);
+		assert.match(fs.readFileSync(revivedReport, "utf-8"), /Stage 2 report/);
+		assert.ok(revived.results[0]?.output?.includes(`Output saved to: ${revivedReport}`), revived.results[0]?.output);
+	});
+
+	it("writes an output-less resume of a relative-output foreground run next to its saved report", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const executor = makeAsyncExecutor([makeAgent("worker")]);
+		mockPi.onCall({ output: "Stage 1 report" });
+		const first = await executor.execute("foreground-relative-output", {
+			agent: "worker", task: "Initial work", async: false, acceptance: false, output: "report.md",
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(first.isError, undefined, first.content[0]?.type === "text" ? first.content[0].text : undefined);
+		const report = first.details.results[0]?.savedOutputPath ?? "";
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/);
+
+		mockPi.onCall({ output: "Stage 2 report" });
+		const result = await executor.execute("revive-relative-output", {
+			action: "resume", id: first.details.runId, message: "Continue", acceptance: false,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as AsyncExecutionResult;
+		assert.ok(!result.isError, result.content[0]?.text);
+		await readAsyncPayload(result.details.asyncId!);
+		assert.match(fs.readFileSync(report, "utf-8"), /Stage 1 report/);
+		const revivedReport = path.join(path.dirname(report), `report.${result.details.asyncId!.slice(0, 8)}.md`);
+		assert.match(fs.readFileSync(revivedReport, "utf-8"), /Stage 2 report/);
 	});
 
 	it("revives an inherited parent model outside the current registry", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

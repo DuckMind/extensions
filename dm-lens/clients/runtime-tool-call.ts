@@ -153,6 +153,13 @@ function getToolCallRawFilePath(
 	}
 
 	if (toolName === "lsp_navigation") {
+		// #3650: the tool declares its target as `path`
+		// (`tools/lsp-navigation.ts:863`). Reading `filePath` first left every
+		// read-only navigation call with no path at all, so nothing resolved and
+		// every path-keyed step below (`if (!filePath) return;` included) was
+		// skipped for a file the call had just named. `filePath` stays as the
+		// fallback the branch already accepted, in the same order as `read`.
+		if (typeof inputObj.path === "string") return inputObj.path;
 		return typeof inputObj.filePath === "string"
 			? inputObj.filePath
 			: undefined;
@@ -445,6 +452,7 @@ async function captureOpaqueBaseline(
 	root: string,
 	sessionRoot: boolean,
 	startedAt: number,
+	toolName: string,
 ): Promise<{ state: PendingOpaqueBaseline; note: string }> {
 	if (!sessionRoot)
 		return { state: { startedAt, strategy: "git" }, note: "git" };
@@ -469,6 +477,11 @@ async function captureOpaqueBaseline(
 		};
 	}
 	const outcome = await captureFileStats(root, { withHashes: true });
+	// #4905: bash names its unknown verdict through its coverage row at the
+	// result, so a refused home root would leave no ledger record for it. One
+	// record per session (the ledger's once-key is the subject).
+	if (outcome.unknownReason === "home-root")
+		recordOpaqueCaptureRefused("home-root", toolName);
 	return {
 		state: outcome.snapshot
 			? { startedAt, strategy: "stat-diff", stats: outcome.snapshot }
@@ -730,6 +743,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					root,
 					index === 0,
 					started,
+					toolName,
 				);
 				if (index === 0) resultNote = baseline.note;
 				// Session-stamped slot: a concurrent-secondary session (#473)
@@ -832,6 +846,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			cacheManager,
 			ctx.cwd ?? runtime.projectRoot,
 			ctx.host ?? "pi",
+			deps.sessionId,
 		);
 		if (guard.block) {
 			return {
@@ -962,7 +977,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			recordDegradationOnce({
 				kind: "path-variant-unresolved",
 				subject: filePath,
-				reason: `${toolName}: no file at the resolved path, and none of pi's variants matched (${tried})`,
+				reason: `${toolName}: no file at the resolved path, and none of DM's variants matched (${tried})`,
 			});
 		}
 		return;

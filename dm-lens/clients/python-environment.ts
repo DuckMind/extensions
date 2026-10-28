@@ -1,6 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 import os from "node:os";
-import path, { dirname, join, resolve } from "node:path";
+import path, { dirname, join } from "node:path";
 import {
 	extractTomlTableSection,
 	hasTomlTable,
@@ -10,8 +10,8 @@ import {
 import { resolveLanguage } from "./language-registry.js";
 import { parseJsonc } from "./review-graph/tsconfig-paths.js";
 import {
-	isAtOrAboveHomeDir,
 	matchesWorkspaceMemberPattern,
+	realpathOrResolve,
 	toPosix,
 	UV_WORKSPACE_EXCLUDE_DIALECT,
 	UV_WORKSPACE_MEMBERS_DIALECT,
@@ -76,11 +76,13 @@ async function findUvWorkspace(
 	startDir: string,
 	homeDir: string,
 ): Promise<UvWorkspace | undefined> {
-	const resolvedStart = path.resolve(startDir);
+	// `isStartDir` compares with the walk's own first directory, so the start
+	// and the project it finds share the walk's axis whatever the caller
+	// passes (#4847 review F5).
+	let walkStart: string | undefined;
 	let nearestProject: string | undefined;
-	for (const dir of walkUpDirs(startDir)) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) break;
-
+	for (const dir of walkUpDirs(startDir, { homeDir })) {
+		walkStart ??= dir;
 		let content: string;
 		try {
 			content = await readFile(path.join(dir, "pyproject.toml"), "utf8");
@@ -98,7 +100,7 @@ async function findUvWorkspace(
 				root: dir,
 				explicit: true,
 				projectRoot: nearestProject,
-				isStartDir: nearestProject === resolvedStart,
+				isStartDir: nearestProject === walkStart,
 				members: parseTomlStringArray(workspaceTable, "members"),
 				exclude: parseTomlStringArray(workspaceTable, "exclude"),
 			};
@@ -110,7 +112,7 @@ async function findUvWorkspace(
 				root: nearestProject,
 				explicit: false,
 				projectRoot: nearestProject,
-				isStartDir: nearestProject === resolvedStart,
+				isStartDir: nearestProject === walkStart,
 				members: [],
 				exclude: [],
 			}
@@ -215,10 +217,10 @@ export async function detectPythonEnvironment(
 	homeDir: string = os.homedir(),
 	options: { allowAmbient?: boolean } = {},
 ): Promise<PythonEnvironment | undefined> {
-	// `path.resolve` once at the seam entry so `isStartDir` below compares like
-	// with like: `walkUpDirs` resolves its input, a caller's argument need not
-	// be normalized.
-	const root = path.resolve(projectRoot);
+	// The path identity once at the seam entry so `isStartDir` below compares
+	// like with like: `walkUpDirs` climbs its input's identity (#4689 item 6),
+	// and the member and containment checks below read the same axis.
+	const root = realpathOrResolve(projectRoot);
 	const uvWorkspace = await findUvWorkspace(root, homeDir);
 	// `UV_PROJECT_ENVIRONMENT` and the workspace `.venv` are uv PROJECT
 	// settings. uv applies them to a directory only when that directory IS the
@@ -248,7 +250,9 @@ export async function detectPythonEnvironment(
 	// without a stable project marker or explicit path, they remain undiscoverable.
 	const allowAmbient = options.allowAmbient ?? true;
 	const isWithinProjectRoot = (candidateRoot: string): boolean => {
-		const relative = path.relative(root, path.resolve(candidateRoot));
+		// Both sides are identities (#4847 review F1): an ambient root spelled
+		// through a link to the project is inside it.
+		const relative = path.relative(root, realpathOrResolve(candidateRoot));
 		return (
 			relative !== ".." &&
 			!relative.startsWith(`..${path.sep}`) &&
@@ -307,14 +311,14 @@ export async function detectPythonEnvironment(
 				recordDegradationOnce({
 					kind: "trust-refusal",
 					subject: `python-environment:${candidate.root}`,
-					reason: `project Python environment refused: pi project trust is ${getProjectTrustState()}`,
+					reason: `project Python environment refused: DM project trust is ${getProjectTrustState()}`,
 				})
 			) {
 				logExtension({
 					subsystem: "project-trust",
 					level: "warn",
 					message:
-						"project Python environment refused: mark the project trusted in pi or upgrade pi",
+						"project Python environment refused: mark the project trusted in DM or upgrade DM",
 					metadata: { source: candidate.source },
 				});
 			}
@@ -875,8 +879,11 @@ export async function detectPythonTargetVersion(
 ): Promise<PythonTargetVersion | undefined> {
 	if (resolveLanguage(filePath)?.id !== "python") return undefined;
 	const open = new Set(PYTHON_DECLARATION_SOURCES);
-	for (const dir of walkUpDirs(dirname(resolve(filePath)))) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) return undefined;
+	// #4689 item 6: from the module's identity, so a module linked in from
+	// another project reads that project's declaration.
+	for (const dir of walkUpDirs(dirname(realpathOrResolve(filePath)), {
+		homeDir,
+	})) {
 		const { declaration, closed } = await readPythonDeclarationInDirectory(
 			dir,
 			open,

@@ -103,6 +103,7 @@ function text(result: { content: Array<{ type: string; text?: string }> }): stri
 
 afterEach(() => {
 	for (const channel of createdChannels.splice(0)) fs.rmSync(channel, { recursive: true, force: true });
+	delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
 });
 
 /** Deterministic session/model seam: real launch hooks and tools, with the host's tool allowlist. */
@@ -796,8 +797,9 @@ describe("supervisor ask registration", () => {
 				assert.match(JSON.stringify(await runtime.tool.execute("reply", { action: "reply", replyTo: next, message: "Approved" })), new RegExp(next));
 			} finally {
 				await runtime?.shutdown();
-				for (const dir of channels) fs.rmSync(dir, { recursive: true, force: true });
-				fs.rmSync(root, { recursive: true, force: true });
+				// No process or watcher of this script holds these; Windows can briefly hold a just-written file.
+				for (const dir of channels) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+				fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 			}
 		`;
 		const env = { ...process.env };
@@ -817,7 +819,12 @@ describe("supervisor ask registration", () => {
 			const first = writeRequest({ sessionId, runId });
 			const tool = tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!;
 			await assert.rejects(tool.execute("wrong", { action: "reply", to: "different-agent", message: "Approved" }), /No pending supervisor request matches/);
-			await assert.rejects(tool.execute("unknown", { action: "reply", replyTo: "unknown", message: "Approved" }), /No pending supervisor request found/);
+			// A reply to a request that is gone names the one that can still be answered.
+			await assert.rejects(tool.execute("unknown", { action: "reply", replyTo: "unknown", message: "Approved" }), (error: Error) => {
+				assert.match(error.message, /No pending supervisor request found for replyTo 'unknown'\. It was answered, expired or withdrawn\. Pending now:/);
+				assert.match(error.message, new RegExp(`- ${first}: worker \\[${runId}#0\\]`));
+				return true;
+			});
 			assert.equal(channel.pending.has(first), true);
 			const second = writeRequest({ sessionId, runId });
 			await assert.rejects(tool.execute("ambiguous", { action: "reply", message: "Approved" }), /Multiple pending supervisor requests/);
@@ -843,7 +850,7 @@ describe("supervisor ask registration", () => {
 			channel.start();
 			const tool = tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!;
 			const expired = writeRequest({ sessionId, runId, expiresAt: Date.now() - 1 });
-			await assert.rejects(tool.execute("expired", { action: "reply", replyTo: expired, message: "Too late" }), /No pending supervisor request found/);
+			await assert.rejects(tool.execute("expired", { action: "reply", replyTo: expired, message: "Too late" }), /No pending supervisor request found.*No pending supervisor requests\./);
 			const missing = writeRequest({ sessionId, runId });
 			const resolved = writeRequest({ sessionId, runId });
 			await tool.execute("pending", { action: "pending" });
@@ -1011,6 +1018,61 @@ describe("supervisor ask registration", () => {
 			await tool.execute("after-acceptance", { action: "pending" });
 			assert.equal(attempts, 0);
 			assert.equal(channel.pending.size, 0);
+		} finally { channel.dispose(); }
+	});
+
+	it("moves a queued ask's deadline forward until its notice reaches the parent model", async () => {
+		process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "1000";
+		const sessionId = `session-${randomUUID()}`;
+		const runId = `run-${randomUUID()}`;
+		const handlers = new Map<string, Set<(event: unknown) => void>>();
+		const dm = {
+			...makePi({ tools: new Map() }),
+			on(name: string, handler: (event: unknown) => void) {
+				const set = handlers.get(name) ?? new Set();
+				handlers.set(name, set.add(handler));
+				return () => { set.delete(handler); };
+			},
+		};
+		const emit = (name: string, event: unknown) => { for (const handler of handlers.get(name) ?? []) handler(event); };
+		let appended = false;
+		const channel = createNativeSupervisorChannel(dm as never, makeState(sessionId, makeCtx(sessionId)), {
+			platform: "darwin",
+			parentWake: { sendMessage: () => appended },
+		});
+		const expiresAt = (requestId: string) => JSON.parse(fs.readFileSync(path.join(resolveSupervisorChannelDir(runId, "worker", 0), "requests", `${requestId}.json`), "utf-8")).expiresAt as number;
+		try {
+			channel.start();
+			const queued = writeRequest({ sessionId, runId, expiresAt: Date.now() + 100 });
+			channel.hasPendingRequests();
+			channel.hasPendingRequests();
+			assert.ok(expiresAt(queued) > Date.now() + 500, "a notice DM queued behind a busy run must not let the ask expire unread");
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			assert.equal(channel.hasPendingRequests(), true);
+			assert.equal(channel.pending.has(queued), true, "the parent keeps the ask past its original deadline");
+
+			emit("message_start", { message: { role: "custom", customType: "subagent_supervisor_request", details: { requestId: queued } } });
+			assert.equal(handlers.get("message_start")?.size ?? 0, 1, "DM keeps one guarded subscription after delivery");
+			const delivered = expiresAt(queued);
+			await new Promise((resolve) => setTimeout(resolve, 600));
+			channel.hasPendingRequests();
+			assert.equal(expiresAt(queued), delivered, "a delivered ask keeps its deadline");
+
+			// 500 ms: long enough not to expire (and be removed) on a slow runner, shorter than the 1000 ms extension.
+			const dropped = writeRequest({ sessionId, runId, expiresAt: Date.now() + 500 });
+			channel.hasPendingRequests();
+			emit("agent_end", {});
+			const settled = expiresAt(dropped);
+			channel.hasPendingRequests();
+			assert.equal(expiresAt(dropped), settled, "a notice still queued when the run settles was dropped and is not extended");
+
+			appended = true;
+			const visibleDeadline = Date.now() + 500;
+			const visible = writeRequest({ sessionId, runId, expiresAt: visibleDeadline });
+			channel.hasPendingRequests();
+			channel.hasPendingRequests();
+			assert.equal(expiresAt(visible), visibleDeadline, "an ask appended to an idle parent is visible already and keeps its deadline");
+			assert.equal(handlers.get("message_start")?.size ?? 0, 1, "idle notices do not register more listeners");
 		} finally { channel.dispose(); }
 	});
 

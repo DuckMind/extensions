@@ -203,7 +203,7 @@ describe("agent management config parsing", () => {
 		assert.ok(reviewer, "reviewer builtin should be present in capability output");
 		assert.deepEqual(reviewer.tools.names, ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"]);
 		assert.match(readText(listed), /Tools: read, grep, find, ls, watchdog_diff, contact_supervisor/);
-		assert.equal("acceptance" in reviewer, false);
+		assert.deepEqual(reviewer.acceptance, { role: "read-only" });
 	});
 
 	it("reports bare and disabled acceptance declarations in capabilities", () => {
@@ -995,6 +995,18 @@ Advise only.
 		);
 		assert.equal(chainResult.isError, true);
 		assert.match(readText(chainResult), /Durable chain definitions were removed/);
+	});
+
+	it("saves explicit thinking: off on create and padded update", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const agentsDir = path.join(tempDir, ".dm", "agents");
+		assert.equal(handleCreate({ config: { name: "quiet", description: "Quiet", scope: "project", thinking: "off" } }, ctx).isError, false);
+		assert.match(fs.readFileSync(path.join(agentsDir, "quiet.md"), "utf-8"), /^thinking: off$/m);
+		assert.match(readText(handleManagementAction("get", { agent: "quiet" }, ctx)), /Thinking: off/);
+
+		assert.equal(handleCreate({ config: { name: "loud", description: "Loud", scope: "project", thinking: "high" } }, ctx).isError, false);
+		assert.equal(handleUpdate({ agent: "loud", config: { thinking: " off " } }, ctx).isError, false);
+		assert.match(fs.readFileSync(path.join(agentsDir, "loud.md"), "utf-8"), /^thinking: off$/m);
 	});
 
 	it("creates, updates, reports, clears, and validates acceptance roles", () => {

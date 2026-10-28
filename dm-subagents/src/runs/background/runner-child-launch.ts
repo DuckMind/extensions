@@ -40,7 +40,8 @@ export function buildRunnerChildLaunch(step: RunnerSubagentStep, ctx: RunnerChil
 		remoteReads: step.remoteReads,
 		parentSessionId: step.parentSessionId,
 		parentSessionFile: step.parentSessionFile,
-		forkCacheKey: step.context === "fork" ? deriveForkPromptCacheKey(step.parentSessionId) : undefined,
+		// DM 0.77 lacks context_with_system; preserve fork isolation without cache projection.
+		forkCacheKey: undefined,
 		sessionEnabled: attempt.sessionEnabled,
 		sessionDir: attempt.sessionDir,
 		sessionFile: step.sessionFile,

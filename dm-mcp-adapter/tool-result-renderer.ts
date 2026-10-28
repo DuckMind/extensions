@@ -21,6 +21,7 @@ export interface McpProxyToolCallInput {
   includeSchemas?: boolean;
   server?: string;
   action?: string;
+  cancelTask?: string;
 }
 
 interface McpToolRenderState {
@@ -75,7 +76,6 @@ class CompactMcpToolResult implements Component {
     private readonly inputPreview: string,
     private readonly display: McpToolResultDisplay,
     private readonly theme: RenderTheme,
-    /** Shown after the title and never truncated; the title shrinks instead (e.g. `✗3`). */
     private readonly status = "",
   ) {}
 
@@ -224,6 +224,7 @@ export function formatMcpProxyToolCallLines(
   maxInputChars = DEFAULT_MAX_CALL_INPUT_CHARS,
 ): string[] {
   if (args.action === "ui-messages") return [`mcp ${args.action}`];
+  if (args.cancelTask) return [`mcp cancel task ${args.cancelTask}`];
 
   if (args.tool) {
     const target = args.server ? `${args.tool} @ ${args.server}` : args.tool;
@@ -259,13 +260,6 @@ export function formatMcpDirectToolCallLines(
 ): string[] {
   if (!hasUsefulObjectContent(args)) return [displayName];
   return [displayName, formatJsonish(args, maxInputChars)];
-}
-
-export function formatMcpScriptToolCallLines(
-  args: { code: string },
-  maxInputChars = DEFAULT_MAX_CALL_INPUT_CHARS,
-): string[] {
-  return ["mcpScript", truncateText(args.code, maxInputChars)];
 }
 
 function renderToolCallLines(lines: string[], theme?: RenderTheme) {
@@ -332,12 +326,20 @@ export function createMcpDirectToolCallRenderer(displayName: string, options = r
   };
 }
 
+export function formatMcpScriptToolCallLines(
+  args: { code: string },
+  maxInputChars = DEFAULT_MAX_CALL_INPUT_CHARS,
+): string[] {
+  return ["mcpScript", truncateText(args.code, maxInputChars)];
+}
+
 export function createMcpScriptToolCallRenderer(options = resolveMcpToolRenderOptions()) {
   return (args: { code: string }, theme?: RenderTheme, context?: McpToolRenderContext) => {
-    // Compact mode hides this call row once the result lands, so leave a title for the result row.
-    // The tool list comes from the result's `details.calls` trace (see formatMcpScriptCallSummary);
-    // the script code itself is never copied into the compact row.
-    if (context?.state) context.state.compactTitle = MCP_SCRIPT_TITLE;
+    // Completed compact rows use the operation trace, never the script source.
+    if (context?.state) {
+      context.state.compactTitle = MCP_SCRIPT_TITLE;
+      delete context.state.compactInputPreview;
+    }
     if (shouldUseCompactFinalRender(options, context)) return new EmptyComponent();
     return renderToolCallLines(formatMcpScriptToolCallLines(args), theme);
   };
@@ -347,36 +349,18 @@ const MCP_SCRIPT_TITLE = "mcpScript";
 const MCP_SCRIPT_SUMMARY_MAX_TOOLS = 4;
 
 export interface McpScriptCallSummary {
-  /** Traced operations that failed; the compact row shows it as `mcpScript ✗N`. */
   failed: number;
-  /** What the script touched; "" when it made no MCP operations. */
   preview: string;
 }
 
 const PLAIN_TOOL_PATH = /^[A-Za-z0-9_.\/:@-]+$/;
 
-/**
- * Traced paths are script-supplied. Only identifier-like paths (what MCP tool names look like)
- * are shown bare. Anything else is shown as a quoted, ASCII-escaped JSON string, so it cannot
- * break the row, cannot pass for summary syntax (`foo×2`, `a, b`, ` · `, `+1 more`), and stays
- * distinct from the clean path it may resemble (`demo_red` vs `"\u001b[31mdemo_red"`).
- */
 function formatTracedPath(path: string): string {
   if (PLAIN_TOOL_PATH.test(path)) return path;
-  // JSON.stringify quotes and escapes C0 controls, quotes and backslashes; escaping all other
-  // non-ASCII too rules out DEL, C1 controls, bidi overrides and invisible characters.
+  // Script-controlled paths cannot inject terminal controls or impersonate summary delimiters.
   return JSON.stringify(path).replace(/[^\x20-\x7e]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
-/**
- * Failure count and compact-row preview for an mcpScript run, from the `details.calls` trace.
- * The preview lists distinct tool paths in first-call order with repeat counts, then other
- * operation counts, e.g. `github_search_issues×6, slack_post_message · search`.
- * Scripts that only describe tools list the described paths instead (`describe a, b`).
- * The failure count is rendered as a title status, not in the preview: narrow rows drop the
- * preview first, and the status is never truncated (the title shrinks instead).
- * Returns null for non-script results.
- */
 export function formatMcpScriptCallSummary(
   details: McpToolResultDetails | undefined,
   maxTools = MCP_SCRIPT_SUMMARY_MAX_TOOLS,
@@ -415,7 +399,7 @@ export function formatMcpScriptCallSummary(
     const describes = [...describeCounts.values()].reduce((sum, count) => sum + count, 0);
     if (describes > 0) metaCounts.set("describe", describes);
   }
-  const meta = [...metaCounts].map(([kind, count]) => withCount(kind, count)).join(", ");
+  const meta = [...metaCounts].map(([kind, count]) => withCount(formatTracedPath(kind), count)).join(", ");
   return { failed, preview: [tools, meta].filter(Boolean).join(" · ") };
 }
 
@@ -532,7 +516,8 @@ export function renderMcpToolResult(
     return new Text(activeTheme.fg("warning", "Running MCP tool..."), 0, 0);
   }
 
-  const hasErrorDetails = Boolean(result.details.error);
+  // Partial updates from a script tool carry codemode's own details, or none.
+  const hasErrorDetails = Boolean(result.details?.error);
   const expanded = options.expanded || context?.isError === true || hasErrorDetails;
   if (!expanded && renderOptions.resultRendering === "compact") {
     const display = formatMcpToolResultLines(result, false, renderOptions.collapsedResultLines);

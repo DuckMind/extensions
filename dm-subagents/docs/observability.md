@@ -85,7 +85,7 @@ For compact chat results with FleetView as the only live editor surface, merge t
 - `asyncWidgetCollapsed: true` starts each newly mounted async widget as a one-line live status summary; click its header to expand it.
 - `asyncWidgetLayout: "rows"` shows each run in the async widget as one line under a header instead of a block of detail rows; DM's expand key still shows the details.
 
-Thanks to [DraconDev](https://github.com/DraconDev) for reporting the display noise and suggesting summary mode in [#1931](https://github.com/nicobailon/pi-subagents/issues/1931).
+Thanks to [DraconDev](https://github.com/DraconDev) for reporting the display noise and suggesting summary mode in #1931.
 
 ## FleetView
 
@@ -116,8 +116,8 @@ FleetView and the under-editor async widget are both enabled by default; set `as
 Default keys:
 
 - `↑`/`↓` or `j`/`k` — select a child
-- `Shift+K`/`Shift+J` — scroll one line
-- `PgUp`/`PgDn` — scroll one page
+- `K`/`J` (Shift+k / Shift+j) — scroll output one line
+- `PgUp`/`PgDn` — scroll output one body viewport page (structured headers stay pinned)
 - `x`/`Ctrl+O` — toggle tool details
 - `r` — refresh
 - `Esc` — close
@@ -125,6 +125,10 @@ Default keys:
 - `s` — compose an acknowledged message to a selected live async child; Tab cycles `steer`, `follow_up`, and `auto`
 - `D` — stop a selected child's top-level async run after confirmation
 - `H` — open the selected active async child through the available Inspect plugin
+
+In fullscreen mode with DM mouse reporting enabled, primary-click a visible roster row to select that child. Wheel or trackpad input over the output pane (including its pinned header) scrolls the same viewport as the keyboard. Owned wheel events stay inside the inspector, even at the top and bottom. New output follows the bottom until you scroll away; reaching the bottom resumes following. Steering/redo drafts and stop confirmation retain input ownership, and Prompt Audit blocks roster clicks. Footer shortcuts remain text hints, not buttons.
+
+In regular (non-fullscreen) mode, the terminal retains mouse scrolling and scrollback ownership; internal-pane wheel scrolling and roster clicking are not promised. Use the keyboard controls above to navigate clipped inspector output in either mode. The extension does not enable terminal mouse tracking.
 
 Set `fleetKeybindings` in the extension config to replace inspector-level keys when a terminal intercepts keys such as `PgUp`, `PgDn`, `Home`, or `End`. Prompt modes keep fixed keys such as `Esc`, `Enter`, `Tab`, and stop-confirmation `Y`/`N`.
 
@@ -155,9 +159,11 @@ If something feels misconfigured, run `/subagents-doctor` or ask: "Check whether
 ## Host inspection protocol (RPC)
 
 RPC hosts receive live async status through the bounded `subagent-async` widget
-(`DM_SUBAGENT_ASYNC_JSON:` payload). For on-demand detail — a child's delegated
-task, transcript window, or final output — hosts can invoke the extension
-command:
+(`DM_SUBAGENT_ASYNC_JSON:` payload). Step nodes report the `agent` the child
+runs as, and the `model` and `thinking` level it runs on once its status reports
+them. For on-demand
+detail — a child's delegated task, transcript window, or final output — hosts
+can invoke the extension command:
 
 ```text
 /subagents-inspect-rpc <requestId> <asyncId> [childId] [--lines N]
@@ -183,6 +189,10 @@ Inspection properties:
 - `task` is the child session's first user message and is only populated when
   it is genuinely attributable (fresh-context child whose session file fits the
   read window); forked children omit it.
+- `resolvedModel` (`{ provider, model }`) is the pair DM recorded on the
+  inspected child's latest own assistant reply, never the requested model. It is
+  absent before the first reply, for run-level inspection of a multi-step or
+  workflow run, and for runs recorded before dm-subagents reported it.
 - `childId` is exactly the node id the host received in the status snapshot
   (step `workflowKey`/`runId`/`step:<index>`, or a nested run id).
 
@@ -234,6 +244,8 @@ child stop API.
 ### Status and result fields
 
 The status/result fields are: `lifecycleArtifactVersion`, `runId`/`id`, `sessionId`, `mode`, `state`, `startedAt`, `lastUpdate`, `endedAt`, `durationMs`, `cwd`, `asyncDir`, `sessionFile`, `outputFile`, `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `model`/`requestedModel`, `toolCount`, `turnCount`, optional `launchResolvedExtensions`, optional `runtimeAcknowledgedExtensions`, and nested `children` when a child is allowed to launch subagents.
+
+A workflow child's own status adds `parentWorkflowRunId` and `workflowKey`. Use that pair to bind the child to its workflow. The child's `toolCallId` is a launch id the workflow host generates for that child, not the id of the parent tool call that started the workflow. While an async child runs, its session path is in `steps[0].sessionFile`; the top-level `sessionFile` is written when it completes.
 
 `requestedModel` records the launch's requested model (the explicit `--model` override, else the agent's configured model) before registry normalization.
 

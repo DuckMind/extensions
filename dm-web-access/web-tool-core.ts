@@ -12,16 +12,20 @@ import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { normalizeFetchContentParams, type FetchContentParams } from "./fetch-params.ts";
 import { resolveAuthFetchProfile, type AuthFetchProfile } from "./auth-fetch.ts";
 import { findContent, type FindMode } from "./content-find.ts";
+import { CLAIM_JUDGE_MODELS, judgeClaim, type ClaimJudgeModel } from "./claim-judge.ts";
+import { extractPageFields, formatPageExtraction, parseExtractFields } from "./field-extract.ts";
 import {
 	assertSearchProviderSelectionAllowed,
 	normalizeSearchProviderSelection,
+	parseProviderArgument,
+	validateSearchModelOverride,
 	search,
 	type SearchProvider,
 	type SearchProviderSelection,
 } from "./gemini-search.ts";
 import { isOpenAISearchAvailable } from "./openai-search.ts";
 import type { SearchResult } from "./perplexity.ts";
-import { getWebSearchConfigPath, runWithProxy } from "./utils.ts";
+import { getWebSearchConfigPath, isRecord, runWithProxy } from "./utils.ts";
 import { deleteResult, generateId, getResult, storeResult, type QueryResultData, type StoredSearchData } from "./storage.ts";
 import {
 	buildResearchArtifact,
@@ -64,6 +68,12 @@ export interface WebSearchConfig {
 	valyuApiKey?: unknown;
 	keenableApiKey?: unknown;
 	ceramicApiKey?: unknown;
+	linkupApiKey?: unknown;
+	linkupDepth?: unknown;
+	ninerouterBaseUrl?: unknown;
+	ninerouterApiKey?: unknown;
+	ninerouterProvider?: unknown;
+	deepseekApiKey?: unknown;
 	degoogBaseUrl?: unknown;
 	degoogApiKey?: unknown;
 	degoogEngines?: unknown;
@@ -76,9 +86,11 @@ export interface WebSearchConfig {
 	autoOpenBrowser?: unknown;
 	curatorRemote?: unknown;
 	summaryModel?: string;
+	queryRewriteModel?: string;
 	summaryGenerationDeadlineMs?: unknown;
 	summaryInstructions?: unknown;
 	maxInlineContentChars?: unknown;
+	sourceCheck?: unknown;
 	fetch?: {
 		defaultMode?: unknown;
 		allowedModes?: unknown;
@@ -89,6 +101,7 @@ export interface WebSearchConfig {
 	};
 	tools?: Partial<Record<keyof ToolNames, { enabled?: boolean }>>;
 	toolActivation?: unknown;
+	toolExposure?: unknown;
 	commands?: Partial<Record<"websearch" | "curator" | "search" | "google-account", { enabled?: boolean }>>;
 	toolNames?: Partial<ToolNames>;
 	shortcuts?: {
@@ -136,14 +149,16 @@ export const DEFAULT_TOOL_NAMES: ToolNames = {
 	getSearchContent: "get_search_content",
 };
 const SEARCH_QUERY_CONCURRENCY = 3;
-const FETCH_MODES = ["readable", "raw", "answer"] as const;
+const FETCH_MODES = ["readable", "raw", "answer", "extract"] as const;
 export type FetchMode = typeof FETCH_MODES[number];
 export type FetchModeConfig = { defaultMode: FetchMode; allowedModes: FetchMode[] };
+// Extract sends page text to Cloudflare, so it is offered only when fetch.allowedModes lists it.
+const DEFAULT_FETCH_MODES: FetchMode[] = ["readable", "raw", "answer"];
 
 export function resolveFetchModeConfig(config: WebSearchConfig): FetchModeConfig {
-	const configuredModes = config.fetch?.allowedModes ?? FETCH_MODES;
+	const configuredModes = config.fetch?.allowedModes ?? DEFAULT_FETCH_MODES;
 	if (!Array.isArray(configuredModes) || configuredModes.length === 0 || configuredModes.some(mode => !FETCH_MODES.includes(mode as FetchMode))) {
-		throw new Error(`fetch.allowedModes in ${WEB_SEARCH_CONFIG_PATH} must be a non-empty array containing only "readable", "raw", or "answer"`);
+		throw new Error(`fetch.allowedModes in ${WEB_SEARCH_CONFIG_PATH} must be a non-empty array containing only "readable", "raw", "answer", or "extract"`);
 	}
 	const allowedModes = configuredModes as FetchMode[];
 	const duplicateMode = allowedModes.find((mode, index) => allowedModes.indexOf(mode) !== index);
@@ -151,10 +166,22 @@ export function resolveFetchModeConfig(config: WebSearchConfig): FetchModeConfig
 		throw new Error(`fetch.allowedModes in ${WEB_SEARCH_CONFIG_PATH} must not contain duplicates: "${duplicateMode}"`);
 	}
 	const defaultMode = config.fetch?.defaultMode ?? "readable";
+	if (defaultMode === "extract") {
+		throw new Error(`fetch.defaultMode in ${WEB_SEARCH_CONFIG_PATH} cannot be "extract", because extract needs fields on each call`);
+	}
 	if (!allowedModes.includes(defaultMode as FetchMode)) {
 		throw new Error(`fetch.defaultMode in ${WEB_SEARCH_CONFIG_PATH} must be one of fetch.allowedModes`);
 	}
 	return { defaultMode: defaultMode as FetchMode, allowedModes };
+}
+
+export function resolveClaimJudgeModel(config: WebSearchConfig): ClaimJudgeModel | undefined {
+	if (config.sourceCheck === undefined) return undefined;
+	const judgeModel = isRecord(config.sourceCheck) ? config.sourceCheck.judgeModel : undefined;
+	if (typeof judgeModel !== "string" || !Object.hasOwn(CLAIM_JUDGE_MODELS, judgeModel)) {
+		throw new Error(`sourceCheck.judgeModel in ${WEB_SEARCH_CONFIG_PATH} must be one of ${Object.keys(CLAIM_JUDGE_MODELS).map((model) => `"${model}"`).join(", ")}`);
+	}
+	return judgeModel as ClaimJudgeModel;
 }
 
 // Limit each batch independently so separate DM tool calls can still run in parallel.
@@ -182,7 +209,7 @@ export function normalizeProviderInput(value: unknown, label = "provider"): Sear
 }
 
 export function resolveRequestedProvider(requested: unknown): SearchProviderSelection {
-	const normalizedRequested = normalizeProviderInput(requested);
+	const normalizedRequested = parseProviderArgument(requested);
 	if (normalizedRequested && normalizedRequested !== "auto") {
 		assertSearchProviderSelectionAllowed(normalizedRequested, "Requested provider");
 		return normalizedRequested;
@@ -327,7 +354,7 @@ function initialContentSlice(content: string, maxChars: number): {
 	shownBytes: number;
 	shownLines: number;
 } {
-	let endOffset = Math.min(content.length, maxChars);
+	let endOffset = pageEnd(content, 0, Math.min(content.length, maxChars));
 	if (endOffset < content.length) {
 		const lineBreak = content.lastIndexOf("\n", endOffset);
 		if (lineBreak >= Math.floor(maxChars * 0.8)) endOffset = lineBreak + 1;
@@ -405,7 +432,22 @@ function formatSourceCheckResult(artifact: ResearchArtifact, getSearchContentToo
 	}
 	if (artifact.sources.length > 0) {
 		lines.push("## Sources");
-		for (const source of artifact.sources) lines.push(`${source.rank}. [${source.quality}] ${source.title}\n   ${source.url}`);
+		let budget = 4_000;
+		let omitted = 0;
+		for (const source of artifact.sources) {
+			lines.push(`${source.rank}. [${source.quality}] ${source.title}\n   ${source.url}`);
+			for (const passage of artifact.passages.filter((candidate) => candidate.source_rank === source.rank)) {
+				const flat = passage.text.replace(/\s+/g, " ").trim();
+				// Drop a trailing high surrogate so the cut never splits an emoji.
+				const text = flat.length > 400 ? `${flat.slice(0, 400).replace(/[\uD800-\uDBFF]$/, "")}…` : flat;
+				if (text.length > budget) omitted++;
+				else {
+					budget -= text.length;
+					lines.push(`   - ${passage.passage_id}: ${text}`);
+				}
+			}
+		}
+		if (omitted > 0) lines.push(`${omitted} more passage${omitted === 1 ? "" : "s"} in the artifact.`);
 		lines.push("");
 	}
 	if (artifact.errors?.length) lines.push(`Search errors: ${artifact.errors.map((entry) => `${entry.query}: ${entry.error}`).join("; ")}`);
@@ -498,6 +540,8 @@ export interface WebToolCoreSettings {
 	/** Output ceiling for search results and stored-content pages. fetch_content rereads config per call. */
 	maxInlineContentChars: number;
 	fetchModes: FetchModeConfig;
+	/** Model that judges source_check claims; absent leaves every claim for manual review. */
+	claimJudgeModel?: ClaimJudgeModel;
 }
 
 export interface PageAnswerRequest {
@@ -570,16 +614,26 @@ export function storedContentSourceNames(settings: WebToolCoreSettings): string 
 	]);
 }
 
+/** Keeps a page end from splitting a surrogate pair: it moves back one code unit,
+ * or past the pair when moving back would leave the page empty. */
+function pageEnd(content: string, offset: number, end: number): number {
+	if (end <= offset || end >= content.length) return end;
+	const high = content.charCodeAt(end - 1);
+	const low = content.charCodeAt(end);
+	if (high < 0xd800 || high > 0xdbff || low < 0xdc00 || low > 0xdfff) return end;
+	return end - 1 > offset ? end - 1 : end + 1;
+}
+
 /** Slices content from offset and appends the next-slice instructions, shrinking
  * the slice so the whole page, instructions included, stays within maxChars. */
 function sliceWithContinuation(content: string, offset: number, limit: number, maxChars: number, continuationAt: (endOffset: number) => string): { endOffset: number; text: string } {
-	let endOffset = offset + Math.min(limit, content.length - offset);
+	let endOffset = pageEnd(content, offset, offset + Math.min(limit, content.length - offset));
 	let continuation = "";
 	while (endOffset < content.length) {
 		continuation = continuationAt(endOffset);
 		const overflow = endOffset - offset + continuation.length - maxChars;
 		if (overflow <= 0) break;
-		endOffset -= overflow;
+		endOffset = pageEnd(content, offset, endOffset - overflow);
 	}
 	return { endOffset, text: content.slice(offset, endOffset) + (endOffset < content.length ? continuation : "") };
 }
@@ -740,6 +794,7 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 	}
 
 	async function webSearch(params: WebSearchParams, signal?: AbortSignal, call: WebSearchCallOptions = {}): Promise<WebToolResult> {
+		const model = validateSearchModelOverride(params.provider, params.model);
 		const { extensionContext: ctx, onUpdate } = call;
 		return runWithProxy(typeof params.proxy === "string" ? params.proxy : undefined, async () => {
 			const rawQueryList: unknown[] = Array.isArray(params.queries)
@@ -759,6 +814,7 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 			const allUrls: string[] = [];
 			const allInlineContent: ExtractedContent[] = [];
 			const resolvedProvider = resolveRequestedProvider(params.provider);
+			const providerFromConfig = (parseProviderArgument(params.provider) ?? "auto") === "auto";
 
 			const queryResponses = await runSearchQueries(queryList, async (query) => {
 				signal?.throwIfAborted();
@@ -770,6 +826,8 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 				try {
 					const { answer, results, inlineContent, provider, providerResponses } = await search(query, {
 						provider: resolvedProvider,
+						model,
+						providerFromConfig,
 						numResults: params.numResults,
 						recencyFilter,
 						domainFilter: params.domainFilter,
@@ -868,6 +926,7 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 				try {
 					const response = await search(query, {
 						provider: resolveRequestedProvider(params.provider),
+						providerFromConfig: (parseProviderArgument(params.provider) ?? "auto") === "auto",
 						numResults,
 						recencyFilter,
 						domainFilter,
@@ -897,7 +956,7 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 					fetched = urls.map((url) => ({ url, title: "", content: "", error: err instanceof Error ? err.message : String(err) }));
 				}
 			}
-			const artifact = withClaimAssessment(buildResearchArtifact({
+			const built = buildResearchArtifact({
 				query: claim,
 				provider,
 				summary: summaries.length > 0 ? summaries.join("\n\n") : undefined,
@@ -905,7 +964,29 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 				fetched,
 				recency: recencyFilter,
 				domainFilter,
-			}), [claim]);
+			});
+			let artifact: ResearchArtifact;
+			const failedSearchCount = errors.length;
+			// The judge runs through DM's model registry, so hosts without one (MCP) skip it.
+			const modelRegistry = ctx?.modelRegistry;
+			let judgeFailed = false;
+			if (settings.claimJudgeModel && modelRegistry && built.passages.length > 0 && !signal?.aborted) {
+				const titles = new Map(built.sources.map((source) => [source.rank, source.title || source.url]));
+				const passages = built.passages.map((passage) => ({ id: passage.passage_id, source: titles.get(passage.source_rank) ?? passage.source_url, text: passage.text }));
+				const judgment = await judgeClaim(settings.claimJudgeModel, claim, passages, modelRegistry, signal);
+				artifact = { ...built, claims: [judgment.assessment] };
+				if (judgment.error) {
+					judgeFailed = true;
+					errors.push({ query: "claim judge", error: judgment.error });
+				}
+			} else {
+				artifact = withClaimAssessment(built, [claim]);
+			}
+			const assessment = artifact.claims![0]!;
+			// Snippets alone rarely settle a claim; a judge failure already names its own cause.
+			if (!params.fetchContent && assessment.status === "unclear" && !judgeFailed) {
+				artifact.claims = [{ ...assessment, rationale: `${assessment.rationale} Only search snippets were checked; retry with fetchContent: true to include the pages.` }];
+			}
 			if (errors.length > 0) artifact.errors = errors;
 			storeResearchArtifact(artifact);
 			host.publishResult?.({
@@ -916,7 +997,7 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 			});
 			return {
 				content: [{ type: "text", text: formatSourceCheckResult(artifact, getSearchContentEnabled ? toolNames.getSearchContent : null) }],
-				details: { responseId: artifact.id, artifact, sourceCount: artifact.sources.length, passageCount: artifact.passages.length, searchCount: queries.length },
+				details: { responseId: artifact.id, artifact, sourceCount: artifact.sources.length, passageCount: artifact.passages.length, searchCount: queries.length, failedSearchCount },
 			};
 		});
 	}
@@ -949,8 +1030,22 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 			if (mode === "answer" && options.model) {
 				return { content: [{ type: "text", text: "Error: use answerModel, not model, with mode answer." }], details: { error: "model is incompatible with mode answer" } };
 			}
-			if (mode === "answer" && options.auth !== undefined) {
-				return { content: [{ type: "text", text: "Error: auth cannot be combined with mode answer." }], details: { error: "auth cannot be combined with mode answer" } };
+			// Authenticated page text never goes to a hosted model.
+			if ((mode === "answer" || mode === "extract") && options.auth !== undefined) {
+				return { content: [{ type: "text", text: `Error: auth cannot be combined with mode ${mode}.` }], details: { error: `auth cannot be combined with mode ${mode}` } };
+			}
+			if (mode !== "extract" && params.fields !== undefined) {
+				return { content: [{ type: "text", text: "Error: fields requires mode extract." }], details: { error: "fields requires mode extract" } };
+			}
+			let extractFields: ReturnType<typeof parseExtractFields> | undefined;
+			if (mode === "extract") {
+				try {
+					if (params.fields === undefined) throw new Error("mode extract requires fields");
+					extractFields = parseExtractFields(params.fields);
+				} catch (err) {
+					const error = err instanceof Error ? err.message : String(err);
+					return { content: [{ type: "text", text: `Error: ${error}.` }], details: { error } };
+				}
 			}
 			let authFetchProfile: AuthFetchProfile | undefined;
 			if (options.auth !== undefined) {
@@ -980,12 +1075,16 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 				...(authFetchProfile ? { authFetchProfile } : {}),
 			};
 			const fetchResults = await fetchAllContent(urlList, signal, fetchOptions(requestOptions, options.proxy));
+			// Reject image-as-payload results (direct images, video frames — they set mimeType and/or frames).
+			// A text result that merely attaches a thumbnail (YouTube analysis) stays answerable.
+			const textResults = mode === "answer" || mode === "extract"
+				? fetchResults.map(result => !result.error && (result.mimeType?.startsWith("image/") || result.frames?.length)
+					? { ...result, error: `${mode === "answer" ? "Page answer" : "Field extraction"} requires textual fetched content` }
+					: result)
+				: fetchResults;
 			const presentedResults = mode === "answer"
-				? await Promise.all(fetchResults.map(async result => {
+				? await Promise.all(textResults.map(async result => {
 					if (result.error) return result;
-					if (result.thumbnail || result.mimeType?.startsWith("image/")) {
-						return { ...result, error: "Page answer requires textual fetched content" };
-					}
 					try {
 						if (!host.answerFromPage) throw new Error("this host cannot answer from fetched pages");
 						const answer = await host.answerFromPage({
@@ -999,7 +1098,11 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 						return { ...result, error: `Page answer failed: ${err instanceof Error ? err.message : String(err)}` };
 					}
 				}))
-				: fetchResults;
+				: textResults;
+			const extractLimit = pLimit(3);
+			const extractions = extractFields
+				? await Promise.all(presentedResults.map(result => result.error ? undefined : extractLimit(() => extractPageFields(result.content, extractFields!, { modelRegistry: ctx?.modelRegistry }, signal))))
+				: undefined;
 			const successful = presentedResults.filter((r) => !r.error).length;
 			const totalChars = presentedResults.reduce((sum, r) => sum + r.content.length, 0);
 
@@ -1012,6 +1115,40 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 			} satisfies FetchedContentData;
 			const storedContent = storeFetchResult(responseId, data, authFetchProfile);
 			const structuredContent = fetchStructuredContent(storedContent ? responseId : null, presentedResults);
+
+			if (extractions) {
+				structuredContent.urls.forEach((entry, index) => {
+					if (extractions[index]) entry.extraction = extractions[index];
+				});
+				let output = "## Extracted fields\n";
+				presentedResults.forEach((result, index) => {
+					output += `\n### ${result.title || result.url}\n`;
+					output += result.error ? `Error: ${result.error}\n` : formatPageExtraction(extractions[index]!);
+				});
+				const outputLimit = getMaxInlineContentChars();
+				if (output.length > outputLimit) output = `${output.slice(0, outputLimit)}\n\n[Results cut at ${outputLimit} characters; ask for fewer fields or URLs.]\n`;
+				// Extract rejects auth, so the pages are always stored.
+				const anyUncertain = extractions.some((extraction) => extraction && "fields" in extraction && Object.values(extraction.fields).some((field) => field.status === "uncertain"));
+				output += getSearchContentEnabled
+					? `\n---\nThe fetched pages are stored as responseId "${responseId}". Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0 }) to read the first one; urlIndex follows the order above.${anyUncertain ? " To check an uncertain value, add findText with its guess." : ""}`
+					: "\n---\nContent retrieval is not registered.";
+				return {
+					// A page that fetched but could not be extracted still counts as fetched: its content is stored.
+					...(successful === 0 ? { isError: true } : {}),
+					content: [{ type: "text", text: output }],
+					structuredContent,
+					details: {
+						urls: urlList,
+						urlCount: urlList.length,
+						successful,
+						mode,
+						responseId,
+						// The TUI summarizes a single URL from these, as for the other modes.
+						...(urlList.length === 1 ? { title: presentedResults[0].title, totalChars: presentedResults[0].content.length, ...(presentedResults[0].error ? { error: presentedResults[0].error } : {}) } : {}),
+						extractions: presentedResults.map((result, index) => ({ url: result.url, ...(result.error ? { error: result.error } : extractions[index]) })),
+					},
+				};
+			}
 
 			if (urlList.length === 1) {
 				const result = presentedResults[0];
@@ -1031,9 +1168,7 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 
 				if (truncated) {
 					output += `\n\n---\nShowing ${slice.endOffset} of ${fullLength} chars, ${slice.shownBytes} of ${slice.totalBytes} bytes, and ${slice.shownLines} of ${slice.totalLines} lines. `;
-					if (mode === "answer") {
-						output += "Answer output is truncated. Stored content is the original source, not the remaining answer. ";
-					}
+					if (mode === "answer") output += "Stored content is the original source, not the remaining answer. ";
 					output += storedContent
 						? getSearchContentEnabled
 							? mode === "answer"
@@ -1090,34 +1225,21 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 				};
 			}
 
-			let output: string;
-			if (mode === "answer") {
-				// Answers are generated, not stored, so they must be visible here; the
-				// stored responseId only reaches the original source pages.
-				let budget = getMaxInlineContentChars();
-				output = "## Page answers\n";
-				for (const { url, title, content, error } of presentedResults) {
-					if (error) {
-						output += `\n### ${url}\nError: ${error}\n`;
-						continue;
-					}
+			// Answers are generated, not stored, so they must be shown here in full up to the output limit.
+			let budget = mode === "answer" ? getMaxInlineContentChars() : 0;
+			let output = mode === "answer" ? "## Page answers\n" : "## Fetched URLs\n\n";
+			for (const { url, title, content, error } of presentedResults) {
+				if (mode !== "answer") {
+					output += error ? `- ${url}: Error - ${error}\n` : `- ${title || url} (${content.length} chars)\n`;
+				} else if (error) {
+					output += `\n### ${url}\nError: ${error}\n`;
+				} else {
 					const shown = content.slice(0, budget);
 					budget -= shown.length;
 					const marker = shown.length === content.length
 						? ""
-						: shown.length === 0
-							? "\n[answer omitted; earlier answers used the output limit, fetch fewer URLs per call for complete answers]"
-							: "\n[answer truncated at the output limit; fetch fewer URLs per call for complete answers]";
+						: `\n[answer ${shown.length ? "truncated at the output limit;" : "omitted; earlier answers used the output limit,"} fetch fewer URLs per call for complete answers]`;
 					output += `\n### ${title || url}\n${shown}${marker}\n`;
-				}
-			} else {
-				output = "## Fetched URLs\n\n";
-				for (const { url, title, content, error } of presentedResults) {
-					if (error) {
-						output += `- ${url}: Error - ${error}\n`;
-					} else {
-						output += `- ${title || url} (${content.length} chars)\n`;
-					}
 				}
 			}
 			const retrievalHint = mode === "answer"
@@ -1386,7 +1508,7 @@ export function createWebToolCore(host: WebToolCoreHost): WebToolCoreInstance {
 				};
 			}
 
-			const endOffset = Math.min(offset + limit, urlData.content.length);
+			const endOffset = pageEnd(urlData.content, offset, Math.min(offset + limit, urlData.content.length));
 			const contentSlice = urlData.content.slice(offset, endOffset);
 			const hasMore = endOffset < urlData.content.length;
 			let text = `# ${urlData.title || urlData.url}\n\n${contentSlice}`;
@@ -1445,10 +1567,10 @@ function standaloneError(error: string): WebToolResult {
 // URL, or every source_check search failed. A working search with zero matches
 // is not.
 export function markToolError<T extends Omit<WebToolResult, "structuredContent">>(result: T): T {
-	const { error, queryCount, successfulQueries, urlCount, successful, searchCount, artifact } = result.details;
+	const { error, queryCount, successfulQueries, urlCount, successful, searchCount, failedSearchCount } = result.details;
 	const nothingSucceeded = (typeof queryCount === "number" && queryCount > 0 && successfulQueries === 0)
 		|| (typeof urlCount === "number" && urlCount > 0 && successful === 0)
-		|| (typeof searchCount === "number" && searchCount > 0 && (artifact as ResearchArtifact).errors?.length === searchCount);
+		|| (typeof searchCount === "number" && searchCount > 0 && failedSearchCount === searchCount);
 	return error !== undefined || nothingSucceeded ? { ...result, isError: true } : result;
 }
 
@@ -1504,6 +1626,7 @@ export function createStandaloneWebToolCore(): StandaloneWebToolCore {
 		},
 		maxInlineContentChars: getMaxInlineContentChars(config),
 		fetchModes: resolveFetchModeConfig(config),
+		claimJudgeModel: resolveClaimJudgeModel(config),
 	};
 	const storedIds: string[] = [];
 	const remember = (id: string) => {

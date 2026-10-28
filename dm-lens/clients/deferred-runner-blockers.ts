@@ -84,7 +84,10 @@ export function judgeDeferredRunnerFindings(
 	cwd: string,
 	options: { quiet?: boolean } = {},
 ): DeferredRunnerVerdict {
-	const findings = pending.result?.diagnostics ?? [];
+	// #4130: the run's fault reaches the agent once, as turn end's failure note.
+	const findings = (pending.result?.diagnostics ?? []).flatMap((d) =>
+		d.runnerFault === true ? [] : [d],
+	);
 	if (findings.length === 0) {
 		return { stale: 0, live: 0, kept: [], suppressed: 0, bytes: undefined };
 	}

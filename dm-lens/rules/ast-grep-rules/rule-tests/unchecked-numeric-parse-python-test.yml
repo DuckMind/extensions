@@ -12,7 +12,22 @@ valid:
         g = int(s)
     except ValueError:
         pass
+  - |
+    # #4840: round() and len() already return numbers.
+    a = float(round(v, 3))
+    b = int(len(xs))
+  - |
+    # #4841 review F4: abs(), sum() and ord() raise TypeError, never ValueError,
+    # and return a number otherwise.
+    c = int(abs(v))
+    d = float(sum(xs))
+    e = int(ord(ch))
 invalid:
   - 'int("42")'
   - 'float("3.14")'
   - 'int(user_input)'
+  - 'int(s.strip())'
+  - 'float(round_trip(s))'
+  - |
+    # min() and max() return their argument's type, so a string can reach int().
+    int(min(parts))

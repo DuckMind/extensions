@@ -1,12 +1,29 @@
-import { type Component } from "@duckmind/dm-tui";
+import { type Component, type TuiMouseEvent } from "@duckmind/dm-tui";
 
-// The bundled TUI has no MouseRegion. Preserve the visible, key-expandable
-// component; a future host can replace this wrapper with mouse delivery.
 export class MouseRegion implements Component {
-  private readonly child: Component;
-  constructor(child: Component, _onMouse: (event: { type: string; button: string }) => unknown) {
-    this.child = child;
-  }
-  render(width: number): string[] { return this.child.render(width); }
-  invalidate(): void { this.child.invalidate(); }
+	private readonly child: Component;
+	private readonly onMouse: (event: TuiMouseEvent) => { handled: boolean; render?: boolean } | undefined;
+
+	constructor(child: Component, onMouse: (event: TuiMouseEvent) => { handled: boolean; render?: boolean } | undefined) {
+		this.child = child;
+		this.onMouse = onMouse;
+	}
+
+	render(width: number): string[] {
+		return this.child.render(width);
+	}
+
+	invalidate(): void {
+		this.child.invalidate();
+	}
+
+	handleMouse(event: TuiMouseEvent): { handled: boolean; render?: boolean } | undefined {
+		if (
+			event.type !== "click" || event.button !== "left" ||
+			event.shift || event.alt || event.ctrl ||
+			event.x < 0 || event.x >= event.width || event.y < 0 || event.y >= this.child.render(event.width).length
+		) return undefined;
+		const result = this.onMouse(event);
+		return result?.handled ? { ...result, render: result.render ?? true } : result;
+	}
 }

@@ -288,6 +288,8 @@ export type DegradationKind =
 	 * repeats it every turn.
 	 */
 	| "dead-code-late-scan-dropped"
+	/** A deferred autofix scope was already attempted; once per tool/scope per session. */
+	| "deferred-autofix-duplicate-scope"
 	/**
 	 * #3814: the commit gate's pre-check of settled collect-later runner answers
 	 * (`absorbSettledRunnerBlockers`) threw. The gate falls back to the blocker
@@ -340,6 +342,14 @@ export type DegradationKind =
 	 * so a broken consumer cannot spam the agent-facing summary.
 	 */
 	| "disk-change-subscriber-failed"
+	/**
+	 * #4742: the exact-URI watched-files events for published paths no client
+	 * holds could not be built or delivered (`notifyUnheldPaths`,
+	 * clients/disk-change-subscribers.ts), so a closed module changed on disk
+	 * may keep its old bytes in a live server. Subject: the normalized root;
+	 * one row per root per session.
+	 */
+	| "disk-change-unheld-notify-failed"
 	| "dispatch-non-absolute-baseline-path"
 	/**
 	 * A server-initiated `workspace/applyEdit` fell back to the mutation
@@ -385,6 +395,14 @@ export type DegradationKind =
 	 * Subject is the tool.
 	 */
 	| "fix-run-agent-edit-overwritten"
+	/**
+	 * #3915: the deferred autofix drain's loss notice threw while reporting a
+	 * restore's loss — the advisory queue, the renderer, or the host `notify` —
+	 * so the notice never reached the session. Recorded instead of letting the
+	 * rejection reach `bounded()`'s boxed handler, which swallows it once the
+	 * deadline has fired. Subject is the drained file; once per file.
+	 */
+	| "fix-run-loss-notice-failed"
 	/** A bounded pre-run call was not carried into a fixer run (#3830). */
 	| "fix-run-pending-call-cap"
 	/**
@@ -458,6 +476,13 @@ export type DegradationKind =
 	 * session; subject is the lock directory.
 	 */
 	| "generation-lock-wait-skipped"
+	/**
+	 * #4921: a concurrent in-process session's write, with no blocker of its
+	 * own, met a commit-gate record another session owns and left it (and the
+	 * process-wide latch) untouched. Subject is the writing session; once per
+	 * session, because each of its clean writes meets the same record.
+	 */
+	| "git-guard-non-owner-write"
 	/**
 	 * Failed-first test state was retired only after ENOENT/ENOTDIR evidence,
 	 * retained when the filesystem probe was indeterminate, or evicted at the
@@ -770,10 +795,18 @@ export type DegradationKind =
 	 */
 	| "lsp-created-import-scan-incomplete"
 	/**
-	 * #4476: the walk of a root's declaration files passed its directory or
-	 * file cap, so a declaration file created, edited or deleted outside
-	 * dm-lens under that root reaches no language server and refuses no
-	 * diagnostics-cache entry (clients/out-of-band-changes.ts). Once per root.
+	 * Two emitters, both in clients/out-of-band-changes.ts.
+	 *
+	 * #4476, the cap: the walk of a root's declaration files passed its
+	 * directory or file cap, so a declaration file created, edited or deleted
+	 * outside dm-lens under that root reaches no language server and refuses no
+	 * diagnostics-cache entry. Subject is the root. Once per root.
+	 *
+	 * #4905, the home ceiling: the root is the home folder or above it
+	 * (compared by real path), so the declaration walk is skipped and a
+	 * declaration file changed outside dm-lens under it is not looked for. The
+	 * install stamp is still read and compared, so an install still publishes.
+	 * Subject is `home-root`. Once per session.
 	 */
 	| "lsp-declaration-look-capped"
 	/**
@@ -987,6 +1020,23 @@ export type DegradationKind =
 	 * "hung" server is truly hung or just answering late.
 	 */
 	| "lsp-pull-unconfirmed"
+	/**
+	 * #4801: a read-only command (`runReadOnlyServerCommand`, reached from the
+	 * warm-attach membership probe and the didOpen project-identity probe) hit
+	 * `PROBE_COMMAND_TIMEOUT_MS` and gave up on the answer for good, so its
+	 * request was cancelled on the wire and released locally instead of being
+	 * left pending. Subject is the server id and `recordDegradationOnce` keeps
+	 * it at one row per server per session — never one per probe, which on a
+	 * wedged server would be one row per attach.
+	 *
+	 * This is deliberately NOT `warm-attach-membership-probe-abandoned`: that
+	 * one fires when the CALLER's remaining budget abandons the wait
+	 * (`clients/warm-attach.ts`'s `withinRemaining`), not when the request's own
+	 * ceiling wins, so before this row a release left no record anywhere. The
+	 * row marks a release that happened; a regression that stopped releasing
+	 * never reaches it, so the wire test of the ceiling pins that case.
+	 */
+	| "lsp-readonly-command-released"
 	/** A config registry decision dropped or admitted executable project data. */
 	| "lsp-registry-decision"
 	/** A host-created pi-agent staging root was declined as an LSP root. */
@@ -1051,6 +1101,14 @@ export type DegradationKind =
 	 * detached `workspace/didCreateFiles` announcement threw (#4787).
 	 */
 	| "lsp-sibling-announcement"
+	/**
+	 * #4532 gap 13: a module a diagnostics call's target imports, open in no
+	 * server, could not be read to compare its bytes with the ones last seen
+	 * (clients/lsp/index.ts `unheldBytesMoved`). Its stat alone is compared, so
+	 * a rewrite of the same bytes is sent as a change. Subject is the path.
+	 * Once per path per session.
+	 */
+	| "lsp-unheld-dependency-unreadable"
 	/**
 	 * A language-server child process CLOSED without dm-lens having asked it to
 	 * (#1969). `clientShutdown()` sets `state.shutdownRequested`, so evictions
@@ -2550,6 +2608,8 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
  */
 const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	"log-sink-rotated",
+	// Project-scoped autofix dedupe is intentional, not a failed fixer (#4862).
+	"deferred-autofix-duplicate-scope",
 	// #2504 review round 8 (S1): both fire on the ordinary re-edit cadence
 	// (a carry-forward window closing, or a session boundary) and are
 	// self-healing -- the next turn's analysis or deferral re-observes the

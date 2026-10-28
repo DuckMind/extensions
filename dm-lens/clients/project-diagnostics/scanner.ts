@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { createDispatchContext } from "../dispatch/dispatcher.js";
 import { evaluateRules } from "../dispatch/fact-rule-runner.js";
@@ -13,7 +14,7 @@ import {
 import type { Diagnostic } from "../dispatch/types.js";
 import { detectFileKind } from "../file-kinds.js";
 import { isTestFile } from "../file-utils.js";
-import { isAtOrAboveHomeDir } from "../path-utils.js";
+import { isAtOrAboveHomeDir, realpathOrResolve } from "../path-utils.js";
 import { getProjectDiagnosticsScannerMaxFiles } from "../project-scale.js";
 import { captureReviewGraphStructuralIr } from "../review-graph/builder.js";
 import {
@@ -510,8 +511,15 @@ export async function scanProjectDiagnostics(
 	// The cheap tier is bounded by DEFAULT_MAX_FILES, but from $HOME it still
 	// traverses a huge unrelated tree until it happens to keep that many source
 	// files. An explicit `files` list (#461) is a caller-chosen subset, not a
-	// walk, so it is never refused here. Same ceiling as fresh-fetch.ts.
-	if (!options.files && isAtOrAboveHomeDir(cwd, options.homeDir)) {
+	// walk, so it is never refused here. Same ceiling as fresh-fetch.ts, by
+	// real path on both sides (#4911).
+	if (
+		!options.files &&
+		isAtOrAboveHomeDir(
+			realpathOrResolve(cwd),
+			realpathOrResolve(options.homeDir ?? os.homedir()),
+		)
+	) {
 		return {
 			version: PROJECT_DIAGNOSTICS_CACHE_VERSION,
 			cwd,

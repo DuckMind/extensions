@@ -19,6 +19,7 @@ import { recordWaitCompletion } from "../../src/runs/background/wait-completions
 import { completionArchivePath, completionReplayPath } from "../../src/runs/background/completion-replay.ts";
 import { formatOutputArtifactContent } from "../../src/shared/artifacts.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
+import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
 
 const SESSION_ID = "session-current";
 
@@ -130,6 +131,20 @@ describe("inspect-rpc resolution and ownership", () => {
 		assert.equal(reply.task, undefined);
 		assert.equal(reply.finalOutput, undefined);
 	});
+	it("inspects a run inherited from a session this process replaced", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-inspect-inherited-"));
+		recordSessionReplacement(SESSION_ID, "session-replaced");
+		const { resultsDir } = makeRun(root, {
+			runId: "run-inherited",
+			sessionId: "session-replaced",
+			sessionMessages: [userMessage("Inherited task"), assistantMessage("Done.")],
+			resultPayload: { summary: "Inherited summary", results: [{ agent: "worker", output: "inherited answer", success: true }] },
+		});
+		const reply = buildInspectReply({ requestId: "r-inherited", asyncId: "run-inherited" }, makeDeps(root, resultsDir));
+		assert.equal(reply.error, undefined);
+		assert.equal(reply.task, "Inherited task");
+		assert.equal(reply.finalOutput, "Inherited summary");
+	});
 	it("returns no_active_session when the request cannot be attributed", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-inspect-nosession-"));
 		const { resultsDir } = makeRun(root, { runId: "run-x" });
@@ -192,6 +207,35 @@ describe("inspect-rpc reply content", () => {
 		const serialized = JSON.stringify(reply);
 		assert.equal(serialized.includes(sessionFile), false);
 		assert.equal(serialized.includes(root), false);
+	});
+	it("reports the provider and model the child's own reply recorded, and nothing a run-level workflow or historical status cannot attribute", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-inspect-model-"));
+		const resolvedModel = { provider: "openai-codex", model: "gpt-6-sol" };
+		const single = makeRun(root, { runId: "run-model", steps: [{ agent: "worker", status: "complete", model: "llama-swap/qwen3.5:9b", resolvedModel }] });
+		assert.deepEqual(buildInspectReply({ requestId: "m1", asyncId: "run-model" }, makeDeps(root, single.resultsDir)).resolvedModel, resolvedModel);
+		const historical = makeRun(root, { runId: "run-model-old", steps: [{ agent: "worker", status: "complete", model: "llama-swap/qwen3.5:9b" }] });
+		assert.equal(buildInspectReply({ requestId: "m4", asyncId: "run-model-old" }, makeDeps(root, historical.resultsDir)).resolvedModel, undefined);
+		// A background workflow child records its reply in its own run's status; the workflow's step only names that run.
+		const workflow = makeRun(root, { runId: "run-model-wf", mode: "workflow", steps: [{ agent: "planner", status: "complete", workflowKey: "step-a", runId: "run-model-wf-child" }] });
+		const writeChild = (runId: string, extra: Record<string, unknown>) => {
+			const child = makeRun(root, { runId, steps: [{ agent: "planner", status: "complete", resolvedModel }] });
+			const statusPath = path.join(child.asyncDir, "status.json");
+			fs.writeFileSync(statusPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(statusPath, "utf-8")), ...extra }), "utf-8");
+		};
+		writeChild("run-model-wf-child", { parentWorkflowRunId: "run-model-wf" });
+		const wfDeps = makeDeps(root, workflow.resultsDir);
+		assert.equal(buildInspectReply({ requestId: "m2", asyncId: "run-model-wf" }, wfDeps).resolvedModel, undefined);
+		assert.deepEqual(buildInspectReply({ requestId: "m3", asyncId: "run-model-wf", childId: "step-a" }, wfDeps).resolvedModel, resolvedModel);
+		assert.deepEqual(buildInspectReply({ requestId: "m3b", asyncId: "run-model-wf", childId: "run-model-wf-child" }, wfDeps).resolvedModel, resolvedModel);
+		// A named run that is not this workflow's child, or belongs to another session, is not attributed.
+		makeRun(root, { runId: "run-model-wf2", mode: "workflow", steps: [{ agent: "planner", status: "complete", workflowKey: "step-b", runId: "run-model-other" }, { agent: "planner", status: "complete", workflowKey: "step-c", runId: "run-model-foreign" }] });
+		writeChild("run-model-other", { parentWorkflowRunId: "run-model-wf" });
+		writeChild("run-model-foreign", { parentWorkflowRunId: "run-model-wf2", sessionId: "session-other" });
+		assert.equal(buildInspectReply({ requestId: "m3c", asyncId: "run-model-wf2", childId: "step-b" }, wfDeps).resolvedModel, undefined);
+		assert.equal(buildInspectReply({ requestId: "m3d", asyncId: "run-model-wf2", childId: "step-c" }, wfDeps).resolvedModel, undefined);
+		const long = makeRun(root, { runId: "run-model-long", steps: [{ agent: "worker", status: "complete", resolvedModel: { provider: "p".repeat(500), model: "m".repeat(500) } }] });
+		const capped = buildInspectReply({ requestId: "m5", asyncId: "run-model-long" }, makeDeps(root, long.resultsDir)).resolvedModel;
+		assert.ok(capped && capped.provider.length <= 64 && capped.model.length <= 160);
 	});
 	it("resolves a direct step child by snapshot node id", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-inspect-child-"));
@@ -563,6 +607,7 @@ describe("inspect-rpc bounds", () => {
 		const big = "x".repeat(1_000);
 		const { resultsDir } = makeRun(root, {
 			runId: "run-big",
+			steps: [{ agent: "worker", status: "complete", resolvedModel: { provider: "openai-codex", model: "gpt-6-sol" } }],
 			sessionMessages: Array.from({ length: 300 }, (_, index) => assistantMessage(`${index}:${big}`)),
 			resultPayload: { summary: big.repeat(9), results: [] },
 		});
@@ -571,6 +616,7 @@ describe("inspect-rpc bounds", () => {
 		const bytes = Buffer.byteLength(JSON.stringify(reply), "utf-8");
 		assert.ok(bytes <= MAX_SERIALIZED_BYTES, `reply ${bytes} exceeds ${MAX_SERIALIZED_BYTES}`);
 		assert.ok((reply.truncated?.messages ?? 0) > 0);
+		assert.deepEqual(reply.resolvedModel, { provider: "openai-codex", model: "gpt-6-sol" }, "message trimming must keep the resolved model");
 	});
 	it("caps per-field lengths", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-inspect-caps-"));

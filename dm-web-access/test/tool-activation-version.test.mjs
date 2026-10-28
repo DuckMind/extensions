@@ -104,8 +104,7 @@ test("a host-redirected warm session restores exactly the tools it recorded", ()
 
 test("a host older than 0.86.0 falls back to eager web tools without crashing", () => {
 	const state = run({ legacyHost: true });
-	assert.equal(state.warnings.length, 1);
-	assert.match(state.warnings[0], /requires DM 0\.86\.0 or newer/);
+	assert.deepEqual(state.warnings, []);
 	assert.equal(state.active.includes("web_enable"), false);
 	assert.ok(state.active.includes("web_search"), `expected eager web_search, got ${state.active.join(", ")}`);
 });

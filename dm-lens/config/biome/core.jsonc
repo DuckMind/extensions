@@ -60,10 +60,10 @@
 				"noDoubleEquals": "error",
 				"noEmptyInterface": "warn",
 				"noExplicitAny": "warn"
-			},
-			"nursery": {
-				"useSortedClasses": "off"
 			}
+			// No "nursery" group (refs #4886): nursery rules are off unless
+			// named, and biome renames them between minors, so one stale key
+			// makes the managed (latest) biome reject this whole config.
 		}
 	},
 	"javascript": {

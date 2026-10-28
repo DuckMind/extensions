@@ -65,6 +65,7 @@ function createFixture(handler: CallHandler, wrap?: (transport: Transport) => Tr
     reads,
     tools,
     listCount: () => listCount,
+    clientVersion: () => server?.getClientVersion(),
     createTransport,
     notifyToolsChanged: () => server!.sendToolListChanged(),
     dropConnection: () => serverTransport?.close(),
@@ -124,6 +125,7 @@ describe("host-managed MCP adapter", () => {
     await adapter.ready();
     await adapter.ready();
     expect(fixture.createTransport).toHaveBeenCalledTimes(1);
+    expect(fixture.clientVersion()).toMatchObject({ name: "dm-mcp-fixture" });
     const first = installPi(adapter);
     const reloaded = installPi(adapter);
     expect([...first.tools.keys()]).toEqual(["fixture_echo"]);
@@ -401,6 +403,7 @@ describe("host-managed MCP adapter", () => {
 
     expect(result.details).toMatchObject({ error: "host_error", sent: true });
     expect(text(result)).toContain("may have run");
+    expect(text(result)).toContain("blocked by the approval gate");
     expect(fixture.calls).toHaveLength(1);
     expect(fixture.reads).toEqual([]);
   });

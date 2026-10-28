@@ -21,7 +21,7 @@ export const readQuietStartup = getQuietStartup;
 const RUNTIME_MODE_LIST = RUNTIME_MODES.join("|");
 const PONYTAIL_COMMAND_DESCRIPTION = `Set mode: ${RUNTIME_MODE_LIST}. Commands: status, default <mode>`;
 
-// Every item is a complete command: pi submits on Enter, so a bare "default" would run without a mode.
+// Every item is a complete command: DM submits on Enter, so a bare "default" would run without a mode.
 // Values only: per-level descriptions would be a second copy of the Levels table in SKILL.md.
 export function completePonytailArgs(prefix) {
   const typed = String(prefix || "").trimStart();
@@ -84,7 +84,7 @@ export default function ponytailExtension(pi) {
     // ponytail: hide the indicator but keep the ruleset active (#324).
     if (hideStatus) return;
     if (!c?.ui?.setStatus) return;
-    // ponytail: try/catch guards against pi-web theme proxy throwing before initTheme
+    // ponytail: try/catch guards against the web theme proxy throwing before initTheme
     let theme;
     try { theme = c.ui.theme; if (!theme?.fg) return; } catch { return; }
     if (currentMode === "off") {
@@ -112,7 +112,7 @@ export default function ponytailExtension(pi) {
     const normalized = String(args || "").trim();
     const message = normalized ? `${skillName} ${normalized}` : skillName;
 
-    // pi.sendUserMessage does not expand skill commands on its own, so without
+    // The host's sendUserMessage does not expand skill commands on its own, so without
     // expandPromptTemplates the alias lands as the literal text
     // "/skill:ponytail-review" and the skill body never reaches the agent.
     if (ctx?.isIdle?.() === false) {
@@ -209,7 +209,7 @@ export default function ponytailExtension(pi) {
     }
   });
 
-  // Both hosts emit session_tree. Pi re-emits session_start on /new, /resume and
+  // Both hosts emit session_tree. DM re-emits session_start on /new, /resume and
   // /fork; OMP emits session_switch and session_branch instead.
   for (const eventName of ["session_tree", "session_switch", "session_branch"]) {
     pi.on(eventName, async (_event, ctx) => {
@@ -234,9 +234,9 @@ export default function ponytailExtension(pi) {
       return;
     }
     const instructions = getPonytailInstructions(currentMode);
-    // Prefer structured sections so Pi can keep the cached prefix when other
+    // Prefer structured sections so DM can keep the cached prefix when other
     // extensions change their own section (#953). Fall back to replacement
-    // for older Pi versions without systemPromptOptions.sections.
+    // for older DM versions without systemPromptOptions.sections.
     const sections = event?.systemPromptOptions?.sections;
     if (sections && typeof sections === "object") {
       sections.ponytail = instructions;

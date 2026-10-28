@@ -7,6 +7,7 @@ import { truncateForLedger } from "../../../ledger-bounds.js";
 import {
 	type Diagnostic,
 	type DispatchContext,
+	faultResult,
 	findingsResult,
 	type RunnerResult,
 } from "../../types.js";
@@ -353,24 +354,17 @@ export function finishParsedRun(input: FinishParsedRunInput): RunnerResult {
 	if (input.diagnostics.length === 0) {
 		if (status !== 0 && raw.trim().length > 0) {
 			const message = `${input.tool} exited ${status} but its output could not be parsed`;
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: `${input.tool}:parse-error:1`,
-						message,
-						filePath: input.ctx.filePath,
-						line: 1,
-						column: 1,
-						severity: "warning",
-						semantic: "warning",
-						tool: input.tool,
-					},
-				],
-				semantic: "warning",
-				failureKind: "parser_error",
-				failureMessage: message,
-			};
+			return faultResult(
+				{ kind: "parser_error", failureMessage: message },
+				{
+					id: `${input.tool}:parse-error:1`,
+					message,
+					filePath: input.ctx.filePath,
+					line: 1,
+					column: 1,
+					tool: input.tool,
+				},
+			);
 		}
 		return { status: "succeeded", diagnostics: [], semantic: "none" };
 	}

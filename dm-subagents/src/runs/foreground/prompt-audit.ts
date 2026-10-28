@@ -1,7 +1,6 @@
 import type { Agent, StreamFn, ThinkingLevel } from "@duckmind/dm-agent-core";
 import type { ExtensionContext } from "@duckmind/dm-coding-agent";
 import type { ProviderHeaders } from "@duckmind/dm-ai";
-import { streamSimple } from "@duckmind/dm-ai/compat";
 import { agentStreamOptions } from "../../shared/agent-stream-options.ts";
 import { opencodeSessionHeaders } from "../../shared/opencode-session-headers.ts";
 import type { ForegroundRunControl } from "../../shared/types.ts";
@@ -71,9 +70,10 @@ export async function rewritePromptWithGuidance(input: {
 	]);
 	const auth = await resolveRewriteAuth(input.ctx, model);
 	const registryStream = (input.ctx.modelRegistry as { streamSimple?: StreamFn }).streamSimple;
+	const hostStream = input.streamFn || registryStream ? undefined : (await import("@duckmind/dm-ai/compat")).streamSimple;
 	const baseStreamFn: StreamFn = input.streamFn ?? (registryStream
 		? (nextModel, context, streamOptions) => registryStream.call(input.ctx.modelRegistry, nextModel, context, streamOptions)
-		: (nextModel, context, streamOptions) => streamSimple(nextModel, context, streamOptions));
+		: hostStream!);
 	const sessionId = input.ctx.sessionManager.getSessionId();
 	const streamFn: StreamFn = (nextModel, context, streamOptions) => baseStreamFn(nextModel, context, {
 		...streamOptions,

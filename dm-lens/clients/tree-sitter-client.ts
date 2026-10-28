@@ -45,6 +45,7 @@ import {
 	vendoredGrammarsDir,
 } from "./grammar-source.js";
 import { getPackageRoot, resolvePackagePath } from "./package-root.js";
+import { walkUpDirs } from "./path-utils.js";
 import { resolveWebTreeSitterPackageDir } from "../scripts/lib/web-tree-sitter-dir.mjs";
 import {
 	assertInstallAllowed,
@@ -298,18 +299,22 @@ function isGrammarLoadTimeout(err: unknown): boolean {
  * creates it — so the nearest EXISTING ancestor is what gets probed.
  */
 function grammarWriteBlockedReason(dir: string): string | undefined {
-	let probe = dir;
-	while (!fs.existsSync(probe)) {
-		const parent = path.dirname(probe);
-		if (parent === probe) return "ENOENT";
-		probe = parent;
+	// #4689 item 6 (batch 7): the nearest directory that exists, on the walk
+	// that climbs the DIR's path identity. A hand-rolled `path.dirname` chain
+	// over the caller's spelling compares ancestors the kernel does not
+	// necessarily open for this directory; `walkUpDirs` answers each candidate
+	// already on the identity axis, and the first one on disk is the one whose
+	// writability decides.
+	for (const candidate of walkUpDirs(dir)) {
+		if (!fs.existsSync(candidate)) continue;
+		try {
+			fs.accessSync(candidate, fs.constants.W_OK);
+			return undefined;
+		} catch (err) {
+			return (err as { code?: string })?.code ?? "EACCES";
+		}
 	}
-	try {
-		fs.accessSync(probe, fs.constants.W_OK);
-		return undefined;
-	} catch (err) {
-		return (err as { code?: string })?.code ?? "EACCES";
-	}
+	return "ENOENT";
 }
 
 /**

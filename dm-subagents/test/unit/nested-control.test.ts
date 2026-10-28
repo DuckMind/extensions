@@ -19,6 +19,7 @@ import { isActiveAsyncState } from "../../src/runs/background/active-run-index.t
 import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
 import { readStatus } from "../../src/shared/utils.ts";
 import { interruptRequestPath } from "../../src/runs/background/control-channel.ts";
+import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
 
 const routeRoots: string[] = [];
 const fanoutListenerCleanupKey = "__piSubagentFanoutChildNestedControlInboxCleanups";
@@ -527,6 +528,53 @@ describe("nested control routing", () => {
 		}
 	});
 
+	it("shows the transcript of an async run inherited from a session this process replaced", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-inherited-transcript-"));
+		const runId = `inherited-transcript-${randomUUID()}`;
+		try {
+			const successorSessionFile = path.join(root, "successor.jsonl");
+			const replacedSessionFile = path.join(root, "replaced.jsonl");
+			recordSessionReplacement(successorSessionFile, replacedSessionFile);
+			const sessionFile = path.join(root, "replaced", runId, "run-0", "session.jsonl");
+			fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+			fs.writeFileSync(sessionFile, `${JSON.stringify({ message: { role: "assistant", content: "INHERITED_SESSION_LINE" } })}\n`);
+			fs.mkdirSync(path.join(ASYNC_DIR, runId), { recursive: true });
+			fs.writeFileSync(path.join(ASYNC_DIR, runId, "status.json"), JSON.stringify({ runId, sessionId: replacedSessionFile, mode: "single", state: "complete", startedAt: 100, lastUpdate: 200, steps: [{ agent: "worker", status: "complete", sessionFile }] }));
+			const state = createState();
+			state.currentSessionId = successorSessionFile;
+
+			const result = await createExecutor(state).execute("transcript", { action: "status", id: runId, index: 0, view: "transcript" }, new AbortController().signal, undefined, ctx(root, successorSessionFile));
+
+			assert.match(text(result), /INHERITED_SESSION_LINE/);
+		} finally {
+			fs.rmSync(path.join(ASYNC_DIR, runId), { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("trusts nested session files under the root of a session this process replaced, and no other session's", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-nested-terminal-inherited-"));
+		try {
+			const successorSessionFile = path.join(root, "successor.jsonl");
+			recordSessionReplacement(successorSessionFile, path.join(root, "replaced.jsonl"));
+			const resume = (owner: string) => {
+				const runId = `nested-${owner}-resume`;
+				const sessionFile = path.join(root, owner, runId, "run-0", "session.jsonl");
+				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+				fs.writeFileSync(sessionFile, "");
+				const route = createNestedRun(runId, "complete", { sessionFile });
+				return createExecutor(stateWithNestedRoute(route), [{ name: "worker", description: "Worker", prompt: "Do work" }])
+					.execute("resume", { action: "resume", id: runId, message: "continue" }, new AbortController().signal, undefined, ctx(root, successorSessionFile));
+			};
+
+			// Past the trust check, revival stops at the missing recovery descriptor.
+			assert.match(text(await resume("replaced")), /missing its required recovery identity/);
+			assert.match(text(await resume("unrelated")), /outside trusted nested session roots/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects terminal nested resume session files from sibling run directories", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-nested-terminal-sibling-"));
 		try {
@@ -545,6 +593,98 @@ describe("nested control routing", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	describe("resume of a run that a resume replaced", () => {
+		const accepted = /missing its required recovery identity/;
+		const refused = /not under that nested run's session directory/;
+		type RunSpec = { id: string; sessionFile: string; revivedFrom?: string; state?: "running" | "complete" | "stopped" };
+		const sessionFileIn = (root: string, ...dirs: string[]) => {
+			const sessionFile = path.join(root, ...dirs, "run-0", "session.jsonl");
+			fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+			fs.writeFileSync(sessionFile, "");
+			return sessionFile;
+		};
+		const addRun = (route: ReturnType<typeof createNestedRoute>, run: RunSpec) => {
+			const state = run.state ?? "complete";
+			writeNestedEvent(route, {
+				type: state === "running" ? "subagent.nested.updated" : "subagent.nested.completed",
+				ts: 100,
+				parentRunId: route.rootRunId,
+				parentStepIndex: 0,
+				child: { id: run.id, parentRunId: route.rootRunId, parentStepIndex: 0, depth: 1, path: [{ runId: route.rootRunId, stepIndex: 0 }], state, agent: "worker", ownerState: state === "running" ? "live" : "gone", sessionFile: run.sessionFile, ...(run.revivedFrom ? { revivedFrom: run.revivedFrom } : {}) },
+			});
+		};
+		const resume = async (root: string, target: string, runs: RunSpec[], outOfScope: RunSpec[] = []) => {
+			const parentSessionFile = path.join(root, "parent.jsonl");
+			fs.writeFileSync(parentSessionFile, "");
+			const route = createNestedRoute("root-control");
+			routeRoots.push(path.dirname(route.eventSink));
+			for (const run of runs) addRun(route, run);
+			const other = createNestedRoute("root-other");
+			routeRoots.push(path.dirname(other.eventSink));
+			for (const run of outOfScope) addRun(other, run);
+			const result = await createExecutor(stateWithNestedRoute(route), [{ name: "worker", description: "Worker", prompt: "Do work" }])
+				.execute("resume", { action: "resume", id: target, message: "continue" }, new AbortController().signal, undefined, ctx(root, parentSessionFile));
+			return text(result);
+		};
+		const withRoot = async (body: (root: string) => Promise<void>) => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-nested-revived-"));
+			try {
+				await body(root);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		};
+
+		it("accepts the session its in-scope source owns, through a chain of up to 8 replacements", () => withRoot(async (root) => {
+			const sessionFile = sessionFileIn(root, "parent", "source");
+			assert.match(await resume(root, "replacement", [
+				{ id: "source", sessionFile },
+				{ id: "replacement", sessionFile, revivedFrom: "source" },
+			]), accepted);
+			const chain = (hops: number): RunSpec[] => [
+				{ id: "source", sessionFile },
+				...Array.from({ length: hops }, (_, index) => ({ id: `r${index + 1}`, sessionFile, revivedFrom: index === 0 ? "source" : `r${index}` })),
+			];
+			assert.match(await resume(root, "r2", chain(2)), accepted);
+			assert.match(await resume(root, "r8", chain(8)), accepted);
+			assert.match(await resume(root, "r9", chain(9)), refused);
+		}));
+
+		it("refuses when the source is missing, out of scope, live, stopped, owns another file, or forms a cycle", () => withRoot(async (root) => {
+			const sessionFile = sessionFileIn(root, "parent", "source");
+			const replacement = { id: "replacement", sessionFile, revivedFrom: "source" };
+			assert.match(await resume(root, "replacement", [replacement]), refused);
+			assert.match(await resume(root, "replacement", [replacement], [{ id: "source", sessionFile }]), refused);
+			assert.match(await resume(root, "replacement", [{ id: "source", sessionFile, state: "running" }, replacement]), refused);
+			assert.match(await resume(root, "replacement", [{ id: "source", sessionFile, state: "stopped" }, replacement]), refused);
+			assert.match(await resume(root, "replacement", [{ id: "source", sessionFile: sessionFileIn(root, "parent", "source", "other") }, { ...replacement, sessionFile: sessionFileIn(root, "parent", "sibling") }]), refused);
+			const shared = sessionFileIn(root, "parent", "neither");
+			assert.match(await resume(root, "a", [{ id: "a", sessionFile: shared, revivedFrom: "b" }, { id: "b", sessionFile: shared, revivedFrom: "a" }]), refused);
+		}));
+
+		it("refuses when the source's own session file fails its checks", () => withRoot(async (root) => {
+			const siblingFile = sessionFileIn(root, "parent", "sibling");
+			assert.match(await resume(root, "replacement", [{ id: "source", sessionFile: siblingFile }, { id: "replacement", sessionFile: siblingFile, revivedFrom: "source" }]), refused);
+		}));
+
+		it("refuses when the source's own session file is a symlink", (context) => withRoot(async (root) => {
+			const siblingFile = sessionFileIn(root, "parent", "sibling");
+			const link = path.join(root, "parent", "source", "run-0", "session.jsonl");
+			fs.mkdirSync(path.dirname(link), { recursive: true });
+			try {
+				fs.symlinkSync(siblingFile, link);
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EPERM" || code === "EACCES") {
+					context.skip("file symlink creation is unavailable");
+					return;
+				}
+				throw error;
+			}
+			assert.match(await resume(root, "replacement", [{ id: "source", sessionFile: link }, { id: "replacement", sessionFile: siblingFile, revivedFrom: "source" }]), refused);
+		}));
 	});
 
 	it("emits a failed completed nested event when foreground execution throws after start", async () => {

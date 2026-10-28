@@ -12,14 +12,14 @@ import { buildSkillInjection, resolveSkills } from "../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
 import { appendAgentRefinementOverlay } from "../agents/agent-refinements.ts";
 import { rewriteSubagentPrompt } from "../runs/shared/subagent-prompt-runtime.ts";
+import { assertNoToolModifierEntries } from "../runs/shared/child-tool-plan.ts";
 import { resolveExistingReadPaths } from "../shared/settings.ts";
 import { MODEL_ONLY_TOOL } from "../shared/extension-context.ts";
 
-interface PendingRequest { operation: "prompt" | "steer" | "follow-up" | "abort" | "supervisor-reply"; text?: string; supervisorId?: string }
+interface PendingRequest { operation: "prompt" | "steer" | "follow-up" | "abort" | "supervisor-reply"; text?: string; supervisorId?: string; error?: string }
 interface BridgeContext {
 	isIdle(): boolean;
 	hasPendingMessages(): boolean;
-	getActiveTools?(): string[];
 	sessionManager?: { getSessionId?(): string; getSessionFile?(): string | undefined };
 	model?: { provider?: string; id?: string };
 }
@@ -41,6 +41,7 @@ export function resolveRemoteHerdrResources(cwd: string, resources: { agent: str
 	const skillPrompt = buildSkillInjection(skills.resolved);
 	const reads = resources.reads === undefined ? agent.defaultReads ?? false : resources.reads; const readPaths = Array.isArray(reads) ? resolveExistingReadPaths(reads, cwd) : [];
 	const systemPrompt = appendAgentRefinementOverlay(`${agent.systemPrompt}${buildAgentMemoryInjection(agent, cwd)}${skillPrompt ? `\n\n${skillPrompt}` : ""}${readPaths.length ? `\n\n[Read from: ${readPaths.join(", ")}]` : ""}`, { cwd, agentName: agent.name });
+	assertNoToolModifierEntries(agent.name, agent.tools ?? []);
 	const denied = new Set(agent.excludeTools ?? []); const tools = (agent.tools === undefined ? remoteDefaultTools : agent.tools).filter((tool) => !denied.has(tool) && (!resources.toolCeiling || resources.toolCeiling.includes(tool))); if (agent.tools === undefined && !tools.length) throw new Error(`Remote agent '${agent.name}' resolved no default active tools within the inherited ceiling.`);
 	return { agent: agent.name, skills: names, tools, systemPrompt, inheritProjectContext: agent.inheritProjectContext, inheritGlobalContext: agent.inheritGlobalContext, inheritSkills: agent.inheritSkills };
 }
@@ -64,7 +65,7 @@ export default function registerHerdrPiBridge(dm: ExtensionAPI): void {
 	let resolvedContextPolicy: { agent: string; inheritProjectContext: boolean; inheritGlobalContext: boolean; inheritSkills: boolean } | undefined;
 	let configured = false;
 	const pending = new Map<string, PendingRequest>();
-	const supervisor = new Map<string, { reason: "need_decision" | "interview_request" | "progress_update"; resolve(answer: string): void }>();
+	const supervisor = new Map<string, { reason: "need_decision" | "interview_request" | "progress_update"; resolve(answer: string): void; reject(error: Error): void }>();
 	let evidenceCursor = 0; let journalBytes = 0; const journal: HerdrPiFrame[] = [];
 	const send = (frame: { type: string; [key: string]: unknown }) => {
 		const record = { protocol: HERDR_PI_PROTOCOL, runId, ...frame, cursor: ++evidenceCursor } as HerdrPiFrame; const size = Buffer.byteLength(JSON.stringify(record)); journal.push(record); journalBytes += size; while (journal.length > 512 || journalBytes > 8 * 1024 * 1024) { const removed = journal.shift(); if (removed) journalBytes -= Buffer.byteLength(JSON.stringify(removed)); }
@@ -72,7 +73,6 @@ export default function registerHerdrPiBridge(dm: ExtensionAPI): void {
 		client.write(encodeHerdrPiFrame(record));
 	};
 	const sessionId = (ctx: BridgeContext) => ctx.sessionManager?.getSessionId?.();
-	const activeTools = (ctx: BridgeContext) => ctx.getActiveTools?.() ?? [];
 
 	dm.registerTool({
 		name: "contact_supervisor",
@@ -84,8 +84,8 @@ export default function registerHerdrPiBridge(dm: ExtensionAPI): void {
 			if (input.reason !== "interview_request" && !input.message?.trim()) throw new Error("message is required for supervisor decisions and progress updates.");
 			const id = `sup_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 			send({ type: "supervisor-request", requestId: id, reason: input.reason, message: input.message?.slice(0, 65_536) ?? "", ...(input.interview !== undefined ? { interview: input.interview } : {}), expectsReply: input.reason !== "progress_update", nativeSessionId });
-			if (input.reason === "progress_update") { await new Promise<string>((resolve) => supervisor.set(id, { reason: input.reason, resolve })); return { content: [{ type: "text", text: "Supervisor progress update queued." }], details: { delivered: true, requestId: id, reason: input.reason } }; }
-			const reason = input.reason as "need_decision" | "interview_request"; const answer = await new Promise<string>((resolve) => supervisor.set(id, { reason, resolve })); const details: Record<string, unknown> = { requestId: id, reason }; if (reason === "interview_request") try { details.structuredReply = JSON.parse(answer.replace(/^```(?:json)?\s*|\s*```$/giu, "")); } catch { details.structuredReplyParseError = "Supervisor interview reply was not valid JSON."; }
+			if (input.reason === "progress_update") { await new Promise<string>((resolve, reject) => supervisor.set(id, { reason: input.reason, resolve, reject })); return { content: [{ type: "text", text: "Supervisor progress update queued." }], details: { delivered: true, requestId: id, reason: input.reason } }; }
+			const reason = input.reason; const answer = await new Promise<string>((resolve, reject) => supervisor.set(id, { reason, resolve, reject })); const details: Record<string, unknown> = { requestId: id, reason }; if (reason === "interview_request") try { details.structuredReply = JSON.parse(answer.replace(/^```(?:json)?\s*|\s*```$/giu, "")); } catch { details.structuredReplyParseError = "Supervisor interview reply was not valid JSON."; }
 			return { content: [{ type: "text", text: `**Reply from supervisor:**\n${answer}` }], details };
 		},
 	});
@@ -104,19 +104,25 @@ export default function registerHerdrPiBridge(dm: ExtensionAPI): void {
 		else {
 			const entry = request.supervisorId ? supervisor.get(request.supervisorId) : undefined;
 			if (!entry) throw new Error("Unknown supervisor request.");
-			supervisor.delete(request.supervisorId!); entry.resolve(request.text ?? "");
+			supervisor.delete(request.supervisorId!); if (request.error !== undefined) entry.reject(new Error(request.error)); else entry.resolve(request.text ?? "");
 		}
 		send({ type: "control-ack", requestId, operation: request.operation, nativeSessionId });
 	};
 	dm.registerCommand("dm-subagents-bridge", { description: "Internal pane-native request dispatch", handler: (args, ctx) => execute(args.trim(), ctx as unknown as BridgeContext) });
 
 	const on = dm.on as unknown as (name: string, handler: (event: Record<string, unknown>, ctx: BridgeContext) => unknown) => void;
-	on("before_agent_start", (event) => resolvedSystemPrompt && resolvedContextPolicy ? { systemPrompt: `${rewriteSubagentPrompt(typeof event.systemPrompt === "string" ? event.systemPrompt : "", { inheritProjectContext: resolvedContextPolicy.inheritProjectContext, inheritGlobalContext: resolvedContextPolicy.inheritGlobalContext, inheritSkills: resolvedContextPolicy.inheritSkills })}\n\n<active_agent name=${JSON.stringify(resolvedContextPolicy.agent)}/>\n\n${resolvedSystemPrompt}` } : undefined);
+	on("before_agent_start", (event) => {
+		// The remote DM fills its append slot from the remote operator's APPEND_SYSTEM.md; it is not the child's
+		// prompt, as for local children. Cleared before event.systemPrompt renders from these options.
+		const options = event.systemPromptOptions as { appendSystemPrompt?: unknown } | undefined;
+		if (typeof options?.appendSystemPrompt === "string") options.appendSystemPrompt = "";
+		return resolvedSystemPrompt && resolvedContextPolicy ? { systemPrompt: `${rewriteSubagentPrompt(typeof event.systemPrompt === "string" ? event.systemPrompt : "", { inheritProjectContext: resolvedContextPolicy.inheritProjectContext, inheritGlobalContext: resolvedContextPolicy.inheritGlobalContext, inheritSkills: resolvedContextPolicy.inheritSkills })}\n\n<active_agent name=${JSON.stringify(resolvedContextPolicy.agent)}/>\n\n${resolvedSystemPrompt}` } : undefined;
+	});
 	on("session_start", (_event, ctx) => {
 		context = ctx; nativeSessionId = sessionId(ctx);
 		if (!nativeSessionId) throw new Error("Pane-native DM bridge requires a persisted native session identity.");
 		fs.writeFileSync(manifestPath, JSON.stringify({ protocol: HERDR_PI_PROTOCOL, packageVersion: packageJson.version, runId, socketPath, nativeSessionId, pid: process.pid }), { mode: 0o600, flag: "wx" });
-		send({ type: "ready", packageVersion: packageJson.version, nativeSessionId, sessionFile: ctx.sessionManager?.getSessionFile?.(), cwd: process.cwd(), tools: activeTools(ctx), model: ctx.model?.provider && ctx.model.id ? `${ctx.model.provider}/${ctx.model.id}` : undefined, configured, activeRequestId, evidenceCursor, evidenceFloor: journal[0]?.cursor ?? evidenceCursor + 1, initialGit: gitEvidence(process.cwd()) });
+		send({ type: "ready", packageVersion: packageJson.version, nativeSessionId, sessionFile: ctx.sessionManager?.getSessionFile?.(), cwd: process.cwd(), tools: dm.getActiveTools(), model: ctx.model?.provider && ctx.model.id ? `${ctx.model.provider}/${ctx.model.id}` : undefined, configured, activeRequestId, evidenceCursor, evidenceFloor: journal[0]?.cursor ?? evidenceCursor + 1, initialGit: gitEvidence(process.cwd()) });
 	});
 	on("message_end", (event) => {
 		const message = event.message as AgentMessage | undefined;
@@ -142,21 +148,22 @@ export default function registerHerdrPiBridge(dm: ExtensionAPI): void {
 						const invalidSkills = resources.skills !== undefined && (!Array.isArray(resources.skills) || resources.skills.some((name) => typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(name)));
 						const invalidReads = resources.reads !== undefined && resources.reads !== false && (!Array.isArray(resources.reads) || resources.reads.some((name) => typeof name !== "string"));
 						if (typeof resources.agent !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(resources.agent) || invalidSkills || invalidReads) throw new Error("Remote logical resource names are invalid.");
-						const resolved = resolveRemoteHerdrResources(process.cwd(), { agent: resources.agent, ...(resources.skills ? { skills: resources.skills as string[] } : {}), ...(resources.toolCeiling ? { toolCeiling: resources.toolCeiling as string[] } : {}), ...(resources.reads !== undefined ? { reads: resources.reads as string[] | false } : {}) }, context ? activeTools(context) : []); resolvedSystemPrompt = resolved.systemPrompt; resolvedContextPolicy = resolved;
-						(dm as unknown as { setActiveTools?(tools: string[]): void }).setActiveTools?.(resolved.tools); const acknowledged = context ? activeTools(context) : []; if (acknowledged.some((tool) => !resolved.tools.includes(tool)) || resolved.tools.some((tool) => !acknowledged.includes(tool))) throw new Error("Remote DM did not apply the resolved active-tool set exactly.");
+						const resolved = resolveRemoteHerdrResources(process.cwd(), { agent: resources.agent, ...(resources.skills ? { skills: resources.skills as string[] } : {}), ...(resources.toolCeiling ? { toolCeiling: resources.toolCeiling as string[] } : {}), ...(resources.reads !== undefined ? { reads: resources.reads as string[] | false } : {}) }, context ? dm.getActiveTools() : []); resolvedSystemPrompt = resolved.systemPrompt; resolvedContextPolicy = resolved;
+						dm.setActiveTools(resolved.tools); const acknowledged = context ? dm.getActiveTools() : []; if (acknowledged.some((tool) => !resolved.tools.includes(tool)) || resolved.tools.some((tool) => !acknowledged.includes(tool))) throw new Error("Remote DM did not apply the resolved active-tool set exactly.");
 						configured = true; send({ type: "configured", requestId: frame.requestId, nativeSessionId, agent: resolved.agent, skills: resolved.skills, model: context?.model?.provider && context.model.id ? `${context.model.provider}/${context.model.id}` : undefined, tools: acknowledged }); continue;
 					}
 					if (frame.type !== "prepare" || typeof frame.requestId !== "string" || pending.has(frame.requestId) || !configured) throw new Error("Invalid, duplicate, or unconfigured bridge request.");
 					const operation = frame.operation;
 					if (!(["prompt", "steer", "follow-up", "abort", "supervisor-reply"] as unknown[]).includes(operation)) throw new Error("Unsupported bridge operation.");
 					const text = frame.text; if (text !== undefined && (typeof text !== "string" || Buffer.byteLength(text) > 256 * 1024)) throw new Error("Bridge request text is invalid or too large.");
-					pending.set(frame.requestId, { operation: operation as PendingRequest["operation"], ...(text !== undefined ? { text } : {}), ...(typeof frame.supervisorId === "string" ? { supervisorId: frame.supervisorId } : {}) });
+					const error = frame.error; if (error !== undefined && (operation !== "supervisor-reply" || typeof error !== "string" || Buffer.byteLength(error) > 256 * 1024)) throw new Error("Bridge supervisor error is invalid or too large.");
+					pending.set(frame.requestId, { operation: operation as PendingRequest["operation"], ...(text !== undefined ? { text } : {}), ...(typeof frame.supervisorId === "string" ? { supervisorId: frame.supervisorId } : {}), ...(error !== undefined ? { error } : {}) });
 					send({ type: "prepared", requestId: frame.requestId, nativeSessionId });
 				}
 			} catch (error) { socket.destroy(error as Error); }
 		});
 		socket.on("close", () => { if (client === socket) client = undefined; });
-		if (context && nativeSessionId) send({ type: "ready", packageVersion: packageJson.version, nativeSessionId, sessionFile: context.sessionManager?.getSessionFile?.(), cwd: process.cwd(), tools: activeTools(context), model: context.model?.provider && context.model.id ? `${context.model.provider}/${context.model.id}` : undefined, configured, activeRequestId, evidenceCursor, evidenceFloor: journal[0]?.cursor ?? evidenceCursor + 1, initialGit: gitEvidence(process.cwd()) });
+		if (context && nativeSessionId) send({ type: "ready", packageVersion: packageJson.version, nativeSessionId, sessionFile: context.sessionManager?.getSessionFile?.(), cwd: process.cwd(), tools: dm.getActiveTools(), model: context.model?.provider && context.model.id ? `${context.model.provider}/${context.model.id}` : undefined, configured, activeRequestId, evidenceCursor, evidenceFloor: journal[0]?.cursor ?? evidenceCursor + 1, initialGit: gitEvidence(process.cwd()) });
 	});
 	server.listen(socketPath, () => { fs.chmodSync(socketPath, 0o600); });
 }

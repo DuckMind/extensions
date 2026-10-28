@@ -333,7 +333,8 @@ syncBuiltinESMExports();
 					assert.ok(transcript);
 					assert.match(fs.readFileSync(transcript, "utf-8"), /Blocked by policy/);
 				}
-				assert.equal(mockPi.callCount(), 1);
+				// A structured child that never calls structured_output gets one follow-up prompt.
+				assert.equal(mockPi.callCount(), diagnostic === "structured" && !interrupted ? 2 : 1);
 			});
 		}
 	}
@@ -1671,6 +1672,35 @@ syncBuiltinESMExports();
 		assert.equal(payload.workflowGraph?.nodes?.[1]?.kind, "dynamic-parallel-group");
 		assert.deepEqual(payload.workflowGraph?.nodes?.[1]?.children?.map((child) => child.itemKey), ["src/a.ts", "src/b.ts"]);
 		assert.equal(payload.workflowGraph?.nodes?.[2]?.flatIndex, 3);
+	});
+
+	it("async dynamic fanout children past the original step count report tool calls", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "a" }, { path: "b" }, { path: "c" }] } });
+		for (const item of ["a", "b", "c"]) {
+			mockPi.onCall({ matchArgIncludes: `Read ${item}`, jsonl: [
+				{ type: "tool_execution_start", toolName: "read", toolCallId: `read-${item}`, args: { path: item } },
+				{ type: "tool_execution_end", toolName: "read", toolCallId: `read-${item}`, isError: false },
+				{ type: "message_end", message: { role: "toolResult", toolCallId: `read-${item}`, toolName: "read", isError: false, content: [{ type: "text", text: `contents of ${item}` }] } },
+				events.assistantMessage(`read ${item}`),
+			] });
+		}
+		const id = `async-dynamic-tool-calls-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{ expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 }, parallel: { agent: "reader", task: "Read {target.path}" }, collect: { as: "reads" } },
+			],
+			agents: [makeAgent("producer"), makeAgent("reader")],
+			ctx: { dm: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-tools" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok(!result.isError, JSON.stringify(result.content));
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true, JSON.stringify(payload.results.map((child) => child.error)));
+		assert.deepEqual(payload.results.slice(1).map((child) => child.output?.trim()), ["read a", "read b", "read c"]);
 	});
 
 	it("async dynamic fanout blocks queued children when hard reported usage is exhausted", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

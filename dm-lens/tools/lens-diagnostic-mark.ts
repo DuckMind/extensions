@@ -441,7 +441,11 @@ export function createLensDiagnosticMarkTool(
 				cwd,
 				{
 					cwd,
-					filePath: absPath,
+					// The tool is the entry point for this path: the widget mirror keys
+					// syntactically (#1020), so it gets the identity the pipeline
+					// recorded the finding under, not the spelling the model typed
+					// (#4689 item 3). The file IO above keeps the spelling.
+					filePath: normalizeMapKey(absPath),
 					tool,
 					rule,
 					message,

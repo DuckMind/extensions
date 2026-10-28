@@ -16,7 +16,11 @@ import {
 	getProjectIgnoreMatcher,
 	type ProjectIgnoreMatcher,
 } from "./file-utils.js";
-import { isAtOrAboveHomeDir } from "./path-utils.js";
+import {
+	isAtOrAboveHomeDir,
+	realpathOrResolve,
+	walkUpDirs,
+} from "./path-utils.js";
 import { getStartupScanMaxSourceFilesDerived } from "./project-scale.js";
 import {
 	shouldRecurseIntoDir,
@@ -202,16 +206,19 @@ export function isStartupScanVerdictFresh(
  * pre-#807 behavior exactly.
  */
 export function findNearestProjectRoot(startDir: string): string | null {
-	let current = path.resolve(startDir);
-	while (true) {
-		const entryNames = getDirectoryMarkers(current).entryNames;
+	// Spelled on purpose (#4689 item 6): the verdicts below compare this root
+	// and the caller's `cwd` with the spelled `homeDir`, and `scanRoot` is
+	// reported beside the spelled `cwd`. An identity climb needs those ends
+	// moved with it; that is its own slice.
+	let root: string | null = null;
+	for (const dir of walkUpDirs(startDir, { spelling: true })) {
+		const entryNames = getDirectoryMarkers(dir).entryNames;
 		if (PROJECT_ROOT_MARKERS.some((marker) => entryNames.has(marker))) {
-			return current;
+			root = dir;
+			break;
 		}
-		const parent = path.dirname(current);
-		if (parent === current) return null;
-		current = parent;
 	}
+	return root;
 }
 
 interface SourceCountResult {
@@ -369,7 +376,9 @@ function computeStartupScanContext(
 	options: StartupScanOptions = {},
 ): StartupScanContext {
 	const resolvedCwd = path.resolve(cwd);
-	const homeDir = path.resolve(options.homeDir ?? os.homedir());
+	// The ceiling compares real paths on both sides (#4911): the walk below is
+	// spelled, and a HOME or a cwd spelled through a link names the same folder.
+	const homeDir = realpathOrResolve(options.homeDir ?? os.homedir());
 	const maxSourceFiles =
 		options.maxSourceFiles ?? getStartupScanMaxSourceFilesDerived(resolvedCwd);
 	const maxScanEntries = options.maxScanEntries ?? getStartupScanMaxEntries();
@@ -381,7 +390,7 @@ function computeStartupScanContext(
 			scanRoot: resolvedCwd,
 			projectRoot: null,
 			canWarmCaches: false,
-			reason: isAtOrAboveHomeDir(resolvedCwd, homeDir)
+			reason: isAtOrAboveHomeDir(realpathOrResolve(resolvedCwd), homeDir)
 				? "home-dir"
 				: "no-project-root",
 		};
@@ -391,7 +400,7 @@ function computeStartupScanContext(
 	// C:\Users) — means the upward search escaped the workspace; warming caches
 	// would walk an unrelated tree (#250/#253). The old exact `=== homeDir`
 	// check missed the above-home case.
-	if (isAtOrAboveHomeDir(projectRoot, homeDir)) {
+	if (isAtOrAboveHomeDir(realpathOrResolve(projectRoot), homeDir)) {
 		return {
 			cwd: resolvedCwd,
 			scanRoot: projectRoot,
@@ -507,7 +516,9 @@ export async function resolveStartupScanContextAsync(
 	if (cached) return cached;
 
 	const resolvedCwd = path.resolve(cwd);
-	const homeDir = path.resolve(options.homeDir ?? os.homedir());
+	// The ceiling compares real paths on both sides (#4911): the walk below is
+	// spelled, and a HOME or a cwd spelled through a link names the same folder.
+	const homeDir = realpathOrResolve(options.homeDir ?? os.homedir());
 	const maxSourceFiles =
 		options.maxSourceFiles ?? getStartupScanMaxSourceFilesDerived(resolvedCwd);
 	const maxScanEntries = options.maxScanEntries ?? getStartupScanMaxEntries();
@@ -520,11 +531,11 @@ export async function resolveStartupScanContextAsync(
 			scanRoot: resolvedCwd,
 			projectRoot: null,
 			canWarmCaches: false,
-			reason: isAtOrAboveHomeDir(resolvedCwd, homeDir)
+			reason: isAtOrAboveHomeDir(realpathOrResolve(resolvedCwd), homeDir)
 				? "home-dir"
 				: "no-project-root",
 		};
-	} else if (isAtOrAboveHomeDir(projectRoot, homeDir)) {
+	} else if (isAtOrAboveHomeDir(realpathOrResolve(projectRoot), homeDir)) {
 		result = {
 			cwd: resolvedCwd,
 			scanRoot: projectRoot,

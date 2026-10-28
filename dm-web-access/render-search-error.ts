@@ -8,7 +8,7 @@
  * gathered before the cancel, so even an expandable view would have nothing to show.
  *
  * This module is the single source of truth for the error/cancel render PLAN
- * (plain strings, no theme/ANSI), so it is unit-testable without pi's runtime
+ * (plain strings, no theme/ANSI), so it is unit-testable without DM's runtime
  * (@duckmind/dm-tui Text/Box). index.ts.renderResult delegates to it and only
  * applies theme colors + creates Text/Box components.
  *

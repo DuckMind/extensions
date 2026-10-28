@@ -3,13 +3,13 @@
  *
  * One question, asked by every lookup that may start a file dm-lens did not
  * name itself: is this file (or this search-path directory) the session
- * repository's own bytes? Under pi trust other than `trusted`, those bytes
+ * repository's own bytes? Under DM trust other than `trusted`, those bytes
  * never answer a lookup. `isUntrustedProjectPath` is the judgment; the spawn
  * seam (`clients/safe-spawn.ts`), the global-bin lookup
  * (`clients/package-manager.ts`) and the LSP launcher ask it.
  *
  * The identity is fixed, never threaded by a caller: the session root is this
- * process's cwd, the one root pi's trust answer is about. A path is the
+ * process's cwd, the one root DM's trust answer is about. A path is the
  * session repository's when its KERNEL-REAL path (realpath of the spelling,
  * no lexical `..` collapse first) is not in dm-lens's own data dir and:
  *
@@ -90,8 +90,12 @@ export function* projectLocalBinDirs(
 	dir: string,
 	home: string = os.homedir(),
 ): Generator<string> {
-	for (const ancestor of walkUpDirs(dir)) {
-		if (isAtOrAboveHomeDir(ancestor, home)) return;
+	// Spelled by design (#4689 item 6): this is the trust classifier's half of
+	// the resolver/classifier pair (`localBinMatches` climbs the same axis). An
+	// identity bin dir holds neither the alias spelling of a project shim nor
+	// the shim's target, so the project's own binary would stop counting as
+	// project-local and the trust refusal keyed on it would stop applying.
+	for (const ancestor of walkUpDirs(dir, { spelling: true, homeDir: home })) {
 		for (const binDir of PROJECT_LOCAL_BIN_DIRS)
 			yield path.join(ancestor, binDir);
 	}
@@ -197,7 +201,7 @@ export function isSessionRepositoryPath(target: string): boolean {
 }
 
 /**
- * The trust judgment: `target` is the session repository's bytes and pi has
+ * The trust judgment: `target` is the session repository's bytes and DM has
  * not trusted the project. A trusted project (and every MCP host, which latches
  * `trusted` at start) returns before any filesystem work.
  */
@@ -219,14 +223,14 @@ export function recordProjectCommandRefusal(resolvedCommand: string): void {
 		recordDegradationOnce({
 			kind: "trust-refusal",
 			subject: `project-command:${target}`,
-			reason: `lookup resolved inside the project and was refused: pi project trust is ${trust}`,
+			reason: `lookup resolved inside the project and was refused: DM project trust is ${trust}`,
 		})
 	) {
 		logExtension({
 			subsystem: "project-trust",
 			level: "warn",
 			message:
-				"lookup resolved inside the project and was refused: mark the project trusted in pi or upgrade pi",
+				"lookup resolved inside the project and was refused: mark the project trusted in DM or upgrade DM",
 			metadata: { command: resolvedCommand, target, trust },
 		});
 	}
@@ -234,7 +238,7 @@ export function recordProjectCommandRefusal(resolvedCommand: string): void {
 
 /**
  * The first line of a `which`/`where` answer, or `null` when there is none or
- * it names the session repository's bytes under untrusted pi trust (a global
+ * it names the session repository's bytes under untrusted DM trust (a global
  * dir can hold a link into the project). Callers start the answer by path, so
  * the spawn seam's lookup judgment never sees it: this is that judgment.
  */

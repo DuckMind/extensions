@@ -3,13 +3,12 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath, resolveProviderApiUrl, fetchWithCredentialRedirects } from "./utils.ts";
 
 const PERPLEXITY_SEARCH_URL = "https://api.perplexity.ai/search";
 const PERPLEXITY_CHAT_URL = "https://api.perplexity.ai/chat/completions";
 const CONFIG_PATH = getWebSearchConfigPath();
-
-const REQUEST_TIMEOUT_MS = 30_000;
+const SEARCH_TIMEOUT_MS = 30_000;
 
 const RATE_LIMIT = {
 	maxRequests: 10,
@@ -31,6 +30,7 @@ export interface SearchResponse {
 }
 
 export interface SearchOptions {
+	model?: string;
 	numResults?: number;
 	recencyFilter?: "day" | "week" | "month" | "year";
 	domainFilter?: string[];
@@ -38,6 +38,7 @@ export interface SearchOptions {
 }
 
 interface WebSearchConfig {
+	perplexityBaseUrl?: unknown;
 	perplexityApiKey?: unknown;
 }
 
@@ -119,6 +120,7 @@ async function postPerplexity(
 	body: Record<string, unknown>,
 	options: PerplexityRequestOptions,
 ): Promise<Record<string, unknown>> {
+	const apiUrl = resolveProviderApiUrl("perplexity", url, loadConfig().perplexityBaseUrl);
 	checkRateLimit();
 
 	const activityId = activityMonitor.logStart({ type: "api", query: options.activityQuery });
@@ -132,15 +134,14 @@ async function postPerplexity(
 
 	const apiKey = await getApiKey(options.signal);
 
-	// A stalled connection otherwise holds the search for the whole turn. The deadline is reported as a
-	// timeout, not an abort, so callers fall through to another provider instead of treating it as cancellation.
-	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+	// Reported as a timeout, not an abort: a raw TimeoutError reads as cancellation and would end the search.
+	const timeout = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
 	const timedOut = () => timeout.aborted && !options.signal?.aborted;
 	const timeoutError = () => new Error("Perplexity API error 408: request timed out");
 
 	let response: Response;
 	try {
-		response = await fetch(url, {
+		response = await fetchWithCredentialRedirects(apiUrl, {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${apiKey}`,
@@ -148,7 +149,7 @@ async function postPerplexity(
 			},
 			body: JSON.stringify(body),
 			signal: options.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
-		});
+		}, ["Authorization"]);
 	} catch (err) {
 		if (timedOut()) {
 			activityMonitor.logError(activityId, "request timed out");

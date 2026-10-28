@@ -893,7 +893,7 @@ function registryDecision(
 ): void {
 	if (allowed || !provenance || !isRepoTier(provenance.tier)) return;
 	const subject = `${id}:${field}:${provenance.tier}`;
-	const reason = `project LSP ${field} refused for ${id}: pi project trust is ${trust}`;
+	const reason = `project LSP ${field} refused for ${id}: DM project trust is ${trust}`;
 	recordDegradationOnce({
 		kind: "lsp-registry-decision",
 		subject,
@@ -908,7 +908,7 @@ function registryDecision(
 				subsystem: "lsp-registry",
 				level: "warn",
 				message:
-					"project LSP executables refused: mark the project trusted in pi or upgrade pi",
+					"project LSP executables refused: mark the project trusted in DM or upgrade DM",
 				metadata: { serverId: id, field },
 			});
 		}
@@ -943,6 +943,173 @@ function getConfigForFile(filePath: string): RegisteredLSPConfig {
  */
 export function registerLSPConfig(config: LSPConfig): RegisteredLSPConfig {
 	return compileLspRegistry(config, config.__provenance);
+}
+
+/** One trait's decision for a command-override copy (#4833). */
+interface OverrideTraitDecision {
+	/** True = the copy keeps the catalog row's value; false = it resets. */
+	readonly keep: boolean;
+	readonly why: string;
+}
+
+/**
+ * #4833: what a `lsp.serverOverrides.<id>.command` copy does with EVERY
+ * `LSPServerInfo` trait, decided once, here. The override swaps the binary and
+ * keeps the catalog row's identity, but the row's measured values were
+ * measured on the CATALOG binary, so the copy runs another binary under facts
+ * nobody measured for it. #4829 found `resendRecheck` riding the copy; this
+ * table replaces that one-off drop.
+ *
+ * The rule: a trait is KEPT only when it is routing identity (which files the
+ * entry serves) or when its failure direction is restrictive (a guard that
+ * declines or refuses, a budget that only waits longer, a ceiling that only
+ * lowers a shared default), so keeping a value measured on another binary
+ * costs speed or coverage and never a wrong verdict. Every trait that is an
+ * optimistic claim about how the binary behaves RESETS to its documented
+ * fail-safe default (absent, or `unmeasured`).
+ *
+ * Fail closed: the copy is built from the kept keys only, so a field the table
+ * does not name never reaches the copy, and the mapped type below refuses to
+ * compile until a new `LSPServerInfo` member is decided.
+ * `tests/config/lsp-override-copy-census.test.ts` holds the table to the
+ * interface's real declaration in both directions.
+ *
+ * The server-id-keyed wait strategy (`wait-policy/strategies.ts`) is not a
+ * field here: the copy's `spawn` reports `launchVariant: "override"` and
+ * `getStrategy` answers that with the default strategy, so silentOnClean,
+ * emptyFirstPublish, diagnosticsFence and workspaceIndexing (and the rest of
+ * the row) reset too.
+ */
+export const OVERRIDE_COPY_TRAITS: {
+	readonly [K in keyof LSPServerInfo]-?: OverrideTraitDecision;
+} = {
+	id: {
+		keep: true,
+		why: "Routing identity: the override is keyed by this id.",
+	},
+	name: {
+		keep: true,
+		why: "Routing identity: how the entry is named in output.",
+	},
+	extensions: {
+		keep: true,
+		why: "Routing: which files the entry serves; an override swaps the binary, not the language mapping.",
+	},
+	role: {
+		keep: true,
+		why: "Routing: primary versus auxiliary selection is a policy of the entry, not a measurement.",
+	},
+	root: {
+		keep: true,
+		why: "Routing: where the workspace is hosted; the override changes the binary only.",
+	},
+	rootMarkers: {
+		keep: true,
+		why: "Routing: the marker table behind the shared root seam.",
+	},
+	fallbackFor: {
+		keep: true,
+		why: "Routing: which preferred server this entry backs up.",
+	},
+	pathFilter: {
+		keep: true,
+		why: "Routing: the candidacy gate beyond extensions.",
+	},
+	executesProjectCode: {
+		keep: true,
+		why: "Protective: a true value refuses an untrusted spawn; resetting would widen.",
+	},
+	looseFileRoot: {
+		keep: true,
+		why: "Protective: a decline keeps a home-directory walk from starting; resetting would widen.",
+	},
+	spawnNeedsProjectFile: {
+		keep: true,
+		why: "Protective: a decline before spawn; wrongly kept it costs a spawn, never a verdict.",
+	},
+	requiresProjectRoot: {
+		keep: true,
+		why: "Restrictive: only demotes an empty answer to unconfirmed.",
+	},
+	availabilityKey: {
+		keep: true,
+		why: "Protective: the adopted-root project-local binary refusal reads it; resetting would widen.",
+	},
+	projectLocalCommand: {
+		keep: true,
+		why: "Protective: the adopted-root project-local binary refusal reads it; resetting would widen.",
+	},
+	settingsSection: {
+		keep: true,
+		why: "Documented (#4758): the section sits on the server so a command override keeps it.",
+	},
+	initializeTimeoutMs: {
+		keep: true,
+		why: "Wait budget at or above the shared default; too short kills a slow-bootstrap server, too long only waits.",
+	},
+	clientWaitTimeoutMs: {
+		keep: true,
+		why: "Wait budget; a longer wait costs time and never a wrong verdict.",
+	},
+	notifyInflightLimit: {
+		keep: true,
+		why: "Ceiling that only lowers the shared default; a lower cap costs round trips, a higher one risks the stall it bounded.",
+	},
+	idleEviction: {
+		keep: false,
+		why: "Reset to unmeasured (never evicted): 'transparent' needs per-server evidence.",
+	},
+	replyOrdering: {
+		keep: false,
+		why: "Reset to unmeasured (barrier armed): the notify barrier's soundness rests on the measured ordering.",
+	},
+	resendRecheck: {
+		keep: false,
+		why: "Reset to unmeasured (no re-send): a server that publishes nothing for unchanged bytes loses the answer (#4782).",
+	},
+	autoPropagateDiagnostics: {
+		keep: false,
+		why: "Reset (active touch of neighbours): an optimistic claim that the server pushes dependents.",
+	},
+	autoInstall: {
+		keep: false,
+		why: "Reset: it installs the catalog binary, not the override's.",
+	},
+	custom: {
+		keep: false,
+		why: "Reset: marks config-supplied rows; catalog rows never declare it.",
+	},
+	command: {
+		keep: false,
+		why: "Reset: the custom-row command token; the override's command lives in its spawn.",
+	},
+	covers: {
+		keep: false,
+		why: "Reset: the custom-row covers claim; catalog rows declare theirs in BUILTIN_SERVER_RUNNER_COVERS.",
+	},
+	trustAllowed: {
+		keep: false,
+		why: "Set by the copy: the registry admitted the override's command.",
+	},
+	spawn: {
+		keep: false,
+		why: "Set by the copy: launches the override's command.",
+	},
+};
+
+/** The kept traits of a catalog row; every key the table does not keep is absent. */
+function keptOverrideTraits(server: LSPServerInfo): Record<string, unknown> {
+	const kept: Record<string, unknown> = {};
+	for (const [trait, value] of Object.entries(server)) {
+		// A key the table does not name is dropped, not copied (fail closed).
+		if (
+			Object.hasOwn(OVERRIDE_COPY_TRAITS, trait) &&
+			OVERRIDE_COPY_TRAITS[trait as keyof LSPServerInfo].keep
+		) {
+			kept[trait] = value;
+		}
+	}
+	return kept;
 }
 
 /**
@@ -1072,8 +1239,15 @@ export function compileLspRegistry(
 		const argv = Array.isArray(override.command)
 			? override.command
 			: [override.command, "--stdio"];
+		// #4833: the copy keeps only what `OVERRIDE_COPY_TRAITS` keeps; every
+		// other measured trait of the catalog binary resets (`idleEviction` is
+		// the one required field, so its fail-safe value is spelled here).
 		return {
-			...server,
+			...(keptOverrideTraits(server) as Omit<
+				LSPServerInfo,
+				"spawn" | "trustAllowed" | "idleEviction"
+			>),
+			idleEviction: "unmeasured" as const,
 			trustAllowed: true,
 			async spawn(
 				root: string,
@@ -1087,7 +1261,9 @@ export function compileLspRegistry(
 					cwd: root,
 					env: override.env ? { ...process.env, ...override.env } : process.env,
 				});
-				return { process: proc };
+				// "override": the wait policy's server-id-keyed rows were measured on
+				// the catalog binary (`getStrategy`).
+				return { process: proc, launchVariant: "override" as const };
 			},
 		};
 	});

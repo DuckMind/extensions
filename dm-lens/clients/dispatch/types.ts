@@ -161,6 +161,13 @@ export interface Diagnostic {
 	 * Never part of identity.
 	 */
 	positionStale?: true;
+	/**
+	 * #4130: the diagnostic reports the runner's own failure (`faultResult`), not
+	 * a finding about the code. Turn end delivers that fault once, as the
+	 * failure note, so the deferred verdict drops this row. Never part of
+	 * identity.
+	 */
+	runnerFault?: true;
 }
 
 /**
@@ -443,6 +450,36 @@ export function findingsResult(
 		};
 	}
 	return { ...verdict, diagnostics };
+}
+
+/**
+ * The result of a run that BROKE and says so (#4130): `failed` with its own
+ * fault kind, never `blocking_diagnostics`. The synthetic diagnostic keeps the
+ * inline path from reading the run as clean. It is a warning by construction:
+ * a tool that could not read its own output says nothing about the code, so it
+ * must not enter the blocker map (#3814). `runnerFault` marks it, so turn end
+ * delivers the fault once, as the failure note. A runner with real partial
+ * findings beside a fault kind (rust-clippy) builds its own result instead.
+ */
+export function faultResult(
+	fault: { kind: string; failureMessage: string },
+	diagnostic: Pick<Diagnostic, "id" | "message" | "filePath" | "tool"> &
+		Partial<Pick<Diagnostic, "line" | "column" | "rule" | "fixable">>,
+): RunnerResult {
+	return {
+		status: "failed",
+		diagnostics: [
+			{
+				...diagnostic,
+				severity: "warning",
+				semantic: "warning",
+				runnerFault: true,
+			},
+		],
+		semantic: "warning",
+		failureKind: fault.kind,
+		failureMessage: fault.failureMessage.slice(0, 200),
+	};
 }
 
 /**

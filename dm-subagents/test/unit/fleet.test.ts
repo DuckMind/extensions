@@ -4,26 +4,47 @@ import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { visibleWidth, type MarkdownTheme } from "@duckmind/dm-tui";
+import { TuiAltScreen, TuiMainScreen, visibleWidth, type Component, type TuiMouseEvent, type MarkdownTheme } from "@duckmind/dm-tui";
 import { createEventBus } from "@duckmind/dm-coding-agent";
 import { registerInspector } from "../../src/api/inspectors.ts";
 import { getInspectorPlugins, registerInspectorEventListener } from "../../src/inspectors/plugins.ts";
 import { EXTERNAL_RUN_REGISTRY_KEY, EXTERNAL_RUN_REGISTRY_VERSION, registerExternalRun } from "../../src/api/external-runs.ts";
 import { collectFleetSnapshot, openSubagentFleet, SubagentFleetComponent } from "../../src/tui/fleet.ts";
-import { persistForegroundRunHistory, restoreForegroundRunHistory } from "../../src/runs/foreground/foreground-history.ts";
+import { discardRunningForegroundRun, FOREGROUND_OWNER_EXITED_STOP_ERROR, persistForegroundRun, restoreForegroundRunHistory } from "../../src/runs/foreground/foreground-history.ts";
+import { resetBootIdForTesting } from "../../src/runs/background/boot-id.ts";
+import { currentPidNamespaceScope } from "../../src/runs/background/pid-namespace.ts";
+import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { spawnSync } from "node:child_process";
 import { FLEET_STATUS_WIDGET_KEY } from "../../src/tui/fleet-status.ts";
 import { setMainThinkingLevelSource } from "../../src/tui/running-tone.ts";
 import { registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
 import { getArtifactPaths, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
 import type { HerdrClient } from "../../src/inspectors/herdr/client.ts";
 import { createHerdrInspectorPlugin } from "../../src/inspectors/herdr/plugin.ts";
-import type { SubagentState } from "../../src/shared/types.ts";
+import type { ForegroundResumeRun, SubagentState } from "../../src/shared/types.ts";
 import { fauxAssistantMessage } from "@duckmind/dm-ai/providers/faux";
 import { createAssistantMessageEventStream } from "@duckmind/dm-ai";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
 
 function clearExternalRuns(): void {
 	delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_RUN_REGISTRY_KEY)];
+}
+
+function foregroundHistoryFile(resultsDir: string, runId: string): string {
+	return path.join(resultsDir, "foreground-history", `${encodeIndexSegment(runId)}.json`);
+}
+
+/** Writes a raw record as another DM process, or an older version, would have left it. */
+function writeForegroundHistoryFile(resultsDir: string, run: { runId: string }): void {
+	fs.mkdirSync(path.join(resultsDir, "foreground-history"), { recursive: true });
+	fs.writeFileSync(foregroundHistoryFile(resultsDir, run.runId), JSON.stringify(run), "utf-8");
+}
+
+function savedForegroundRuns(resultsDir: string): Map<string, ForegroundResumeRun> {
+	const dir = path.join(resultsDir, "foreground-history");
+	const files = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+	return new Map(files.map((name) => JSON.parse(fs.readFileSync(path.join(dir, name), "utf-8")) as ForegroundResumeRun).map((run) => [run.runId, run]));
 }
 
 function stateForTest(): SubagentState {
@@ -55,6 +76,7 @@ function writeAsyncRun(root: string, input: {
 	contexts?: Array<"fresh" | "fork">;
 	models?: string[];
 	thinking?: string[];
+	descriptions?: string[];
 	output?: string;
 	transcript?: Array<Record<string, unknown>>;
 }): string {
@@ -78,6 +100,7 @@ function writeAsyncRun(root: string, input: {
 			...(input.contexts?.[index] ? { context: input.contexts[index] } : {}),
 			...(input.models?.[index] ? { model: input.models[index] } : {}),
 			...(input.thinking?.[index] ? { thinking: input.thinking[index] } : {}),
+			...(input.descriptions?.[index] ? { description: input.descriptions[index] } : {}),
 			status: input.state === "complete" ? "complete" : input.state === "failed" ? "failed" : index === 0 ? "running" : "pending",
 			startedAt: 100,
 			...(index === 0 ? { sessionFile: path.join(asyncDir, `${agent}.jsonl`), ...(transcriptPath ? { transcriptPath } : {}) } : {}),
@@ -349,7 +372,9 @@ describe("native subagent fleet", () => {
 		}
 	});
 
-	it("shows live prompt summaries and opens Prompt Audit with the authored prompt visible", async () => {
+	it("shows live prompt summaries and opens Prompt Audit with the authored prompt visible", async (t) => {
+		// Frames are compared whole, and running rows show wall-clock elapsed time.
+		t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
 		const sentinel = "PROMPT_AUDIT_SENTINEL_1021";
 		const secondSentinel = "PROMPT_AUDIT_SECOND_CHILD";
 		const state = stateForTest();
@@ -396,6 +421,10 @@ describe("native subagent fleet", () => {
 			component.handleInput("p");
 			assert.doesNotMatch(component.render(100).join("\n"), /Prompt text hidden|Enter reveal|r hide/);
 			assert.match(component.render(100).join("\n"), new RegExp(sentinel));
+			const pointer: TuiMouseEvent = { type: "click", button: "left", x: 5, y: 4, screenX: 5, screenY: 4, width: 100, height: 23, shift: false, alt: false, ctrl: false };
+			const promptFrame = component.render(100);
+			assert.equal(component.handleMouse(pointer)?.handled, true);
+			assert.deepEqual(component.render(100), promptFrame, "Prompt Audit owns roster clicks");
 			component.handleInput("2");
 			assert.match(component.render(100).join("\n"), /Read from: context\.md/);
 			component.handleInput("3");
@@ -405,6 +434,9 @@ describe("native subagent fleet", () => {
 			assert.deepEqual(clipboardWrites, [`[Read from: context.md]\n\n${sentinel}\n\n---\nRuntime acceptance`]);
 			assert.match(component.render(100).join("\n"), /Copied visible prompt view/);
 			component.handleInput("g");
+			const redoFrame = component.render(100);
+			assert.equal(component.handleMouse({ ...pointer, type: "wheel", x: 70, wheelDelta: 5 })?.handled, true);
+			assert.deepEqual(component.render(100), redoFrame, "redo draft owns wheel input");
 			for (const char of "make narrower") component.handleInput(char);
 			component.handleInput("\r");
 			await new Promise((resolve) => setImmediate(resolve));
@@ -552,6 +584,35 @@ describe("native subagent fleet", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("names each async child's task on its roster row and keeps the run id in the detail header", (t) => {
+		t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-row-task-"));
+		try {
+			writeAsyncRun(root, {
+				id: "row-task-run",
+				agents: ["worker", "worker"],
+				descriptions: [
+					"Fix login bug",
+					"Fix two Cycode Python SAST findings in entity-gov and add regression tests for both of the reported injection paths",
+				],
+			});
+			const component = new SubagentFleetComponent({ terminal: { rows: 32, columns: 140 }, requestRender() {} } as never, theme as never, stateForTest(), () => {}, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme });
+			try {
+				const lines = component.render(140);
+				const roster = lines.map((line) => line.split("│")[1] ?? "");
+				const short = roster.find((row) => row.includes("worker · Fix login bug"));
+				const long = roster.find((row) => row.includes("worker · Fix two Cycode"));
+				assert.ok(short, `short task row missing:\n${roster.join("\n")}`);
+				assert.ok(long, `long task row missing:\n${roster.join("\n")}`);
+				assert.ok(long.includes("..."), "a long task is cut to the row");
+				assert.ok(!long.includes("injection paths"));
+				assert.equal(visibleWidth(long), visibleWidth(short), "both rows keep the roster width");
+				assert.ok(!short.includes("row-task"), "the row shows the task instead of the run id");
+				assert.ok(lines.some((line) => (line.split("│")[2] ?? "").includes("row-task")), "the detail header still shows the run id");
+			} finally { component.dispose(); }
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
 	it("colors running Fleet rows by their child's recorded level, and whole runs by the main session's", () => {
@@ -904,9 +965,8 @@ describe("native subagent fleet", () => {
 				updatedAt: 300,
 				children: [{ agent: "outsider", index: 0, status: "completed", savedOutputPath: outputPath }],
 			});
-			persistForegroundRunHistory(state, { resultsDir });
-			const historyFile = path.join(resultsDir, "foreground-history.json");
-			if (process.platform !== "win32") assert.equal(fs.statSync(historyFile).mode & 0o777, 0o600);
+			for (const run of state.foregroundRuns!.values()) persistForegroundRun(run, { resultsDir });
+			if (process.platform !== "win32") assert.equal(fs.statSync(foregroundHistoryFile(resultsDir, "restored")).mode & 0o777, 0o600);
 
 			const restored = stateForTest();
 			restored.baseCwd = cwd;
@@ -940,28 +1000,9 @@ describe("native subagent fleet", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-terminal-"));
 		try {
 			const resultsDir = path.join(root, "results");
-			fs.mkdirSync(resultsDir, { recursive: true });
-			fs.writeFileSync(path.join(resultsDir, "foreground-history.json"), JSON.stringify({
-				version: 1,
-				runs: [
-					{
-						runId: "stale-running",
-						mode: "single",
-						cwd: root,
-						sessionId: "session-current",
-						updatedAt: 300,
-						children: [{ agent: "worker", index: 0, status: "running", currentTool: "bash" }],
-					},
-					{
-						runId: "terminal",
-						mode: "single",
-						cwd: root,
-						sessionId: "session-current",
-						updatedAt: 200,
-						children: [{ agent: "reviewer", index: 0, status: "completed", finalOutput: "done" }],
-					},
-				],
-			}, null, 2), "utf-8");
+			// A running row without an owner pid cannot be judged, so it is never admitted.
+			writeForegroundHistoryFile(resultsDir, { runId: "stale-running", mode: "single", cwd: root, sessionId: "session-current", updatedAt: 300, children: [{ agent: "worker", index: 0, status: "running", currentTool: "bash" }] });
+			writeForegroundHistoryFile(resultsDir, { runId: "terminal", mode: "single", cwd: root, sessionId: "session-current", updatedAt: 200, children: [{ agent: "reviewer", index: 0, status: "completed", finalOutput: "done" }] });
 
 			const restored = stateForTest();
 			restored.baseCwd = root;
@@ -969,18 +1010,157 @@ describe("native subagent fleet", () => {
 			assert.deepEqual([...restored.foregroundRuns!.keys()], ["terminal"]);
 			assert.deepEqual(collectFleetSnapshot(restored).items.map((item) => item.key), ["foreground-recent:terminal:0"]);
 
-			const state = stateForTest();
-			state.foregroundRuns!.set("stale-running", {
-				runId: "stale-running",
-				mode: "single",
+			fs.rmSync(foregroundHistoryFile(resultsDir, "stale-running"));
+			persistForegroundRun({ runId: "stale-running", mode: "single", cwd: root, sessionId: "session-current", updatedAt: 400, children: [{ agent: "worker", index: 0, status: "running" }] }, { resultsDir });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()], ["terminal"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a running foreground record in the file and loads it as stopped only once its DM process is gone", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-running-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "child-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			const exited = spawnSync(process.execPath, ["-e", ""]).pid;
+			assert.ok(exited);
+			const running = (runId: string, owner: { pid: number; pidNamespaceScope?: string; bootId?: string }) => ({
+				runId,
+				mode: "single" as const,
 				cwd: root,
 				sessionId: "session-current",
-				updatedAt: 400,
-				children: [{ agent: "worker", index: 0, status: "running" as never }],
+				updatedAt: 100,
+				parentWorkflowRunId: "workflow-parent",
+				children: [{ agent: "worker", index: 0, status: "running" as const, activityState: "active" as const, currentTool: "bash", sessionFile, resumeContract: { outputMode: "inline" as const } }],
+				owner: { pidNamespaceScope: currentPidNamespaceScope(), ...owner },
 			});
-			persistForegroundRunHistory(state, { resultsDir });
-			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
-			assert.deepEqual(persisted.runs.map((run) => run.runId), ["terminal"]);
+			persistForegroundRun(running("owner-dead", { pid: exited }), { resultsDir });
+			persistForegroundRun(running("owner-alive", { pid: process.pid, bootId: "boot-now" }), { resultsDir });
+			// This test process is alive, so only the boot id can say this owner is gone.
+			persistForegroundRun(running("owner-rebooted", { pid: process.pid, bootId: "boot-before" }), { resultsDir });
+			persistForegroundRun(running("owner-other-namespace", { pid: exited, pidNamespaceScope: "pid:[container]" }), { resultsDir });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).values()].map((run) => [run.runId, run.children[0]?.status, run.owner !== undefined]).sort(), [
+				["owner-alive", "running", true], ["owner-dead", "running", true], ["owner-other-namespace", "running", true], ["owner-rebooted", "running", true],
+			]);
+
+			const restored = stateForTest();
+			restored.baseCwd = root;
+			resetBootIdForTesting(() => "boot-now");
+			try {
+				assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 2);
+			} finally {
+				resetBootIdForTesting();
+			}
+			assert.deepEqual([...restored.foregroundRuns!.keys()].sort(), ["owner-dead", "owner-rebooted"]);
+			const stopped = restored.foregroundRuns!.get("owner-dead")!;
+			assert.deepEqual(stopped.children[0], { agent: "worker", index: 0, status: "stopped", exitCode: 1, error: FOREGROUND_OWNER_EXITED_STOP_ERROR, finalOutput: FOREGROUND_OWNER_EXITED_STOP_ERROR, sessionFile, resumeContract: { outputMode: "inline" } });
+			assert.equal(stopped.owner, undefined);
+			assert.equal(stopped.parentWorkflowRunId, "workflow-parent");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("prunes the oldest final records beyond the cap, and a running record only once its owner is dead", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-prune-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const exited = spawnSync(process.execPath, ["-e", ""]).pid;
+			assert.ok(exited);
+			const run = (runId: string, ownerPid?: number): ForegroundResumeRun => ({ runId, mode: "single", cwd: root, sessionId: "session-current", updatedAt: 100, ...(ownerPid ? { owner: { pid: ownerPid } } : {}), children: [{ agent: "worker", index: 0, status: ownerPid ? "running" : "completed" }] });
+			// The two oldest files are running records: one whose owner is alive (its final save will
+			// replace it later) and one left by a DM process that died.
+			for (const [index, [runId, ownerPid]] of ([["running-live", process.pid], ["running-dead", exited], ["final-1", undefined], ["final-2", undefined]] as const).entries()) {
+				persistForegroundRun(run(runId, ownerPid), { resultsDir });
+				fs.utimesSync(foregroundHistoryFile(resultsDir, runId), 1_000 + index, 1_000 + index);
+			}
+			persistForegroundRun(run("final-3"), { resultsDir, limit: 2 });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()].sort(), ["final-2", "final-3", "running-live"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("saves each foreground run to its own file without rewriting another process's record", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-own-file-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const run = (runId: string, extra: Partial<ForegroundResumeRun> = {}): ForegroundResumeRun => ({ runId, mode: "single", cwd: root, sessionId: "session-current", updatedAt: 100, children: [{ agent: "worker", index: 0, status: "completed" }], ...extra });
+			// Run A belongs to another DM process: this process's state never held it.
+			persistForegroundRun(run("run-a", { owner: { pid: process.pid + 1 }, children: [{ agent: "worker", index: 0, status: "running" }] }), { resultsDir });
+			const fileA = foregroundHistoryFile(resultsDir, "run-a");
+			fs.utimesSync(fileA, 1_000, 1_000);
+			const bytesA = fs.readFileSync(fileA, "utf-8");
+			persistForegroundRun(run("run-b"), { resultsDir });
+			assert.equal(fs.readFileSync(fileA, "utf-8"), bytesA);
+			assert.equal(fs.statSync(fileA).mtimeMs, 1_000_000, "run A's file was not rewritten");
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()].sort(), ["run-a", "run-b"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("restores this session's saved runs, skips a corrupt file, and ignores and removes the old single history file", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-files-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const run = (runId: string, sessionId: string) => ({ runId, mode: "single" as const, cwd: root, sessionId, updatedAt: 100, children: [{ agent: "worker", index: 0, status: "completed" as const }] });
+			const legacyFile = path.join(resultsDir, "foreground-history.json");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			fs.writeFileSync(legacyFile, JSON.stringify({ version: 1, runs: [run("legacy", "session-current")] }), "utf-8");
+			persistForegroundRun(run("current", "session-current"), { resultsDir });
+			persistForegroundRun(run("other-session", "session-other"), { resultsDir });
+			fs.writeFileSync(path.join(resultsDir, "foreground-history", "corrupt.json"), "{not json", "utf-8");
+			assert.equal(fs.existsSync(legacyFile), false);
+
+			const restored = stateForTest();
+			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 1);
+			assert.deepEqual([...restored.foregroundRuns!.keys()], ["current"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("discards a running foreground record only while this process owns it", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-running-discard-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			const running = (runId: string, ownerPid: number) => ({ runId, mode: "single" as const, cwd: root, sessionId: "session-current", updatedAt: 100, owner: { pid: ownerPid }, children: [{ agent: "worker", index: 0, status: "running" as const }] });
+			persistForegroundRun(running("threw", process.pid), { resultsDir });
+			persistForegroundRun(running("other-owner", process.pid + 1), { resultsDir });
+			discardRunningForegroundRun("threw", { resultsDir });
+			discardRunningForegroundRun("other-owner", { resultsDir });
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()], ["other-owner"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("shows a foreground child cut off by a DM exit as interrupted, with its resume id only when a transcript exists", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-interrupted-"));
+		try {
+			const sessionFile = path.join(root, "child-session.jsonl");
+			fs.writeFileSync(sessionFile, "{}\n", "utf-8");
+			const state = stateForTest();
+			state.baseCwd = root;
+			const interrupted = (runId: string, extra: { sessionFile?: string } = {}) => ({ runId, mode: "single" as const, cwd: root, sessionId: state.currentSessionId!, updatedAt: 100, children: [{ agent: "worker", index: 0, status: "stopped" as const, exitCode: 1, error: FOREGROUND_OWNER_EXITED_STOP_ERROR, finalOutput: FOREGROUND_OWNER_EXITED_STOP_ERROR, ...extra }] });
+			state.foregroundRuns!.set("run-interrupted", interrupted("run-interrupted", { sessionFile }));
+			const statusText = (id: string) => {
+				const status = inspectSubagentStatus({ id }, { asyncDirRoot: path.join(root, "runs"), resultsDir: path.join(root, "results"), state });
+				return status.content[0]?.type === "text" ? status.content[0].text : "";
+			};
+			assert.match(statusText("run-interrupted"), /^1\. worker interrupted when DM exited · resume run-interrupted, exit 1/m);
+			const component = new SubagentFleetComponent({ terminal: { rows: 28, columns: 140 }, requestRender() {} } as never, theme as never, state, () => {}, { refreshMs: 60_000 });
+			try {
+				assert.ok(component.render(140).some((line) => line.includes("State: interrupted when DM exited · resume run-interrupted")));
+			} finally {
+				component.dispose();
+			}
+
+			state.foregroundRuns!.set("run-no-transcript", interrupted("run-no-transcript"));
+			assert.match(statusText("run-no-transcript"), /^1\. worker interrupted when DM exited, exit 1/m);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -990,36 +1170,15 @@ describe("native subagent fleet", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-foreground-contract-bound-"));
 		try {
 			const resultsDir = path.join(root, "results");
-			fs.mkdirSync(resultsDir, { recursive: true });
-			const oversizedContract = { outputSchema: { type: "object", description: "x".repeat(65 * 1024) } };
-			fs.writeFileSync(path.join(resultsDir, "foreground-history.json"), JSON.stringify({
-				version: 1,
-				runs: [{
-					runId: "oversized",
-					mode: "single",
-					cwd: root,
-					sessionId: "session-current",
-					updatedAt: 200,
-					children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
-				}],
-			}), "utf-8");
+			const oversized = (runId: string) => ({ runId, mode: "single" as const, cwd: root, sessionId: "session-current", updatedAt: 200, children: [{ agent: "worker", index: 0, status: "completed" as const, resumeContract: { outputSchema: { type: "object", description: "x".repeat(65 * 1024) } } }] });
+			writeForegroundHistoryFile(resultsDir, oversized("saved-oversized"));
 
 			const restored = stateForTest();
 			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 0);
-			assert.equal(restored.foregroundRuns?.has("oversized"), false);
+			assert.equal(restored.foregroundRuns?.has("saved-oversized"), false);
 
-			const state = stateForTest();
-			state.foregroundRuns!.set("oversized", {
-				runId: "oversized",
-				mode: "single",
-				cwd: root,
-				sessionId: "session-current",
-				updatedAt: 200,
-				children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
-			});
-			persistForegroundRunHistory(state, { resultsDir });
-			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
-			assert.deepEqual(persisted.runs, []);
+			persistForegroundRun(oversized("oversized"), { resultsDir });
+			assert.equal(fs.existsSync(foregroundHistoryFile(resultsDir, "oversized")), false);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1046,7 +1205,12 @@ describe("native subagent fleet", () => {
 					children: [{ agent: "worker", index: 0, status: "completed", savedOutputPath: outputPath }],
 				});
 			}
-			persistForegroundRunHistory(state, { resultsDir, limit: 2 });
+			for (const [index, run] of [...state.foregroundRuns!.values()].entries()) {
+				persistForegroundRun(run, { resultsDir, limit: 2 });
+				// Distinct mtimes in save order: the cap prunes the oldest file.
+				fs.utimesSync(foregroundHistoryFile(resultsDir, run.runId), 1_000 + index, 1_000 + index);
+			}
+			assert.deepEqual([...savedForegroundRuns(resultsDir).keys()].sort(), ["run-1", "run-2"]);
 			fs.rmSync(path.join(artifactsRoot, "outputs", "run-2", "output.md"), { force: true });
 
 			const restored = stateForTest();
@@ -1105,22 +1269,17 @@ describe("native subagent fleet", () => {
 			try {
 				const lines = component.render(100);
 				assert.ok(lines.some((line) => line.includes("FINAL ASYNC OUTPUT")));
-				const detailText = (rendered: string[]) => rendered.map((line) => line.split("│").at(-2)?.trim() ?? "").join("");
-				const artifactIn = (rendered: string[]) => detailText(rendered).includes("output-0.log");
-				let artifactVisible = artifactIn(lines);
-				for (let page = 0; !artifactVisible && page < 8; page++) {
-					component.handleInput("\x1b[5~"); // page up through the detail viewport
-					artifactVisible = artifactIn(component.render(100));
-				}
-				assert.ok(artifactVisible, "artifact path remains reachable by scrolling");
 				assert.ok(lines.some((line) => line.includes("worker") && line.includes("[fork]")));
-				assert.ok(detailText(lines).includes("worker.jsonl"));
+				// The detail pane hard-wraps long paths at any character, so read it back as one string.
+				const detail = lines.map((line) => (line.replace(/\x1b\[[0-9;]*m/g, "").split("│")[2] ?? "").trimEnd()).join("");
+				assert.ok(detail.includes(path.join(asyncDir, "output-0.log")));
+				assert.ok(detail.includes(path.join(asyncDir, "worker.jsonl")));
 				for (const line of lines) assert.ok(visibleWidth(line) <= 100, `line exceeded width: ${line}`);
 				tui.terminal.rows = 10;
 				assert.ok(component.render(100).length <= 8, "short-terminal render should fit the overlay's 85% height cap");
 				component.handleInput("\x1b[6~");
 				component.handleInput("r");
-				assert.ok(renderRequests >= 2);
+				assert.equal(renderRequests, 1, "paging at the bottom is a no-op; refresh requests a render");
 				component.handleInput("\x1b");
 				assert.equal(closed, true);
 			} finally {
@@ -1194,6 +1353,169 @@ describe("native subagent fleet", () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("selects rendered roster rows and consumes normalized output wheel input", (t) => {
+		t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-pointer-"));
+		try {
+			writeAsyncRun(root, { id: "pointer", agents: ["alpha", "beta"], transcript: [{ recordType: "message", role: "assistant", text: Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n") }] });
+			const component = new SubagentFleetComponent({ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never, theme as never, stateForTest(), () => {}, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme });
+			const event = (changes: Partial<TuiMouseEvent>): TuiMouseEvent => ({ type: "wheel", button: "none", x: 70, y: 10, screenX: 81, screenY: 15, width: 100, height: 27, shift: false, alt: false, ctrl: false, wheelDelta: -1, ...changes });
+			try {
+				const bottom = component.render(100);
+				assert.equal((component as Component).handleMouse?.(event({}))?.handled, true, "output wheel must be owned");
+				const wheel = component.render(100);
+				assert.notDeepEqual(wheel, bottom);
+				component.handleInput("J");
+				assert.deepEqual(component.render(100), bottom);
+				assert.equal((component as Component).handleMouse?.(event({ type: "click", button: "left", x: 5, y: 4 }))?.handled, true);
+				const selected = component.render(100);
+				assert.match(selected[1]!, /beta/);
+				for (const outside of [{ x: 5, y: 4 }, { x: 50, y: 0 }]) {
+					assert.equal((component as Component).handleMouse?.(event(outside))?.handled, true, "wheel outside the output pane must not reach the transcript");
+					assert.deepEqual(component.render(100), selected);
+				}
+			} finally { component.dispose(); }
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("hit-tests the rendered roster across refresh, removal, resize, blank rows, and unsupported pointers", () => {
+		const state = stateForTest();
+		for (let i = 0; i < 30; i++) state.foregroundControls.set(`run-${i}`, { runId: `run-${i}`, mode: "single", startedAt: i + 1, updatedAt: i + 1, currentAgent: `agent-${i}`, currentIndex: 0 });
+		const terminal = { rows: 32, columns: 100 };
+		const component = new SubagentFleetComponent({ terminal, requestRender() {} } as never, theme as never, state, () => {}, { refreshMs: 60_000, markdownTheme });
+		const click = (changes: Partial<TuiMouseEvent> = {}) => component.handleMouse({ type: "click", button: "left", x: 5, y: 3, screenX: 40, screenY: 20, width: 100, height: 27, shift: false, alt: false, ctrl: false, ...changes });
+		try {
+			component.handleInput("\x1b[F");
+			const rendered = component.render(100);
+			const firstVisible = /agent-\d+/.exec(rendered[3]!)![0];
+			for (const changes of [{ x: 0 }, { x: 37 }, { y: 2 }, { button: "right" as const }, { type: "drag" as const }, { shift: true }]) {
+				assert.equal(click(changes), undefined);
+				assert.match(component.render(100)[1]!, /agent-29/);
+			}
+			// Insert a row ahead of the rendered slice without rendering a replacement frame.
+			state.foregroundControls.set("inserted", { runId: "inserted", mode: "single", startedAt: 0.5, updatedAt: 1, currentAgent: "inserted", currentIndex: 0 });
+			component.handleInput("r");
+			assert.equal(click()?.handled, true);
+			assert.ok(component.render(100)[1]!.includes(firstVisible), "click resolves rendered key, not a refreshed row index");
+			component.handleInput("\x1b[F");
+			const lastFrame = component.render(100);
+			const removedAgent = /agent-\d+/.exec(lastFrame[3]!)![0];
+			state.foregroundControls.delete(removedAgent.replace("agent", "run"));
+			component.handleInput("r");
+			assert.equal(click(), undefined, "removed rendered keys are ignored");
+			terminal.rows = 20;
+			assert.equal(click(), undefined, "pre-resize hit regions cannot select");
+			component.render(35);
+			assert.equal(click({ width: 35 }), undefined);
+			state.foregroundControls.clear();
+			state.foregroundControls.set("only", { runId: "only", mode: "single", startedAt: 1, updatedAt: 1, currentAgent: "only", currentIndex: 0 });
+			component.handleInput("r"); component.render(100);
+			assert.equal(click({ y: 5 }), undefined, "blank roster rows are not targets");
+		} finally { component.dispose(); }
+	});
+
+	it("routes fullscreen terminal mouse input through the host overlay and preserves regular keyboard navigation", (t) => {
+		t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-host-"));
+		try {
+			writeAsyncRun(root, { id: "host", agents: ["alpha", "beta"], transcript: [{ recordType: "message", role: "assistant", text: Array.from({ length: 200 }, (_, i) => `host line ${i}`).join("\n") }] });
+			for (const fullscreen of [true, false]) {
+				let input: (data: string) => void = () => {};
+				const writes: string[] = [];
+				const terminal = {
+					rows: 40, columns: 120, kittyProtocolActive: false,
+					start(handler: (data: string) => void) { input = handler; }, stop() {}, async drainInput() {},
+					write(data: string) { writes.push(data); }, moveBy() {}, hideCursor() {}, showCursor() {},
+					clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+				};
+				const tui = fullscreen ? new TuiAltScreen(terminal, false, undefined, { mouse: true, wheelScrollLines: 1 }) : new TuiMainScreen(terminal);
+				const component = new SubagentFleetComponent(tui, theme as never, stateForTest(), () => {}, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme, actions: { async steer() { return { text: "steered" }; }, stop() { throw new Error("pointer must not activate stop"); } } });
+				tui.addChild({ render: () => Array.from({ length: 200 }, (_, i) => `transcript ${i}`), invalidate() {} });
+				tui.start();
+				const overlay = tui.showOverlay(component, { width: 100, row: 2, col: 8 });
+				try {
+					tui.renderNow();
+					const bottom = component.render(100);
+					if (fullscreen && tui instanceof TuiAltScreen) {
+						// The transcript starts following its bottom. Unhandled wheel input would fall back to
+						// transcript scrolling, which clamps silently at either bound; move the transcript away
+						// from both bounds first so fallback in either direction becomes observable.
+						const endOffset = tui.viewportTop;
+						tui.scrollBy(-10);
+						tui.renderNow();
+						const top = tui.viewportTop;
+						assert.ok(top > 0, "setup must leave upward wheel-fallback room in the transcript");
+						assert.ok(top < endOffset, "setup must leave downward wheel-fallback room in the transcript");
+						const bounds = overlay.getBounds()!;
+						const mouse = (button: number, x: number, y: number, release = false) => input(`\x1b[<${button};${bounds.col + x + 1};${bounds.row + y + 1}${release ? "m" : "M"}`);
+						mouse(64, 70, 12);
+						tui.renderNow();
+						assert.notDeepEqual(component.render(100), bottom);
+						assert.equal(tui.viewportTop, top);
+						for (let i = 0; i < 230; i++) mouse(64, 70, 12);
+						tui.renderNow();
+						assert.equal(tui.viewportTop, top, "top limit must consume wheel");
+						for (let i = 0; i < 230; i++) mouse(65, 70, 12);
+						tui.renderNow();
+						assert.equal(tui.viewportTop, top, "bottom limit must consume wheel");
+						assert.deepEqual(component.render(100), bottom);
+						mouse(0, 5, 4); mouse(0, 5, 4, true);
+						tui.renderNow();
+						assert.match(component.render(100)[1]!, /beta/);
+						input("k"); tui.renderNow();
+						input("D"); tui.renderNow();
+						const modal = component.render(100);
+						mouse(64, 70, 12); mouse(0, 5, 4); mouse(0, 5, 4, true);
+						tui.renderNow();
+						assert.deepEqual(component.render(100), modal);
+						assert.equal(tui.viewportTop, top, "confirmation modal must not leak wheel input");
+					} else {
+						input("K"); tui.renderNow();
+						assert.notDeepEqual(component.render(100), bottom);
+						input("J"); tui.renderNow();
+						assert.deepEqual(component.render(100), bottom);
+						assert.ok(!writes.some((data) => /\x1b\[\?100[0236]h/.test(data)), "regular mode must not enable mouse tracking");
+					}
+				} finally { overlay.hide(); component.dispose(); tui.stop(); }
+			}
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("records long-transcript cache and render-request counters", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-counters-"));
+		const original = fsDefault.openSync;
+		let reads = 0;
+		let requests = 0;
+		let scans = 0;
+		const readdir = fsDefault.readdirSync;
+		try {
+			writeAsyncRun(root, { id: "counters", transcript: [{ recordType: "message", role: "assistant", text: Array.from({ length: 1000 }, (_, i) => `detail ${i}`).join("\n") }] });
+			const component = new SubagentFleetComponent({ terminal: { rows: 32, columns: 100 }, requestRender() { requests++; } } as never, theme as never, stateForTest(), () => {}, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme });
+			fsDefault.openSync = ((file: Parameters<typeof original>[0], ...args: unknown[]) => {
+				if (String(file).endsWith("transcript-0.jsonl")) reads++;
+				return (original as Function)(file, ...args);
+			}) as typeof original;
+			t.mock.method(fsDefault, "readdirSync", (...args: Parameters<typeof readdir>) => { scans++; return readdir(...args); });
+			syncBuiltinESMExports();
+			const start = performance.now();
+			try {
+				component.render(100);
+				for (let i = 0; i < 20; i++) { component.handleInput("K"); component.render(100); }
+				assert.equal(reads, 1);
+				assert.equal(requests, 20);
+				t.diagnostic(`1000 lines / 21 renders: transcript reads=${reads}, requests=${requests}, elapsed=${(performance.now() - start).toFixed(1)}ms`);
+				for (let i = 0; i < 20; i++) {
+					component.handleMouse({ type: "wheel", button: "none", x: 70, y: 12, screenX: 70, screenY: 12, width: 100, height: 27, shift: false, alt: false, ctrl: false, wheelDelta: -1 });
+					component.render(100);
+				}
+				assert.equal(reads, 1, "pointer renders reuse the transcript cache");
+				assert.equal(scans, 0, "pointer handling and rendering do not scan directories");
+				assert.equal(requests, 40);
+				t.diagnostic(`after 20 wheel movements: transcript reads=${reads}, directory scans=${scans}, requests=${requests}`);
+			} finally { component.dispose(); }
+		} finally { fsDefault.openSync = original; t.mock.restoreAll(); syncBuiltinESMExports(); fs.rmSync(root, { recursive: true, force: true }); }
 	});
 
 	it("renders structured tool activity and assistant Markdown when a child transcript is available", () => {
@@ -1989,6 +2311,120 @@ describe("native subagent fleet", () => {
 				lines = component.render(90);
 				assert.ok(lines.some((line) => line.includes("LATEST LIVE OUTPUT")), "live transcript should keep following new output");
 				assert.ok(renderRequests > 0);
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("selecting a child shows the bottom and reselecting returns there without per-child memory", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-select-follow-"));
+		try {
+			for (const id of ["alpha-run", "beta-run"]) {
+				writeAsyncRun(root, {
+					id,
+					agents: [id.replace("-run", "")],
+					transcript: [{ recordType: "message", role: "assistant", text: Array.from({ length: 200 }, (_, i) => `${id} line ${i}`).join("\n") }],
+				});
+			}
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				stateForTest(),
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, markdownTheme },
+			);
+			try {
+				const opening = component.render(100);
+				assert.ok(opening.some((line) => line.includes("alpha-run line 199")), "opening Fleet shows the newest output");
+				assert.ok(!opening.some((line) => line.includes("alpha-run line 0")));
+				for (let i = 0; i < 20; i++) component.handleInput("K");
+				const scrolledAway = component.render(100);
+				assert.notDeepEqual(scrolledAway, opening, "scrolling away must move the viewport");
+				assert.ok(!scrolledAway.some((line) => line.includes("alpha-run line 199")));
+				component.handleInput("j");
+				const betaBottom = component.render(100);
+				assert.ok(betaBottom.some((line) => line.includes("beta-run line 199")), "selecting a child shows its newest output");
+				assert.ok(!betaBottom.some((line) => line.includes("beta-run line 0")));
+				for (let i = 0; i < 20; i++) component.handleInput("K");
+				const betaScrolled = component.render(100);
+				assert.ok(!betaScrolled.some((line) => line.includes("beta-run line 199")));
+				component.handleInput("k");
+				const reselected = component.render(100);
+				assert.ok(reselected.some((line) => line.includes("alpha-run line 199")), "reselecting returns to the bottom with no per-child memory");
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("Prompt Audit opens at top, child and view changes reset top, and exiting resumes bottom follow", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-fleet-audit-follow-"));
+		try {
+			const state = stateForTest();
+			state.baseCwd = root;
+			state.artifactDirPreference = "project";
+			const control = {
+				runId: "audit-follow-run",
+				sessionId: "session-current",
+				mode: "parallel" as const,
+				startedAt: 10,
+				updatedAt: 20,
+				activeChildren: new Map([
+					[0, { index: 0, agent: "worker", startedAt: 10, updatedAt: 20 }],
+					[1, { index: 1, agent: "reviewer", startedAt: 11, updatedAt: 21 }],
+				]),
+			};
+			state.foregroundControls.set(control.runId, control);
+			const artifactsRoot = getProjectArtifactsDir(root);
+			for (const [agent, index] of [["worker", 0], ["reviewer", 1]] as const) {
+				const lines = Array.from({ length: 200 }, (_, i) => `${agent} line ${i}`).join("\n");
+				fs.mkdirSync(artifactsRoot, { recursive: true });
+				fs.writeFileSync(getArtifactPaths(artifactsRoot, control.runId, agent, index).transcriptPath, `${JSON.stringify({ recordType: "message", role: "assistant", text: lines })}\n`);
+			}
+			const longLines = (prefix: string) => Array.from({ length: 60 }, (_, i) => `${prefix} ${i}`).join("\n");
+			registerLivePromptAudit(control, 0, longLines("audit line"), `${longLines("audit line")}\n\n---\n${longLines("runtime line")}`);
+			registerLivePromptAudit(control, 1, longLines("second audit line"), longLines("second audit line"));
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ refreshMs: 60_000, markdownTheme },
+			);
+			try {
+				const opening = component.render(100);
+				assert.ok(opening.some((line) => line.includes("worker line 199")), "normal output follows the bottom before Prompt Audit");
+				component.handleInput("p");
+				const auditFrame = component.render(100);
+				assert.ok(auditFrame.some((line) => line.includes("audit line 0")), "Prompt Audit opens at the top");
+				assert.ok(!auditFrame.some((line) => line.includes("audit line 59")));
+				// Scroll away from the top first: staying at the top would make the transition below
+				// indistinguishable from preserving the existing offset.
+				for (let i = 0; i < 20; i++) component.handleInput("J");
+				const scrolledAudit = component.render(100);
+				assert.ok(!scrolledAudit.some((line) => line.includes("audit line 0")), "scrolled away from the top before the view change");
+				component.handleInput("2");
+				const runtimeFrame = component.render(100);
+				assert.ok(runtimeFrame.some((line) => line.includes("runtime line 0")), "view changes reset to the top");
+				assert.ok(!runtimeFrame.some((line) => line.includes("runtime line 59")));
+				component.handleInput("1");
+				component.render(100);
+				for (let i = 0; i < 20; i++) component.handleInput("J");
+				const scrolledForChild = component.render(100);
+				assert.ok(!scrolledForChild.some((line) => line.includes("audit line 0")), "scrolled away from the top before the child change");
+				component.handleInput("j");
+				const secondFrame = component.render(100);
+				assert.ok(secondFrame.some((line) => line.includes("second audit line 0")), "child changes reset to the top");
+				assert.ok(!secondFrame.some((line) => line.includes("second audit line 59")));
+				component.handleInput("\x1b");
+				const exited = component.render(100);
+				assert.ok(exited.some((line) => line.includes("reviewer line 199")), "exiting Prompt Audit resumes normal output bottom follow");
+				assert.ok(!exited.some((line) => line.includes("reviewer line 0")));
 			} finally {
 				component.dispose();
 			}

@@ -24,10 +24,9 @@
  * session manager (`noteHostSessionManager`) and records the outcome either
  * way.
  */
-import { realpath } from "node:fs/promises";
-import { resolve } from "node:path";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
+import { realpathOrResolveAsync } from "./path-utils.js";
 import { compareOrdinal } from "./string-utils.js";
 
 type FileMutationQueue = <T>(
@@ -87,7 +86,7 @@ function resolved(sdk: {
 			: hostSessionManager instanceof sdk.SessionManager;
 	if (hostCopy === false) {
 		unavailable(
-			"the host SDK import loaded a second copy of the package (the host's session manager is not its SessionManager), so its queue does not order pi's own edits",
+			"the host SDK import loaded a second copy of the package (the host's session manager is not its SessionManager), so its queue does not order DM's own edits",
 		);
 	} else {
 		logExtension({
@@ -108,8 +107,11 @@ function resolveHostQueue(loader: HostSdkLoader) {
 }
 
 /**
- * Run `fn` inside pi's mutation queue for `filePath`, or directly when no
- * host queue is registered or reachable.
+ * Run `fn` inside the host's mutation queue for `filePath`'s path identity, or
+ * directly when no host queue is registered or reachable. The queue key is the
+ * identity, not a spelling: `path.resolve` first folded a `..` after a
+ * directory link lexically, so `link/../f.ts` entered the queue of a file the
+ * writer never touches (#4689 shape 1).
  */
 export function withHostFileMutationQueue<T>(
 	filePath: string,
@@ -118,28 +120,28 @@ export function withHostFileMutationQueue<T>(
 	const loader = loadHostSdk;
 	if (!loader) return fn();
 	return resolveHostQueue(loader).then((queue) =>
-		queue ? queue(resolve(filePath), fn) : fn(),
+		queue
+			? realpathOrResolveAsync(filePath).then((key) => queue(key, fn))
+			: fn(),
 	);
 }
 
 /**
  * #3541: `withHostFileMutationQueue` for a writer of several files. It enters
  * one queue at a time, in one order of the keys, so two such writers never
- * each hold a path the other waits for. A path is keyed the way pi keys its
- * queue (its realpath, or the resolved spelling of a missing path:
- * `@duckmind/dm-coding-agent` `dist/core/tools/file-mutation-queue.js`
- * `getMutationQueueKey`), so two spellings of one file enter its queue once;
- * the queue is not reentrant, and a second entry would wait on the first.
+ * each hold a path the other waits for. A path is keyed by its path identity
+ * (`realpathOrResolveAsync`), the same key pi's own queue derives from the path
+ * it is handed (`@duckmind/dm-coding-agent`
+ * `dist/core/tools/file-mutation-queue.js` `getMutationQueueKey`), so two
+ * spellings of one file enter its queue once; the queue is not reentrant, and a
+ * second entry would wait on the first.
  */
 export async function withHostFileMutationQueues<T>(
 	filePaths: readonly string[],
 	fn: () => Promise<T>,
 ): Promise<T> {
 	const keys = await Promise.all(
-		filePaths.map((filePath) => {
-			const resolvedPath = resolve(filePath);
-			return realpath(resolvedPath).catch(() => resolvedPath);
-		}),
+		filePaths.map((filePath) => realpathOrResolveAsync(filePath)),
 	);
 	return [...new Set(keys)]
 		.sort(compareOrdinal)

@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/abix5/pi-cliproxyapi.git"
+    "url": "git+https://github.com/que-nguyen/dm.git"
   },
   "files": [
     "index.ts",

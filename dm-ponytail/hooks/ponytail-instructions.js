@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Shared Ponytail instruction builder for Claude hooks and Pi extension.
+// Shared Ponytail instruction builder for Claude hooks and the DM extension.
 
 const fs = require('fs');
 const path = require('path');

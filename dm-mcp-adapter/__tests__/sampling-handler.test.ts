@@ -5,6 +5,7 @@ import type { SamplingHandlerOptions } from "../sampling-handler.ts";
 
 const mocks = vi.hoisted(() => ({
   complete: vi.fn(),
+  result: vi.fn(),
 }));
 
 vi.mock("@duckmind/dm-ai/compat", () => ({ completeSimple: mocks.complete }));
@@ -61,6 +62,7 @@ function createOptions(overrides: Partial<SamplingHandlerOptions> = {}): Samplin
       getApiKeyAndHeaders: vi.fn(async () => ({ ok: true as const, apiKey: "test-key" })),
     },
     getCurrentModel: vi.fn(() => undefined),
+    getThinkingLevel: vi.fn(() => "off" as const),
     getSignal: vi.fn(() => undefined),
     ...overrides,
   };
@@ -84,7 +86,7 @@ function createSamplingRequest(params: CreateMessageRequest["params"]): CreateMe
 
 describe("sampling handler", () => {
   beforeEach(() => {
-    mocks.complete.mockReset().mockResolvedValue({
+    mocks.result.mockReset().mockResolvedValue({
       role: "assistant",
       content: [{ type: "text", text: "Bonjour" }],
       api: "anthropic-messages",
@@ -94,6 +96,7 @@ describe("sampling handler", () => {
       stopReason: "stop",
       timestamp: 1,
     });
+    mocks.complete.mockReset().mockImplementation(() => mocks.result());
   });
 
   it("converts approved MCP sampling requests using DM host credentials", async () => {
@@ -132,6 +135,44 @@ describe("sampling handler", () => {
       model: "anthropic/claude-sonnet",
       stopReason: "endTurn",
     });
+  });
+
+  it("samples with the session thinking level so reasoning-only endpoints accept the request", async () => {
+    const { handleSamplingRequest } = await import("../sampling-handler.ts");
+    await handleSamplingRequest(createOptions({ getThinkingLevel: () => "high" }), createSamplingRequest({
+      messages: [{ role: "user", content: { type: "text", text: "Hello" } }],
+      maxTokens: 50,
+      metadata: { reasoning_budget: 4096 },
+    }));
+
+    expect(mocks.complete.mock.calls[0][2]).toEqual({
+      maxTokens: 50,
+      metadata: { reasoning_budget: 4096 },
+      reasoning: "high",
+      apiKey: "test-key",
+    });
+  });
+
+  it("leaves reasoning unset when the session thinking level is off", async () => {
+    await runBasicSampling({ getThinkingLevel: () => "off" });
+
+    expect(mocks.complete.mock.calls[0][2]).not.toHaveProperty("reasoning");
+  });
+
+  it("uses host-authenticated completeSimple without registry streaming", async () => {
+    const { handleSamplingRequest } = await import("../sampling-handler.ts");
+    mocks.complete.mockReset().mockImplementation(() => mocks.result());
+    const result = await handleSamplingRequest(createOptions({
+      modelRegistry: { getAvailable: () => [model], getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }) },
+      getThinkingLevel: () => "high",
+    }), createSamplingRequest({
+      messages: [{ role: "user", content: { type: "text", text: "Hello" } }],
+      maxTokens: 50,
+      metadata: { locale: "fr" },
+    }));
+
+    expect(result.content).toEqual({ type: "text", text: "Bonjour" });
+    expect(mocks.complete.mock.calls[0][2]).toEqual({ maxTokens: 50, metadata: { locale: "fr" }, reasoning: "high", apiKey: "test-key" });
   });
 
   it("rejects failed host authorization without sampling or exposing credentials", async () => {
@@ -250,7 +291,7 @@ describe("sampling handler", () => {
     }, { hints: [{ name: "haiku" }] })).rejects.toThrow("Provider is not configured: anthropic");
 
     expect(mocks.complete).toHaveBeenCalledTimes(1);
-    expect(mocks.complete.mock.calls[0][0]).toBe(haiku);
+    expect(mocks.complete.mock.calls[0]?.[0]).toBe(haiku);
   });
 
   it("preserves current-model-first selection when no hints are provided", async () => {

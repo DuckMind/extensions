@@ -105,7 +105,7 @@ import {
 } from "./config-core/records.js";
 import {
 	homeRelativePath,
-	isAtOrAboveHomeDir,
+	realpathOrResolve,
 	walkUpDirs,
 } from "./path-utils.js";
 import {
@@ -436,10 +436,12 @@ export function findNestedProjectMutationValue(
 	projectRoot: string,
 	homeDir = os.homedir(),
 ): NestedProjectMutationValue | undefined {
-	const root = path.resolve(projectRoot);
-	const start = path.dirname(path.resolve(editedFilePath));
-	for (const dir of walkUpDirs(start)) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) break;
+	// #4689 item 6: the walk climbs the edited file's identity, so the root
+	// bound and the home ceiling are identities too. A file linked in from
+	// outside the root is outside at its first step and reads no nested config.
+	const root = realpathOrResolve(projectRoot);
+	const start = path.dirname(realpathOrResolve(editedFilePath));
+	for (const dir of walkUpDirs(start, { homeDir })) {
 		const rel = path.relative(root, dir);
 		if (rel.startsWith("..") || path.isAbsolute(rel)) break;
 		const config = loadDmLensConfigInDir(dir);

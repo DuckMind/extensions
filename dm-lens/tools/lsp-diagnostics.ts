@@ -95,6 +95,7 @@ import {
 import { exceedsLspSyncLimits } from "../clients/lsp/content-limits.js";
 import {
 	goPackageFilesToAnnounce,
+	type ImportScope,
 	importTargetsToAnnounce,
 } from "../clients/lsp/created-import-targets.js";
 
@@ -132,6 +133,8 @@ type LspHealthLike = {
 type PrimaryUnavailableTally = {
 	count: number;
 	cause: PrimaryUnavailableCause | undefined;
+	/** #4806: the root verdicts of those files, which name why no server ran. */
+	rootFallbackReasons: readonly string[];
 };
 
 type BatchOptions = {
@@ -580,6 +583,16 @@ export function createLspDiagnosticsTool(
 					details: {},
 				};
 			}
+
+			// #4532 gap 13: a document the server already holds may have changed
+			// outside DM (a `cp`, a bash write) since pi last synced it. The touch
+			// below re-syncs only the files this call names, and its own drift
+			// sweep is rate-limited and not awaited, so a held file the named file
+			// depends on answered stale on the first call and clean on the second.
+			// The full forced sweep checks every held document and re-pushes each
+			// drifted one before any answer is read; it sends nothing for a held
+			// document whose bytes are unchanged.
+			await lspService.sweepDocumentDrift({ force: true, full: true });
 
 			if (Array.isArray(typedParams.paths) && typedParams.paths.length > 0) {
 				if (typedParams.paths.length > MAX_BATCH_FILES) {
@@ -1699,7 +1712,9 @@ async function collectFileDiagnosticResult(
 	// #3750: a clean verdict from a server whose root fell back is unconfirmed.
 	// Before the aux-gap demotion below so the primary's reason is the one named.
 	const rootFallback =
-		confirmation === "clean" ? await primaryRootFallback(file, cwd) : undefined;
+		confirmation === "clean" || primaryUnavailable !== undefined
+			? await primaryRootFallback(file, cwd)
+			: undefined;
 	if (rootFallback) confirmation = "unconfirmed";
 	// #1470/#1493: an auxiliary that never reported — cut off by the aux grace timer,
 	// or silent with nothing published for this content — contributed no evidence
@@ -1855,10 +1870,10 @@ async function runFileDiagnostics(
 	// #4346: a module this file imports, created outside dm-lens, reaches its
 	// servers before the touch (the batch path gates this on cached findings;
 	// one file needs no gate), and so do a Go file's package files.
-	lspService.announceCreatedFiles([
-		...goPackageFilesToAnnounce([absPath]),
-		...(await importTargetsToAnnounce(cwd, [absPath])),
-	]);
+	lspService.announceCreatedFiles(
+		goPackageFilesToAnnounce([absPath]),
+		await importTargetsToAnnounce(cwd, [absPath]),
+	);
 	// #3505 r2: the widget row is observed at the read, not after the touch.
 	const observedAt = Date.now();
 	const {
@@ -1944,7 +1959,7 @@ async function runFileDiagnostics(
 	// #3750: a clean verdict from a server whose root fell back is unconfirmed.
 	// Before the aux-gap narrowing below so the primary's reason is the one named.
 	const rootFallback =
-		confirmation === "clean"
+		confirmation === "clean" || primaryUnavailable !== undefined
 			? await primaryRootFallback(absPath, cwd)
 			: undefined;
 	if (rootFallback) confirmation = "unconfirmed";
@@ -2024,7 +2039,13 @@ async function runFileDiagnostics(
 	const primaryLine = (() => {
 		// #4322: the language server never answered, so neither "timed out" nor
 		// "silent-on-clean" describes it.
-		if (primaryUnavailable !== undefined) return primaryUnavailable;
+		// #4806: no client ran, so the root verdict is the durable cause (a
+		// project-less directory), which the start-problem wording cannot name.
+		if (primaryUnavailable !== undefined) {
+			return rootFallback
+				? `${primaryUnavailable} ${describeRootFallback(rootFallback, false)}.`
+				: primaryUnavailable;
+		}
 		if (diagnosticsUnsupportedServerIds.length > 0) {
 			return `Primary LSP${primaryId ? ` (${primaryId})` : ""}: navigation-only — diagnostics unsupported (no pull provider or publish evidence).`;
 		}
@@ -2158,7 +2179,10 @@ async function runFileDiagnostics(
 			...(skipReason !== undefined && { skipReason }),
 			...(primaryUnavailable !== undefined && { primaryUnavailable }),
 			...(rootFallback && {
-				rootFallbackReason: describeRootFallback(rootFallback),
+				rootFallbackReason: describeRootFallback(
+					rootFallback,
+					primaryUnavailable === undefined,
+				),
 			}),
 			// #1470: which servers this result does NOT speak for. Absent when it
 			// speaks for all of them.
@@ -2193,6 +2217,7 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	let timedOut = 0;
 	let primaryUnavailable = 0;
 	const primaryUnavailableCauses: PrimaryUnavailableCause[] = [];
+	const primaryUnavailableRootReasons = new Set<string>();
 	const rootFallbackReasons = new Set<string>();
 	let navigationOnly = 0;
 	let tooLarge = 0;
@@ -2218,7 +2243,15 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 					primaryUnavailableCauses.push(result.primaryUnavailableCause);
 			}
 			if (result.rootFallback) {
-				rootFallbackReasons.add(describeRootFallback(result.rootFallback));
+				// #4806: a file no server answered names its root verdict with the
+				// unavailable files, not with the files a hosted server answered.
+				if (result.primaryUnavailable !== undefined) {
+					primaryUnavailableRootReasons.add(
+						describeRootFallback(result.rootFallback, false),
+					);
+				} else {
+					rootFallbackReasons.add(describeRootFallback(result.rootFallback));
+				}
 			}
 		} else if (classifyBatchFileOutcome(result) === "clean") {
 			// Unsupported, unavailable and failed files were never checked.
@@ -2232,6 +2265,7 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 		primaryUnavailable: {
 			count: primaryUnavailable,
 			cause: combinePrimaryUnavailableCauses(primaryUnavailableCauses),
+			rootFallbackReasons: [...primaryUnavailableRootReasons],
 		},
 		rootFallbackReasons: [...rootFallbackReasons],
 		navigationOnly,
@@ -2331,14 +2365,21 @@ function unconfirmedReasonClause(
 	unconfirmed: number,
 	timedOut: number,
 	rootFallbackReasons: readonly string[] = [],
-	primaryUnavailable: PrimaryUnavailableTally = { count: 0, cause: undefined },
+	primaryUnavailable: PrimaryUnavailableTally = {
+		count: 0,
+		cause: undefined,
+		rootFallbackReasons: [],
+	},
 ): string {
 	// #4322: a fourth, disjoint reason — no language server answered at all.
 	// The rest of the unconfirmed files keep their own explanation.
 	if (primaryUnavailable.count > 0) {
 		const head =
 			`${primaryUnavailable.count} with no language server answer ` +
-			`(${PRIMARY_UNAVAILABLE_CAUSE[primaryUnavailable.cause ?? "unstarted"]})`;
+			`(${PRIMARY_UNAVAILABLE_CAUSE[primaryUnavailable.cause ?? "unstarted"]})` +
+			(primaryUnavailable.rootFallbackReasons.length > 0
+				? `: ${primaryUnavailable.rootFallbackReasons.join("; ")}`
+				: "");
 		const rest = unconfirmed - primaryUnavailable.count;
 		return rest > 0
 			? `${head}; the other ${rest}: ${unconfirmedReasonClause(rest, timedOut, rootFallbackReasons)}`
@@ -2430,20 +2471,26 @@ async function collectBatchDiagnostics(
 	// #4320: a module created since a file was cached must reach its servers
 	// before any lookup below, whatever the order of `files`. #4346: so must a
 	// module named only by a file's imports, which nothing reports when it was
-	// created outside dm-lens: for every file a fresh clean entry will not
-	// answer (#4368 r1 F1; a write-hook touch records no entry). So must a Go
-	// file's package files, which no import names; and each resolved file's
-	// imports go to the cache, which refuses an entry only for a creation in
-	// its dependency scope.
-	lspService.announceCreatedFiles([
-		...files,
-		...goPackageFilesToAnnounce(files),
-		...(await importTargetsToAnnounce(
-			resolvedCwd,
-			files.filter((file) => !cacheCtx.servesClean(file, scopeKey)),
-			(file, scope) => cacheCtx.noteImportScope(file, scope),
-		)),
-	]);
+	// created outside dm-lens. So must a Go file's package files, which no
+	// import names; and each resolved file's imports go to the cache. #4532
+	// gap 13: a file a fresh clean entry answers (#4368 r1 F1) is resolved
+	// too, in its own capped call so it displaces none of the others, and an
+	// import of it changed outside DM then refuses the entry it would replay.
+	const servedClean: string[] = [];
+	const unanswered = files.filter((file) => {
+		if (!cacheCtx.servesClean(file, scopeKey)) return true;
+		servedClean.push(file);
+		return false;
+	});
+	const noteScope = (file: string, scope: ImportScope) =>
+		cacheCtx.noteImportScope(file, scope);
+	lspService.announceCreatedFiles(
+		[...files, ...goPackageFilesToAnnounce(files)],
+		[
+			...(await importTargetsToAnnounce(resolvedCwd, unanswered, noteScope)),
+			...(await importTargetsToAnnounce(resolvedCwd, servedClean, noteScope)),
+		],
+	);
 	const groups = groupFilesByPrimaryServer(files);
 	await runPerServerGroups(
 		groups,

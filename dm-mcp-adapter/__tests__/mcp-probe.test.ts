@@ -164,6 +164,10 @@ describe("MCP endpoint shape probe", () => {
       classification: "endpoint responded with a JSON-RPC 2.0 envelope",
     });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string)).toMatchObject({
+      method: "initialize",
+      params: { clientInfo: { name: "dm-mcp-probe" } },
+    });
   });
 
   it("falls back to legacy when server/discover returns a different protocol version", async () => {

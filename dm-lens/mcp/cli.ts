@@ -157,7 +157,7 @@ async function main(): Promise<void> {
 		subsystem: "project-trust",
 		level: "debug",
 		message:
-			"build-graph: workspace trust belongs to the calling client; pi trust not consulted",
+			"build-graph: workspace trust belongs to the calling client; DM trust not consulted",
 	});
 
 	const command = process.argv[2];

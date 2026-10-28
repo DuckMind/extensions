@@ -36,7 +36,8 @@ function hasOutstandingWork(deps: AutoDrainDeps, sessionId: string, nowMs: numbe
 	const detachedForeground = [...(deps.state.foregroundRuns?.values() ?? [])].some((run) =>
 		run.sessionId === sessionId && run.children.some((child) => child.status === "detached")
 	);
-	return asyncRuns.length > 0 || snapshotBackgroundWork(sessionId, nowMs).items.length > 0 || detachedForeground;
+	const runtimeId = deps.state.supervisorOwnerSessionId;
+	return asyncRuns.length > 0 || snapshotBackgroundWork(runtimeId ? [sessionId, runtimeId] : [sessionId], nowMs).items.length > 0 || detachedForeground;
 }
 
 /** Drain all work owned by the current headless session, including work added while draining. */

@@ -51,6 +51,31 @@ export function isLoopbackHostname(hostnameValue: string): boolean {
 		|| (isIP(normalized) === 4 && normalized.split(".", 1)[0] === "127");
 }
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function allowsHttpBaseUrls(): boolean {
+	const environmentValue = process.env.PI_WEB_ACCESS_ALLOW_HTTP_BASE_URLS;
+	if (environmentValue !== undefined) {
+		const value = environmentValue.trim().toLowerCase();
+		if (value === "true" || value === "1") return true;
+		if (value === "false" || value === "0") return false;
+		throw new Error("Invalid configuration: PI_WEB_ACCESS_ALLOW_HTTP_BASE_URLS must be true, false, 1, or 0");
+	}
+	const path = getWebSearchConfigPath();
+	if (!existsSync(path)) return false;
+	let raw: unknown;
+	try {
+		raw = JSON.parse(readFileSync(path, "utf-8"));
+	} catch (err) {
+		throw new Error(`Failed to parse ${path}: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	const value = isRecord(raw) ? raw.allowHttpBaseUrls : undefined;
+	if (value !== undefined && typeof value !== "boolean") throw new Error(`allowHttpBaseUrls in ${path} must be a boolean`);
+	return value === true;
+}
+
 export function resolveApiBaseUrl(options: ApiBaseUrlOptions): string {
 	const fromEnvironment = options.environmentValue !== undefined;
 	const value = fromEnvironment ? options.environmentValue : options.configuredValue;
@@ -69,7 +94,7 @@ export function resolveApiBaseUrl(options: ApiBaseUrlOptions): string {
 	} catch {
 		throw new Error(`${source} must be an absolute HTTP(S) URL`);
 	}
-	if (url.protocol !== "https:" && (url.protocol !== "http:" || !isLoopbackHostname(url.hostname))) {
+	if (url.protocol !== "https:" && (url.protocol !== "http:" || (!isLoopbackHostname(url.hostname) && !allowsHttpBaseUrls()))) {
 		throw new Error(`${source} must be an absolute HTTPS URL`);
 	}
 	if (url.username || url.password) {
@@ -85,6 +110,25 @@ export function resolveApiBaseUrl(options: ApiBaseUrlOptions): string {
 	return url.toString().replace(/\/+$/, "");
 }
 
+// Other tools commonly set the bare OLLAMA_BASE_URL (a local Ollama server) and DEEPSEEK_BASE_URL
+// (an OpenAI-compatible root ending in /v1), so these providers read PI_-prefixed names instead.
+const PI_PREFIXED_ENVIRONMENT_STEMS = new Set(["ollama", "deepseek"]);
+
+/** Resolve a provider's API root without dropping its endpoint path or a gateway prefix. */
+export function resolveProviderApiUrl(configStem: string, defaultUrl: string, configuredValue: unknown): string {
+	const official = new URL(defaultUrl);
+	const environmentKey = (PI_PREFIXED_ENVIRONMENT_STEMS.has(configStem) ? "PI_" : "")
+		+ configStem.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toUpperCase() + "_BASE_URL";
+	const baseUrl = resolveApiBaseUrl({
+		configKey: configStem + "BaseUrl",
+		configuredValue,
+		defaultValue: official.origin,
+		environmentKey,
+		environmentValue: process.env[environmentKey],
+	});
+	return baseUrl + official.pathname + official.search;
+}
+
 const API_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const API_REQUEST_BODY_HEADERS = ["Content-Encoding", "Content-Language", "Content-Location", "Content-Type"];
 const MAX_API_REDIRECTS = 5;
@@ -93,8 +137,11 @@ export async function fetchWithCredentialRedirects(
 	url: string,
 	init: RequestInit,
 	credentialHeaders: readonly string[],
+	credentialQueryParams: readonly string[] = [],
 ): Promise<Response> {
 	let current = new URL(url);
+	const source = new URL(url);
+	for (const name of credentialQueryParams) source.searchParams.delete(name);
 	let requestInit = init;
 
 	for (let redirects = 0; ; redirects++) {
@@ -104,7 +151,7 @@ export async function fetchWithCredentialRedirects(
 		const location = response.headers.get("location");
 		if (!location) return response;
 		if (redirects === MAX_API_REDIRECTS) {
-			throw new Error(`Too many API redirects from ${url}`);
+			throw new Error(`Too many API redirects from ${source}`);
 		}
 
 		const next = new URL(location, current);
@@ -122,6 +169,7 @@ export async function fetchWithCredentialRedirects(
 			requestInit = { ...withoutBody, method: "GET", headers };
 		}
 		if (next.origin !== current.origin) {
+			for (const name of credentialQueryParams) next.searchParams.delete(name);
 			const headers = new Headers(requestInit.headers);
 			for (const name of credentialHeaders) headers.delete(name);
 			requestInit = { ...requestInit, headers };
@@ -306,6 +354,9 @@ function noProxyEntryMatches(hostname: string, entry: string): boolean {
 export function isProxyBypassedUrl(url: URL): boolean {
 	const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
 	if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "127.0.0.1" || hostname === "::1") return true;
+	// GCE metadata server (and any GCE_METADATA_HOST override) must be reached directly, never via proxy.
+	const gceHost = process.env.GCE_METADATA_HOST?.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+	if (hostname === "metadata.google.internal" || hostname === "169.254.169.254" || (gceHost && noProxyEntryMatches(hostname, gceHost))) return true;
 	const noProxy = process.env.NO_PROXY || process.env.no_proxy;
 	if (noProxy && noProxy.split(",").some((entry) => noProxyEntryMatches(hostname, entry.trim()))) return true;
 	return false;

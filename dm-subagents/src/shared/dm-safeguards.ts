@@ -1,7 +1,7 @@
 // DM-specific checks retained across the upstream SDK child-session migration.
 const READ_ONLY = new Set(["read", "grep", "find", "ls", "web_search", "fetch_content",
   "get_search_content", "intercom", "contact_supervisor", "structured_output"]);
-const IMPLEMENTATION = /\b(?:implement|modify|edit|refactor|ship|land)\b|\b(?:fix|patch)\s+(?:(?:the|a|an|this|that)\s+)?(?:it|bug|defect|issues?|problems?|failures?|regressions?|tests?|errors?|code|source|implementation|files?|module|config)\b|\b(?:create|update|add|remove|replace|delete|write)\s+(?:(?:the|a|an)\s+)?(?:code|files?|tests?|source|module|config|implementation|changes?)\b/i;
+const IMPLEMENTATION = /\b(?:implement|modify|edit|refactor|ship|land)\b|\b(?:fix|patch)\s+(?:(?:the|a|an|this|that)\s+)?(?:it|bug|defect|issues?|problems?|failures?|regressions?|tests?|errors?|code|source|implementation|files?|module|config|parser|build|workflow)\b|\b(?:create|update|add|remove|replace|delete|write)\s+(?:(?:the|a|an)\s+)?(?:code|files?|tests?|source|module|config|implementation|changes?)\b/i;
 const NO_EDIT = /\b(?:do not|don't|must not|without)\s+(?:edit|modify|write|touch|change)(?:(?!\b(?:but|and|then)\b)[^.;,:!?\n])*/gi;
 function requiresMutation(task: string): boolean {
   const scoped = task.replace(NO_EDIT, " ");
@@ -41,6 +41,7 @@ export function dmRetryDelay(run: RetryEvidence, attempt: number): number | unde
   // No transcript at all: a short SDK startup failure. Provider errors may
   // contribute one assistant error record, but must never include tool work.
   if (!error && run.messages.length === 0 && run.durationMs <= 2000) return [250, 750, 1500][attempt];
+  // SAFETY: transcript entries may have any shape; optional access to a missing errorMessage rejects the retry.
   if (error && !TOOL_FAILURE.test(error) && PROVIDER_FAILURE.test(error)
     && (run.messages.length === 0 || run.messages.length === 1 &&
       (run.messages[0] as { errorMessage?: string })?.errorMessage?.trim() === error)) {

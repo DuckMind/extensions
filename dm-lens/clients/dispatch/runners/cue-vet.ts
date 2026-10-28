@@ -118,7 +118,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
-import { findingsResult } from "../types.js";
+import { faultResult, findingsResult } from "../types.js";
 import { PRIORITY } from "../priorities.js";
 
 const cue = createAvailabilityChecker("cue", ".exe", ["version"]);
@@ -458,26 +458,19 @@ const cueVetRunner: RunnerDefinition = {
 			// Nonzero exit, some output, but nothing in it could be attributed to
 			// ANY file — a real failure must not present as zero findings.
 			const message = raw.slice(0, 300) || "cue vet exited non-zero";
-			return {
-				status: "failed",
-				diagnostics: [
-					{
-						id: "cue-vet-unparsed",
-						message,
-						filePath: ctx.filePath,
-						line: 1,
-						column: 1,
-						severity: "error",
-						semantic: "blocking",
-						tool: "cue-vet",
-						rule: "vet",
-						fixable: false,
-					},
-				],
-				semantic: "blocking",
-				failureKind: "unconfirmed_output",
-				failureMessage: message.slice(0, 200),
-			};
+			return faultResult(
+				{ kind: "unconfirmed_output", failureMessage: message },
+				{
+					id: "cue-vet-unparsed",
+					message,
+					filePath: ctx.filePath,
+					line: 1,
+					column: 1,
+					tool: "cue-vet",
+					rule: "vet",
+					fixable: false,
+				},
+			);
 		}
 
 		if (filtered.length === 0) {

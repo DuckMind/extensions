@@ -34,7 +34,6 @@ import * as path from "node:path";
 import { DEPRECATED_CONFIG_SURFACES } from "./config-diagnostic-codes.js";
 import { errorClassName } from "./error-class.js";
 import {
-	isAtOrAboveHomeDir,
 	isWindowsPath,
 	normalizeFilePath,
 	realpathOrResolve,
@@ -189,12 +188,10 @@ export function configSearchDirs(
 	startDir: string,
 	homeDir: string = os.homedir(),
 ): string[] {
-	const dirs: string[] = [];
-	for (const dir of walkUpDirs(startDir)) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) break;
-		dirs.push(dir);
-	}
-	return dirs;
+	// #4689 item 6: the walk climbs the start's identity and stops at the
+	// home's identity, so neither a link-spelled root nor a link-spelled home
+	// moves the ceiling.
+	return [...walkUpDirs(startDir, { homeDir })];
 }
 
 /**

@@ -78,7 +78,11 @@ import {
 import { exceedsLspSyncLimits } from "./content-limits.js";
 import { probeTsserverProjectIdentity } from "./tsserver-sync.js";
 import { getStrategy } from "./wait-policy/index.js";
-import { isAuxiliary, type LspServerRole } from "./server-traits.js";
+import {
+	isAuxiliary,
+	type LspLaunchVariant,
+	type LspServerRole,
+} from "./server-traits.js";
 import {
 	FILE_CHANGED,
 	FILE_CREATED,
@@ -529,7 +533,7 @@ export interface LSPClientInfo {
 	 *  binary/protocol variant this client instance is actually running.
 	 *  Undefined = single-variant server or not yet reported (fail-safe:
 	 *  consumers must treat that as classic/default behavior). */
-	getLaunchVariant(): "classic" | "native-ts7" | undefined;
+	getLaunchVariant(): LspLaunchVariant | undefined;
 	/**
 	 * Run a server command via workspace/executeCommand. Hardened: the command
 	 * MUST be in the server's advertised list or this rejects without sending.
@@ -1422,7 +1426,7 @@ export interface LSPClientState {
 	readonly startedAtMs?: number;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts). Undefined =
 	 *  single-variant server or not yet reported. */
-	readonly launchVariant?: "classic" | "native-ts7";
+	readonly launchVariant?: LspLaunchVariant;
 	readonly root: string;
 	readonly lspProcess: LSPProcess;
 	/**
@@ -3218,7 +3222,8 @@ export function setupIncomingHandlers(
 						emptyFirstPublish: strategy.emptyFirstPublish,
 						// `pubVersion`, the `[lsp-pub]` trace's own field name for the
 						// publish's LSP document version — not a lifecycle identity, and
-						// not the retired glossary spelling (AGENTS.md "session, turn or generation lifecycle").
+						// not the retired glossary spelling (docs/defect-shapes.md "session, turn or
+						// generation lifecycle").
 						pubVersion: docVersion ?? "push-unversioned",
 					},
 				});
@@ -6412,17 +6417,45 @@ export async function runReadOnlyServerCommand(
 			reason: `command "${command}" is not advertised by the ${state.serverId} server`,
 		};
 	}
+	// #4801: a timed-out probe is abandoned for good, so it is cancelled on the
+	// wire and released locally. Without the signal the request stayed pending
+	// for as long as the server stayed silent, kept the connection busy, and
+	// kept `ClientRegistry` from ever evicting the client.
+	const abandon = new AbortController();
+	const request = safeSendRequest<unknown>(
+		state.connection,
+		"workspace/executeCommand",
+		{ command, arguments: args ?? [] },
+		abandon.signal,
+		undefined,
+		true,
+	);
 	try {
-		const result = await withTimeout(
-			safeSendRequest<unknown>(state.connection, "workspace/executeCommand", {
-				command,
-				arguments: args ?? [],
-			}),
-			timeoutMs,
-		);
+		const result = await withTimeout(request, timeoutMs);
 		return { executed: true, result };
 	} catch (err) {
 		if (err instanceof Error && err.message.startsWith("Timeout after")) {
+			abandon.abort();
+			// The abort only SCHEDULES the release: it cancels the token (the wire
+			// `$/cancelRequest`) and resolves the sentinel that wins the race, and
+			// the count itself drops in `safeSendRequest`'s `finally`. Awaiting the
+			// raced request here is what makes "the client is idle when the caller
+			// resumes" a guarantee instead of a property of the current `async`
+			// hop count: without it one behaviour-preserving hop removal leaves
+			// `isBusy()` true for a tick after the caller sees the timeout. It is
+			// bounded — the abort is exactly what settles the race, so this cannot
+			// wait on the server.
+			await request;
+			// #4801: a regression of the release is otherwise invisible in
+			// production. The request ceiling is not the caller-deadline abandon
+			// `warm-attach-membership-probe-abandoned` records, and the caller only
+			// sees a `timed out after ...ms` reason either way. One row per server
+			// per session: a wedged server is probed once per attach.
+			recordDegradationOnce({
+				kind: "lsp-readonly-command-released",
+				subject: state.serverId,
+				reason: `${command} timed out after ${timeoutMs}ms; the request was cancelled and released locally`,
+			});
 			return {
 				executed: false,
 				reason: `workspace/executeCommand timed out after ${timeoutMs}ms`,
@@ -6633,7 +6666,10 @@ export async function createLSPClient(options: {
 	 *  binary/protocol variant was launched for this server id. Undefined =
 	 *  single-variant server or not yet reported; consumers must treat that as
 	 *  the classic/default behavior (fail-safe). */
-	launchVariant?: "classic" | "native-ts7";
+	launchVariant?: LspLaunchVariant;
+	/** See `LSPServerInfo.settingsSection` (server.ts): the section name
+	 *  under which `initialization` answers `workspace/configuration`. */
+	settingsSection?: string;
 	/** The declared role ({@link LspServerRole}); an auxiliary's failed config
 	 *  gates its empty publications (#4764). Absent behaves as non-auxiliary. */
 	role?: LspServerRole;
@@ -6649,6 +6685,7 @@ export async function createLSPClient(options: {
 		initialization,
 		initializeTimeoutMs = INITIALIZE_TIMEOUT_MS,
 		launchVariant,
+		settingsSection,
 		role,
 		onDiagnosticsPublished,
 	} = options;
@@ -6890,7 +6927,17 @@ export async function createLSPClient(options: {
 			noteWorkspaceFileCreated(state.serverId, state.root, uris.map(uriToPath)),
 	);
 
-	setupIncomingHandlers(state, initialization, onDiagnosticsPublished);
+	// #4758: `initializationOptions` stays the server's own startup shape, while
+	// the settings tree (what a `workspace/configuration` pull is answered from,
+	// and the `didChangeConfiguration` payload) puts that blob under the section
+	// the server asks for. rust-analyzer's startup options ARE its
+	// `rust-analyzer` section, so the pull answer restates them instead of
+	// sending `{}`.
+	const settings =
+		settingsSection && initialization
+			? { [settingsSection]: initialization }
+			: initialization;
+	setupIncomingHandlers(state, settings, onDiagnosticsPublished);
 	connection.listen();
 	setupConnectionLifecycle(state, recentStderr);
 
@@ -7045,9 +7092,9 @@ export async function createLSPClient(options: {
 	state.staticDiagnosticsMode = state.workspaceDiagnosticsSupport.mode;
 
 	await safeSendNotification(connection, "initialized", {});
-	if (initialization) {
+	if (settings) {
 		await safeSendNotification(connection, "workspace/didChangeConfiguration", {
-			settings: initialization,
+			settings,
 		});
 	}
 
@@ -7715,6 +7762,9 @@ async function safeSendNotification(
 
 const activeRequestsByConnection = new WeakMap<MessageConnection, number>();
 
+/** Sentinel `safeSendRequest` races against a reply when `releaseOnAbort` is set. */
+const RELEASED_ON_ABORT = Symbol("released-on-abort");
+
 /** A request dm-lens sent on this connection is still unanswered. */
 export function isConnectionBusy(connection: MessageConnection): boolean {
 	return (activeRequestsByConnection.get(connection) ?? 0) > 0;
@@ -7731,15 +7781,33 @@ async function safeSendRequest<T>(
 	// Item 1). The rejection that follows is swallowed (treated as `undefined`).
 	signal?: AbortSignal,
 	settlement?: { cancelled: boolean },
+	// #4801: vscode-jsonrpc settles a cancelled request only when the server
+	// answers it, so a server that ignores `$/cancelRequest` (a wedged one)
+	// holds the busy count for good. A caller that has already given up on the
+	// answer and wants the connection counted idle again passes true: abort then
+	// also settles this call locally, right after the cancel is sent. Off by
+	// default because the pull-diagnostic and navigation callers keep the
+	// request pending on purpose, to watch for the late answer.
+	releaseOnAbort = false,
 ): Promise<T | undefined> {
 	// Already abandoned before we even sent — don't bother the server.
 	if (signal?.aborted) return undefined;
 
 	let tokenSource: InstanceType<typeof CancellationTokenSource> | undefined;
 	let onAbort: (() => void) | undefined;
+	let released: Promise<typeof RELEASED_ON_ABORT> | undefined;
+	let release: (() => void) | undefined;
 	if (signal) {
 		tokenSource = new CancellationTokenSource();
-		onAbort = () => tokenSource?.cancel();
+		if (releaseOnAbort) {
+			released = new Promise((resolve) => {
+				release = () => resolve(RELEASED_ON_ABORT);
+			});
+		}
+		onAbort = () => {
+			tokenSource?.cancel();
+			release?.();
+		};
 		signal.addEventListener("abort", onAbort, { once: true });
 	}
 
@@ -7765,7 +7833,10 @@ async function safeSendRequest<T>(
 		const MAX_ATTEMPTS = 2;
 		for (let attempt = 1; ; attempt++) {
 			try {
-				return (await send()) as T;
+				if (!released) return (await send()) as T;
+				const reply = await Promise.race([send(), released]);
+				if (reply === RELEASED_ON_ABORT) return undefined;
+				return reply as T;
 			} catch (err) {
 				if (isCancellationError(err)) {
 					if (settlement) settlement.cancelled = true;

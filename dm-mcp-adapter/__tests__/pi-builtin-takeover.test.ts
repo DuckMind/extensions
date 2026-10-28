@@ -47,12 +47,12 @@ describe("DM host extension loading", () => {
     expect(extensions.find((extension) => extension.path === adapterPath)?.commands.has("mcp")).toBe(true);
   }, 20_000);
 
-  it("keeps /mcp available when the host supplies an in-memory config", async () => {
+  it("defers /mcp to the host when it supplies an in-memory config", async () => {
     const { extensions, errors } = await load({ config: true });
 
     expect(errors).toEqual([]);
     const adapter = extensions.find((extension) => extension.path === "<inline:1>");
     expect(adapter?.commands.has("mcp-adapter")).toBe(true);
-    expect(adapter?.commands.has("mcp")).toBe(true);
+    expect(adapter?.commands.has("mcp")).toBe(false);
   }, 20_000);
 });

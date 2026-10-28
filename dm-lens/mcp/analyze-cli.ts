@@ -279,7 +279,7 @@ async function main(): Promise<void> {
 		subsystem: "project-trust",
 		level: "debug",
 		message:
-			"analyze-cli: workspace trust belongs to the calling client; pi trust not consulted",
+			"analyze-cli: workspace trust belongs to the calling client; DM trust not consulted",
 	});
 
 	const hookMode = process.argv.includes("--hook");

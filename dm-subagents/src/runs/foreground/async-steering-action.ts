@@ -9,6 +9,7 @@ import { deliverInterruptRequest, queueRevivalBrief, requestAsyncSteer, type Ste
 import { resolveAsyncResumeTarget } from "../background/async-resume.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { actionResultFromSteeringStatus, claimSteeringRecovery, createSteeringStatus, recordSteeringRequest, remainingSteeringRecoveryLimits, steeringReceipt, updateSteeringTarget, waitForSteeringAction } from "../background/steering.ts";
+import { ownsRun } from "../shared/run-ownership.ts";
 
 function steerTargetsAccepted(result: Pick<SteerActionResult, "targets"> | undefined): boolean {
 	const targets = result?.targets ?? [];
@@ -52,7 +53,7 @@ export async function steerAsyncRun(input: {
 	const asyncDir = input.location.asyncDir;
 	const snapshot = input.findPendingAsks ? readStatus(asyncDir) : null;
 	if (snapshot?.mode === "single"
-		&& (!input.state.currentSessionId || snapshot.sessionId === input.state.currentSessionId)
+		&& (!input.state.currentSessionId || ownsRun(input.state.currentSessionId, snapshot.sessionId))
 		&& (snapshot.state === "running" || snapshot.state === "queued")
 		&& snapshot.steps?.length === 1 && (input.index === undefined || input.index === 0)
 		&& (snapshot.steps[0]?.status === "running" || snapshot.steps[0]?.status === "pending")) {
@@ -69,7 +70,7 @@ export async function steerAsyncRun(input: {
 	// The read-only snapshot precedes even stale-run reconciliation. An ask arriving
 	// later does not make a runner acknowledgement proof of consumption or unblocking.
 	const status = reconcileAsyncRun(asyncDir, { kill: input.kill }).status;
-	if (input.state.currentSessionId && status?.sessionId !== input.state.currentSessionId) {
+	if (input.state.currentSessionId && !ownsRun(input.state.currentSessionId, status?.sessionId)) {
 		return {
 			content: [{ type: "text", text: `Async run '${input.runId}' was not found in the active session.` }],
 			isError: true,
@@ -85,10 +86,26 @@ export async function steerAsyncRun(input: {
 	}
 	const steps = status.steps ?? [];
 	if (status.state !== "running" && status.state !== "queued") {
-		const retained = input.mode === "follow_up" && canQueueRetainedAsyncFollowUp(status, input.index);
+		const followUpEligible = canQueueRetainedAsyncFollowUp(status, input.index);
+		const retained = input.mode === "follow_up" && followUpEligible;
 		if (!retained) {
+			// Name the terminal state and the next action so a steer that lost a race with
+			// completion does not look like a missing run. Mirrors the sibling nested/workflow errors.
+			// Offer resume only when the resume action's own target checks accept the run (it resolves without
+			// requiring a session file, as at subagent-executor's resume), and otherwise say why not.
+			let resumeHint = `Continue it with action "resume", or read its saved result.`;
+			try {
+				resolveAsyncResumeTarget({ dir: asyncDir, index: input.index }, { kill: input.kill }, { requireSessionFile: false, sessionId: input.state.currentSessionId ?? undefined });
+			} catch (error) {
+				resumeHint = `action "resume" is not available either: ${error instanceof Error ? error.message : String(error)}`;
+			}
+			const hint = followUpEligible
+				? `Queue this message for its next resume with mode "follow_up", or continue the run now with action "resume".`
+				: input.mode === "follow_up"
+					? `mode "follow_up" requires a completed single-child workflow run with a persisted session. ${resumeHint}`
+					: resumeHint;
 			return {
-				content: [{ type: "text", text: `Async run '${input.runId}' is not running or queued and cannot be steered.` }],
+				content: [{ type: "text", text: `Async run '${input.runId}' is ${status.state} and cannot be steered; steering requires state "running" or "queued". ${hint}` }],
 				isError: true,
 				details: { mode: "management", results: [] },
 			};
@@ -216,15 +233,23 @@ export async function steerAsyncRun(input: {
 				fs.rmSync(claimPath, { force: true });
 				throw new Error(`Failed to commit steering recovery interrupt: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			const pauseDeadline = Date.now() + (input.recoveryTimeoutMs ?? 15_000);
+			const pauseBudgetMs = input.recoveryTimeoutMs ?? 15_000;
+			const pauseDeadline = Date.now() + pauseBudgetMs;
 			let paused: AsyncStatus | null = null;
+			let lastObservedState: string | undefined;
 			while (Date.now() <= pauseDeadline) {
 				if (input.signal?.aborted) break;
 				const candidate = readStatus(asyncDir);
+				lastObservedState = candidate?.state;
 				if (candidate?.state === "paused" && candidate.endedAt !== undefined) { paused = candidate; break; }
 				await new Promise<void>((resolve) => setTimeout(resolve, 50));
 			}
-			if (!paused) throw new Error("Source run did not reach confirmed paused state within 15 seconds; no replacement was launched and the recovery claim remains committed to prevent a delayed duplicate.");
+			if (!paused) {
+				// The attempt is over, so release single-flight for later steers. Keep the marker so a late
+				// acknowledgment of this request is still recorded as late.
+				fs.rmSync(claimPath, { force: true });
+				throw new Error(`Source run did not confirm a paused state within ${pauseBudgetMs / 1000} seconds after the recovery interrupt (last observed state: ${lastObservedState ?? "unknown"}). No replacement was launched and the steering message was not applied. Once it pauses, continue it with action "resume" and id "${status.runId}".`);
+			}
 			let recoveryTarget;
 			try {
 				recoveryTarget = resolveAsyncResumeTarget(

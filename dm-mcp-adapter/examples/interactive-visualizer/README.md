@@ -15,7 +15,7 @@ npm run build
 npm run install-local
 ```
 
-Restart pi. The `show_chart` tool will be available via the MCP proxy.
+Restart DM. The `show_chart` tool will be available via the MCP proxy.
 
 ## Usage
 

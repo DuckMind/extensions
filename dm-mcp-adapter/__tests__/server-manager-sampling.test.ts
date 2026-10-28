@@ -1,15 +1,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { RESOURCE_MIME_TYPE } from "../ui-app-bridge-helpers.ts";
+
+const testCwd = join(tmpdir(), "pi-mcp-cwd");
+const testHome = join(tmpdir(), "pi-mcp-home");
+const sessionCwd = join(tmpdir(), "pi-session-cwd");
+const serverCwd = join(tmpdir(), "server-cwd");
 
 const mocks = vi.hoisted(() => ({
   clients: [] as any[],
   transports: [] as any[],
   open: vi.fn(async () => undefined),
+  attachTaskSession: vi.fn(async (_options: any) => undefined),
+  completeSimple: vi.fn(),
+}));
+
+vi.mock("@duckmind/dm-ai/compat", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  completeSimple: mocks.completeSimple,
 }));
 
 vi.mock("open", () => ({ default: mocks.open }));
+
+vi.mock("../mcp-tasks.ts", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  attachTaskSession: mocks.attachTaskSession,
+}));
 
 vi.mock("@modelcontextprotocol/client", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -49,6 +67,7 @@ describe("McpServerManager sampling", () => {
     mocks.clients.length = 0;
     mocks.transports.length = 0;
     mocks.open.mockClear();
+    mocks.attachTaskSession.mockClear();
   });
 
   afterEach(() => {
@@ -62,10 +81,10 @@ describe("McpServerManager sampling", () => {
     } else {
       process.env.HOME = originalHome;
     }
-    rmSync("/tmp/pi-mcp-cwd", { recursive: true, force: true });
-    rmSync("/tmp/pi-mcp-home", { recursive: true, force: true });
-    rmSync("/tmp/pi-session-cwd", { recursive: true, force: true });
-    rmSync("/tmp/server-cwd", { recursive: true, force: true });
+    rmSync(testCwd, { recursive: true, force: true });
+    rmSync(testHome, { recursive: true, force: true });
+    rmSync(sessionCwd, { recursive: true, force: true });
+    rmSync(serverCwd, { recursive: true, force: true });
   });
 
   it("advertises sampling and registers the handler before connecting", async () => {
@@ -149,7 +168,8 @@ describe("McpServerManager sampling", () => {
         url: "https://example.com/connect",
       },
     });
-    const completionHandler = client.setNotificationHandler.mock.calls[0][1];
+    const completionHandler = client.setNotificationHandler.mock.calls
+      .find(([method]: [string]) => method === "notifications/elicitation/complete")[1];
     completionHandler({ params: { elicitationId: "unknown-id" } });
     completionHandler({ params: { elicitationId: "known-id" } });
     completionHandler({ params: { elicitationId: "known-id" } });
@@ -210,6 +230,43 @@ describe("McpServerManager sampling", () => {
     expect(mocks.clients[0].setRequestHandler).toHaveBeenCalledTimes(2);
   });
 
+  it("bounds a task's sampling by the task, not the current turn, while plain sampling follows the turn", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    const manager = new McpServerManager();
+    const turn = new AbortController();
+    const turnCancelled = new Error("turn cancelled");
+    manager.setSamplingConfig({
+      autoApprove: true,
+      modelRegistry: {
+        getAvailable: () => [{ provider: "test", id: "model", name: "model" }],
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-only" }),
+        // The run ends only when its signal aborts.
+      } as any,
+      getCurrentModel: () => undefined,
+      getThinkingLevel: () => "off",
+      getSignal: () => turn.signal,
+    });
+    mocks.completeSimple.mockImplementation((_model: unknown, _context: unknown, options: { signal: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+            options.signal.addEventListener("abort", () => reject(new Error("sampling aborted")), { once: true });
+      }));
+    await manager.connect("demo", { command: "node", args: ["server.js"] });
+    const request = { method: "sampling/createMessage", params: { messages: [{ role: "user", content: { type: "text", text: "hi" } }], maxTokens: 10 } };
+
+    const task = new AbortController();
+    const taskRun = mocks.attachTaskSession.mock.calls[0][0].onSampling(request, task.signal);
+    const settled = vi.fn();
+    taskRun.then(settled, settled);
+    turn.abort(turnCancelled);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settled).not.toHaveBeenCalled();
+    task.abort();
+    await expect(taskRun).rejects.toThrow("sampling aborted");
+
+    const [, plainHandler] = mocks.clients[0].setRequestHandler.mock.calls.find(([method]: [string]) => method === "sampling/createMessage");
+    await expect(plainHandler(request)).rejects.toBe(turnCancelled);
+  });
+
   it("does not advertise sampling when no sampling config is set", async () => {
     const { McpServerManager } = await import("../server-manager.ts");
     const manager = new McpServerManager();
@@ -256,6 +313,30 @@ describe("McpServerManager sampling", () => {
       { mode: "auto" },
       { mode: { pin: "2026-07-28" } },
     ]);
+  });
+
+  it("does not advertise MCP Apps to a server with openUi: false", async () => {
+    const { McpServerManager } = await import("../server-manager.ts");
+    const manager = new McpServerManager();
+    manager.setSamplingConfig({
+      autoApprove: true,
+      modelRegistry: {} as any,
+      getCurrentModel: () => undefined,
+      getSignal: () => undefined,
+    });
+
+    await manager.connect("headless", { command: "node", args: ["server.js"], openUi: false });
+    await manager.connect("windowed", { command: "node", args: ["server.js"] });
+
+    const sessionCapabilities = mocks.attachTaskSession.mock.calls.map(([options]) => options.clientCapabilities);
+    expect(mocks.clients[0].options.capabilities).toEqual({ sampling: {} });
+    expect(sessionCapabilities[0]).toEqual({ sampling: {} });
+    const windowed = {
+      extensions: { "io.modelcontextprotocol/ui": { mimeTypes: [RESOURCE_MIME_TYPE] } },
+      sampling: {},
+    };
+    expect(mocks.clients[1].options.capabilities).toEqual(windowed);
+    expect(sessionCapabilities[1]).toEqual(windowed);
   });
 
   it("refreshes cached lists and ignores notifications from replaced clients", async () => {
@@ -510,10 +591,10 @@ describe("McpServerManager sampling", () => {
 
   it("expands environment variables and tilde in stdio cwd", async () => {
     const { McpServerManager } = await import("../server-manager.ts");
-    process.env.MCP_TEST_CWD = "/tmp/pi-mcp-cwd";
-    process.env.HOME = "/tmp/pi-mcp-home";
-    mkdirSync("/tmp/pi-mcp-cwd/nested", { recursive: true });
-    mkdirSync("/tmp/pi-mcp-home/nested", { recursive: true });
+    process.env.MCP_TEST_CWD = testCwd;
+    process.env.HOME = testHome;
+    mkdirSync(join(testCwd, "nested"), { recursive: true });
+    mkdirSync(join(testHome, "nested"), { recursive: true });
 
     const envManager = new McpServerManager();
     await envManager.connect("env-cwd", {
@@ -529,33 +610,33 @@ describe("McpServerManager sampling", () => {
       cwd: "~/nested",
     });
 
-    expect(mocks.transports[0].options).toMatchObject({ cwd: "/tmp/pi-mcp-cwd/nested" });
-    expect(mocks.transports[1].options).toMatchObject({ cwd: "/tmp/pi-mcp-home/nested" });
+    expect(mocks.transports[0].options).toMatchObject({ cwd: join(testCwd, "nested") });
+    expect(mocks.transports[1].options).toMatchObject({ cwd: join(testHome, "nested") });
   });
 
   it("uses the session cwd for stdio servers without an explicit cwd", async () => {
     const { McpServerManager } = await import("../server-manager.ts");
-    mkdirSync("/tmp/pi-session-cwd", { recursive: true });
-    const manager = new McpServerManager("/tmp/pi-session-cwd");
+    mkdirSync(sessionCwd, { recursive: true });
+    const manager = new McpServerManager(sessionCwd);
 
     await manager.connect("session-cwd", { command: "node", args: ["server.js"] });
 
-    expect(mocks.transports[0].options).toMatchObject({ cwd: "/tmp/pi-session-cwd" });
+    expect(mocks.transports[0].options).toMatchObject({ cwd: sessionCwd });
   });
 
   it("prefers an explicit stdio cwd over the session cwd", async () => {
     const { McpServerManager } = await import("../server-manager.ts");
-    mkdirSync("/tmp/pi-session-cwd", { recursive: true });
-    mkdirSync("/tmp/server-cwd", { recursive: true });
-    const manager = new McpServerManager("/tmp/pi-session-cwd");
+    mkdirSync(sessionCwd, { recursive: true });
+    mkdirSync(serverCwd, { recursive: true });
+    const manager = new McpServerManager(sessionCwd);
 
     await manager.connect("explicit-cwd", {
       command: "node",
       args: ["server.js"],
-      cwd: "/tmp/server-cwd",
+      cwd: serverCwd,
     });
 
-    expect(mocks.transports[0].options).toMatchObject({ cwd: "/tmp/server-cwd" });
+    expect(mocks.transports[0].options).toMatchObject({ cwd: serverCwd });
   });
 
   it("applies the global timeout to connect and discovery requests", async () => {

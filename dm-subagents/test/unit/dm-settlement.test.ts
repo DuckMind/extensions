@@ -3,31 +3,33 @@ import { it } from "node:test";
 import { onDmBeforeSettle } from "../../src/shared/dm-settlement.ts";
 
 function harness() {
-	let listener: ((event: any, ctx: any) => void) | undefined;
-	const queued: Array<{ message: any; options: any }> = [];
-	const dm = {
-		on(name: string, fn: typeof listener) {
-			if (name === "agent_end") listener = fn;
-		},
-		sendMessage(message: any, options: any) { queued.push({ message, options }); },
-	};
-	const entries = [
+	const final = { role: "assistant", stopReason: "stop", content: [] as unknown[] };
+	const entries: Array<{ type: string; customType?: string; content?: string; display?: boolean; message?: typeof final }> = [
 		{ type: "custom_message", customType: "subagent-notify", content: "finished", display: true },
-		{ type: "message", message: { role: "assistant", stopReason: "stop", content: [] } },
+		{ type: "message", message: final },
 	];
 	const ctx = {
 		hasPendingMessages: () => false,
 		signal: undefined as AbortSignal | undefined,
 		sessionManager: { getBranch: () => entries },
 	};
-	const final = entries[1].message;
+	const queued: Array<{ message: unknown; options: unknown }> = [];
+	let listener: ((event: { messages: Array<typeof final> }, context: typeof ctx) => void) | undefined;
+	const dm = {
+		on(name: string, fn: typeof listener) {
+			if (name === "agent_end") listener = fn;
+		},
+		sendMessage(message: unknown, options: unknown) {
+			queued.push({ message, options });
+		},
+	};
 	const end = () => listener?.({ messages: [final] }, ctx);
-	return { dm, ctx, entries, queued, end };
+	return { dm, ctx, entries, queued, final, end };
 }
 
 it("queues one continuation from a completed agent_end, with branch-local context", () => {
 	const h = harness();
-	const dispose = onDmBeforeSettle(h.dm as any, event => {
+	const dispose = onDmBeforeSettle(h.dm as unknown as Parameters<typeof onDmBeforeSettle>[0], event => {
 		assert.equal(event.outcome, "completed");
 		assert.equal(event.context.contextMessages[0]?.customType, "subagent-notify");
 		assert.equal(event.context.contextMessages[1]?.role, "assistant");
@@ -43,17 +45,16 @@ it("queues one continuation from a completed agent_end, with branch-local contex
 it("does not revive aborted, failed, pending, or former-session reminders", () => {
 	const h = harness();
 	let calls = 0;
-	const dispose = onDmBeforeSettle(h.dm as any, () => {
+	const dispose = onDmBeforeSettle(h.dm as unknown as Parameters<typeof onDmBeforeSettle>[0], () => {
 		calls++;
 		return { entries: [{ type: "custom_message", customType: "warning", content: "blocked" }] };
 	});
 	h.ctx.signal = AbortSignal.abort();
 	h.end();
 	h.ctx.signal = undefined;
-	h.entries[1].message.stopReason = "error";
-	h.ctx.hasPendingMessages = () => false;
+	h.final.stopReason = "error";
 	h.end();
-	h.entries[1].message.stopReason = "stop";
+	h.final.stopReason = "stop";
 	h.ctx.hasPendingMessages = () => true;
 	h.end();
 	assert.equal(calls, 0);

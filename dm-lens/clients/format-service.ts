@@ -180,11 +180,11 @@ export class FormatService {
 		this.fileTime.read(absolutePath);
 
 		for (const [index, result] of results.entries()) {
-			// The widget keys rows by spelling and every other writer passes the
-			// caller's path, so this one keeps it too; #4689 item 3 moves them all
-			// to the identity together (#4675 F2).
+			// The widget keys syntactically (#1020), so its writers pass the path
+			// identity; this method resolved it at its entry (`absolutePath`), the
+			// key the pipeline's own record for the same file uses (#4689 item 3).
 			recordFormatter(
-				path.resolve(filePath),
+				absolutePath,
 				formatters[index]?.name ?? "unknown",
 				result.changed,
 				result.success,

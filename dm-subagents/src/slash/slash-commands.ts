@@ -18,6 +18,7 @@ import {
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { findModelInfo, toModelInfo } from "../shared/model-info.ts";
 import { shortenPath } from "../shared/formatters.ts";
+import { canRenderComponents } from "../shared/extension-context.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
 import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
 import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
@@ -38,6 +39,7 @@ import {
 import {
 	SLASH_RESULT_TYPE,
 	SLASH_TEXT_RESULT_TYPE,
+	SLASH_TEXT_VIEW_ONLY_DETAILS,
 	SLASH_SUBAGENT_CANCEL_EVENT,
 	SLASH_SUBAGENT_REQUEST_EVENT,
 	SLASH_SUBAGENT_RESPONSE_EVENT,
@@ -146,7 +148,7 @@ const makeProviderCompletions = (state: SubagentState) => (prefix: string) => {
 };
 
 function sendSlashText(dm: ExtensionAPI, text: string): void {
-	dm.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true });
+	dm.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true, details: SLASH_TEXT_VIEW_ONLY_DETAILS });
 }
 
 async function withSlashStatus<T>(
@@ -404,7 +406,7 @@ async function requestSlashRun(
 				const tool = update.currentTool ? ` ${update.currentTool}` : "";
 				const count = update.toolCount ?? 0;
 				const liveDetailKey = keyText("app.tools.expand");
-				ctx.ui.setStatus("subagent-slash", `${count} tools${tool} | ${liveDetailKey} live detail`);
+				ctx.ui.setStatus("subagent-slash", `${count} tools${tool}${liveDetailKey ? ` | ${liveDetailKey} live detail` : ""}`);
 			} catch (error) {
 				if (isStaleExtensionContextError(error)) {
 					finish(() => reject(error));
@@ -627,7 +629,7 @@ export function registerSlashCommands(
 	};
 	const showFleet = async (ctx: ExtensionContext) => {
 		state.lastUiContext = ctx;
-		if (ctx.mode !== "tui") {
+		if (!canRenderComponents(ctx)) {
 			await runCommand(ctx, { action: "status", view: "fleet" });
 			return;
 		}
@@ -810,7 +812,7 @@ export function registerSlashCommands(
 				ctx.ui.notify(message, "error");
 				return;
 			}
-			if (ctx.mode !== "tui") {
+			if (!canRenderComponents(ctx)) {
 				sendSlashText(dm, stopFallbackText(targets));
 				return;
 			}

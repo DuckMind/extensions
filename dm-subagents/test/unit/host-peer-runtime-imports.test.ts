@@ -99,7 +99,8 @@ test("every host peer package the detached async runner imports is aliased to th
 	assert.ok(packageRoot, "expected the dm package (or its test shim) to be resolvable");
 	const resolved = resolveHostPeerAliases(packageRoot);
 	assert.deepEqual(resolved.missing, []);
-	for (const specifier of aliased) assert.ok(fs.existsSync(resolved.aliases[specifier]!), `alias target for ${specifier} exists`);
+	// Optional subpaths the installed host does not export (dm-agent-core "./node" on DM 1.2.0) resolve to no alias.
+	for (const specifier of aliased) if (specifier in resolved.aliases) assert.ok(fs.existsSync(resolved.aliases[specifier]!), `alias target for ${specifier} exists`);
 });
 
 test("the standalone inspector runner reaches no host peer package, because its jiti has no alias map", () => {
@@ -172,7 +173,7 @@ test("resolveCompileFromPackageRoot resolves typebox hoisted to an ancestor node
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-hoisted-root-"));
 	try {
 		writeFakeTypeboxPackage(path.join(tmp, "node_modules", "typebox"));
-		const packageRoot = path.join(tmp, "apps", "dm", "node_modules", "@earendil-works", "dm-coding-agent");
+		const packageRoot = path.join(tmp, "apps", "dm", "node_modules", "@duckmind", "dm-coding-agent");
 		fs.mkdirSync(packageRoot, { recursive: true });
 		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "@duckmind/dm-coding-agent", version: "0.0.0" }));
 
@@ -236,14 +237,14 @@ test("validateStructuredOutputValue validates values against a JSON Schema", asy
 	assert.ok(invalid.status === "invalid" && invalid.message.length > 0);
 });
 
-test("chord is omitted before 0.85, but required host-first on chord-era and unknown hosts (#2026)", () => {
+test("chord is required only when the host declares it, and aliased host-first whenever present (#2026, #2854)", () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "dm-subagents-chord-alias-"));
 	const host = path.join(root, "host");
 	const extension = path.join(root, "extension");
 	const chord = "@earendil-works/chord";
-	function writePackage(dir: string, name: string, version: string, exports: Record<string, string>) {
+	function writePackage(dir: string, name: string, version: string, exports: Record<string, string>, extra: Record<string, unknown> = {}) {
 		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version, exports }));
+		fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version, exports, ...extra }));
 		for (const target of Object.values(exports)) fs.writeFileSync(path.join(dir, target), "export {};\n");
 	}
 	const hostChord = path.join(host, "node_modules", chord);
@@ -264,12 +265,20 @@ test("chord is omitted before 0.85, but required host-first on chord-era and unk
 		assert.equal(preChord.aliases[`${chord}/context`], undefined);
 		// An extension-local copy must never satisfy a missing host chord export.
 		writePackage(path.join(extension, "node_modules", chord), chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
-		for (const version of ["0.85.0", "0.85.1", "1.0.0", "0.84.4-test", "unknown"]) {
-			writePackage(host, "@duckmind/dm-coding-agent", version, hostExports);
+		// DM 1.2.0+ no longer depends on chord: an undeclared, absent chord is not required.
+		for (const version of ["1.2.0", "2.0.0-test"]) {
+			writePackage(host, "@duckmind/dm-coding-agent", version, hostExports, { dependencies: { "@duckmind/dm-tui": "^1.2.0" } });
 			const result = resolveHostPeerAliases(host);
-			for (const specifier of [chord, `${chord}/context`]) assert.ok(result.missing.includes(specifier), version);
+			assert.deepEqual(result.missing, [], version);
+			assert.equal(result.aliases[chord], undefined, version);
 		}
-		writePackage(host, "@duckmind/dm-coding-agent", "0.85.1", hostExports);
+		// A host that declares chord (0.85 through 1.1) fails closed when it is missing.
+		for (const field of ["dependencies", "optionalDependencies"]) {
+			writePackage(host, "@duckmind/dm-coding-agent", "1.1.0", hostExports, { [field]: { [chord]: "^1.1.0" } });
+			const result = resolveHostPeerAliases(host);
+			for (const specifier of [chord, `${chord}/context`]) assert.ok(result.missing.includes(specifier), field);
+		}
+		writePackage(host, "@duckmind/dm-coding-agent", "0.85.1", hostExports, { dependencies: { [chord]: "^0.85.1" } });
 		writePackage(hostChord, chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
 		let result = resolveHostPeerAliases(host);
 		assert.deepEqual(result.missing, []);

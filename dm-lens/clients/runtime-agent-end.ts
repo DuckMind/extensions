@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import {
@@ -535,7 +536,22 @@ export async function handleAgentEnd({
 			policy?.scope && policy.scope !== "file"
 				? `${policy.defaultTool ?? "unknown"}:${path.resolve(record.cwd)}`
 				: `${policy?.defaultTool ?? "unknown"}:${filePath}`;
-		if (executedAutofixScopes.has(scopeKey)) continue;
+		if (executedAutofixScopes.has(scopeKey)) {
+			// Once per tool/scope per session, not per skipped file or drain.
+			recordDegradationOnce({
+				kind: "deferred-autofix-duplicate-scope",
+				subject: createHash("sha256").update(scopeKey).digest("hex"),
+				reason: "deferred autofix scope already attempted in this drain",
+				metadata: {
+					scopeKey,
+					reason: "duplicate-scope",
+					tool: policy?.defaultTool ?? "unknown",
+					scope: policy?.scope ?? "file",
+					filePath,
+				},
+			});
+			continue;
+		}
 		executedAutofixScopes.add(scopeKey);
 		// #4131: the fixer's recordWritten below credits authorship without
 		// bytes the agent saw, so it may only advance one whose bytes still hold.
@@ -617,17 +633,39 @@ export async function handleAgentEnd({
 		} finally {
 			fixHold?.release();
 		}
-		// The restore of agent edits the fixer overwrote waits for pi's queue
-		// entries (#3830), so it is awaited here, after the hold is released,
-		// never inside it.
-		const loss = await restoring;
-		if (loss && (loss.lost.length > 0 || loss.possiblyLost.length > 0)) {
-			// The agent's turn is over, so a UI notify alone reaches nobody it
-			// could act through (and print/json modes drop it): queue the same
-			// text for the model's next `context` call as well.
-			const text = renderFixRunLoss(loss);
-			queueAgentAdvisory(text, session);
-			notify(`dm-lens: ${text}`, "warning");
+		// #3915: bound only the wait, after releasing the target's hold.
+		// The original restore still owns its queued writes and reports loss
+		// once when it settles, even after the deadline or caller abort.
+		if (restoring) {
+			// #3915: the restore needs no `lateFormatCompletions`-style registration — every file it writes is an agent-edited one, which `wholePackageChangedFiles` excludes from `changedFiles`, so no `dmlens:files:touched` event and no drain write names a restored file.
+			await bounded(
+				restoring.then((loss) => {
+					if (loss.lost.length > 0 || loss.possiblyLost.length > 0) {
+						try {
+							// Keep the captured session: a late advisory must not reach
+							// the session that replaced this drain.
+							const text = renderFixRunLoss(loss);
+							queueAgentAdvisory(text, session);
+							notify(`dm-lens: ${text}`, "warning");
+						} catch (err) {
+							// #3915: `bounded()` boxes this rejection and swallows it once
+							// its deadline fired, so the loss notice failure is recorded.
+							const message = err instanceof Error ? err.message : String(err);
+							recordDegradationOnce({
+								kind: "fix-run-loss-notice-failed",
+								subject: filePath,
+								reason: `the deferred autofix loss notice failed: ${message}`,
+							});
+						}
+					}
+				}),
+				{
+					ms: HOOK_WALL_BUDGET_MS.agent_settled,
+					signal,
+					hook: "agent_settled",
+					label: "deferred-autofix-restore",
+				},
+			);
 		}
 	}
 	if (deferredAutofixFixes.length > 0) {

@@ -85,11 +85,16 @@ describe("resolveGlobalNpmRoot", () => {
 		const { dir, env } = fixture("exit 1");
 		const pidFile = path.join(dir, "npm.pid");
 		const executable = path.join(dir, "bin", "npm");
-		fs.writeFileSync(executable, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);\n`, { mode: 0o755 });
-		// Under a parallel full suite, launching a fresh Node process may exceed 500 ms.
-		assert.equal(await resolveGlobalNpmRoot({ env, timeoutMs: 3000 }), null);
+		// sh records its pid at once, where a Node fixture could still be booting when the timeout kills it;
+		// exec keeps that pid, so the check below still targets the owned process, not a wrapper.
+		fs.writeFileSync(executable, `#!/bin/sh\necho $$ > '${pidFile}'\nexec sleep 30\n`, { mode: 0o755 });
+		// Concurrent suite load can delay the shell before it writes its PID.
+		assert.equal(await resolveGlobalNpmRoot({ env, timeoutMs: 2500 }), null);
 		const pid = Number(fs.readFileSync(pidFile, "utf8"));
-		await new Promise<void>((resolve) => setTimeout(resolve, 30));
+		for (let waited = 0; waited < 5_000; waited += 20) {
+			try { process.kill(pid, 0); } catch { break; }
+			await new Promise<void>((resolve) => setTimeout(resolve, 20));
+		}
 		assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "timed-out npm must exit");
 	});
 

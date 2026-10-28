@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { initTheme } from "@duckmind/dm-coding-agent";
 import { SelectorComponent } from "../../src/slash/selector.ts";
-import { initDmTestTheme } from "../support/dm-theme.ts";
 
-initDmTestTheme();
+initTheme("dark");
 
 function createHarness(items: Array<{ value: string; label: string; current?: boolean }>) {
 	const results: Array<{ confirmed: boolean; value?: string }> = [];

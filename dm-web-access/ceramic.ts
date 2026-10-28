@@ -5,7 +5,7 @@ import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
 import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
-import { fetchWithCredentialRedirects, getWebSearchConfigPath } from "./utils.ts";
+import { fetchWithCredentialRedirects, getWebSearchConfigPath, resolveProviderApiUrl } from "./utils.ts";
 
 const CERAMIC_SEARCH_URL = "https://api.ceramic.ai/search";
 const CONFIG_PATH = getWebSearchConfigPath();
@@ -17,6 +17,7 @@ const REQUEST_DESCRIPTION_CHARS = 1_000;
 const MAX_SNIPPET_CHARS = 500;
 
 interface WebSearchConfig {
+	ceramicBaseUrl?: unknown;
 	ceramicApiKey?: unknown;
 }
 
@@ -151,7 +152,7 @@ export async function searchWithCeramic(query: string, options: SearchOptions = 
 	let response: Response;
 	let entries: CeramicResult[];
 	try {
-		response = await fetchWithCredentialRedirects(CERAMIC_SEARCH_URL, {
+		response = await fetchWithCredentialRedirects(resolveProviderApiUrl("ceramic", CERAMIC_SEARCH_URL, loadConfig().ceramicBaseUrl), {
 			method: "POST",
 			headers: {
 				Accept: "application/json",

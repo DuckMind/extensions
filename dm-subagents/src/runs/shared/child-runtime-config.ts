@@ -14,6 +14,12 @@ import type { RequiredChildExtensionSnapshot } from "../../shared/required-child
  * dm-subagents loaded into a child session stays inert.
  */
 export const SUBAGENT_CHILD_ENV = "DM_SUBAGENT_CHILD";
+/**
+ * Pid of the async runner, set by the runner itself. A session's extensions
+ * can compare it with process.pid to tell that the process outlives the
+ * session. Descendants inherit the value but have their own pid.
+ */
+export const SUBAGENT_RUNNER_PID_ENV = "DM_SUBAGENT_RUNNER_PID";
 /** Root parent session id the parent publishes for dm-permission-system ask forwarding. */
 export const SUBAGENT_PARENT_SESSION_ENV = "DM_SUBAGENT_PARENT_SESSION";
 

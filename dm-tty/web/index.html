@@ -60,6 +60,12 @@
       <span id="copy-status" role="status" aria-live="polite"></span>
       <pre id="history-text"></pre>
     </section>
+    <div id="output-menu" class="output-menu" role="menu" aria-label="Terminal text actions" hidden>
+      <button id="output-paste" type="button" role="menuitem">Paste</button>
+      <button id="output-select" type="button" role="menuitem">Select</button>
+      <button id="output-select-all" type="button" role="menuitem">Select All</button>
+      <button id="output-copy" type="button" role="menuitem" hidden>Copy</button>
+    </div>
     <form id="command-form" autocomplete="off" hidden>
       <label class="sr-only" for="command">Shell command (Vietnamese IME)</label>
       <textarea id="command" rows="1" wrap="off" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Shell command (Vietnamese IME)"></textarea>

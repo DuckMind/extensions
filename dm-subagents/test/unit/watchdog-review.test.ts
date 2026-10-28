@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import type { StreamFn } from "@duckmind/dm-agent-core";
 import { Type } from "typebox";
 import { WATCHDOG_GUIDANCE_MAX_CHARS } from "../../src/watchdog/guidance.ts";
+import { getCurrentSystemPrompt, getCurrentTools } from "../../src/shared/dm-declarations.ts";
 import {
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
@@ -15,7 +16,6 @@ import {
 	type SimpleStreamOptions,
 	type TranscriptContext,
 } from "@duckmind/dm-ai";
-import { getCurrentSystemPrompt, getCurrentTools } from "../support/dm-transcript.ts";
 import { DEFAULT_WATCHDOG_CONFIG } from "../../src/watchdog/settings.ts";
 import { createMainWatchdogReview, resolveWatchdogReviewModel } from "../../src/watchdog/review.ts";
 import { MainWatchdogRuntime, type WatchdogReviewRequest } from "../../src/watchdog/runtime.ts";
@@ -168,7 +168,9 @@ describe("main watchdog review adapter", () => {
 
 		await createMainWatchdogReview(context, { streamFn })(request(enabledConfig(), []));
 
-		assert.equal(calls[0]?.context.systemPrompt, [
+		assert.deepEqual(calls[0]?.context.messages[0], {
+			role: "system",
+			content: [
 				"You are the main-session subagent watchdog for DM.",
 				"Review only the supplied parent turn delta. Inspect repository files only when needed to verify a concrete concern.",
 				"You are read-only. You may use read, grep, find, and ls. Do not edit files, run shell commands, spawn agents, or mutate state.",
@@ -181,8 +183,11 @@ describe("main watchdog review adapter", () => {
 				"<cwd>",
 				"/tmp/watchdog-parent/../watchdog-review",
 				"</cwd>",
-			].join("\n"));
-		assert.deepEqual(getCurrentTools(calls[0]!.context).map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_warn"]);
+			].join("\n"),
+			toolsAdded: getCurrentTools(calls[0]!.context.messages),
+			timestamp: calls[0]?.context.messages[0]?.timestamp,
+		});
+		assert.deepEqual(getCurrentTools(calls[0]!.context.messages).map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_warn"]);
 	});
 
 	it("rejects before provider invocation when the helper cwd can escape its system section", async () => {
@@ -330,7 +335,7 @@ describe("main watchdog review adapter", () => {
 			const { streamFn, calls } = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
 
 			await createMainWatchdogReview(ctx, { streamFn })(request(enabledConfig(), []));
-			const prompt = getCurrentSystemPrompt(calls[0]!.context);
+			const prompt = getCurrentSystemPrompt(calls[0]!.context.messages);
 			assert.match(prompt, /Standing instructions from WATCHDOG\.md \(project first, then user\):\nNever accept skipped tests\.\n\nu+\n\n<cwd>/);
 			assert.equal(prompt.split("(project first, then user):\n")[1]?.split("\n\n<cwd>")[0]?.length, WATCHDOG_GUIDANCE_MAX_CHARS, "combined guidance is capped from the head");
 
@@ -338,7 +343,7 @@ describe("main watchdog review adapter", () => {
 			disabled.guidance = { watchdogMd: false };
 			const second = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
 			await createMainWatchdogReview(ctx, { streamFn: second.streamFn })(request(disabled, []));
-			assert.doesNotMatch(getCurrentSystemPrompt(second.calls[0]!.context), /Standing instructions/);
+			assert.doesNotMatch(getCurrentSystemPrompt(second.calls[0]!.context.messages), /Standing instructions/);
 		} finally {
 			if (originalAgentDir === undefined) delete process.env.DM_CODING_AGENT_DIR;
 			else process.env.DM_CODING_AGENT_DIR = originalAgentDir;
@@ -351,14 +356,14 @@ describe("main watchdog review adapter", () => {
 		const ctx = createCtx({ current });
 		const withBaseline = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
 		await createMainWatchdogReview(ctx, { streamFn: withBaseline.streamFn, diffBaseline: async () => ({ root: "/tmp/watchdog-review", ref: "abc123" }) })(request(enabledConfig(), []));
-		assert.deepEqual(getCurrentTools(withBaseline.calls[0]!.context).map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_diff", "watchdog_warn"]);
-		assert.match(getCurrentSystemPrompt(withBaseline.calls[0]!.context), /watchdog_diff/);
+		assert.deepEqual(getCurrentTools(withBaseline.calls[0]!.context.messages).map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_diff", "watchdog_warn"]);
+		assert.match(getCurrentSystemPrompt(withBaseline.calls[0]!.context.messages), /watchdog_diff/);
 
 		const without = createStreamFn([fauxAssistantMessage("done", { stopReason: "stop" })]);
 		await createMainWatchdogReview(ctx, { streamFn: without.streamFn, diffBaseline: async () => undefined })(request(enabledConfig(), []));
-		const tools = getCurrentTools(without.calls[0]!.context);
+		const tools = getCurrentTools(without.calls[0]!.context.messages);
 		assert.deepEqual(tools.map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_warn"]);
-		assert.doesNotMatch(getCurrentSystemPrompt(without.calls[0]!.context), /watchdog_diff/);
+		assert.doesNotMatch(getCurrentSystemPrompt(without.calls[0]!.context.messages), /watchdog_diff/);
 		const schema = tools.find((tool) => tool.name === "watchdog_warn")?.parameters as any;
 		assert.deepEqual(schema.required?.includes("importance"), true);
 		assert.deepEqual(schema.properties.importance.enum, ["low", "medium", "high"]);
@@ -378,7 +383,7 @@ describe("main watchdog review adapter", () => {
 		await createMainWatchdogReview(ctx, { streamFn })(request(enabledConfig(), warnings));
 
 		assert.equal(warnings.length, 0);
-		assert.deepEqual(getCurrentTools(calls[0]!.context).map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_warn"]);
+		assert.deepEqual(getCurrentTools(calls[0]!.context.messages).map((tool) => tool.name).sort(), ["find", "grep", "ls", "read", "watchdog_warn"]);
 		const toolResult = calls[1]?.context.messages.find((message) => message.role === "toolResult" && message.toolName === "bash");
 		assert.equal(toolResult?.isError, true);
 	});

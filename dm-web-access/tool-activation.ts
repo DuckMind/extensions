@@ -16,13 +16,17 @@ const CAPABILITY_LABELS: Record<WebCapability, string> = {
 	"stored-content": "stored-result retrieval",
 };
 
-function supportsDynamicTools(pi: ExtensionAPI): boolean {
+export function supportsDynamicTools(pi: ExtensionAPI): boolean {
 	if (typeof pi.getAllTools !== "function" || typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return false;
 	// DM 0.86.0 shipped transcript-backed tool changes in the same release that made pi.on() return
 	// an unsubscribe function. Probe the host API object: an imported VERSION can come from a stale
 	// DM package installed beside this extension instead of the running host.
-	const unsubscribe: unknown = pi.on("session_start", () => {});
-	if (typeof unsubscribe !== "function") return false;
+	const probe = () => {};
+	const unsubscribe: unknown = pi.on("session_start", probe);
+	if (typeof unsubscribe !== "function") {
+		pi.off?.("session_start", probe);
+		return false;
+	}
 	unsubscribe();
 	return true;
 }
@@ -63,7 +67,7 @@ function transcriptToolNames(messages: SessionContext["messages"]): Set<string> 
 export function registerWebToolActivation(pi: ExtensionAPI, tools: ReadonlyArray<WebActivationTool>, mode: "auto" | "dynamic"): void {
 	if (tools.length === 0) return;
 	if (!supportsDynamicTools(pi)) {
-		console.warn("[dm-web-access] Dynamic tool activation requires DM 0.86.0 or newer; web tools remain eagerly available.");
+		// All configured web tools were registered before this optional activation setup.
 		return;
 	}
 	const names = tools.map(tool => tool.name);

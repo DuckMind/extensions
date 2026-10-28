@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProjectDataDir } from "./file-utils.js";
 import { writeFileAtomic } from "./atomic-write.js";
+import { findNearestContaining, walkUpDirs } from "./path-utils.js";
 import { safeSpawn } from "./safe-spawn.js";
 
 // --- Types ---
@@ -51,32 +52,24 @@ const MAX_HISTORY_PER_FILE = 20;
  * Check whether cwd is inside a Git worktree.
  */
 function isInsideGitRepo(startDir: string): boolean {
-	let dir = path.resolve(startDir);
-	while (true) {
-		if (fs.existsSync(path.join(dir, ".git"))) {
-			return true;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return false;
+	return findNearestContaining(startDir, [".git"]) !== undefined;
 }
 
 /**
  * Get current git commit hash (short)
  */
 function getCurrentCommit(startDir: string): string {
-	const repoStartDir = path.resolve(startDir);
-	if (!isInsideGitRepo(repoStartDir)) {
+	if (!isInsideGitRepo(startDir)) {
 		return "unknown";
 	}
-	let spawnDir = repoStartDir;
-	while (!fs.existsSync(spawnDir)) {
-		const parent = path.dirname(spawnDir);
-		if (parent === spawnDir) return "unknown";
-		spawnDir = parent;
+	let spawnDir: string | undefined;
+	for (const dir of walkUpDirs(startDir)) {
+		if (fs.existsSync(dir)) {
+			spawnDir = dir;
+			break;
+		}
 	}
+	if (spawnDir === undefined) return "unknown";
 
 	// #2095: the seam pipes stderr, so a failing `git rev-parse` stays out of
 	// the pi TUI. #4530: a bare `git` is a lookup, and the seam judges it

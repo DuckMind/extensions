@@ -6,6 +6,7 @@ import {
 	isUnderDir,
 	normalizeEphemeralMapKey,
 	realpathOrResolve,
+	walkUpDirs,
 } from "./path-utils.js";
 
 /**
@@ -48,11 +49,13 @@ function classifyTmpDir(dir: string): TmpDirClass {
 	const real = realpathOrResolve(dir);
 	let result = NOT_EPHEMERAL;
 	if (isUnderDir(real, tmpRoot)) {
-		for (
-			let current = real;
-			current !== tmpRoot && path.dirname(current) !== current;
-			current = path.dirname(current)
-		) {
+		// #4689 item 6 (batch 7): the climb is the shared upward walk, already
+		// on the identity axis this classifier starts on (`real`). The tmpdir
+		// stop is kept: the walk breaks AT it, so a repository sitting at the
+		// tmpdir itself never owns what is below it (#1129 F12), and the temp
+		// root's own ancestors are never probed.
+		for (const current of walkUpDirs(real)) {
+			if (current === tmpRoot) break;
 			if (isRealGitMarker(path.join(current, ".git"))) {
 				result = { checkout: true };
 				break;

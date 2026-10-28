@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { load as loadYaml } from "./deps/js-yaml.js";
 import { resolvePackagePath } from "./package-root.js";
-import { findLocalToolConfig } from "./path-utils.js";
+import { findLocalToolConfig, realpathOrResolve } from "./path-utils.js";
 import {
 	getUserRuleRoot,
 	ruleCorpusFingerprintForCycle,
@@ -55,14 +55,6 @@ export function findLocalSgconfig(startDir: string): string | undefined {
 	return findLocalToolConfig(startDir, SGCONFIG_NAMES);
 }
 
-function canonicalDir(dir: string): string {
-	try {
-		return fs.realpathSync.native(dir);
-	} catch {
-		return path.resolve(dir);
-	}
-}
-
 /**
  * Rule sources in the precedence order shared by raw ast-grep/LSP and NAPI:
  * project primary, project secondary, user primary, user secondary, bundled
@@ -75,7 +67,7 @@ export function getAstGrepRuleSources(
 	const packageRoot = resolvePackagePath(import.meta.url);
 	const candidates: AstGrepRuleSource[] = [];
 
-	if (canonicalDir(root) !== canonicalDir(packageRoot)) {
+	if (realpathOrResolve(root) !== realpathOrResolve(packageRoot)) {
 		candidates.push(
 			{
 				dir: path.join(root, "rules", "ast-grep-rules", "rules"),
@@ -90,7 +82,7 @@ export function getAstGrepRuleSources(
 		);
 	}
 	const userRoot = getUserRuleRoot();
-	if (canonicalDir(userRoot) !== canonicalDir(root)) {
+	if (realpathOrResolve(userRoot) !== realpathOrResolve(root)) {
 		candidates.push(
 			{
 				dir: path.join(userRoot, "ast-grep-rules", "rules"),
@@ -127,7 +119,7 @@ export function getAstGrepRuleSources(
 	const seen = new Set<string>();
 	return candidates.filter((source) => {
 		if (!fs.existsSync(source.dir)) return false;
-		const key = canonicalDir(source.dir);
+		const key = realpathOrResolve(source.dir);
 		if (seen.has(key)) return false;
 		seen.add(key);
 		return true;
@@ -188,7 +180,7 @@ function parseRuleDocuments(content: string): RuleDocument[] {
 const bundledSnapshots = new Map<string, RuleSourceSnapshot>();
 
 function snapshotRuleSource(source: AstGrepRuleSource): RuleSourceSnapshot {
-	const cacheKey = canonicalDir(source.dir);
+	const cacheKey = realpathOrResolve(source.dir);
 	if (source.origin === "bundled") {
 		const cached = bundledSnapshots.get(cacheKey);
 		if (cached) return cached;
@@ -241,7 +233,7 @@ function sourceFingerprint(sources: RuleSourceSnapshot[]): string {
 		hash.update("\0");
 		hash.update(source.tier);
 		hash.update("\0");
-		hash.update(canonicalDir(source.dir));
+		hash.update(realpathOrResolve(source.dir));
 		hash.update("\0");
 		hash.update(source.digest);
 		hash.update("\0");
@@ -332,7 +324,7 @@ function rootArtifactKey(root: string): string {
 export function resolveBaselineSgconfig(
 	projectRoot = process.cwd(),
 ): string | undefined {
-	const root = canonicalDir(path.resolve(projectRoot || process.cwd()));
+	const root = realpathOrResolve(path.resolve(projectRoot || process.cwd()));
 	// FORCED, so this path opts out of the cycle memo. It runs once per
 	// ast-grep LSP spawn (`clients/lsp/server.ts`, `spawn(root, options)`),
 	// never on a per-file or per-call path, and #497's point-7 contract —

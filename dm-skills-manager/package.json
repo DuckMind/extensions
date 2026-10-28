@@ -28,7 +28,7 @@
     "extensions": [
       "./extensions/skills-manager.ts"
     ],
-    "image": "https://raw.githubusercontent.com/vanillagreencom/kendex/9e4bc7e8ffa832e8d86b6e849cff1a108a679225/pi-extensions/pi-skills-manager/assets/skills-manager.png"
+    "image": "https://raw.githubusercontent.com/DuckMind/extensions/main/dm-skills-manager/assets/skills-manager.png"
   },
   "kendex": {
     "extensionManager": {
@@ -121,12 +121,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vanillagreencom/kendex.git"
+    "url": "git+https://github.com/DuckMind/extensions.git"
   },
   "bugs": {
-    "url": "https://github.com/vanillagreencom/kendex/issues"
+    "url": "https://github.com/DuckMind/extensions/issues"
   },
-  "homepage": "https://github.com/vanillagreencom/kendex#readme",
+  "homepage": "https://github.com/DuckMind/extensions/tree/main/dm-skills-manager#readme",
   "peerDependencies": {
     "@duckmind/dm-ai": "*",
     "@duckmind/dm-coding-agent": "*",

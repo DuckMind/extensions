@@ -218,7 +218,7 @@ export function hasLiveSessionInProcess(except?: LiveSessionMember): boolean {
 					kind: "session-member-disposed",
 					subject: "no-shutdown",
 					reason:
-						"a live session's context was invalidated with no session_shutdown (pi's AgentSession.dispose); it no longer holds the shared teardown, and its own end-of-session work did not run",
+						"a live session's context was invalidated with no session_shutdown (DM's AgentSession.dispose); it no longer holds the shared teardown, and its own end-of-session work did not run",
 				});
 		}
 	}

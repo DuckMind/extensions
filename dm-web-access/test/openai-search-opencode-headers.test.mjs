@@ -74,7 +74,7 @@ test("OpenAI search through opencode-go keeps provider headers and picks the new
 	assert.equal(request.body.model, "gpt-6-luna");
 	assert.equal(request.headers["x-existing"], "kept");
 	assert.equal(request.headers["x-opencode-session"], "session-1");
-	assert.equal(request.headers["x-opencode-client"], "pi");
+	assert.equal(request.headers["x-opencode-client"], "dm");
 });
 
 for (const [name, options, url] of [
@@ -87,7 +87,7 @@ for (const [name, options, url] of [
 		assert.equal(out.error, undefined);
 		assert.equal(out.requests[0].url, url);
 		assert.equal(out.requests[0].headers["x-opencode-session"], "session-1");
-		assert.equal(out.requests[0].headers["x-opencode-client"], "pi");
+		assert.equal(out.requests[0].headers["x-opencode-client"], "dm");
 	});
 }
 

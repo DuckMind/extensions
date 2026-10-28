@@ -29,3 +29,17 @@ it("announces each upgrade's highlights once, only in a UI session", async () =>
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+it("starts quietly when the seen version cannot be recorded", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dm-upgrade-notice-"));
+	const changelog = path.join(dir, "CHANGELOG.md");
+	fs.writeFileSync(changelog, CHANGELOG);
+	fs.writeFileSync(path.join(dir, "not-a-directory"), "");
+	const notices: string[] = [];
+	try {
+		await showUpgradeNotice({ hasUI: true, ui: { notify: (message: string) => notices.push(message) } }, path.join(dir, "not-a-directory", "dm-subagents"), changelog, "0.3.0");
+		assert.deepEqual(notices, []);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});

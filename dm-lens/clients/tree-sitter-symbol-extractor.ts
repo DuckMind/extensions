@@ -1045,7 +1045,12 @@ export class TreeSitterSymbolExtractor {
 			...(decorators.length > 0 ? { decorators } : {}),
 			...(isAsync ? { isAsync: true } : {}),
 			...(docInfo
-				? { doc: docInfo.text, docStartLine: docInfo.startLine }
+				? {
+						doc: docInfo.text,
+						...(docInfo.startLine !== undefined
+							? { docStartLine: docInfo.startLine }
+							: {}),
+					}
 				: {}),
 		};
 	}
@@ -1072,11 +1077,49 @@ export class TreeSitterSymbolExtractor {
 	 * summarized text (`doc`) and the 1-based start line of the attached comment
 	 * block (`docStartLine`, #523) — readSymbol extends its returned range to that
 	 * line so an agent reading a symbol sees its contract, not just its body.
+	 * A Python docstring (#4948) is the first string statement INSIDE the body, so
+	 * it yields `text` only: its `startLine` stays undefined, because a start line
+	 * below the signature would make readSymbol's range cut the signature off.
 	 */
 	// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter node
 	private extractDocCommentInfo(
 		declNode: any,
-	): { text: string; startLine: number } | undefined {
+	): { text: string; startLine?: number } | undefined {
+		if (
+			this.languageId === "python" &&
+			(declNode.type === "function_definition" ||
+				declNode.type === "class_definition")
+		) {
+			// Only the FIRST statement of the body counts, as in Python itself; a
+			// string after other code is a no-op expression, not a docstring. The
+			// language gate matters: `function_definition` is also PHP's, C's and
+			// bash's node, and a bare PHP string is not documentation (#4951 F1).
+			const first = declNode.childForFieldName("body")?.namedChild(0);
+			let expr =
+				first?.type === "expression_statement"
+					? first.namedChild(0)
+					: undefined;
+			if (expr?.type === "parenthesized_expression") expr = expr.namedChild(0);
+			// Adjacent literals (`"a" "b"`) concatenate into one docstring.
+			const parts =
+				expr?.type === "concatenated_string"
+					? expr.namedChildren
+					: expr
+						? [expr]
+						: [];
+			// Plain, `r` and `u` strings only: `b`/`f` prefixes are not docstrings.
+			const bodies = parts.map((part: any) =>
+				part.type === "string"
+					? /^[rRuU]?("""|'''|"|')([\s\S]*)\1$/.exec(String(part.text))?.[2]
+					: undefined,
+			);
+			const text =
+				bodies.length > 0 &&
+				bodies.every((x: string | undefined) => x !== undefined)
+					? this.summarizeDocComment(bodies.join(""))
+					: undefined;
+			if (text) return { text };
+		}
 		const isComment = (n: any): boolean =>
 			!!n && n.type === TreeSitterSymbolExtractor.COMMENT_NODE_KIND;
 		const isDeco = (n: any) =>

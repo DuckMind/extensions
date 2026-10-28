@@ -1,6 +1,7 @@
 import { Agent, type AgentTool, type StreamFn } from "@duckmind/dm-agent-core";
 import { convertToLlm, type ExtensionContext } from "@duckmind/dm-coding-agent";
 import { streamSimple } from "@duckmind/dm-ai/compat";
+import type { SystemMessage } from "@duckmind/dm-ai";
 import { Type, type Static } from "typebox";
 import { appendPermissionAudit, permissionArgsPreview } from "../runs/shared/permissions.ts";
 import { agentStreamOptions } from "../shared/agent-stream-options.ts";
@@ -100,12 +101,21 @@ export function createWatchdogPermissionArbiter(options: WatchdogPermissionArbit
 				const baseStreamFn: StreamFn = options.streamFn ?? (registryStream
 					? (model, context, streamOptions) => registryStream.call(request.ctx.modelRegistry, model, context, streamOptions)
 					: (model, context, streamOptions) => streamSimple(model, context, streamOptions));
-				const streamFn: StreamFn = (model, context, streamOptions) => baseStreamFn(model, context, {
-					...streamOptions,
-					...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
-					env: auth.env || streamOptions?.env ? { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } : undefined,
-					headers: { ...opencodeSessionHeaders(model, sessionId), ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
-				});
+				let declaration: SystemMessage | undefined;
+				const streamFn: StreamFn = (model, context, streamOptions) => {
+					declaration ??= {
+						role: "system",
+						content: context.systemPrompt ?? "",
+						toolsAdded: (context.tools ?? []).map(({ name, description, parameters }) => ({ name, description, parameters })),
+						timestamp: Date.now(),
+					};
+					return baseStreamFn(model, options.streamFn ? { ...context, messages: [declaration, ...context.messages] } : context, {
+						...streamOptions,
+						...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+						env: auth.env || streamOptions?.env ? { ...(auth.env ?? {}), ...(streamOptions?.env ?? {}) } : undefined,
+						headers: { ...opencodeSessionHeaders(model, sessionId), ...(streamOptions?.headers ?? {}), ...(auth.headers ?? {}) },
+					});
+				};
 				const systemPrompt = [
 					"You are the dm-subagents watchdog permission arbiter.",
 					"Decide only whether this exact non-bash child tool call should proceed.",

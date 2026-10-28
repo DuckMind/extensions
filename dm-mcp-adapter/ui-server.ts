@@ -22,9 +22,10 @@ import { logger } from "./logger.ts";
 import type { McpServerManager, ServerConnection } from "./server-manager.ts";
 import type { McpExtensionState } from "./state.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery, type SessionRecoveryDeps } from "./session-recovery.ts";
-import { ensureToolCallApproved, isToolCallApprovalRequired } from "./tool-approval.ts";
+import { approvalBlockedResult, ensureToolCallApproved, isToolCallApprovalRequired } from "./tool-approval.ts";
 import { callToolViaTaskSession } from "./mcp-tasks.ts";
 import { callToolPausingForElicitation } from "./elicitation-handler.ts";
+import { callToolAnsweringExecutorPauses } from "./executor-pauses.ts";
 import { extractUiToolVisibility, isUiToolCallableByApp, isUiToolVisibleToModel } from "./ui-tool-visibility.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import {
@@ -517,19 +518,12 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
               ? { ok: false as const, reason: "approval_required_headless" as const }
               : { ok: true as const };
           if (approval.ok === false) {
-            const denied = approval.reason === "denied";
-            const message = denied
-              ? `The user declined approval to run MCP tool "${callParams.name}" on server "${options.serverName}".`
-              : `MCP tool "${callParams.name}" on server "${options.serverName}" is approval-gated and requires an interactive session.`;
+            const blocked = approvalBlockedResult(approval, options.serverName, callParams.name);
             sendJson(res, 200, {
               ok: true,
               result: {
-                content: [{ type: "text" as const, text: message }],
-                details: {
-                  error: denied ? "approval_denied" : "approval_required",
-                  server: options.serverName,
-                  tool: callParams.name,
-                },
+                content: [{ type: "text" as const, text: blocked.text }],
+                details: blocked.details,
               },
             });
             return;
@@ -537,15 +531,25 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
           const callTool = async (conn: ServerConnection) => {
             await options.manager.ensureListen?.(options.serverName, conn);
             const requestOptions = options.manager.getRequestOptions?.(options.serverName);
-            if (conn.taskSession) {
-              return callToolViaTaskSession(conn.taskSession, {
-                name: callArgs.name,
-                args: callArgs.arguments,
-                requestTimeoutMs: requestOptions?.timeout,
-                signal: requestOptions?.signal,
-              });
-            }
-            return callToolPausingForElicitation(conn.client, callArgs, requestOptions);
+            return callToolAnsweringExecutorPauses({
+              conn,
+              manager: options.manager,
+              serverName: options.serverName,
+              params: callArgs,
+              requestOptions,
+              signal: requestOptions?.signal,
+              call: async (params, callOptions) => {
+                if (conn.taskSession) {
+                  return callToolViaTaskSession(conn.taskSession, {
+                    name: params.name,
+                    args: params.arguments ?? {},
+                    requestTimeoutMs: callOptions?.timeout,
+                    signal: callOptions?.signal,
+                  });
+                }
+                return callToolPausingForElicitation(conn.client, params, callOptions);
+              },
+            });
           };
           const result = options.config
             ? await withSessionRecovery(

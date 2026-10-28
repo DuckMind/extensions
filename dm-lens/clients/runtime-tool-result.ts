@@ -142,6 +142,7 @@ import { requestBootstrapClients } from "./bootstrap.js";
 import { bounded } from "./deadline-utils.js";
 import type { DiskChangeRuntime } from "./disk-changes.js";
 import {
+	type ChunkableDiskChangeInput,
 	DISK_CHANGE_MAX_RECORDED_PATHS,
 	publishDiskChangeChunked,
 } from "./disk-changes.js";
@@ -152,7 +153,10 @@ import {
 	readHeldDocumentsAnswer,
 	SAME_HEAD_DISCARD_SOURCE,
 } from "./disk-change-subscribers.js";
-import { lookForOutOfBandChanges } from "./out-of-band-changes.js";
+import {
+	lookForOutOfBandChanges,
+	oweDeclarationWalk,
+} from "./out-of-band-changes.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import {
 	incrementDegradationCount,
@@ -306,6 +310,11 @@ export function resyncHeadMove(args: HeadLook): Promise<void> {
 	// `discarded`). Synchronous, so a joining caller's paths are in the
 	// accumulator before any drain that could owe them.
 	addHeadDiscards(args.key, args.discarded);
+	// #4532 gap 6: the same holds for this call's declaration walk. A bash
+	// result that joins a tool_call look runs the tool_call's closure, whose
+	// out-of-band look would not walk; the demand is owed to the root first, in
+	// the same synchronous step, and the out-of-band pass that runs next takes it.
+	oweDeclarationWalk(args.root, args.trigger);
 	return serializeHeadLook(args.key, async () => {
 		try {
 			await lookForOutOfBandChanges(args.root, args.trigger, args.runtime);
@@ -408,6 +417,7 @@ async function lookAtHead(args: HeadLook): Promise<void> {
 	);
 	const targets = answers.flatMap((answer) => answer.targets);
 	const primary = answers.reduce((count, answer) => count + answer.primary, 0);
+	const unheld = answers.reduce((count, answer) => count + answer.unheld, 0);
 	const resyncFailed = answers.some((answer) => answer.failed);
 	const drained = answers.every((answer) => answer.drained);
 	const held = answers.reduce((count, answer) => count + answer.held, 0);
@@ -450,6 +460,8 @@ async function lookAtHead(args: HeadLook): Promise<void> {
 				heldPopulation: unlistable ? "all-held" : "delta-held",
 				current: held - targets.length,
 				primary,
+				// #4742: delta paths no client holds, sent as watched-files events.
+				unheld,
 				primaryMs,
 				drained,
 				resynced: count("resynced"),
@@ -470,7 +482,10 @@ async function lookAtHead(args: HeadLook): Promise<void> {
 
 /**
  * #4535 slice 2: the recovered set's detached follow-up, one publish per
- * `DISK_CHANGE_MAX_RECORDED_PATHS` chunk of the recovered population.
+ * `DISK_CHANGE_MAX_RECORDED_PATHS` chunk of the recovered population. Slice 3's
+ * settled sweep runs the same pass over its own origin ({@link
+ * publishSettledSweepDrift}): the chunking, the per-chunk drift await and the
+ * failure record are one chain, not one per detector.
  *
  * The spacing matters. A single publish over a longer population is reported
  * as `paths: "unknown"`, and the consumer's only honest reading of that is
@@ -493,23 +508,17 @@ async function lookAtHead(args: HeadLook): Promise<void> {
  * one row per chunk (review round 3, p3-3: the base branch dropped the whole
  * set with a `dbg` line, which for a detached chain is no record at all).
  */
-async function publishRecoveredDrift(
+async function publishDriftPass(
 	root: string,
 	paths: readonly string[],
+	detector: Pick<ChunkableDiskChangeInput, "origin" | "sources" | "kind"> & {
+		/** What the record calls this chunk's paths. */
+		noun: string;
+	},
 ): Promise<void> {
+	const { noun, ...origin } = detector;
 	await publishDiskChangeChunked(
-		{
-			root,
-			origin: "bash-recovery",
-			sources: [BASH_RECOVERY_DRIFT_SOURCE],
-			// `inferred`, the conservative label: the stat-diff strategy hashed
-			// the bytes, but the git strategy reported a status pair and an mtime
-			// window without reading them. A marker that wants to confirm "not
-			// reproduced" reads the bytes itself; the drift pass does exactly
-			// that.
-			kind: "inferred",
-			paths,
-		},
+		{ root, ...origin, paths },
 		undefined,
 		undefined,
 		async ({ results, failedSubscribers }, { index, total }) => {
@@ -525,11 +534,55 @@ async function publishRecoveredDrift(
 				incrementDegradationCount({
 					kind: "disk-change-recovered-drift-failed",
 					subject: root,
-					reason: `chunk ${index + 1} of ${total} rejected, so its ${dropped} recovered path(s) were never republished to a server: ${cause instanceof Error ? cause.message : String(cause)}`,
+					reason: `chunk ${index + 1} of ${total} rejected, so its ${dropped} ${noun} path(s) were never republished to a server: ${cause instanceof Error ? cause.message : String(cause)}`,
 				});
 			}
 		},
 	);
+}
+
+/**
+ * The recovered set's drift pass. `inferred`, the conservative label: the
+ * stat-diff strategy hashed the bytes, but the git strategy reported a status
+ * pair and an mtime window without reading them. A marker that wants to confirm
+ * "not reproduced" reads the bytes itself; the drift pass does exactly that.
+ */
+const RECOVERED_DRIFT_PASS = {
+	origin: "bash-recovery",
+	sources: [BASH_RECOVERY_DRIFT_SOURCE],
+	kind: "inferred",
+	noun: "recovered",
+} as const;
+
+/**
+ * #4535 slice 3: the settled sweep's drift (D4). The sweep finds a tracked file
+ * whose bytes moved with no tool call to explain it and replays it through the
+ * mutation bridge, which allocates the project sequence per path. The bridge
+ * never reached the language servers or the diagnostics cache, so the sweep now
+ * publishes what it found. No runtime is passed: the bridge already allocated
+ * the sequence, and a second allocation would bump every path twice.
+ *
+ * `observed` only when every path was hash-proven. An `unverifiable` file (its
+ * stat moved, no hashed baseline could confirm a change) is published too,
+ * labelled `inferred`: the LSP consumer compares the bytes itself and pays a
+ * read, while the diagnostics cache refuses the path's entries without reading
+ * one, so an unproven path costs one recompute; leaving it out serves stale views.
+ *
+ * The caller `void`s this: `agent_settled` never waits on a server, and the
+ * chain records its own failures (see {@link publishDriftPass}).
+ */
+export function publishSettledSweepDrift(
+	root: string,
+	found: { drifted: readonly string[]; unverifiable: readonly string[] },
+): Promise<void> {
+	const paths = [...new Set([...found.drifted, ...found.unverifiable])];
+	if (paths.length === 0) return Promise.resolve();
+	ensureDiskChangeSubscribers();
+	return publishDriftPass(root, paths, {
+		origin: "settled-sweep",
+		kind: found.unverifiable.length > 0 ? "inferred" : "observed",
+		noun: "settled-sweep",
+	});
 }
 
 /**
@@ -1318,6 +1371,8 @@ function publishInlineVerdict(args: {
 	getFlag: ToolResultDeps["getFlag"];
 	turnStateCwd: string;
 	analysisRootMode: AnalysisRootMode;
+	/** #4921: the write's turn session, which owns the blocker it records. */
+	sessionId: string | undefined;
 }): void {
 	const {
 		runtime,
@@ -1331,6 +1386,7 @@ function publishInlineVerdict(args: {
 		getFlag,
 		turnStateCwd,
 		analysisRootMode,
+		sessionId,
 	} = args;
 	// #3596: a replaced session's handler latches nothing in the live session.
 	const resultLive = writeSession.guardedWrite(filePath, () => true) === true;
@@ -1362,6 +1418,7 @@ function publishInlineVerdict(args: {
 					result.orderTurn ?? writeOrderTurn,
 					// #3503: the freshness baseline is the analysis read.
 					result.analysisReadAtMs,
+					sessionId,
 				),
 			) !== undefined;
 	} else {
@@ -1426,6 +1483,7 @@ function publishInlineVerdict(args: {
 				wholeFileClean || ownBlockerRetired ? filePath : undefined,
 				analysisRootMode,
 				wholeFileClean,
+				sessionId,
 			);
 		}
 	}
@@ -2109,6 +2167,49 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		});
 	}
 
+	// Search tools reveal specific lines (file:line) the agent then edits — register
+	// those shown lines (± context) as reads so the follow-up edit isn't blocked (#169).
+	// Our tools attach locations as `details.searchReads`; bash grep is parsed from
+	// `grep -n` output. Only shown lines are registered, never the whole file.
+	//
+	// #1884: this runs BEFORE the `path_attribution_missing` refusal below, because
+	// the two answer different questions. The refusal answers for the call's NAMED
+	// path, which no attribution can resolve, and keeps every path-keyed step
+	// closed; a `searchReads` entry carries its own path, so the lines a
+	// relative-path `lsp_navigation` result showed are delivered evidence either
+	// way. Registered after the refusal, they were dropped, and the agent's
+	// follow-up edit to a line it had just been shown was blocked.
+	if (deps.readGuard && event.isError !== true && !getFlag("no-read-guard")) {
+		const searchReads: SearchReadLocation[] = [];
+		const detailSearchReads = (
+			event.details as { searchReads?: SearchReadLocation[] }
+		)?.searchReads;
+		if (Array.isArray(detailSearchReads))
+			searchReads.push(...detailSearchReads);
+		if (
+			event.toolName === "bash" &&
+			typeof (event.input as { command?: unknown }).command === "string"
+		) {
+			const command = (event.input as { command: string }).command;
+			const output = event.content
+				.map((part) => (typeof part.text === "string" ? part.text : ""))
+				.join("\n");
+			searchReads.push(
+				...extractGrepSearchReadsFromOutput(command, workspaceRoot, output),
+			);
+		}
+		if (searchReads.length > 0) {
+			registerSearchReads(deps.readGuard, searchReads, {
+				projectRoot: workspaceRoot,
+				turnIndex: runtime.turnIndex,
+				writeIndex: runtime.peekWriteIndex(),
+				...(readEvidenceToolCallId !== undefined && {
+					toolCallId: readEvidenceToolCallId,
+				}),
+			});
+		}
+	}
+
 	let resolutionBasis: string;
 	if (attribution) {
 		resolutionBasis = attribution.originCwd;
@@ -2761,14 +2862,14 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					.then(() =>
 						Promise.all(
 							[...driftByRoot].map(([root, paths]) =>
-								publishRecoveredDrift(root, paths),
+								publishDriftPass(root, paths, RECOVERED_DRIFT_PASS),
 							),
 						),
 					)
 					.catch((err) => {
 						// The one handler the base branch had for this detached chain.
 						// The publisher never rejects (see `publishDiskChange`'s contract)
-						// and a drift rejection is recorded by `publishRecoveredDrift`
+						// and a drift rejection is recorded by `publishDriftPass`
 						// chunk by chunk (review round 3, p3-3; #4612 r4 lets the chain
 						// go on), so only a programming error reaches here.
 						// none: the two failure paths this chain owns record themselves, so
@@ -3015,41 +3116,6 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	// Search tools reveal specific lines (file:line) the agent then edits — register
-	// those shown lines (± context) as reads so the follow-up edit isn't blocked (#169).
-	// Our tools attach locations as `details.searchReads`; bash grep is parsed from
-	// `grep -n` output. Only shown lines are registered, never the whole file.
-	if (deps.readGuard && event.isError !== true && !getFlag("no-read-guard")) {
-		const searchReads: SearchReadLocation[] = [];
-		const detailSearchReads = (
-			event.details as { searchReads?: SearchReadLocation[] }
-		)?.searchReads;
-		if (Array.isArray(detailSearchReads))
-			searchReads.push(...detailSearchReads);
-		if (
-			event.toolName === "bash" &&
-			typeof (event.input as { command?: unknown }).command === "string"
-		) {
-			const command = (event.input as { command: string }).command;
-			const output = event.content
-				.map((part) => (typeof part.text === "string" ? part.text : ""))
-				.join("\n");
-			searchReads.push(
-				...extractGrepSearchReadsFromOutput(command, workspaceRoot, output),
-			);
-		}
-		if (searchReads.length > 0) {
-			registerSearchReads(deps.readGuard, searchReads, {
-				projectRoot: workspaceRoot,
-				turnIndex: runtime.turnIndex,
-				writeIndex: runtime.peekWriteIndex(),
-				...(readEvidenceToolCallId !== undefined && {
-					toolCallId: readEvidenceToolCallId,
-				}),
-			});
-		}
-	}
-
 	// A read whose host call errored delivered nothing: its tool_call capture
 	// is released by `handleToolExecutionEnd`, which pi emits right after this
 	// handler, keyed by the call (#4185 round 4).
@@ -3198,8 +3264,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						reason: delivered
 							? "the file changed between DM's read and its tool_result; the read is recorded from the delivered text"
 							: captureEvidence
-								? "the file changed between DM's read and its tool_result; pi's line count does not vouch for the delivered text, so the tool_call's capture is the evidence"
-								: "the file changed between DM's read and its tool_result; pi's line count does not vouch for the delivered text and there is no hashed tool_call capture, so the read is not recorded",
+								? "the file changed between DM's read and its tool_result; DM's line count does not vouch for the delivered text, so the tool_call's capture is the evidence"
+								: "the file changed between DM's read and its tool_result; DM's line count does not vouch for the delivered text and there is no hashed tool_call capture, so the read is not recorded",
 					});
 				}
 				const evidence =
@@ -3608,6 +3674,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							getFlag,
 							turnStateCwd: observedTurnStateCwd,
 							analysisRootMode: observedRootMode,
+							sessionId: deps.sessionId,
 						});
 					}
 				}
@@ -4345,6 +4412,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		getFlag,
 		turnStateCwd,
 		analysisRootMode,
+		sessionId: deps.sessionId,
 	});
 
 	// #2050 AC3 / #2657: `linked-worktree` is a WRITABLE class

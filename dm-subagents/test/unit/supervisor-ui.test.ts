@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { visibleWidth } from "@duckmind/dm-tui";
+import { initTheme } from "@duckmind/dm-coding-agent";
 import {
 	parseSupervisorReplyData, parseSupervisorRequestDetails, supervisorReplyHint,
 	SUPERVISOR_REPLY_ENTRY_TYPE, SUPERVISOR_REQUEST_MESSAGE_TYPE,
 } from "../../src/intercom/supervisor-ui.ts";
 import { renderSubagentEntry, renderSubagentMessage } from "../../src/tui/subagent-messages.ts";
-import { initDmTestTheme } from "../support/dm-theme.ts";
-
-initDmTestTheme();
+initTheme("dark");
 const identityTheme = {
 	fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text,
 	bold: (text: string) => text,

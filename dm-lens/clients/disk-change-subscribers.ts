@@ -28,7 +28,12 @@
 import * as nodeFs from "node:fs";
 import { hashContentBytes } from "./content-stamp.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
-import { type DiskChange, subscribeDiskChange } from "./disk-changes.js";
+import {
+	DISK_CHANGE_ORIGINS,
+	type DiskChange,
+	type DiskChangeOrigin,
+	subscribeDiskChange,
+} from "./disk-changes.js";
 import type { DriftDisposition } from "./lsp/document-drift.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import { peekLSPService } from "./lsp/capabilities.js";
@@ -67,9 +72,15 @@ const WATCHED_FILE_TYPE: Record<DiskPathChangeEvent["type"], number> = {
  * scanned before `at` is the only direction that cannot serve a stale entry.
  * Naming the recorded 64 of 70 changed declarations would refuse strictly less
  * than the detector's full list did before #4535 (catalog shape 10).
+ *
+ * Every origin reaches it (#4535 slice 3). Slice 2 left this handler filtering
+ * to `out-of-band`, so a HEAD move, a bash-recovered rewrite or a settled-sweep
+ * drift refused only the entries whose OWN file moved: a cached entry for an
+ * unchanged importer of a changed file kept serving its pre-change finding.
+ * The origins are declared at registration ({@link ensureDiskChangeSubscribers}),
+ * where the consumer census reads them, not in a branch here.
  */
 function diagnosticsCacheSubscriber(change: DiskChange): void {
-	if (change.origin !== "out-of-band") return;
 	if (change.sources.includes("install") || change.paths === "unknown")
 		noteWorkspaceDependenciesChanged(change.at);
 	if (change.paths === "unknown") return;
@@ -133,6 +144,12 @@ export interface HeldDocumentsAnswer {
 	targets: string[];
 	/** Documents this pass sent to a primary. */
 	primary: number;
+	/**
+	 * #4742: published paths NO client holds that went out as exact-URI
+	 * watched-files events (`notifyUnheldPaths`). `0` when there were none, the
+	 * population was unknown, or the send failed (that case is recorded).
+	 */
+	unheld: number;
 	/** A primary send threw; the next check may read a stale view. */
 	failed: boolean;
 	/** Every client that took a send answered its drain probe in time. */
@@ -148,6 +165,7 @@ const NO_HELD_DOCUMENTS: HeldDocumentsAnswer = {
 	held: 0,
 	targets: [],
 	primary: 0,
+	unheld: 0,
 	failed: false,
 	drained: true,
 };
@@ -161,6 +179,7 @@ const UNCHECKED_HELD_DOCUMENTS: HeldDocumentsAnswer = {
 	held: -1,
 	targets: [],
 	primary: 0,
+	unheld: 0,
 	failed: true,
 	drained: false,
 };
@@ -221,6 +240,71 @@ async function sendToHeldPrimaries(
 }
 
 /**
+ * #4742: tell the live primaries about published paths no client holds.
+ *
+ * A server keeps the bytes of a module it read for an importer, and a module
+ * that is not open in any server is neither resynced (the held-document phase
+ * skips it) nor re-read by the server: pyright kept the pre-move bytes of an
+ * imported module, and flagged every attribute of it as unknown on each run
+ * for the server's life. A watched-files event for the exact URI is what makes
+ * the server re-read a closed file, so each unheld path goes out through the
+ * seam #4476 built for declaration files, which delivers to live clients of the
+ * file's servers only and never spawns one.
+ *
+ * The type is read from the disk now, not from the detector: a path that is
+ * gone is Deleted and a present one is Changed. The detectors' deltas carry
+ * names only, so a path born inside the change cannot be told from an edited
+ * one here: every present path is then offered to `announceCreatedFiles`, which
+ * sends Created per live client only where the path is new to that client (a
+ * Created-only server cache, a cached missing import, is cleared only by it).
+ * A git checkout rewrites an edited file too, so an edited closed module may
+ * also be announced Created once per client; the server treats it as the
+ * re-read the Changed already asked for. At most `DISK_CHANGE_MAX_RECORDED_PATHS` stats: the publisher
+ * never names more in one record, and a stat error other than a missing path
+ * is the failure recorded below.
+ *
+ * A failure must not cost the held-document phase that runs after it, so it is
+ * recorded once per root and the phase goes on.
+ */
+function notifyUnheldPaths(
+	service: NonNullable<ReturnType<typeof peekLSPService>>,
+	change: DiskChange,
+	held: ReadonlySet<string>,
+): number {
+	if (change.paths === "unknown") return 0;
+	const unheld = change.paths.flatMap((filePath) =>
+		held.has(filePath) ? [] : [filePath],
+	);
+	if (unheld.length === 0) return 0;
+	try {
+		const events = unheld.map((filePath) => ({
+			filePath,
+			type: WATCHED_FILE_TYPE[
+				nodeFs.statSync(filePath, { throwIfNoEntry: false }) === undefined
+					? "deleted"
+					: "changed"
+			],
+		}));
+		service.notifyOutOfBandFileChanges(events);
+		// A path born inside the change (absent on the old commit) is Changed
+		// above, and a server that cached its failed lookup keeps the failure
+		// through Changed (pyright: the importer stays "unknown import symbol");
+		// only Created clears it (#4320). Each live client decides which
+		// present paths are new to it (birth and its own announced set); an
+		// absent path is skipped there.
+		service.announceCreatedFiles(unheld);
+		return events.length;
+	} catch (cause) {
+		recordDegradationOnce({
+			kind: "disk-change-unheld-notify-failed",
+			subject: change.root,
+			reason: `the watched-files events for ${unheld.length} unheld path(s) were not delivered, so a closed module changed on disk may keep its old bytes in a live server: ${cause instanceof Error ? cause.message : String(cause)}`,
+		});
+		return 0;
+	}
+}
+
+/**
  * D2/D1: the held-document phase of a disk change. The candidates are the
  * publish's own population, narrowed to what a live client holds:
  *
@@ -245,6 +329,9 @@ async function resyncHeldDocuments(
 		change.paths === "unknown"
 			? [...held]
 			: change.paths.filter((filePath) => held.has(filePath));
+	// Before the primary phase: the drain probe that phase ends with then covers
+	// these events too, and a failure here is recorded, never thrown past it.
+	const unheld = notifyUnheldPaths(service, change, held);
 	const { targets, primary, failed, drained } = await sendToHeldPrimaries(
 		change.root,
 		candidates,
@@ -254,6 +341,7 @@ async function resyncHeldDocuments(
 		held: candidates.length,
 		targets,
 		primary,
+		unheld,
 		failed,
 		drained,
 	};
@@ -347,8 +435,18 @@ async function lspSubscriber(change: DiskChange): Promise<unknown> {
 						drainMs: HOOK_WALL_BUDGET_MS.tool_result_edit,
 					});
 		case "settled-sweep":
+			// The sweep found a tracked file whose bytes moved with no tool call to
+			// explain it. A server holding it is as stale as after a HEAD move; the
+			// replay through the mutation bridge never reached LSP. The settle is
+			// not a tool hook, so the budget is the settle's own.
+			return resyncHeldDocuments(change, {
+				drift: true,
+				drainMs: HOOK_WALL_BUDGET_MS.agent_settled,
+			});
 		case "drift-heartbeat":
-			// Slice 3 folds these detector origins onto this consumer.
+			// Not delivered (see {@link LSP_ORIGINS}): the heartbeat IS the LSP
+			// service's own resync, and a second resync of the same bytes would
+			// race the first.
 			return undefined;
 	}
 	const unreachable: never = change.origin;
@@ -359,6 +457,15 @@ async function lspSubscriber(change: DiskChange): Promise<unknown> {
 export const DIAGNOSTICS_CACHE_CONSUMER = "diagnostics-cache";
 /** Consumer id of the LSP subscriber (census + tests). */
 export const LSP_CONSUMER = "lsp";
+
+/**
+ * Every origin but the heartbeat: its detector is the LSP service resyncing a
+ * drifted document itself, so a delivery back to the service would be the same
+ * write twice.
+ */
+const LSP_ORIGINS: readonly DiskChangeOrigin[] = DISK_CHANGE_ORIGINS.flatMap(
+	(origin) => (origin === "drift-heartbeat" ? [] : [origin]),
+);
 
 /**
  * The LSP consumer's answer for one publish, as a detector reads it.
@@ -378,11 +485,12 @@ export const LSP_CONSUMER = "lsp";
  *   root per session, and only that case is
  *   `disk-change-lsp-consumer-missing` (F7).
  *
- * An answer of `undefined` is neither: the `settled-sweep` and
- * `drift-heartbeat` branches of {@link lspSubscriber} answer it on purpose
- * (they have no held-document policy until slice 3). `results.has` is the
- * discriminator, so a consumer that ANSWERED is never reported as one that was
- * never asked (review round 3, p3-2).
+ * An answer of `undefined` is neither: {@link lspSubscriber} answers it on
+ * purpose for an origin that has no held-document policy, and `results.has` is
+ * the discriminator, so a consumer that ANSWERED is never reported as one that
+ * was never asked (review round 3, p3-2). A consumer that is not DELIVERED the
+ * origin ({@link LSP_ORIGINS}) is absent from `results` and is the missing
+ * case, which no awaited caller reaches: the heartbeat has none.
  */
 export function readHeldDocumentsAnswer(
 	results: ReadonlyMap<string, unknown>,
@@ -412,6 +520,10 @@ let registered = false;
 export function ensureDiskChangeSubscribers(): void {
 	if (registered) return;
 	registered = true;
-	subscribeDiskChange(DIAGNOSTICS_CACHE_CONSUMER, diagnosticsCacheSubscriber);
-	subscribeDiskChange(LSP_CONSUMER, lspSubscriber);
+	subscribeDiskChange(
+		DIAGNOSTICS_CACHE_CONSUMER,
+		diagnosticsCacheSubscriber,
+		DISK_CHANGE_ORIGINS,
+	);
+	subscribeDiskChange(LSP_CONSUMER, lspSubscriber, LSP_ORIGINS);
 }

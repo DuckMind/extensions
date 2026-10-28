@@ -55,6 +55,7 @@ import { registerQuietWindowTask } from "../quiet-window.js";
 import type { GenerationHandle } from "../generation-guard.js";
 import type { LSPClientInfo, LSPDiagnostic } from "./client.js";
 import type { LSPService } from "./index.js";
+import { isTsgoLaunchVariant } from "./server-traits.js";
 
 import {
 	classifyCascadeWaitTier as classifySharedCascadeWaitTier,
@@ -113,8 +114,8 @@ export function classifyCascadeWaitTier(
 	const primary = resolvePrimaryServerForWaitPolicy(filePath, snapshots);
 	if (
 		primary?.serverId === "typescript" &&
-		primary.snapshot?.launchVariant === "native-ts7" &&
-		primary.snapshot.workspaceDiagnosticsSupport?.mode === "push-only"
+		isTsgoLaunchVariant(primary.snapshot?.launchVariant) &&
+		primary.snapshot?.workspaceDiagnosticsSupport?.mode === "push-only"
 	) {
 		return "collect-later";
 	}

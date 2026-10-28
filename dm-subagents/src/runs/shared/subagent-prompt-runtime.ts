@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AnthropicMessagesCompat } from "@duckmind/dm-ai";
+import { declarationsEqual, getCurrentSystemMessage, getCurrentTools, type SystemMessage, type TranscriptMessages } from "../../shared/dm-declarations.ts";
 import type { BeforeAgentStartEvent, BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@duckmind/dm-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { permissionDecision } from "./permissions.ts";
@@ -107,6 +109,17 @@ function findSectionEnd(prompt: string, startIndex: number, nextHeaders: string[
 }
 
 export function stripProjectContext(prompt: string): string {
+	// DM's safe runtime renders project files as a distinct layer, followed by
+	// independent facts/workflow/environment layers that must remain available.
+	const safeStart = prompt.indexOf("\n\n# Project Context\n");
+	if (safeStart !== -1 && prompt.includes("# Context Layers")) {
+		const remaining = prompt.slice(safeStart + 2);
+		const end = /\n\n# (?:Project Facts|Workflow Context|Environment Context)\n/.exec(remaining);
+		if (end?.index !== undefined) {
+			return `${prompt.slice(0, safeStart)}\n\n${remaining.slice(end.index + 2)}`;
+		}
+		return prompt.slice(0, safeStart);
+	}
 	const xmlStartIndex = prompt.indexOf(PROJECT_CONTEXT_XML_HEADER);
 	if (xmlStartIndex !== -1) {
 		const closingTag = "</project_context>";
@@ -172,16 +185,25 @@ function stripGlobalInstructionsFromLegacyContext(context: string): string {
 }
 
 export function stripGlobalContext(prompt: string): string {
+	const safeStart = prompt.indexOf("\n\n# Project Context\n");
+	if (safeStart !== -1 && prompt.includes("# Context Layers")) {
+		const safeEnd = /\n\n# (?:Project Facts|Workflow Context|Environment Context)\n/.exec(prompt.slice(safeStart + 2));
+		if (safeEnd) {
+			const end = safeStart + 2 + safeEnd.index;
+			const layer = stripGlobalInstructionsFromLegacyContext(prompt.slice(safeStart, end));
+			const safeLayer = /^## [^\r\n]+$/m.test(layer) ? layer : "";
+			prompt = `${prompt.slice(0, safeStart)}${safeLayer}${prompt.slice(end)}`;
+		}
+	}
 	const rewrittenXml = prompt.replace(/<project_context>[\s\S]*?<\/project_context>/gi, (context) => {
 		const rewritten = stripGlobalInstructionsFromXmlContext(context);
 		return /<project_instructions\b/i.test(rewritten) ? rewritten : "";
 	});
 	const legacyStartIndex = rewrittenXml.indexOf(PROJECT_CONTEXT_LEGACY_HEADER);
 	if (legacyStartIndex === -1) return rewrittenXml;
-	const legacyEndIndex = findSectionEnd(rewrittenXml, legacyStartIndex + PROJECT_CONTEXT_LEGACY_HEADER.length, [SKILLS_HEADER, DATE_HEADER, "\n\n# Environment Context\n\n"]);
+	const legacyEndIndex = findSectionEnd(rewrittenXml, legacyStartIndex + PROJECT_CONTEXT_LEGACY_HEADER.length, [SKILLS_HEADER, DATE_HEADER]);
 	const legacyContext = rewrittenXml.slice(legacyStartIndex, legacyEndIndex);
-	const filtered = stripGlobalInstructionsFromLegacyContext(legacyContext);
-	return `${rewrittenXml.slice(0, legacyStartIndex)}${/^## /m.test(filtered) ? filtered : ""}${rewrittenXml.slice(legacyEndIndex)}`;
+	return `${rewrittenXml.slice(0, legacyStartIndex)}${stripGlobalInstructionsFromLegacyContext(legacyContext)}${rewrittenXml.slice(legacyEndIndex)}`;
 }
 
 export function stripInheritedSkills(prompt: string): string {
@@ -194,9 +216,11 @@ export function stripInheritedSkills(prompt: string): string {
 export function stripSubagentOrchestrationSkill(prompt: string): string {
 	return prompt
 		.replace(/\n{0,2}<skill\s+name=["']dm-subagents["'][^>]*>[\s\S]*?<\/skill>\n{0,2}/g, "\n\n")
-		.replace(/^[ \t]*<skill>[\s\S]*?<\/skill>[ \t]*(?:\r?\n)?/gm, (block) => SUBAGENT_ORCHESTRATION_SKILL_NAME_PATTERN.test(block) ? "" : block)
-		.replace(/^(Loaded skills: )(.*)$/gm, (_line, prefix: string, names: string) =>
-			`${prefix}${names.split(", ").filter((name) => name !== "dm-subagents").join(", ")}`);
+		.replace(/^[ \t]*<skill>[\s\S]*?<\/skill>(?:\r?\n)?/gm, (block) => SUBAGENT_ORCHESTRATION_SKILL_NAME_PATTERN.test(block) ? "" : block)
+		.replace(/^(Loaded skills: )(.*)$/gm, (_line, prefix: string, names: string) => {
+			const remaining = names.split(",").map((name) => name.trim()).filter((name) => name && name !== "dm-subagents");
+			return prefix + (remaining.join(", ") || "(none loaded)");
+		});
 }
 
 function stripChildBoundaryInstructions(prompt: string): string {
@@ -224,11 +248,14 @@ function stripInheritedPromptText(prompt: string, options: InheritedPromptOption
 	return stripChildBoundaryInstructions(stripSubagentOrchestrationSkill(rewritten));
 }
 
-function appendChildBoundary(prompt: string, options: ChildBoundaryOptions): string {
+function childBoundary(options: ChildBoundaryOptions): string {
 	const boundary = options.fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
-	const structured = options.structuredOutput ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
+	return options.structuredOutput ? `${boundary}\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : boundary;
+}
+
+function appendChildBoundary(prompt: string, options: ChildBoundaryOptions): string {
 	// DM's base prompt stays first so providers that recognize it by its opening still do.
-	return `${stripChildBoundaryInstructions(prompt)}\n\n${boundary}${structured}`;
+	return `${stripChildBoundaryInstructions(prompt)}\n\n${childBoundary(options)}`;
 }
 
 export function rewriteSubagentPrompt(prompt: string, options: InheritedPromptOptions & ChildBoundaryOptions): string {
@@ -252,6 +279,10 @@ function rewritesChildPrompt(config: ChildRuntimeConfig): boolean {
 /** Installed after every other extension: a returned prompt freezes out sections added after it. */
 export function registerSubagentPromptBoundary(dm: ExtensionAPI, config: ChildRuntimeConfig): void {
 	if (!rewritesChildPrompt(config)) return;
+	// A returned prompt replaces the whole system prompt of every request. A fork must send its
+	// parent's prompt unchanged to reuse its prompt cache, so its boundary goes in its task
+	// message instead (see projectForkRequest).
+	if (config.forkCacheKey) return;
 	dm.on("before_agent_start", (event) => {
 		const finalized = appendChildBoundary(event.systemPrompt, { fanoutChild: config.fanoutChild, structuredOutput: Boolean(config.structuredOutput) });
 		return finalized === event.systemPrompt ? undefined : { systemPrompt: finalized };
@@ -289,6 +320,136 @@ const PROMPT_CACHE_KEY_APIS = new Set([
 	"openai-completions",
 	"openai-responses",
 ]);
+
+const isSystemMessage = <T extends { role: string }>(message: T): message is T & SystemMessage => message.role === "system";
+const writtenBefore = (message: { timestamp?: unknown }, forkedAt: number) => typeof message.timestamp === "number" && message.timestamp < forkedAt;
+const promptText = (message: SystemMessage | undefined) => typeof message?.content === "string" ? message.content : (message?.content ?? []).map((block) => block.text ?? "").join("");
+
+/** The system messages older than `forkedAt`: the prompt and tool state a fork inherited. */
+export function systemMessagesBefore<T extends { role: string }>(messages: readonly T[], forkedAt: number): T[] {
+	return messages.filter((message) => isSystemMessage(message) && writtenBefore(message as { timestamp?: unknown }, forkedAt));
+}
+
+/** The model that wrote a fork's inherited history. */
+export type InheritedModel = { provider: string; api: string; model: string };
+
+/** The provider, API and model of the last assistant message older than `forkedAt`. */
+export function modelBefore(messages: readonly { role: string }[], forkedAt: number): InheritedModel | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index] as { role: string; timestamp?: unknown; provider?: unknown; api?: unknown; model?: unknown };
+		if (message.role !== "assistant" || !writtenBefore(message, forkedAt)) continue;
+		if (typeof message.provider !== "string" || typeof message.api !== "string" || typeof message.model !== "string") return undefined;
+		return { provider: message.provider, api: message.api, model: message.model };
+	}
+	return undefined;
+}
+
+/**
+ * Sections that describe what a session has (tools, skills, agents, docs, project files) rather
+ * than who it is. A fork is told which tools it can call, and it inherited the rest with the
+ * parent's prompt, so its own versions of these sections are not repeated in its task message.
+ */
+const LOADOUT_SECTIONS = new Set(["tools", "rules", "docs", "skills", "advertised_subagents", "mcp_servers", "project_context"]);
+
+/**
+ * The child's own instructions, which a fork sends in its task message instead of its system
+ * prompt: the text its own system messages (`own`) add, the sections it changed except the loadout
+ * ones, the tools it can call, and its boundary. `parent` is the inherited system messages and
+ * `child` the whole request.
+ */
+function forkInstructions(input: { parent: TranscriptMessages; child: TranscriptMessages; own: TranscriptMessages; boundary?: string }): string {
+	const parent = getCurrentSystemMessage(input.parent);
+	const child = getCurrentSystemMessage(input.child);
+	const parts = [
+		"The system prompt and tool list of this conversation are the parent session's, sent unchanged so this request reuses the parent's prompt cache. The instructions below are yours and take precedence over the parent's role.",
+		`Tools you can call: ${getCurrentTools(input.child).map((tool) => tool.name).join(", ") || "none"}. Any other declared tool belongs to the parent session and fails if called.`,
+	];
+	const ownPrompt = promptText(getCurrentSystemMessage(input.own));
+	if (ownPrompt.length > 0) parts.push(ownPrompt);
+	for (const [name, value] of Object.entries(child?.sections ?? {})) {
+		if (!LOADOUT_SECTIONS.has(name) && value && parent?.sections?.[name] !== value) parts.push(value);
+	}
+	if (input.boundary) parts.push(input.boundary);
+	return `<subagent_instructions>\n${parts.join("\n\n")}\n</subagent_instructions>`;
+}
+
+function prependText<T>(message: T, text: string): T {
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return { ...message, content: `${text}\n\n${content}` };
+	if (Array.isArray(content)) return { ...message, content: [{ type: "text", text }, ...content] };
+	return message;
+}
+
+/**
+ * A forked child starts with its parent's history, and Anthropic-style providers cache a request
+ * as one prefix: tools, then the system prompt, then the messages. The child's own prompt (its
+ * role, tool list and boundary) and its own tools changed that prefix right after the tools, so
+ * every fork re-read the parent's whole conversation without the prompt cache.
+ *
+ * A fork's request now starts exactly as its parent's last one did:
+ * - The system messages it inherited (`inherited`, older than `forkedAt`) are sent as they are,
+ *   and the child's own ones are dropped. When a `context` handler made DM collapse the request
+ *   into one leading system message, that message is rebuilt from `inherited`.
+ * - Every tool the parent declared stays declared, with the parent's definition. A tool only the
+ *   child has, or one the child defines differently under the parent's name (a `structured_output`
+ *   with its own schema, for example), is declared by one system message at the fork point, so the
+ *   model sees the definition the child's tool checks.
+ * - The child's instructions (its role sections, the boundary, the tools it can call) go first in
+ *   its first own user message, after the inherited history.
+ *
+ * Only what a request sends changes; the session keeps DM's own record. Once a compaction in the
+ * child left no inherited message, there is no parent prefix to match: the child's own prompt is
+ * sent, with the boundary added as a section.
+ */
+export function projectForkRequest<T extends { role: string }>(messages: T[], inherited: readonly T[], forkedAt: number, options: { boundary?: string } = {}): T[] {
+	const own = (message: T) => !writtenBefore(message as { timestamp?: unknown }, forkedAt);
+	if (inherited.length === 0 || !messages.some((message) => !isSystemMessage(message) && !own(message))) {
+		if (!options.boundary) return messages;
+		const at = messages.findIndex((message) => !isSystemMessage(message));
+		const section = { role: "system", content: "", sections: { subagent_boundary: `<subagent_boundary>\n${options.boundary}\n</subagent_boundary>` }, timestamp: forkedAt } as unknown as T;
+		return at === -1 ? [...messages, section] : [...messages.slice(0, at), section, ...messages.slice(at)];
+	}
+	const instructions = forkInstructions({ parent: inherited, child: messages, own: messages.filter((message) => isSystemMessage(message) && own(message)), boundary: options.boundary });
+	const parentTools = new Map(getCurrentTools(inherited).map((tool) => [tool.name, tool]));
+	const childTools = getCurrentTools(messages).filter((tool) => {
+		const parentTool = parentTools.get(tool.name);
+		return !parentTool || !declarationsEqual(parentTool, tool);
+	});
+	const redefined = childTools.filter((tool) => parentTools.has(tool.name)).map((tool) => ({ name: tool.name }));
+	const sentInherited = messages.filter((message) => isSystemMessage(message) && !own(message));
+	const uncollapsed = sentInherited.length === inherited.length && sentInherited.every((message, index) => JSON.stringify(message) === JSON.stringify(inherited[index]));
+	const conversation = messages.filter((message) => !isSystemMessage(message));
+	const head = getCurrentSystemMessage(inherited) as T | undefined;
+	const next = uncollapsed
+		? messages.filter((message) => !isSystemMessage(message) || !own(message))
+		: [...(head ? [head] : []), ...conversation];
+	const firstOwn = next.findIndex((message) => !isSystemMessage(message) && own(message));
+	const task = next.findIndex((message) => message.role === "user" && own(message));
+	const additions: T[] = [];
+	if (childTools.length > 0) additions.push({ role: "system", content: "", ...(redefined.length > 0 ? { toolsRemoved: redefined } : {}), toolsAdded: childTools, timestamp: forkedAt } as unknown as T);
+	if (task === -1) additions.push({ role: "system", content: "", sections: { subagent_instructions: instructions }, timestamp: forkedAt } as unknown as T);
+	else next[task] = prependText(next[task]!, instructions);
+	const at = firstOwn === -1 ? next.length : firstOwn;
+	return [...next.slice(0, at), ...additions, ...next.slice(at)];
+}
+
+/**
+ * DM sends the session id in a session-affinity header to Anthropic-style endpoints that ask for
+ * one (`compat.sendSessionAffinityHeaders`), and routers use it to keep a session on the upstream
+ * that holds its prompt cache. A fork's request starts with its parent's whole cached prefix, so it
+ * names its parent's session to be routed to that cache; otherwise a router with several upstreams
+ * may send it to one that never saw the parent. Only the header DM itself sends is changed, and only
+ * when the child runs on the model that wrote its inherited history (`parentModel`, the last
+ * inherited assistant message): any other model holds no cache of that prefix.
+ */
+export function applyForkSessionAffinity(headers: Record<string, string | null | undefined> | undefined, model: ExtensionContext["model"] | undefined, parentSessionId: string | undefined, parentModel: InheritedModel | undefined): void {
+	const parent = parentSessionId?.trim();
+	if (!headers || !parent || model?.api !== "anthropic-messages") return;
+	if (!parentModel || parentModel.provider !== model.provider || parentModel.api !== model.api || parentModel.model !== model.id) return;
+	const compat = model.compat as AnthropicMessagesCompat | undefined;
+	if (!compat?.sendSessionAffinityHeaders) return;
+	headers[(compat as AnthropicMessagesCompat & { sessionAffinityFormat?: string }).sessionAffinityFormat === "openrouter" ? "x-session-id" : "x-session-affinity"] = parent;
+}
 
 export function rewriteForkCacheProviderRequest(event: BeforeProviderRequestEvent, ctx: Pick<ExtensionContext, "model"> | undefined, forkCacheKey: string | undefined): unknown {
 	const key = forkCacheKey?.trim();
@@ -340,17 +501,27 @@ function stripAssistantSubagentToolCallBlocks(message: unknown): unknown | undef
 	return { ...m, content: filteredContent };
 }
 
-export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean; preserveBoundedCompositeToolIds?: boolean; preserveFanoutToolHistory?: boolean } = {}): unknown[] {
+/**
+ * `inheritedBefore`, set in a forked child to the fork's time, keeps the history the child
+ * inherited as the parent sent it, so its requests can reuse the parent's prompt cache; only tool
+ * ids are still made portable there. The child cannot run `subagent` either way.
+ */
+export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean; preserveBoundedCompositeToolIds?: boolean; preserveFanoutToolHistory?: boolean; inheritedBefore?: number } = {}): unknown[] {
 	const preserveCurrentFanoutToolHistory = options.preserveFanoutToolHistory === true;
 	const sanitizeToolIds = options.sanitizeToolIds ?? true;
+	const inheritedBefore = options.inheritedBefore;
+	// Every message DM projects from a session has a timestamp, so one without it was added at
+	// request time and is treated as the child's own.
+	const inherited = (message: unknown) => inheritedBefore !== undefined && typeof (message as { timestamp?: unknown })?.timestamp === "number" && (message as { timestamp: number }).timestamp < inheritedBefore;
 	let changed = false;
 	const filtered: unknown[] = [];
 	for (const message of messages) {
-		if (isParentOnlySubagentMessage(message) || (!preserveCurrentFanoutToolHistory && isSubagentToolResultMessage(message))) {
+		const keep = inherited(message);
+		if (!keep && (isParentOnlySubagentMessage(message) || (!preserveCurrentFanoutToolHistory && isSubagentToolResultMessage(message)))) {
 			changed = true;
 			continue;
 		}
-		const stripped = preserveCurrentFanoutToolHistory ? message : stripAssistantSubagentToolCallBlocks(message);
+		const stripped = keep || preserveCurrentFanoutToolHistory ? message : stripAssistantSubagentToolCallBlocks(message);
 		if (stripped === undefined) {
 			changed = true;
 			continue;
@@ -492,6 +663,7 @@ export default function registerSubagentPromptRuntime(dm: ExtensionAPI, config?:
 	// the configured inline factory. It must be inert rather than crashing the
 	// child before startup; the inline factory remains the real registration path.
 	if (!config) return;
+	dm.requestSystemDeclarations?.();
 	registerRuntimeExtensionAcknowledgements(dm, config.runtimeAcknowledgements);
 	registerPermissionGate(dm, config.permissions, config.childWatchdog);
 	registerToolBudget(dm, config.toolBudget);
@@ -520,7 +692,8 @@ export default function registerSubagentPromptRuntime(dm: ExtensionAPI, config?:
 		resultFileCoalescer: { schedule: () => false, clear: () => {} },
 	} as unknown as SubagentState;
 	const nestedRootRunId = inheritedNestedRouteOf(config)?.rootRunId;
-	if (typeof dm.registerTool === "function") registerWaitTool(dm, waitState, config.waitTool.enabled, undefined, config.waitTool.defaultTimeoutMs, { nestedRootRunId });
+	// fanout-child assigns config.hasPendingSupervisorRequest after this hook registers, so read it per wait.
+	if (typeof dm.registerTool === "function") registerWaitTool(dm, waitState, config.waitTool.enabled, undefined, config.waitTool.defaultTimeoutMs, { nestedRootRunId }, () => config.hasPendingSupervisorRequest?.() === true);
 	const supervisorMetadata = childSupervisorMetadata(config);
 	let nativeSupervisorClientRegistered = false;
 	const registerNativeSupervisorClientOnce = (): void => {
@@ -558,12 +731,44 @@ export default function registerSubagentPromptRuntime(dm: ExtensionAPI, config?:
 
 	onRuntimeEvent("before_provider_request", (event: unknown, ctx?: ExtensionContext) => rewriteForkCacheProviderRequest(event as BeforeProviderRequestEvent, ctx, config.forkCacheKey));
 
+	// A fork launch sets forkCacheKey. DM writes the fork's session header when it copies the
+	// parent's branch, so every inherited message is older and every message this child writes,
+	// also after a resume, is not.
+	// The inherited system messages and model are read from the session once: a request may hold
+	// only DM's collapsed leading message, and what came before the fork never changes.
+	let inherited: { session: string; forkedAt: number; system: Array<{ role: string }>; model?: InheritedModel } | undefined;
+	const readInherited = (ctx: ExtensionContext | undefined) => {
+		const header = ctx?.sessionManager?.getHeader();
+		if (!header) return undefined;
+		if (inherited?.session !== header.id) {
+			const forkedAt = Date.parse(header.timestamp);
+			const manager = ctx!.sessionManager as NonNullable<typeof ctx>["sessionManager"] & { buildSessionProjection?: () => { messages: Array<{ role: string }> } };
+			const messages = Number.isFinite(forkedAt) ? manager.buildSessionProjection?.().messages ?? [] : [];
+			inherited = { session: header.id, forkedAt, system: systemMessagesBefore(messages, forkedAt), model: modelBefore(messages, forkedAt) };
+		}
+		return Number.isFinite(inherited.forkedAt) ? inherited : undefined;
+	};
+	const boundary = rewritesChildPrompt(config) ? childBoundary({ fanoutChild: config.fanoutChild, structuredOutput: Boolean(config.structuredOutput) }) : undefined;
+	if (config.forkCacheKey) onRuntimeEvent("before_provider_headers", (event: unknown, ctx?: ExtensionContext) => {
+		applyForkSessionAffinity((event as { headers?: Record<string, string | null | undefined> } | undefined)?.headers, ctx?.model, config.parentSessionId, readInherited(ctx)?.model);
+	});
+	if (config.forkCacheKey) onRuntimeEvent("context_with_system", (event: unknown, ctx?: ExtensionContext) => {
+		if (!event || typeof event !== "object" || !("messages" in event) || !Array.isArray(event.messages)) return undefined;
+		const fork = readInherited(ctx);
+		if (!fork) return undefined;
+		const messages = projectForkRequest(event.messages as Array<{ role: string }>, fork.system, fork.forkedAt, { boundary });
+		return messages === event.messages ? undefined : { messages };
+	});
+
 	onRuntimeEvent("context", (event: unknown, ctx?: ExtensionContext) => {
 		if (!event || typeof event !== "object" || !("messages" in event) || !Array.isArray(event.messages)) return undefined;
+		const forkedAt = config.forkCacheKey ? Date.parse(ctx?.sessionManager?.getHeader()?.timestamp ?? "") : Number.NaN;
 		const messages = stripParentOnlySubagentMessages(event.messages, {
 			sanitizeToolIds: !COMPOSITE_TOOL_ID_APIS.has(ctx?.model?.api ?? ""),
-			preserveBoundedCompositeToolIds: ctx?.model?.api === "openai-codex-responses",
+			// Providers that reuse the Codex Responses wire under their own api id (e.g. cliproxyapi-codex-responses) split call_id|item_id the same way.
+			preserveBoundedCompositeToolIds: ctx?.model?.api?.endsWith("-codex-responses") === true,
 			preserveFanoutToolHistory: config.fanoutChild,
+			...(Number.isFinite(forkedAt) ? { inheritedBefore: forkedAt } : {}),
 		});
 		if (messages === event.messages) return undefined;
 		return { messages };

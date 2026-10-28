@@ -1,0 +1,119 @@
+id: no-sql-in-code-execute
+language: TypeScript
+message: "Raw SQL string in code — use query builder or ORM"
+severity: warning
+note: |
+  Raw SQL strings built via concatenation or template substitution are
+  error-prone and open to injection. Use a query builder (knex, drizzle)
+  or ORM (prisma, typeorm), or pass the value as a bind parameter.
+
+  This rule holds only the `.execute` arms; `.query` stays in
+  `no-sql-in-code` / `no-sql-in-code-js` with master's keyword gate. Both
+  read `$SQL` the same way: a `binary_expression` (string concatenation,
+  e.g. `"SELECT ... " + id`) or a template string with at least one
+  `${...}` substitution — the shapes that interpolate a runtime value into
+  the query text. A plain string literal, including one with a `?`
+  placeholder passed beside a params array, is not flagged (#1806).
+
+  2026-10-24 (#1828): `$DB.execute(...)` is the same sink as
+  `$DB.query(...)` (mysql2 and oracledb both take `execute(sql, params)`),
+  so it gets 1-arg and `, $$$REST` arms, plus their `?.` forms. `execute`
+  is also a common task, command and job method name, and the keyword
+  `has` on the `.query` arms matches a keyword anywhere in the call: the
+  callee-name false-positive class #2909 fixed in the tree-sitter
+  `sql-injection` rule. The `.execute` arms therefore use that fix's
+  prefix test instead (`ts_sql_injection_sink` in
+  clients/tree-sitter-client.ts): the first argument's text (the first
+  child of `arguments` that is not a comment) must start with a quote or
+  backtick, then optional whitespace and SQL comments, then a statement
+  from the sibling's alternation. The test reads the first argument only,
+  as the sibling reads only the template, so a later `{ set: ... }` or
+  `from` cannot complete an `UPDATE` or `SELECT`.
+
+  Severity is `warning`, not `error` (#4804 review): statement-shaped
+  English still matches, because the alternation accepts it and an
+  ast-grep rule has no receiver test. `acl.execute("grant " + role)`,
+  `search.execute("create index " + field)`,
+  `config.execute("merge into " + base)`, `"delete from " + cacheKey` and
+  `"select " + label + " from the list"` all flag. All five are pinned as
+  `invalid:` rows, so a later narrowing has a red row to work against.
+  Nothing here blocks an edit: this body measures 22 against
+  `MAX_BLOCKING_RULE_COMPLEXITY` (8) in
+  clients/dispatch/runners/yaml-rule-parser.ts, as master's `.query` body
+  already did at 15, so a per-edit dispatch skips the rule. These findings
+  arrive from the full-analysis path (`blockingOnly: false`, e.g.
+  `dmlens_analyze`), where `error` used to present them as blockers.
+
+  Three edits diverge from the sibling's text
+  (clients/tree-sitter-client.ts:4703): a `\b` after `SELECT` and after
+  `WITH`, so `"selected from "` and `"Within the select list "` do not
+  open a statement; the skip also accepts exactly the `\n`, `\r` and `\t`
+  escapes as written in source, case-sensitively so that `\N` does not
+  count, which catches `"\nSELECT ..."`; and a `--` comment also ends at
+  an escaped `\n` or `\r`, as Postgres ends one at either, so
+  `"-- c\nSELECT ..."` is caught (the comment may also run on to a later
+  escape).
+
+  The two differences this leaves against the sibling are accepted
+  residuals of this change, not a planned follow-up: the sibling's
+  `SELECT` and `WITH` arms carry no word boundary, so
+  `job.execute("selected from " + source)` still flags there, and its
+  skip accepts real whitespace only, so an escaped `"\nSELECT ..."` is a
+  miss there. tests/config/sql-injection-alternation-drift.test.ts keeps
+  the rest of the alternation byte-identical to the sibling's copy.
+
+  Cost (#4804 review, measured on this head for the shared statement
+  test): 2.2 to 23.7 ms per scanned file, 231 to 468 of 2,687 JS/TS files
+  admitted by the literal prefilter, and 0.46 s to 11.7 s for a
+  full-tree scan. The per-file cost does not depend on file size, so it is
+  rule compilation per `findAll` call, not traversal; #4807 tracks it and
+  does not block this rule. A re-measurement of this split reproduces both
+  facts (0.9 to 1.6 ms per file for the `.query` rule, 11 to 12 ms for
+  this one, at 28 KiB and 155 KiB).
+
+  The sibling's other test is out of reach for an ast-grep rule: when the
+  prefix test fails, it still flags a template whose receiver it follows
+  through same-file declarations to an import from a known SQL package, so
+  that is a second way to flag, not a filter.
+
+  Not caught through `execute`: a statement split between its first two
+  tokens (`"DELETE " + "FROM t ..."`), SQL text that opens with `${...}`,
+  a parenthesized argument or one that starts with a variable, whitespace
+  written as `\u000a`, `\x0a` or a backslash line continuation, a
+  FROM-less SELECT built by concatenation (`"SELECT pg_sleep(" + n + ")"`),
+  and statements the alternation does not list (`INSERT IGNORE INTO`,
+  `INSERT OR REPLACE INTO`).
+rule:
+  all:
+    - any:
+        - pattern: $DB.execute($SQL)
+        - pattern: $DB.execute($SQL, $$$REST)
+        - pattern: $DB?.execute($SQL)
+        - pattern: $DB?.execute($SQL, $$$REST)
+    - has:
+        field: arguments
+        has:
+          nthChild:
+            position: 1
+            ofRule:
+              not:
+                kind: comment
+          regex: >-
+            (?i)^["'`](?:\s|(?-i:\\[nrt])|/\*[\s\S]*?\*/|--[^\n]*(?:\n|(?-i:\\[nr])|$))*(?:SELECT\b[\s\S]*(?:\bFROM\b|\$\{)|INSERT\s+INTO\b|UPDATE\s+[\s\S]*\bSET\b|DELETE\s+FROM\b|CREATE\s+(?:OR\s+REPLACE\s+|TEMP(?:ORARY)?\s+|UNIQUE\s+|MATERIALIZED\s+)*(?:TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|PROCEDURE|SEQUENCE|TYPE|EXTENSION)\b|DROP\s+(?:OR\s+REPLACE\s+|TEMP(?:ORARY)?\s+|UNIQUE\s+|MATERIALIZED\s+)*(?:TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|PROCEDURE|SEQUENCE|TYPE|EXTENSION)\b|ALTER\s+(?:OR\s+REPLACE\s+|TEMP(?:ORARY)?\s+|UNIQUE\s+|MATERIALIZED\s+)*(?:TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|PROCEDURE|SEQUENCE|TYPE|EXTENSION)\b|GRANT\b|REVOKE\b|WITH\b[\s\S]*\bSELECT\b|MERGE\s+INTO\b|TRUNCATE\s+TABLE\b|REPLACE\s+INTO\b)
+constraints:
+  SQL:
+    any:
+      - all:
+          - kind: binary_expression
+          - not:
+              all:
+                - has:
+                    field: left
+                    kind: string
+                - has:
+                    field: right
+                    kind: string
+      - all:
+          - kind: template_string
+          - has:
+              kind: template_substitution

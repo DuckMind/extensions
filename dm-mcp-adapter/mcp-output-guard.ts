@@ -64,7 +64,7 @@ export interface McpOutputGuardOptions {
   enabled?: boolean;
   prefix?: string;
   suffix?: string;
-  /** Optional guidance appended when it fits the output limits. */
+  /** Optional legacy script guidance; included only within the output budget. */
   footer?: string;
   emptyTextFallback?: string;
   maxBytes?: number;
@@ -96,10 +96,6 @@ export function resolveMcpOutputGuardOptions(settings?: McpSettings): Pick<McpOu
   };
 }
 
-/**
- * Models retype large results into the next call's arguments unless told otherwise at the moment
- * they see the result; the same wording in tool descriptions did not change that.
- */
 export function scriptPipeHint(scriptTool: boolean | undefined, content: ContentBlock[]): { footer?: string } {
   if (scriptTool !== true) return {};
   const bytes = content.reduce((total, block) => total + (block.type === "text" ? byteLength(block.text) : 0), 0);
@@ -114,6 +110,11 @@ export function guardedMcpDetails(guarded: GuardedMcpOutput): Record<string, unk
     ...(guarded.mcpResult !== undefined ? { mcpResult: guarded.mcpResult } : {}),
     ...(guarded.outputGuard ? { outputGuard: guarded.outputGuard } : {}),
   };
+}
+
+export async function guardMcpText(text: string, options: McpOutputGuardOptions): Promise<{ content: ContentBlock[]; details: Record<string, unknown> }> {
+  const guarded = await guardMcpOutput([{ type: "text", text }], options);
+  return { content: guarded.content, details: guardedMcpDetails(guarded) };
 }
 
 /**
@@ -160,7 +161,7 @@ export async function guardMcpOutput(
   if (truncation.truncated) {
     const { path: fullOutputPath, error: writeError } = await saveArtifact("output", composedOutput);
     const initialNotice = formatTruncationNotice(truncation, fullOutputPath, writeError);
-    // Footers are optional guidance: drop one that would not fit beside the notice rather than exceed the limits.
+    // Optional footer is discarded rather than weakening the output cap.
     const noticeWithFooter = textStats(`\n\n${initialNotice}${footer}`);
     const keptFooter = noticeWithFooter.bytes < maxBytes && noticeWithFooter.lines < maxLines ? footer : "";
     const previewBudget = reserveBudget(maxBytes, maxLines, `${initialNotice}${keptFooter}`);
@@ -484,6 +485,11 @@ async function saveArtifact(kind: string, text: string): Promise<{ path?: string
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** Saves text to a private temp file the way a cut result is saved. */
+export function saveMcpOutputText(text: string): Promise<{ path?: string; error?: string }> {
+  return saveArtifact("output", text);
 }
 
 async function discardArtifact(path: string): Promise<void> {

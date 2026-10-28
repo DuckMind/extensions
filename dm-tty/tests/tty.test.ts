@@ -4,7 +4,7 @@ import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, type RawData } from "ws";
 import { createTtyToken, DmTtyServer } from "../server.ts";
@@ -52,6 +52,29 @@ test("browser assets are local, token-free and protected against framing", { tim
 	}
 	assert.equal((await fetch(url + "/../server.ts")).status, 404);
 	assert.equal((await fetch(url + "/?token=" + token)).status, 404);
+});
+
+test("wildcard listener accepts non-loopback HTTP and same-origin authenticated WebSockets", { timeout: 10_000 }, async (t) => {
+	const address = Object.values(networkInterfaces()).flat()
+		.find((value) => value?.family === "IPv4" && !value.internal && !value.address.startsWith("169.254."))?.address;
+	if (!address) return void t.skip("No non-loopback IPv4 interface available");
+	const token = createTtyToken();
+	const server = new DmTtyServer({ host: "0.0.0.0", port: 0, cwd: process.cwd(), shell: "/bin/sh", token });
+	t.after(() => server.close());
+	const info = await server.start();
+	assert.equal(info.host, "0.0.0.0");
+	const url = `http://${address}:${info.port}`;
+	assert.equal((await fetch(`${url}/health`, { signal: AbortSignal.timeout(3_000) })).status, 200);
+	const socket = new WebSocket(`${url.replace("http:", "ws:")}/terminal`, { origin: url });
+	t.after(() => socket.terminate());
+	await once(socket, "open", { signal: AbortSignal.timeout(3_000) });
+	const ready = once(socket, "message", { signal: AbortSignal.timeout(3_000) });
+	socket.send(JSON.stringify({ v: 1, type: "auth", token }));
+	assert.equal(JSON.parse(String((await ready)[0])).type, "ready");
+	const foreign = new WebSocket(`${url.replace("http:", "ws:")}/terminal`, { origin: "https://untrusted.invalid" });
+	t.after(() => foreign.terminate());
+	const error = await once(foreign, "error", { signal: AbortSignal.timeout(3_000) });
+	assert.match(String(error[0]), /403/);
 });
 
 test("authentication rejects a wrong token without leaking replay", { timeout: 10_000 }, async (t) => {

@@ -65,6 +65,21 @@ test("tty lifecycle starts once, stops, restarts and shuts down with the session
 	await assert.rejects(fetch(nextUrl));
 });
 
+test("default /tty host advertises its wildcard bind before the local browser link", { timeout: 10_000 }, async (t) => {
+	const h = harness();
+	t.after(() => h.close());
+	assert.equal(parseCommand("start", process.cwd()).port, 8765);
+	await h.run("start --port 0");
+	const first = h.notices.at(-1)!;
+	const port = Number(first.match(/dm-tty: http:\/\/0\.0\.0\.0:(\d+)\//)?.[1]);
+	assert.ok(port > 0, first);
+	assert.match(first, new RegExp(`http://127\\.0\\.0\\.1:${port}/`));
+	assert.match(first, /Listening on all interfaces/);
+	assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
+	await h.run("status");
+	assert.equal(h.notices.at(-1), first);
+});
+
 test("tty refuses noninteractive startup before creating a listener", async () => {
 	const h = harness();
 	h.ctx.hasUI = false;

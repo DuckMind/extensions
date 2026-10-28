@@ -899,7 +899,7 @@ export function describeUnavailability(options: {
 	const elapsed = options.elapsedMs ? ` after ${options.elapsedMs}ms` : "";
 	const stalled =
 		options.cause === "host-stall"
-			? " (the pi host event loop stalled during the probe window, so the budget expired on the host side)"
+			? " (the DM host event loop stalled during the probe window, so the budget expired on the host side)"
 			: "";
 	const retry = options.retryAfterMs
 		? ` Retrying in ${Math.round(options.retryAfterMs / 1000)}s.`

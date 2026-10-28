@@ -4,13 +4,13 @@ import { it } from "node:test";
 import registerNotify from "../../src/runs/background/notify.ts";
 
 function harness(manager: { getSessionId(): string }, appended = false) {
-	let beforeSettle: any;
+	const handlers = new Map<string, any>();
 	const sent: any[] = [];
 	const notifier = registerNotify({
 		events: { on: () => () => {} }, isHeld: () => false,
 		on(name: string, handler: any) {
-			if (name === "agent_before_settle") beforeSettle = handler;
-			return () => { if (name === "agent_before_settle") beforeSettle = undefined; };
+			handlers.set(name, handler);
+			return () => { if (handlers.get(name) === handler) handlers.delete(name); };
 		},
 		sendMessage(message: any) { sent.push(message); return appended; },
 	} as never, { currentSessionId: manager.getSessionId(), completionOwnerId: "owner" }, { batchConfig: { enabled: false } });
@@ -21,7 +21,7 @@ function harness(manager: { getSessionId(): string }, appended = false) {
 			id: randomUUID(), sessionId: manager.getSessionId(), completionOwnerId: "owner",
 			success: true, agent: "workflow", summary: "Saved report ready.",
 		}),
-		settle: (messages: any[]) => beforeSettle?.({
+		settle: (messages: any[]) => handlers.get("agent_before_settle")?.({
 			outcome: "completed", continue: false, entries: [],
 			context: { canContinue: true, pendingMessages: [], contextMessages: messages },
 		}),
